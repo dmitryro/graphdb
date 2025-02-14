@@ -1,5 +1,9 @@
+pub mod cli_engine;
+pub mod indexing_caching;
 pub mod network_interfaces;
 pub mod plugin_system;
-pub mod query_engine;
+pub mod query_parser;
+pub mod query_exec_engine;
+pub mod rest_api;
 pub mod storage_engine;
 pub mod transact_indexing;
