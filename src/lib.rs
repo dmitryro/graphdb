@@ -1,5 +1,5 @@
 pub mod query_parser; // Ensure this line exists
-pub mod cli_engine;
+pub mod cli;
 pub mod graph_evolution;
 pub mod network_interfaces;
 pub mod plugin_system;
