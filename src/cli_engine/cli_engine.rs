@@ -1,15 +1,15 @@
-use clap::{Parser, command}; // Import the necessary clap macros and attributes
+use clap::{Parser, command};
 use crossterm::{
     terminal::{Clear, ClearType},
     cursor,
-    style::{self, Color}, // Import only what's needed
+    style::{self, Color},
     ExecutableCommand,
 };
 use std::io::{self, Write};
 use std::collections::HashSet;
-
+use crate::query_parser::{parse_query_from_string, QueryType};
 /// CLI entry point for GraphDB
-#[derive(Parser, Debug)] // Derive Parser from clap
+#[derive(Parser, Debug)]
 #[command(name = "graphdb-cli")]
 #[command(version = "0.1.0")]
 #[command(about = "Experimental Graph Database CLI", long_about = None)]
@@ -17,27 +17,23 @@ struct CliArgs {}
 
 /// Starts the interactive CLI.
 pub fn start_cli() {
-    let _args = CliArgs::parse(); // This will parse command line arguments
+    let _args = CliArgs::parse();
 
-    // Define a set of valid commands, including exit/quit dynamically
     let mut valid_commands: HashSet<&str> = [
-        "help", "status", "list", "connect", "clear", // Add other commands here
+        "help", "status", "list", "connect", "clear",
     ]
     .iter()
     .cloned()
     .collect();
 
-    // Dynamically add exit/quit to the valid commands set
     valid_commands.insert("exit");
     valid_commands.insert("quit");
     valid_commands.insert("q");
 
-    // Access the terminal output and print greeting using terminal features
     let mut stdout = io::stdout();
-    stdout.execute(Clear(ClearType::All)).expect("Failed to clear screen"); // Clear screen
-    stdout.execute(cursor::MoveTo(0, 0)).expect("Failed to move cursor"); // Move cursor to top
+    stdout.execute(Clear(ClearType::All)).expect("Failed to clear screen");
+    stdout.execute(cursor::MoveTo(0, 0)).expect("Failed to move cursor");
 
-    // Use Cyan color for the greeting text
     stdout
         .execute(style::SetForegroundColor(Color::Cyan))
         .expect("Failed to set color");
@@ -46,19 +42,17 @@ pub fn start_cli() {
         "\nWelcome to GraphDB CLI\nType a command and press Enter. Type 'exit' or 'quit' or 'q' to quit.\n\n"
     )
     .expect("Failed to write greeting");
-    stdout.execute(style::ResetColor).expect("Failed to reset color"); // Reset color after greeting
+    stdout.execute(style::ResetColor).expect("Failed to reset color");
 
-    // Ensure terminal message is displayed
     stdout.flush().expect("Failed to flush stdout");
 
     loop {
-        // Display the prompt with colored command input hint
         stdout
             .execute(style::SetForegroundColor(Color::Cyan))
             .expect("Failed to set color");
         print!("=> ");
-        stdout.execute(style::ResetColor).expect("Failed to reset color"); // Reset color after printing the prompt
-        io::stdout().flush().expect("Failed to flush stdout"); // Ensure it prints
+        stdout.execute(style::ResetColor).expect("Failed to reset color");
+        io::stdout().flush().expect("Failed to flush stdout");
 
         let mut input = String::new();
         if let Err(e) = io::stdin().read_line(&mut input) {
@@ -66,24 +60,39 @@ pub fn start_cli() {
             continue;
         }
 
-        let command = input.trim(); // Trim spaces/newlines
+        let command = input.trim();
 
         if valid_commands.contains(command) {
-            // Check if the command is 'exit' or 'quit' (dynamically from the HashSet)
             if command == "exit" || command == "quit" || command == "q" {
-                println!("\nExiting GraphDB CLI... Goodbye!\n"); // Print exit message
-                break; // Graceful exit
+                println!("\nExiting GraphDB CLI... Goodbye!\n");
+                break;
             }
-
-            // Handle other commands dynamically
             println!("Executing command: {}", command);
         } else if !command.is_empty() {
-            // Apply color to the "Unknown command" message
-            stdout
-                .execute(style::SetForegroundColor(Color::Yellow))
-                .expect("Failed to set color");
-            println!("Unknown command: {}", command);
-            stdout.execute(style::ResetColor).expect("Failed to reset color"); // Reset color after colored message
+            // Attempt to parse the command as a query
+            match parse_query_from_string(command) {
+                Ok(parsed_query) => {
+                    // Here you would match on the type of query
+                    match parsed_query {
+                        QueryType::Cypher => {
+                            println!("Cypher query detected: {}", command);
+                        }
+                        QueryType::SQL => {
+                            println!("SQL query detected: {}", command);
+                        }
+                        QueryType::GraphQL => {
+                            println!("GraphQL query detected: {}", command);
+                        }
+                    }
+                }
+                Err(_) => {
+                    stdout
+                        .execute(style::SetForegroundColor(Color::Yellow))
+                        .expect("Failed to set color");
+                    println!("Unknown command: {}", command);
+                    stdout.execute(style::ResetColor).expect("Failed to reset color");
+                }
+            }
         }
     }
 }

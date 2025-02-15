@@ -1,22 +1,18 @@
-use chrono::{DateTime, Utc, Duration};
+// src/graph_evolution/time_window.rs
 
-/// Represents a time window for querying changes.
 #[derive(Debug, Clone)]
 pub struct TimeWindow {
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
+    pub start_time: u64,
+    pub end_time: u64,
 }
 
 impl TimeWindow {
-    /// Creates a time window from a duration (e.g., last 10 minutes).
-    pub fn from_duration(duration: Duration) -> Self {
-        let end = Utc::now();
-        let start = end - duration;
-        Self { start, end }
+    pub fn new(start_time: u64, end_time: u64) -> Self {
+        TimeWindow { start_time, end_time }
     }
 
-    /// Checks if a timestamp is within the window.
-    pub fn contains(&self, timestamp: &DateTime<Utc>) -> bool {
-        *timestamp >= self.start && *timestamp <= self.end
+    pub fn contains(&self, timestamp: u64) -> bool {
+        timestamp >= self.start_time && timestamp <= self.end_time
     }
 }
+
