@@ -7,17 +7,18 @@ pub enum QueryType {
 }
 
 pub fn parse_query_from_string(query: &str) -> Result<QueryType, String> {
-    match parse_query::<&str>(query) {
-        Ok(_) => Ok(QueryType::GraphQL),
-        Err(_) => {
-            if query.starts_with("MATCH") || query.contains("RETURN") {
-                Ok(QueryType::Cypher)
-            } else if query.contains("SELECT") || query.contains("FROM") {
-                Ok(QueryType::SQL)
-            } else {
-                Err("Unrecognized query format".to_string())
-            }
-        }
+    // Try to parse as a GraphQL query
+    if let Ok(_) = parse_query::<&str>(query) {
+        return Ok(QueryType::GraphQL);
     }
+
+    // Try to parse as Cypher or SQL queries
+    if query.starts_with("MATCH") || query.contains("RETURN") {
+        return Ok(QueryType::Cypher);
+    } else if query.contains("SELECT") || query.contains("FROM") {
+        return Ok(QueryType::SQL);
+    }
+
+    Err("Unrecognized query format".to_string())
 }
 
