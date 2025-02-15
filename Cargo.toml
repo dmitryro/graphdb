@@ -37,7 +37,9 @@ r2d2 = "0.8.10"
 anyhow = "1.0.95"
 crossterm = "0.28.1"
 tokio-stream = "0.1.17"
+petgraph = "0.7.1"
+rocksdb = "0.23.0"
 
 [[bin]]
-name = "graph_database"
+name = "graphdb-cli"
 path = "src/main.rs"
