@@ -39,6 +39,8 @@ crossterm = "0.28.1"
 tokio-stream = "0.1.17"
 petgraph = "0.7.1"
 rocksdb = "0.23.0"
+tokio-test = "0.4.4"
+mockall = "0.13.1"
 
 [[bin]]
 name = "graphdb-cli"
