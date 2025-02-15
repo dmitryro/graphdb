@@ -43,6 +43,11 @@ tokio-test = "0.4.4"
 mockall = "0.13.1"
 graphql-parser = "0.4.1"
 
+# Specify both lib and bin
+[lib]
+name = "graph_database"
+path = "src/lib.rs"
+
 [[bin]]
 name = "graphdb-cli"
 path = "src/main.rs"

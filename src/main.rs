@@ -1,5 +1,6 @@
 use clap::{Arg, Command, Subcommand};
 use graph_database::cli_engine::cli_engine::start_cli;
+use graph_database::indexing_caching::{index_node, cache_node_state};
 
 #[derive(Subcommand)]
 enum CliCommands {
@@ -16,6 +17,20 @@ enum CliCommands {
         start: Option<String>,
         #[arg(long, help = "Specify end timestamp for history")]
         end: Option<String>,
+    },
+    #[command(about = "Index a new node in the graph")]
+    IndexNode {
+        #[arg(help = "Specify the node ID to index")]
+        node: String,
+        #[arg(help = "Specify the node data")]
+        data: String,
+    },
+    #[command(about = "Cache a node state")]
+    CacheNodeState {
+        #[arg(help = "Specify the node ID to cache")]
+        node: String,
+        #[arg(help = "Specify the node state to cache")]
+        state: String,
     },
     #[command(about = "Default command")]
     Default,
@@ -39,6 +54,18 @@ fn main() {
                 .arg(Arg::new("start").long("start").num_args(1).help("Specify start timestamp for history"))
                 .arg(Arg::new("end").long("end").num_args(1).help("Specify end timestamp for history")),
         )
+        .subcommand(
+            Command::new("index-node")
+                .about("Index a new node in the graph")
+                .arg(Arg::new("node").help("Specify the node ID to index").required(true))
+                .arg(Arg::new("data").help("Specify the node data").required(true)),
+        )
+        .subcommand(
+            Command::new("cache-node-state")
+                .about("Cache a node state")
+                .arg(Arg::new("node").help("Specify the node ID to cache").required(true))
+                .arg(Arg::new("state").help("Specify the node state to cache").required(true)),
+        )
         .get_matches();
 
     if let Some(("view-graph", sub_m)) = matches.subcommand() {
@@ -60,6 +87,20 @@ fn main() {
             node, start, end
         );
         // Call the function to view the graph history
+    } else if let Some(("index-node", sub_m)) = matches.subcommand() {
+        let node = sub_m.get_one::<String>("node").unwrap();
+        let data = sub_m.get_one::<String>("data").unwrap();
+        println!("Indexing node: {} with data: {}", node, data);
+
+        // Call the indexing function
+        index_node(node, data);
+    } else if let Some(("cache-node-state", sub_m)) = matches.subcommand() {
+        let node = sub_m.get_one::<String>("node").unwrap();
+        let state = sub_m.get_one::<String>("state").unwrap();
+        println!("Caching state for node: {} with state: {}", node, state);
+
+        // Call the caching function
+        cache_node_state(node, state);
     } else {
         // No subcommand provided, call the default start_cli function
         start_cli();
