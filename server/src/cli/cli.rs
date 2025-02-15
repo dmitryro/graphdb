@@ -7,7 +7,7 @@ use crossterm::{
 };
 use std::io::{self, Write};
 use std::collections::HashSet;
-use crate::query_parser::{parse_query_from_string, QueryType};
+use graphdb_lib::query_parser::{parse_query_from_string, QueryType};
 /// CLI entry point for GraphDB
 #[derive(Parser, Debug)]
 #[command(name = "graphdb-cli")]

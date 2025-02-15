@@ -1,6 +1,6 @@
 use clap::{Arg, Command, Subcommand};
-use graph_database::cli_engine::cli_engine::start_cli;
-use graph_database::indexing_caching::{index_node, cache_node_state};
+use graphdb_server::cli::cli::start_cli;
+use graphdb_lib::indexing_caching::{index_node, cache_node_state};
 
 #[derive(Subcommand)]
 enum CliCommands {
