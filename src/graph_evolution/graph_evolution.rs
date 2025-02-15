@@ -1,39 +1,33 @@
-// Graph Evolution
-
-use crate::graph_evolution::change_tracker::{ChangeTracker, GraphChange};
-use crate::graph_evolution::time_window::TimeWindow;
+use chrono::{DateTime, Utc, TimeZone};  // Import TimeZone trait
+use crate::graph_evolution::change_tracker::ChangeTracker;
 use crate::graph_evolution::models::{Node, Edge};
-use std::sync::{Arc, Mutex};
+use crate::graph_evolution::time_window::TimeWindow;
 
-/// Manages graph evolution.
 pub struct GraphEvolution {
-    tracker: Arc<Mutex<ChangeTracker>>,
+    pub change_tracker: ChangeTracker,
 }
 
 impl GraphEvolution {
-    /// Creates a new GraphEvolution instance.
     pub fn new() -> Self {
-        Self {
-            tracker: Arc::new(Mutex::new(ChangeTracker::new())),
+        GraphEvolution {
+            change_tracker: ChangeTracker::new(),
         }
     }
 
-    /// Records a node change.
-    pub fn record_node_change(&self, node: &Node, change_type: &str) {
-        let mut tracker = self.tracker.lock().unwrap();
-        tracker.record_change(&node.id, change_type);
+    // Replay changes up to the end time in the time window
+    pub fn replay_changes(&self, time_window: &TimeWindow) -> Option<(Vec<Node>, Vec<Edge>)> {
+        // Handling the LocalResult from timestamp_opt explicitly
+        let end_time = match Utc.timestamp_opt(time_window.end_time as i64, 0) {
+            chrono::LocalResult::Single(time) => time,
+            _ => return None, // Handle invalid timestamp case
+        };
+
+        self.change_tracker.replay_changes_up_to_time(end_time)
     }
 
-    /// Records an edge change.
-    pub fn record_edge_change(&self, edge: &Edge, change_type: &str) {
-        let mut tracker = self.tracker.lock().unwrap();
-        tracker.record_change(&edge.id, change_type);
-    }
-
-    /// Fetches changes within a time window.
-    pub fn get_changes_within_window(&self, window: TimeWindow) -> Vec<GraphChange> {
-        let tracker = self.tracker.lock().unwrap();
-        tracker.get_changes_within_window(window)
+    // Method to add a change to the graph
+    pub fn record_change(&mut self, timestamp: DateTime<Utc>, node: Option<Node>, edge: Option<Edge>) {
+        self.change_tracker.record_change(timestamp, node, edge);
     }
 }
 
