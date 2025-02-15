@@ -22,7 +22,7 @@ open-cypher = "0.1.1"
 nom = "8.0.0"
 sled = "0.34.7"
 bytes = "1.10.0"
-clap = "4.5.29"
+clap = { version = "4.5.29", features = ["derive"] } 
 hashbrown = "0.15.2"
 pest = "2.7.15"
 lalrpop = "0.22.1"
