@@ -1,8 +1,11 @@
-# Experimental Graph Database built in Rust
+# GraphDB
 
 ![Build Status](https://img.shields.io/badge/build-passing-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Version](https://img.shields.io/badge/version-0.0.1--dev-orange)
+
+### Experimental graph database built in Rust
+
 
 ## Table of Contents
 - [Overview](#overview)

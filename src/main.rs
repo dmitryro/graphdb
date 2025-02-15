@@ -1,5 +1,5 @@
 use clap::{Arg, Command, Subcommand};
-use graph_database::cli_engine::cli_engine::start_cli;
+use graph_database::cli::cli::start_cli;
 use graph_database::indexing_caching::{index_node, cache_node_state};
 
 #[derive(Subcommand)]
