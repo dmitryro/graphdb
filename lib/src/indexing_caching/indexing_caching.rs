@@ -1,26 +1,31 @@
-// src/indexing_caching/indexing_caching.rs
-
 use std::collections::HashMap;
-use anyhow::{Result, Context};
+use anyhow::{Result};
+#[cfg(feature = "with_sled")]
 use sled::Db;
-use petgraph::graph::{DiGraph};
+use petgraph::graph::DiGraph;
 
 #[derive(Debug)]
 pub struct IndexingCache {
     in_memory_cache: HashMap<String, String>,
+    #[cfg(feature = "with_sled")]
     persistent_cache: Db,
     graph_index: DiGraph<String, String>,
 }
 
 impl IndexingCache {
-    pub fn new(persistent_cache_path: &str) -> Result<Self> {
-        let persistent_cache = sled::open(persistent_cache_path)
+    pub fn new(
+        #[cfg(feature = "with_sled")] _persistent_cache_path: &str,
+        #[cfg(not(feature = "with_sled"))] _: &str,
+    ) -> Result<Self> {
+        #[cfg(feature = "with_sled")]
+        let persistent_cache = sled::open(_persistent_cache_path)
             .context("Failed to open persistent cache")?;
-        
+
         let graph_index = DiGraph::new();
 
         Ok(IndexingCache {
             in_memory_cache: HashMap::new(),
+            #[cfg(feature = "with_sled")]
             persistent_cache,
             graph_index,
         })
@@ -30,6 +35,7 @@ impl IndexingCache {
         self.in_memory_cache.insert(key, value);
     }
 
+    #[cfg(feature = "with_sled")]
     pub fn index_data_persistent(&mut self, key: String, value: String) -> Result<()> {
         self.persistent_cache.insert(key.as_bytes(), value.as_bytes())
             .context("Failed to index data in persistent cache")?;
@@ -40,6 +46,7 @@ impl IndexingCache {
         self.in_memory_cache.get(key)
     }
 
+    #[cfg(feature = "with_sled")]
     pub fn get_data_from_persistent(&self, key: &str) -> Result<Option<String>> {
         match self.persistent_cache.get(key.as_bytes())? {
             Some(data) => Ok(Some(String::from_utf8_lossy(&data).to_string())),
