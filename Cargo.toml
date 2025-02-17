@@ -7,4 +7,5 @@ members = [
     "server",
     "client", 
     "rest_api", 
+    "daemon", 
 ]

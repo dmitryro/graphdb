@@ -1,0 +1,6 @@
+[server]
+port = 9002
+
+[daemon]
+user = "graphdbuser"
+group = "GraphDBGroup" 

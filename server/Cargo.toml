@@ -36,6 +36,9 @@ libloading = "0.8.6"
 r2d2 = "0.8.10"
 anyhow = "1.0.95"
 crossterm = "0.28.1"
+config = "0.15.8"
+daemonize = "0.5.0"
+libc = "0.2.169"
 
 
 [dev-dependencies]
@@ -51,13 +54,17 @@ path = "../proto"
 version = "0.1.0"
 features = ["server"]
 
+[dependencies.graphdb-daemon]
+path = "../daemon"
+version = "0.1.0"
+
 [dependencies.graphdb-rest_api]
 path = "../rest_api"
 version = "0.1.0"
 features = ["server"]
 
 [[bin]]
-name = "graphdb-server"
+name = "graphdb-cli"
 path = "src/main.rs"
 
 # Specify both lib and bin
