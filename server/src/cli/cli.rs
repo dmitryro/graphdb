@@ -13,6 +13,8 @@ use std::process::{Command, exit};
 use graphdb_lib::query_parser::{parse_query_from_string, QueryType};
 use config::Config;
 use std::path::Path;
+use std::ffi::CString;
+use proctitle::set_title;
 
 // CLI entry point for GraphDB
 #[derive(Parser, Debug)]
@@ -118,68 +120,61 @@ pub fn start_cli() {
     }
 }
 
+fn set_daemon_process_name(name: &str) {
+      set_title(name);
+}
+
 fn start_daemon(port: Option<u16>) {
     // Define the path to the configuration file
     let config_path = "server/src/cli/config.toml";
 
-    // Get port from command-line argument or config file
-    let port_to_use = match port {
-        Some(p) => p, // Use the port from the command-line argument
-        None => {
-            if Path::new(config_path).exists() {
-                // Read from config file
-                let mut config = Config::builder()
-                    .add_source(config::File::with_name(config_path))
-                    .build()
-                    .unwrap();
-                config.get::<u16>("server.port").unwrap_or_else(|_| {
-                    eprintln!("Configuration file found, but 'server.port' not found. Using default port 8080.");
-                    8080
-                })
-            } else {
-                // Use default port if config file doesn't exist
-                8080
-            }
-        }
-    };
+    // Initialize default host and port
+    let mut host_to_use = "127.0.0.1".to_string();
+    let mut port_to_use = 8080;
+    let mut process_name_to_use: String  = "graphdb-cli".to_string();
 
-    // Read user and group from config (if available)
-    let mut user = None;
-    let mut group = None;
+    // Read from config file if it exists
     if Path::new(config_path).exists() {
-        let mut config = Config::builder()
+        let config = Config::builder()
             .add_source(config::File::with_name(config_path))
             .build()
             .unwrap();
-        if let Ok(config_user) = config.get_string("daemon.user") {
-            user = Some(config_user);
+
+        if let Ok(host) = config.get_string("server.host") {
+            host_to_use = host;
         }
-        if let Ok(config_group) = config.get_string("daemon.group") {
-            group = Some(config_group);
+
+        if let Ok(process_name) = config.get_string("daemon.process_name") {
+            process_name_to_use = process_name;
         }
+
+        if let Ok(port) = config.get_int("server.port") {
+            port_to_use = port as u16;
+        }
+    }
+
+    // Override port if provided as a command-line argument
+    if let Some(p) = port {
+        port_to_use = p;
     }
 
     // Set up the output and error files for the daemon
     let stdout = File::create("/tmp/daemon.out").unwrap();
     let stderr = File::create("/tmp/daemon.err").unwrap();
 
+    // Set the daemon process name
+    set_daemon_process_name("graphdb-daemon");
+
     // Configure the daemon
-    let mut daemonize_builder = DaemonizeBuilder::new()
+    let daemonize = DaemonizeBuilder::default()
         .working_directory("/tmp")
         .umask(0o777)
         .stdout(stdout)
         .stderr(stderr)
-        .process_name("graphdb-daemon");
-
-    // Set user and group if provided in config
-    if let Some(u) = user {
-        daemonize_builder = daemonize_builder.user(&u);
-    }
-    if let Some(g) = group {
-        daemonize_builder = daemonize_builder.group(&g);
-    }
-
-    let daemonize = daemonize_builder.build()
+        .process_name(process_name_to_use.as_str())
+        .host(&*host_to_use)
+        .port(port_to_use)
+        .build()
         .expect("Failed to build Daemonize object");
 
     // Start the daemon
@@ -187,26 +182,40 @@ fn start_daemon(port: Option<u16>) {
         Ok(_) => {
             println!("Daemon started with PID: {}", std::process::id());
             Command::new("server")
+                .arg(format!("--host={}", host_to_use))
                 .arg(format!("--port={}", port_to_use))
                 .spawn()
                 .expect("Failed to start server");
         }
         Err(e) => {
-            eprintln!("Failed to start server: {:?}", e); // Use {:?} for debug formatting
+            eprintln!("Failed to start server: {:?}", e);
             exit(1);
         }
     }
 }
 
 fn stop_daemon() {
-    let pid_file = "/tmp/daemon.pid";
-    if Path::new(pid_file).exists() {
-        let pid = std::fs::read_to_string(pid_file).unwrap();
-        let pid: u32 = pid.trim().parse().unwrap();
-        let _ = Command::new("kill").arg(format!("{}", pid)).spawn();
-        println!("The daemon service was successfully stopped.");
-    } else {
-        println!("No daemon process found.");
+    let process_name = "graphdb-daemon";
+    match Command::new("pgrep")
+        .arg(process_name)
+        .output()
+    {
+        Ok(output) => {
+            if output.status.success() {
+                let pid = String::from_utf8_lossy(&output.stdout);
+                match Command::new("kill")
+                    .arg("-SIGTERM")
+                    .arg(pid.trim())
+                    .status()
+                {
+                    Ok(_) => println!("The daemon service was successfully stopped."),
+                    Err(e) => eprintln!("Failed to stop daemon: {}", e),
+                }
+            } else {
+                println!("No daemon process found.");
+            }
+        }
+        Err(e) => eprintln!("Failed to search for daemon process: {}", e),
     }
 }
 

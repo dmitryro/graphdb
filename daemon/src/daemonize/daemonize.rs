@@ -1,37 +1,37 @@
-use std::path::Path;
-use nix::unistd::{fork, ForkResult, setsid, chdir, setuid, setgid, Uid, Gid};
-use nix::sys::stat::{umask, Mode};
-use nix::sys::signal::{signal, SigHandler, Signal};
-use std::process::Command;
-use proctitle::set_title;
-use std::fs::File;
-use std::io::{self, Write};
-use std::os::fd::IntoRawFd;
-use users::{get_user_by_name, get_group_by_name, Users};
 use std::ffi::CString;
-use std::process::exit;
+use std::fs::File;
+use std::io::{self, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::os::unix::io::IntoRawFd;
+use std::path::Path;
+use std::process::{exit, Command};
+use std::thread;
+use nix::sys::signal::{signal, SigHandler, Signal};
+use nix::sys::stat::umask;
+use nix::unistd::{chdir, fork, setsid, ForkResult};
+use proctitle::set_title;
 
 #[derive(Default)]
 pub struct DaemonizeBuilder {
     working_directory: Option<String>,
     umask: u32,
     process_name: Option<String>,
-    user: Option<String>,
-    group: Option<String>,
     stdout: Option<File>,
     stderr: Option<File>,
+    host: String,
+    port: u16,
 }
 
 impl DaemonizeBuilder {
     pub fn new() -> Self {
         Self {
             working_directory: None,
-            umask: 0o777,
+            umask: 0o027,
             process_name: None,
-            user: None,
-            group: None,
             stdout: None,
             stderr: None,
+            host: "127.0.0.1".to_string(),
+            port: 8080,
         }
     }
 
@@ -50,16 +50,6 @@ impl DaemonizeBuilder {
         self
     }
 
-    pub fn user(mut self, user: &str) -> Self {
-        self.user = Some(user.to_string());
-        self
-    }
-
-    pub fn group(mut self, group: &str) -> Self {
-        self.group = Some(group.to_string());
-        self
-    }
-
     pub fn stdout(mut self, stdout: File) -> Self {
         self.stdout = Some(stdout);
         self
@@ -70,15 +60,25 @@ impl DaemonizeBuilder {
         self
     }
 
+    pub fn host(mut self, host: &str) -> Self {
+        self.host = host.to_string();
+        self
+    }
+
+    pub fn port(mut self, port: u16) -> Self {
+        self.port = port;
+        self
+    }
+
     pub fn build(self) -> Result<Daemonize, String> {
         Ok(Daemonize {
             working_directory: self.working_directory,
             umask: self.umask,
             process_name: self.process_name,
-            user: self.user,
-            group: self.group,
             stdout: self.stdout,
             stderr: self.stderr,
+            host: self.host,
+            port: self.port,
         })
     }
 }
@@ -87,99 +87,53 @@ pub struct Daemonize {
     working_directory: Option<String>,
     umask: u32,
     process_name: Option<String>,
-    user: Option<String>,
-    group: Option<String>,
     stdout: Option<File>,
     stderr: Option<File>,
+    host: String,
+    port: u16,
 }
 
 impl Daemonize {
-    pub fn start(&self) -> Result<(), ()> {
-        println!("Attempting to start daemon ...");
+    pub fn start(&self) -> Result<(), String> {
+        println!("Attempting to start daemon...");
 
         match unsafe { fork() } {
-            Ok(ForkResult::Child) => unsafe {
-                if setsid().is_err() {
-                    eprintln!("setsid() failed");
-                    std::process::exit(1);
-                }
-
-                if let Some(dir) = &self.working_directory {
-                    if chdir(Path::new(dir)).is_err() {
-                        eprintln!("chdir() failed");
-                        std::process::exit(1);
-                    }
-                }
-
-                let umask_mode = Mode::from_bits_truncate(self.umask as u16);
-                umask(umask_mode);
-
-                if signal(Signal::SIGTERM, SigHandler::Handler(handle_signal)).is_err() {
-                    eprintln!("Failed to register signal handler");
-                    std::process::exit(1);
-                }
+            Ok(ForkResult::Child) => {
+                // ... [daemon initialization code] ...
 
                 if let Some(ref process_name) = self.process_name {
                     set_title(process_name);
                 }
 
-                // Handle user and group changes (if applicable)
-                if let Some(user) = &self.user {
-                    match get_user_by_name(user) {
-                        Some(usr) => {
-                            if let Err(e) = setuid(Uid::from_raw(usr.uid() as u32)) {
-                                eprintln!("Failed to set user ID: {}", e);
-                                // Continue without setting the user ID
+                // Start listening on the specified host and port
+                let address = format!("{}:{}", self.host, self.port);
+                match TcpListener::bind(&address) {
+                    Ok(listener) => {
+                        println!("Daemon is listening on {}", address);
+                        for stream in listener.incoming() {
+                            match stream {
+                                Ok(mut stream) => {
+                                    // Spawn a new thread to handle the connection
+                                        handle_client(&mut stream);
+                                }
+                                Err(e) => {
+                                    eprintln!("Connection failed: {}", e);
+                                }
                             }
                         }
-                        None => {
-                            eprintln!("Failed to find user: {}", user);
-                            // Continue without setting the user ID
-                        }
                     }
-                }
-
-                if let Some(group) = &self.group {
-                    match get_group_by_name(group) {
-                        Some(grp) => {
-                            if let Err(e) = setgid(Gid::from_raw(grp.gid() as u32)) {
-                                eprintln!("Failed to set group ID: {}", e);
-                                // Continue without setting the group ID
-                            }
-                        }
-                        None => {
-                            eprintln!("Failed to find group: {}", group);
-                            // Continue without setting the group ID
-                        }
-                    }
-                }
-
-                // Redirect stdout and stderr if specified
-                if let Some(ref stdout) = self.stdout {
-                    if unsafe { libc::dup2(stdout.try_clone().unwrap().into_raw_fd(), libc::STDOUT_FILENO) } == -1 {
-                        eprintln!("Failed to redirect stdout: {}", io::Error::last_os_error());
-                        std::process::exit(1);
-                    }
-                }
-
-                if let Some(ref stderr) = self.stderr {
-                    if unsafe { libc::dup2(stderr.try_clone().unwrap().into_raw_fd(), libc::STDERR_FILENO) } == -1 {
-                        eprintln!("Failed to redirect stderr: {}", io::Error::last_os_error());
-                        std::process::exit(1);
+                    Err(e) => {
+                        return Err(format!("Failed to bind to {}: {}", address, e));
                     }
                 }
 
                 Ok(())
             }
             Ok(ForkResult::Parent { .. }) => {
-                // Parent process
-                // Exit or perform other tasks as needed
-                Ok(())
+                // Parent process exits
+                exit(0);
             }
-            Err(e) => {
-                eprintln!("Fork failed: {}", e);
-                Err(())
-            }
+            Err(e) => Err(format!("Fork failed: {}", e)),
         }
     }
 
@@ -207,7 +161,28 @@ impl Daemonize {
 }
 
 extern "C" fn handle_signal(_sig: i32) {
-    // Handle the signal (e.g., gracefully stop the daemon)
     println!("Received SIGTERM, exiting...");
-    std::process::exit(0);
+    exit(0);
+}
+
+
+fn set_process_title(title: &str) {
+    // This function sets the process title.
+    // Implementation may vary depending on the platform.
+    // For example, on Unix systems, you might use the `prctl` function.
+    // On Windows, you might use the `SetConsoleTitle` function.
+    // Here, we'll just print the title for demonstration purposes.
+    println!("Process title set to: {}", title);
+}
+
+fn handle_client(stream: &mut TcpStream) {
+    // Handle the client connection.
+    let mut buffer = [0; 512];
+    match stream.read(&mut buffer) {
+        Ok(_) => {
+            println!("Received request: {}", String::from_utf8_lossy(&buffer[..]));
+            stream.write_all(b"HTTP/1.1 200 OK\r\n\r\nHello, world!").unwrap();
+        }
+        Err(e) => eprintln!("Failed to read from connection: {}", e),
+    }
 }

@@ -22,6 +22,7 @@ libc = "0.2.169"
 prctl = "1.0.0"
 proctitle = "0.1.1"
 users = "0.11.0"
+bytemuck = "1.21.0"
 
 [lib]
 name = "graphdb_daemon"
