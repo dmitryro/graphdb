@@ -1,4 +1,3 @@
-use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -6,10 +5,12 @@ use std::os::unix::io::IntoRawFd;
 use std::path::Path;
 use std::process::{exit, Command};
 use std::thread;
-use nix::sys::signal::{signal, SigHandler, Signal};
+use nix::sys::signal::{self, signal, SigHandler, Signal};
 use nix::sys::stat::umask;
-use nix::unistd::{chdir, fork, setsid, ForkResult};
+use nix::unistd::{chdir, fork, getpid, setsid, ForkResult};
+use nix::unistd::Pid;
 use proctitle::set_title;
+
 
 #[derive(Default)]
 pub struct DaemonizeBuilder {
@@ -20,6 +21,7 @@ pub struct DaemonizeBuilder {
     stderr: Option<File>,
     host: String,
     port: u16,
+    pid: Option<u32>, // Store the PID here
 }
 
 impl DaemonizeBuilder {
@@ -32,6 +34,7 @@ impl DaemonizeBuilder {
             stderr: None,
             host: "127.0.0.1".to_string(),
             port: 8080,
+            pid: None,
         }
     }
 
@@ -70,7 +73,16 @@ impl DaemonizeBuilder {
         self
     }
 
-    pub fn build(self) -> Result<Daemonize, String> {
+    pub fn pid(mut self, pid: u32) -> Self {
+        self.pid = Some(pid); 
+        self
+    }
+
+    pub fn build(mut self) -> Result<Daemonize, String> {
+        // Capture the current process ID
+        let pid = std::process::id();
+        self.pid = Some(pid);
+
         Ok(Daemonize {
             working_directory: self.working_directory,
             umask: self.umask,
@@ -79,7 +91,24 @@ impl DaemonizeBuilder {
             stderr: self.stderr,
             host: self.host,
             port: self.port,
+            pid: self.pid,
         })
+    }
+
+    // New stop method for DaemonizeBuilder
+    pub fn stop(self) -> Result<(), String> {
+        if let Some(pid) = self.pid {
+            println!("Attempting to stop daemon with PID: {}", pid);
+            match signal::kill(Pid::from_raw(pid as i32), Signal::SIGTERM) {
+                Ok(_) => {
+                    println!("Daemon with PID {} has been terminated.", pid);
+                    Ok(())
+                }
+                Err(e) => Err(format!("Failed to terminate daemon: {}", e)),
+            }
+        } else {
+            Err("No PID specified for the daemon.".to_string())
+        }
     }
 }
 
@@ -91,72 +120,61 @@ pub struct Daemonize {
     stderr: Option<File>,
     host: String,
     port: u16,
+    pid: Option<u32>, // Store the PID here
 }
 
 impl Daemonize {
-    pub fn start(&self) -> Result<(), String> {
-        println!("Attempting to start daemon...");
+	pub fn start(&mut self) -> Result<u32, String> {
+	    println!("Attempting to start daemon...");
 
-        match unsafe { fork() } {
-            Ok(ForkResult::Child) => {
-                // ... [daemon initialization code] ...
+	    match unsafe { fork() } {
+	        Ok(ForkResult::Child) => {
+	            if let Some(ref process_name) = self.process_name {
+	                set_title(process_name);
+	            }
 
-                if let Some(ref process_name) = self.process_name {
-                    set_title(process_name);
+	            let address = format!("{}:{}", self.host, self.port);
+	            match TcpListener::bind(&address) {
+	                Ok(listener) => {
+	                    println!("Daemon is listening on {}", address);
+	                    for stream in listener.incoming() {
+	                        if let Ok(mut stream) = stream {
+	                            handle_client(&mut stream);
+	                        }
+	                    }
+	                }
+	                Err(e) => return Err(format!("Failed to bind to {}: {}", address, e)),
+	            }
+
+	            Ok(getpid().as_raw() as u32) // Return child PID
+	        }
+	        Ok(ForkResult::Parent { child }) => {
+	            self.pid = Some(child.as_raw() as u32);
+	            println!("Daemon started with PID: {}", self.pid.unwrap());
+	            Ok(self.pid.unwrap()) // Return PID instead of exiting
+	        }
+	        Err(e) => Err(format!("Fork failed: {}", e)),
+	    }
+	}
+
+    pub fn stop(&self) -> Result<(), String> {
+        if let Some(pid) = self.pid {
+            println!("Attempting to stop daemon with PID: {}", pid);
+            match signal::kill(Pid::from_raw(pid as i32), Signal::SIGTERM) {
+                Ok(_) => {
+                    println!("Daemon with PID {} has been terminated.", pid);
+                    Ok(())
                 }
-
-                // Start listening on the specified host and port
-                let address = format!("{}:{}", self.host, self.port);
-                match TcpListener::bind(&address) {
-                    Ok(listener) => {
-                        println!("Daemon is listening on {}", address);
-                        for stream in listener.incoming() {
-                            match stream {
-                                Ok(mut stream) => {
-                                    // Spawn a new thread to handle the connection
-                                        handle_client(&mut stream);
-                                }
-                                Err(e) => {
-                                    eprintln!("Connection failed: {}", e);
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        return Err(format!("Failed to bind to {}: {}", address, e));
-                    }
-                }
-
-                Ok(())
+                Err(e) => Err(format!("Failed to terminate daemon: {}", e)),
             }
-            Ok(ForkResult::Parent { .. }) => {
-                // Parent process exits
-                exit(0);
-            }
-            Err(e) => Err(format!("Fork failed: {}", e)),
+        } else {
+            Err("No PID specified for the daemon.".to_string())
         }
     }
 
-    pub fn stop(&self) -> Result<(), String> {
-        if let Some(ref process_name) = self.process_name {
-            let output = Command::new("pkill")
-                .arg("-f")
-                .arg(process_name)
-                .output()
-                .map_err(|e| format!("Failed to execute pkill: {}", e))?;
-
-            if !output.status.success() {
-                return Err(format!(
-                    "Failed to send SIGTERM to daemon: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                ));
-            }
-
-            println!("The daemon service was successfully stopped.");
-        } else {
-            println!("No process name specified.");
-        }
-        Ok(())
+    // Method to retrieve the PID
+    pub fn pid(&self) -> Option<u32> {
+        self.pid
     }
 }
 
@@ -165,13 +183,13 @@ extern "C" fn handle_signal(_sig: i32) {
     exit(0);
 }
 
-
 fn set_process_title(title: &str) {
     // This function sets the process title.
     // Implementation may vary depending on the platform.
     // For example, on Unix systems, you might use the `prctl` function.
     // On Windows, you might use the `SetConsoleTitle` function.
     // Here, we'll just print the title for demonstration purposes.
+    set_title(title);
     println!("Process title set to: {}", title);
 }
 
@@ -186,3 +204,4 @@ fn handle_client(stream: &mut TcpStream) {
         Err(e) => eprintln!("Failed to read from connection: {}", e),
     }
 }
+

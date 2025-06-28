@@ -6,17 +6,37 @@ use crossterm::{
     terminal::{Clear, ClearType},
     ExecutableCommand,
 };
-use std::collections::HashSet;
-use std::fs::File;
-use std::io::{self, Write};
-use std::process::{Command, exit};
+use std::fs::{File};
+use std::io::{self, Write, Read};
+use std::process::{Command, Child, exit, id};
+use std::sync::Mutex;
+use std::vec::Vec;
 use graphdb_lib::query_parser::{parse_query_from_string, QueryType};
-use config::Config;
+use config::{Config, File as ConfigFile}; // Assuming the config crate is used
 use std::path::Path;
+use std::mem::size_of;
+use std::ptr::null_mut;
+use serde_json::to_vec;
+use serde::{Serialize, Deserialize};
+use libc::{IPC_PRIVATE, IPC_CREAT, IPC_RMID}; // Import necessary constants
+use shared_memory::Shmem;
+use shared_memory::ShmemConf;
+use shm::{shmctl, shmget};
+use libc::{SHM_RDONLY, SHM_RND};
+use std::ptr;
 use std::ffi::CString;
-use proctitle::set_title;
+use once_cell::sync::Lazy;
+use std::collections::HashSet;
+use lazy_static::lazy_static;
+use nix::unistd::getpid;
+use nix::unistd::Pid; // Assuming you're using the nix crate for Pid type
+use std::process; // Importing the process module
 
-// CLI entry point for GraphDB
+// Ensure SHARED_MEMORY_KEYS is globally mutable
+lazy_static! {
+    static ref SHARED_MEMORY_KEYS: Mutex<HashSet<i32>> = Mutex::new(HashSet::new());
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "graphdb-cli")]
 #[command(version = "0.1.0")]
@@ -26,15 +46,26 @@ struct CliArgs {
     command: Option<GraphDbCommands>,
 }
 
-/// Subcommands for GraphDB CLI
+#[derive(Serialize, Deserialize, Debug)]
+struct DaemonData {
+    port: u16,
+    host: String,
+    pid: u32, // Change this to i32
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct KVPair {
+    key: String,
+    value: Vec<u8>,
+}
+
+
 #[derive(Subcommand, Debug)]
 enum GraphDbCommands {
-    /// View the graph
     ViewGraph {
         #[arg(value_name = "GRAPH_ID")]
         graph_id: Option<u32>,
     },
-    /// View the graph history
     ViewGraphHistory {
         #[arg(value_name = "GRAPH_ID")]
         graph_id: Option<u32>,
@@ -43,23 +74,33 @@ enum GraphDbCommands {
         #[arg(value_name = "END_DATE")]
         end_date: Option<String>,
     },
-    /// Index a node
     IndexNode {
         #[arg(value_name = "NODE_ID")]
         node_id: Option<u32>,
     },
-    /// Cache the node state
     CacheNodeState {
         #[arg(value_name = "NODE_ID")]
         node_id: Option<u32>,
     },
-    /// Start the server as a daemon
     Start {
         #[arg(short = 'p', long = "port", value_name = "PORT")]
         port: Option<u16>,
     },
-    /// Stop the server daemon
     Stop,
+}
+
+#[derive(Debug, Serialize, Deserialize)] // Add Serialize and Deserialize
+struct SharedData {
+    port: u16,
+    running: bool,
+    host: String,
+    pid: u32,
+    shm_id: i32,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct PidStore {
+    pid: u32,
 }
 
 pub fn start_cli() {
@@ -120,21 +161,15 @@ pub fn start_cli() {
     }
 }
 
-fn set_daemon_process_name(name: &str) {
-      set_title(name);
-}
-
 fn start_daemon(port: Option<u16>) {
-    // Define the path to the configuration file
     let config_path = "server/src/cli/config.toml";
 
-    // Initialize default host and port
     let mut host_to_use = "127.0.0.1".to_string();
-    let mut port_to_use = 8080;
-    let mut process_name_to_use: String  = "graphdb-cli".to_string();
+    let mut port_to_use = port.unwrap_or(8080); // CLI flag takes priority
+    let mut process_name_to_use = "graphdb-cli".to_string();
 
-    // Read from config file if it exists
-    if Path::new(config_path).exists() {
+    // Use config only if port is not provided via CLI flag
+    if port.is_none() && Path::new(config_path).exists() {
         let config = Config::builder()
             .add_source(config::File::with_name(config_path))
             .build()
@@ -143,80 +178,167 @@ fn start_daemon(port: Option<u16>) {
         if let Ok(host) = config.get_string("server.host") {
             host_to_use = host;
         }
-
         if let Ok(process_name) = config.get_string("daemon.process_name") {
             process_name_to_use = process_name;
         }
-
         if let Ok(port) = config.get_int("server.port") {
             port_to_use = port as u16;
         }
     }
 
-    // Override port if provided as a command-line argument
-    if let Some(p) = port {
-        port_to_use = p;
+    // Output HashSet before daemon starts
+    {
+        let shared_memory_keys = SHARED_MEMORY_KEYS.lock().unwrap();
+        println!("Before daemon start, HashSet contents: {:?}", *shared_memory_keys);
     }
 
-    // Set up the output and error files for the daemon
     let stdout = File::create("/tmp/daemon.out").unwrap();
     let stderr = File::create("/tmp/daemon.err").unwrap();
 
-    // Set the daemon process name
-    set_daemon_process_name("graphdb-daemon");
-
-    // Configure the daemon
-    let daemonize = DaemonizeBuilder::default()
+    let mut daemonize = DaemonizeBuilder::new()
         .working_directory("/tmp")
-        .umask(0o777)
+        .umask(0o027)
         .stdout(stdout)
         .stderr(stderr)
-        .process_name(process_name_to_use.as_str())
-        .host(&*host_to_use)
+        .process_name(&process_name_to_use)
+        .host(&host_to_use)
         .port(port_to_use)
         .build()
         .expect("Failed to build Daemonize object");
 
-    // Start the daemon
+    // Start the daemon and capture the child PID
     match daemonize.start() {
-        Ok(_) => {
-            println!("Daemon started with PID: {}", std::process::id());
-            Command::new("server")
-                .arg(format!("--host={}", host_to_use))
-                .arg(format!("--port={}", port_to_use))
-                .spawn()
-                .expect("Failed to start server");
+        Ok(child_pid) => {
+            {
+                let mut shared_memory_keys = SHARED_MEMORY_KEYS.lock().unwrap();
+                shared_memory_keys.insert(child_pid as i32);
+                println!("After inserting child PID, HashSet contents: {:?}", *shared_memory_keys);
+            }
+
+            println!("Daemon started with PID: {}", child_pid);
+            println!("Daemon is listening on {}:{} PID:{}", host_to_use, port_to_use, child_pid);
+            let mut shared_memory_keys = SHARED_MEMORY_KEYS.lock().unwrap();
+            shared_memory_keys.insert(child_pid as i32);
+            println!("After inserting child PID, HashSet contents: {:?}", *shared_memory_keys);
         }
         Err(e) => {
-            eprintln!("Failed to start server: {:?}", e);
-            exit(1);
+            eprintln!("Daemonization failed: {}", e);
         }
     }
+    let mut shared_memory_keys = SHARED_MEMORY_KEYS.lock().unwrap();
+     println!("On exit, after  inserting child PID, HashSet contents: {:?}", *shared_memory_keys);   
 }
 
 fn stop_daemon() {
-    let process_name = "graphdb-daemon";
-    match Command::new("pgrep")
-        .arg(process_name)
-        .output()
-    {
-        Ok(output) => {
-            if output.status.success() {
-                let pid = String::from_utf8_lossy(&output.stdout);
-                match Command::new("kill")
-                    .arg("-SIGTERM")
-                    .arg(pid.trim())
-                    .status()
-                {
-                    Ok(_) => println!("The daemon service was successfully stopped."),
-                    Err(e) => eprintln!("Failed to stop daemon: {}", e),
-                }
-            } else {
-                println!("No daemon process found.");
-            }
+    // Output HashSet before reading PID
+    let mut shared_memory_keys = SHARED_MEMORY_KEYS.lock().unwrap();
+    println!("Before existing, HashSet contents: {:?}", *shared_memory_keys);
+    // Retrieve the stored PID from the shared memory keys
+    let pid: i32 = unsafe {
+        let shared_memory_keys = SHARED_MEMORY_KEYS.lock().unwrap();
+        if let Some(&stored_pid) = shared_memory_keys.iter().next() { // Assuming one PID is stored
+            println!("Found stored PID {} in HashSet", stored_pid);
+            stored_pid
+        } else {
+            eprintln!("No PID found in HashSet, daemon may not be running.");
+            return;
         }
-        Err(e) => eprintln!("Failed to search for daemon process: {}", e),
+    };
+
+    // Attempt to stop the daemon (daemonizer stop)
+    let daemonizer = DaemonizeBuilder::new();
+    match daemonizer.stop() {
+        Ok(_) => {
+            println!("Successfully stopped daemon with PID: {}", pid);
+        }
+        Err(e) => {
+            eprintln!("Failed to stop daemon: {}", e);
+        }
     }
+
+    // Remove the shared memory key from HashSet
+    unsafe {
+        let mut shared_memory_keys = SHARED_MEMORY_KEYS.lock().unwrap();
+        if shared_memory_keys.remove(&pid) { // Remove the actual PID
+            println!("Removed shared memory key {} from HashSet", pid);
+        } else {
+            eprintln!("Failed to remove shared memory key {} from HashSet", pid);
+        }
+
+        // Output HashSet after removing key
+        println!("After daemon stop, HashSet contents: {:?}", *shared_memory_keys);
+    }
+}
+
+fn store_kv_pair(shmem: &Shmem, offset: usize, key: String, value: Vec<u8>) {
+    let kv_store_ptr = unsafe { shmem.as_ptr().add(offset) as *mut KVPair };
+    const NUM_ENTRIES: usize = 10;
+
+    // Convert the key (String) to i32 before working with the keys set
+    let key_as_i32 = match key.parse::<i32>() {
+        Ok(parsed_key) => parsed_key,
+        Err(_) => {
+            eprintln!("Failed to parse key: {}", key);
+            return; // If key can't be parsed as i32, return early
+        }
+    };
+
+    // Check if the shared memory segment is already in use
+    let mut keys = SHARED_MEMORY_KEYS.lock().unwrap();
+    if keys.contains(&key_as_i32) {
+        eprintln!("Shared memory key {} is already in use!", key);
+        return; // Avoid inserting the value if key exists
+    }
+
+    // Look for an empty spot in the key-value store
+    for i in 0..NUM_ENTRIES {
+        let entry_ptr = unsafe { kv_store_ptr.add(i) };
+        let entry = unsafe { entry_ptr.as_mut().unwrap() }; // Get a mutable reference
+
+        if entry.key.is_empty() {
+            entry.key = key.clone(); // Clone key to avoid moving it
+            entry.value = value;
+
+            // Track this key in the HashSet to avoid further inserts
+            keys.insert(key_as_i32); // Insert the key (as i32)
+    
+            return; // Exit after storing
+        }
+    }
+    eprintln!("Key-value store is full!");
+}
+
+fn retrieve_kv_pair(shmem: &Shmem, offset: usize, key: &String) -> Option<Vec<u8>> {
+    let kv_store_ptr = unsafe { shmem.as_ptr().add(offset) as *const KVPair };
+    const NUM_ENTRIES: usize = 10; // Or however many entries you have
+
+    // Check if the key is already in the shared memory keys set
+    let keys = SHARED_MEMORY_KEYS.lock().unwrap();
+
+    // Convert key (String) to i32 before calling contains
+    let key_as_i32 = key.parse::<i32>();
+
+    // Ensure the conversion is successful before proceeding
+    if let Ok(key_i32) = key_as_i32 {
+        if !keys.contains(&key_i32) {
+            eprintln!("Key {} not found in shared memory!", key);
+            return None; // If key is not found, return None
+        }
+    } else {
+        eprintln!("Failed to parse key: {}", key);
+        return None; // If the key couldn't be parsed as i32, return None
+    }
+
+    // Look for the key in the key-value store
+    for i in 0..NUM_ENTRIES {
+        let entry_ptr = unsafe { kv_store_ptr.add(i) };
+        let entry = unsafe { entry_ptr.as_ref().unwrap() }; // Dereference and get a reference
+    
+        if entry.key == *key { // Compare the keys
+            return Some(entry.value.clone()); // Return a clone of the value
+        }
+    }
+    None // Return None if the key is not found
 }
 
 fn interactive_cli() {

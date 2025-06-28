@@ -1,4 +1,5 @@
 use crate::{util::generate_uuid_v1, Identifier};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use uuid::Uuid;
 
@@ -13,6 +14,9 @@ pub struct Vertex {
 
     /// The type of the vertex.
     pub t: Identifier,
+
+    /// Properties associated with this vertex.
+    pub properties: HashMap<String, String>,
 }
 
 impl Vertex {
@@ -35,7 +39,22 @@ impl Vertex {
     /// * `id`: The id of the vertex.
     /// * `t`: The type of the vertex.
     pub fn with_id(id: Uuid, t: Identifier) -> Self {
-        Vertex { id, t }
+        Vertex {
+            id,
+            t,
+            properties: HashMap::new(),
+        }
+    }
+
+    /// Add a property (mutable).
+    pub fn add_property(&mut self, key: &str, value: &str) {
+        self.properties.insert(key.to_string(), value.to_string());
+    }
+
+    /// Builder-style method to add a property (returns Self for chaining).
+    pub fn with_property(mut self, key: &str, value: &str) -> Self {
+        self.properties.insert(key.to_string(), value.to_string());
+        self
     }
 }
 
@@ -67,4 +86,16 @@ mod tests {
             HashSet::from([Vertex::with_id(Uuid::default(), Identifier::new("foo").unwrap())])
         );
     }
+
+    #[test]
+    fn test_add_and_with_property() {
+        let id_type = Identifier::new("TestVertex").unwrap();
+        let mut v = Vertex::new(id_type.clone());
+        v.add_property("key1", "value1");
+        assert_eq!(v.properties.get("key1").map(String::as_str), Some("value1"));
+
+        let v2 = Vertex::new(id_type).with_property("key2", "value2");
+        assert_eq!(v2.properties.get("key2").map(String::as_str), Some("value2"));
+    }
 }
+
