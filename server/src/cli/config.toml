@@ -1,0 +1,8 @@
+[server]
+port = 9002
+host = "127.0.0.1"
+
+[daemon]
+process_name = "graphdb-cli"
+user = "graphdbuser"
+group = "GraphDBGroup" 

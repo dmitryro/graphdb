@@ -1,0 +1,183 @@
+use std::fs::File;
+use std::io::{self, Write};
+use std::os::unix::io::AsRawFd;
+use std::path::Path;
+use nix::unistd::{fork, ForkResult, setsid, chdir, close};
+use nix::sys::stat::{umask, Mode};
+use nix::sys::signal::{signal, SigHandler, Signal};
+use std::process::Command;
+use std::time::Duration;
+use std::thread::sleep;
+use proctitle::set_title;
+
+#[derive(Default)]
+pub struct DaemonizeBuilder {
+    working_directory: Option<String>,
+    user: Option<String>,
+    group: Option<String>,
+    umask: u32,
+    stdout: Option<File>,
+    stderr: Option<File>,
+    process_name: Option<String>,
+}
+
+impl DaemonizeBuilder {
+    pub fn new() -> Self {
+        Self {
+            working_directory: None,
+            user: None,
+            group: None,
+            umask: 0o777,
+            stdout: None,
+            stderr: None,
+            process_name: None,
+        }
+    }
+
+    pub fn working_directory(mut self, dir: &str) -> Self {
+        self.working_directory = Some(dir.to_string());
+        self
+    }
+
+    pub fn user(mut self, _user: &str) -> Self {
+        // User and group switching requires special privileges
+        // This is a simplified example and not implemented here
+        self
+    }
+
+    pub fn group(mut self, _group: &str) -> Self {
+        // User and group switching requires special privileges
+        // This is a simplified example and not implemented here
+        self
+    }
+
+    pub fn umask(mut self, umask: u32) -> Self {
+        self.umask = umask;
+        self
+    }
+
+    pub fn stdout<T: Into<File>>(mut self, stdout: T) -> Self {
+        self.stdout = Some(stdout.into());
+        self
+    }
+
+    pub fn stderr<T: Into<File>>(mut self, stderr: T) -> Self {
+        self.stderr = Some(stderr.into());
+        self
+    }
+
+    pub fn process_name(mut self, name: &str) -> Self {
+        self.process_name = Some(name.to_string());
+        self
+    }
+
+    pub fn build(self) -> Result<Daemonize, String> {
+        Ok(Daemonize {
+            working_directory: self.working_directory,
+            user: self.user,
+            group: self.group,
+            umask: self.umask,
+            stdout: self.stdout,
+            stderr: self.stderr,
+            process_name: self.process_name,
+        })
+    }
+}
+
+pub struct Daemonize {
+    working_directory: Option<String>,
+    user: Option<String>,
+    group: Option<String>,
+    umask: u32,
+    stdout: Option<File>,
+    stderr: Option<File>,
+    process_name: Option<String>,
+}
+
+impl Daemonize {
+    pub fn start(&self) -> Result<(), String> {
+        match unsafe { fork() } {
+            Ok(ForkResult::Child) => {
+                // Child process
+                close(libc::STDIN_FILENO).map_err(|e| format!("Failed to close stdin: {}", e))?;
+                close(libc::STDOUT_FILENO).map_err(|e| format!("Failed to close stdout: {}", e))?;
+                close(libc::STDERR_FILENO).map_err(|e| format!("Failed to close stderr: {}", e))?;
+
+                setsid().map_err(|e| format!("setsid failed: {}", e))?;
+
+                if let Some(dir) = &self.working_directory {
+                    chdir(Path::new(dir)).map_err(|e| format!("chdir failed: {}", e))?;
+                }
+
+                let umask_mode = Mode::from_bits_truncate(self.umask as u16);
+                umask(umask_mode);
+
+                if let Some(ref process_name) = self.process_name {
+                    // Set the process title using proctitle
+                    set_title(process_name);
+                }
+
+                if let Some(ref stdout) = self.stdout {
+                    let stdout_fd = stdout.as_raw_fd();
+                    if unsafe { libc::dup2(stdout_fd, libc::STDOUT_FILENO) } == -1 {
+                        return Err(format!(
+                            "Failed to redirect stdout: {}",
+                            io::Error::last_os_error()
+                        ));
+                    }
+                }
+
+                if let Some(ref stderr) = self.stderr {
+                    let stderr_fd = stderr.as_raw_fd();
+                    if unsafe { libc::dup2(stderr_fd, libc::STDERR_FILENO) } == -1 {
+                        return Err(format!(
+                            "Failed to redirect stderr: {}",
+                            io::Error::last_os_error()
+                        ));
+                    }
+                }
+
+                unsafe {
+                    signal(Signal::SIGTERM, SigHandler::Handler(handle_signal))
+                        .map_err(|e| format!("Failed to register signal handler: {}", e))?;
+                }
+
+                loop {
+                    sleep(Duration::from_secs(60));
+                }
+            }
+            Ok(ForkResult::Parent { .. }) => {
+                Ok(())
+            }
+            Err(e) => Err(format!("Fork failed: {}", e)),
+        }
+    }
+
+    pub fn stop(&self) -> Result<(), String> {
+        if let Some(ref process_name) = self.process_name {
+            let output = Command::new("pkill")
+                .arg("-f")
+                .arg(process_name)
+                .output()
+                .map_err(|e| format!("Failed to execute pkill: {}", e))?;
+
+            if !output.status.success() {
+                return Err(format!(
+                    "Failed to send SIGTERM to daemon: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+
+            println!("The daemon service was successfully stopped.");
+        } else {
+            println!("No process name specified.");
+        }
+        Ok(())
+    }
+}
+
+extern "C" fn handle_signal(_sig: i32) {
+    println!("Received SIGTERM, exiting...");
+    std::process::exit(0);
+}
+
