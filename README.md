@@ -1,10 +1,28 @@
+
 # GraphDB
 
-![Build Status](https://img.shields.io/github/workflow/status/dmitryro/graphdb/CI/main)
-![License](https://img.shields.io/github/license/dmitryro/graphdb)
-![Version](https://img.shields.io/github/v/release/dmitryro/graphdb)
+[![Build Status](https://github.com/dmitryro/graphdb/actions/workflows/ci.yml/badge.svg)](https://github.com/dmitryro/graphdb/actions/workflows/ci.yml)
+[![License](https://img.shields.io/github/license/dmitryro/graphdb)](./LICENSE)
+[![Version](https://img.shields.io/github/v/release/dmitryro/graphdb)](https://github.com/dmitryro/graphdb/releases/latest)
 
 GraphDB is an experimental graph database engine and command-line interface (CLI) optimized for medical and healthcare applications. It allows developers, researchers, and integrators to build, query, and reason about interconnected medical data with high context-awareness.
+
+---
+
+## 📁 Table of Contents
+
+- [🚑 Why Medical Practices Need GraphDB](#-why-medical-practices-need-graphdb)
+- [🧠 What GraphDB Does](#-what-graphdb-does)
+- [🧩 Architecture](#-architecture)
+- [🛠️ How It Works](#️-how-it-works)
+- [🔌 Complementing Existing EHRs](#-complementing-existing-ehrs)
+- [🧪 Example Use Cases](#-example-use-cases)
+- [🚀 Getting Started](#-getting-started)
+- [📂 File Structure](#-file-structure)
+- [🧬 Medical Ontology Support](#-medical-ontology-support)
+- [📢 Contributing](#-contributing)
+- [📜 License](#-license)
+- [🌐 Links](#-links)
 
 ---
 
