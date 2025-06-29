@@ -8,4 +8,5 @@ members = [
     "client", 
     "rest_api", 
     "daemon", 
+    "daemon_api", 
 ]

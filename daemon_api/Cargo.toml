@@ -1,0 +1,13 @@
+[package]
+name = "daemon_api"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+regex = "1.11.1"
+nix = "0.29.0"
+daemonize = "0.5.0"
+graphdb-daemon = { path = "../daemon" }
+config = "0.15.8"
+lazy_static = "1.4.0"
