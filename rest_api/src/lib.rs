@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::fs::OpenOptions;
 use std::io::Write;
 use daemon_api::{start_daemon, stop_daemon};
+use graphdb_lib::query_parser::{parse_query_from_string, QueryType}; // <-- FIXED
 
 fn log_rest_event(message: &str) {
     if let Ok(mut log) = OpenOptions::new()
@@ -17,7 +18,11 @@ fn log_rest_event(message: &str) {
     }
 }
 
-async fn handle_request(req: Request<Body>, shutdown_flag: Arc<Mutex<bool>>, rest_api_port: u16) -> Result<Response<Body>, Infallible> {
+async fn handle_request(
+    req: Request<Body>,
+    shutdown_flag: Arc<Mutex<bool>>,
+    rest_api_port: u16,
+) -> Result<Response<Body>, Infallible> {
     let path = req.uri().path();
     let method = req.method();
 
@@ -39,13 +44,38 @@ async fn handle_request(req: Request<Body>, shutdown_flag: Arc<Mutex<bool>>, res
             Ok(Response::new(Body::from(serde_json::to_string(&response).unwrap())))
         }
 
-        // POST to run a Cypher/SQL/GraphQL query (stub)
+        // POST to run a Cypher/SQL/GraphQL query and return parsed type
         (&hyper::Method::POST, "/api/v1/query") => {
-            // You'd parse and execute the query here; this is a stub
-            let response = json!({
-                "status": "success",
-                "message": "Query received (not yet implemented)"
+            let whole_body = hyper::body::to_bytes(req.into_body()).await.unwrap_or_default();
+            let input: serde_json::Value = serde_json::from_slice(&whole_body).unwrap_or_default();
+            let query = input.get("query").and_then(|q| q.as_str()).unwrap_or("").to_string();
+            let mut response = json!({
+                "status": "error",
+                "message": "No query provided"
             });
+
+            if !query.is_empty() {
+                match parse_query_from_string(&query) {
+                    Ok(query_type) => {
+                        let message = match query_type {
+                            QueryType::Cypher => format!("Cypher query detected: {}", query),
+                            QueryType::SQL => format!("SQL query detected: {}", query),
+                            QueryType::GraphQL => format!("GraphQL query detected: {}", query),
+                        };
+                        response = json!({
+                            "status": "success",
+                            "message": message
+                        });
+                    }
+                    Err(e) => {
+                        response = json!({
+                            "status": "error",
+                            "message": format!("Failed to parse query: {}", e)
+                        });
+                    }
+                }
+            }
+
             Ok(Response::new(Body::from(serde_json::to_string(&response).unwrap())))
         }
 
@@ -204,7 +234,10 @@ async fn handle_request(req: Request<Body>, shutdown_flag: Arc<Mutex<bool>>, res
 
 /// Launch the REST API server on the specified port, with graceful shutdown.
 /// Call this from your CLI or main daemon entry point.
-pub async fn start_server(listen_port: u16, shutdown_rx: tokio::sync::oneshot::Receiver<()>) -> Result<(), hyper::Error> {
+pub async fn start_server(
+    listen_port: u16,
+    shutdown_rx: tokio::sync::oneshot::Receiver<()>
+) -> Result<(), hyper::Error> {
     let addr = SocketAddr::from(([127, 0, 0, 1], listen_port));
     let shutdown_flag = Arc::new(Mutex::new(false));
     let shutdown_flag_for_service = Arc::clone(&shutdown_flag);
