@@ -8,16 +8,21 @@ tokio = { version = "^1.24.2", features = ["rt-multi-thread"], optional = true }
 tokio-stream = { version = "0.1.17", features = ["net"], optional = true }
 libloading = { version = "0.8.6", optional = true }
 glob = { version = "0.3.2", optional = true }
+hyper = { version = "0.14", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+graphdb-daemon = { path = "../daemon" }
+daemon_api = { path = "../daemon_api" }
 
 [lib]
 name = "graphdb_rest_api"
 path = "src/lib.rs"
 
 [features]
-default = ["client"]
-server = ["tokio", "tokio-stream", "libloading", "graphdb-plugin-host", "glob"]
+default = []
+server = ["tokio", "tokio-stream", "libloading", "glob"]
 client = ["tokio", "tokio-stream"]
-test-suite = ["graphdb-lib/test-suite", "client", "server"]
+test-suite = []
 
 [dependencies.graphdb-lib]
 path = "../lib"
