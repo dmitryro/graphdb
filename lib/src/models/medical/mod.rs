@@ -35,7 +35,18 @@ pub mod vitals;
 pub mod x12edi_message;
 pub mod master_patient_index;
 pub mod user;
+// New models for Emergency Care Chart Management
+pub mod triage;
+pub mod ed_event;
+pub mod ed_procedure;
+pub mod disposition;
+pub mod observation;
 
+// New models for Hospital Onboarding
+pub mod hospital;
+pub mod department;
+pub mod facility_unit;
+pub mod staff_assignment;
 
 pub use address::Address;
 pub use billing_address::BillingAddress;
@@ -74,3 +85,16 @@ pub use vitals::Vitals;
 pub use x12edi_message::X12EDIMessage;
 pub use master_patient_index::MasterPatientIndex;
 pub use user::User;
+
+// New models for Emergency Care Chart Management
+pub use triage::Triage;
+pub use ed_event::EdEvent;
+pub use ed_procedure::EdProcedure;
+pub use disposition::Disposition;
+pub use observation::Observation;
+
+// New models for Hospital Onboarding
+pub use hospital::Hospital;
+pub use department::Department;
+pub use facility_unit::FacilityUnit;
+pub use staff_assignment::StaffAssignment;
