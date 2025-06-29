@@ -54,7 +54,16 @@ pub use self::medical::{
     Vitals,
     X12EDIMessage,
     MasterPatientIndex,
-    User, 
-   // Add more here as you expand the medical model set.
+    User,
+    // New models for Emergency Care Chart Management
+    Triage,
+    EdEvent,
+    EdProcedure,
+    Disposition,
+    Observation,
+    // New models for Hospital Onboarding
+    Hospital,
+    Department,
+    FacilityUnit,
+    StaffAssignment,
 };
-

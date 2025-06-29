@@ -22,6 +22,7 @@ diesel_json = "0.2.1"
 open-cypher = "0.1.1"
 nom = "8.0.0"
 sled = "0.34.7"
+regex = "1.11.1"
 bytes = "1.10.0"
 clap = { version = "4.5.29", features = ["derive"] }
 hashbrown = "0.15.2"
