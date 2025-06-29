@@ -1,76 +1,172 @@
+
 # GraphDB
 
-![Build Status](https://img.shields.io/badge/build-passing-brightgreen)
-![License](https://img.shields.io/badge/license-MIT-blue)
-![Version](https://img.shields.io/badge/version-0.0.1--dev-orange)
+[![Rust](https://img.shields.io/badge/Rust-1.72-orange?logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![License](https://img.shields.io/badge/License-MIT-green)](./LICENSE)
+[![Status](https://img.shields.io/badge/Status-Stable-yellow)](https://github.com/dmitryro/graphdb)
 
-### Experimental graph database built in Rust
-
-
-## Table of Contents
-- [Overview](#overview)
-- [Features](#features)
-- [Graph Evolution](#graph-evolution)
-- [CLI Usage](#cli-usage)
-- [Plugin Development](#plugin-development)
-- [API Usage](#api-usage)
-- [Bolt Protocol](#bolt-protocol)
-- [OpenCypher Support](#opencypher-support)
-
-## Overview
-This is an experimental graph database built in Rust, supporting multiple query languages and featuring graph evolution tracking.
-
-## Features
-- **Query Languages**: Supports Cypher, SQL, and GraphQL.
-- **CLI Interface**: Command-line utility for managing and querying graphs.
-- **Plugin System**: Drop Rust-based plugins into a designated directory to extend functionality.
-- **Graph Evolution**: Track changes in graphs over a specified time window.
-- **Bolt Protocol**: Fully supports the Bolt protocol for communication.
-
-## Graph Evolution
-Graph evolution allows tracking changes over time using specified time windows. This enables:
-- Historical queries
-- Change tracking
-- Temporal graph analysis
-
-## CLI Usage
-The CLI tool allows querying and managing the graph database. 
-
-Example usage:
-```sh
-./graphdb-cli --query "MATCH (n) RETURN n"
-```
-
-To enable plugins:
-```sh
-./graphdb-cli --enable-plugins
-```
-
-## Plugin Development
-To create a plugin:
-1. Build a Rust-based plugin.
-2. Place the compiled `.so` or `.dll` file into the `plugins/` directory.
-3. Restart the database to load the plugin.
-
-## API Usage
-Run the API server:
-```sh
-cargo run --release -- serve
-```
-Modify API endpoints in `src/api.rs`.
-
-## Bolt Protocol
-The database fully implements the **Bolt Protocol**, allowing applications to communicate efficiently using binary messaging. This ensures fast and secure transactions with client applications such as Neo4j drivers.
-
-## OpenCypher Support
-The database natively supports **OpenCypher**, enabling users to write expressive graph queries similar to Neo4j. Example:
-```cypher
-MATCH (n:Person)-[r:KNOWS]->(m:Person) RETURN n, r, m;
-```
-This compatibility allows seamless migration from other OpenCypher-compliant databases.
+GraphDB is an experimental graph database engine and command-line interface (CLI) optimized for medical and healthcare applications. It allows developers, researchers, and integrators to build, query, and reason about interconnected medical data with high context-awareness.
 
 ---
 
-For more details, check the documentation and examples provided.
+## 📁 Table of Contents
 
+- [🚑 Why Medical Practices Need GraphDB](#-why-medical-practices-need-graphdb)
+- [🧠 What GraphDB Does](#-what-graphdb-does)
+- [🧩 Architecture](#-architecture)
+- [🛠️ How It Works](#️-how-it-works)
+- [🔌 Complementing Existing EHRs](#-complementing-existing-ehrs)
+- [🧪 Example Use Cases](#-example-use-cases)
+- [🚀 Getting Started](#-getting-started)
+- [📂 File Structure](#-file-structure)
+- [🧬 Medical Ontology Support](#-medical-ontology-support)
+- [📢 Contributing](#-contributing)
+- [📜 License](#-license)
+- [🌐 Links](#-links)
+
+---
+
+## 🚑 Why Medical Practices Need GraphDB
+
+Electronic Health Record (EHR) systems are built around linear, table-based relational models. However, the real world of medicine is graph-like:
+- Patients have **encounters** with **providers**
+- Encounters yield **diagnoses**, **procedures**, **notes**, and **billing codes**
+- Medications and **prescriptions** have drug **interactions** and **side effects**
+- Data flows from **devices**, **labs**, **insurers**, **pharmacies**, and **public health databases**
+
+Traditional EHR systems cannot easily represent or traverse these relationships in a meaningful way. Queries like:
+- "Which patients are at risk given their recent prescriptions and lab results?"
+- "Which providers are likely to undercode given their encounter history?"
+- "Show patient’s medical, behavioral, and socioeconomic graph over the past 3 years."
+
+...are difficult or impossible to perform efficiently using traditional relational models.
+
+GraphDB fills this gap.
+
+---
+
+## 🧠 What GraphDB Does
+
+- Provides a **graph-native data model** with vertices and edges to capture rich relationships
+- Converts **natural or high-level language queries** into **Cypher** or similar graph queries
+- Offers both **CLI** and **daemonized API** modes for flexible integration
+- Supports **plugin-based extensions** for different healthcare domains or data standards (FHIR, HL7, ICD-10, CPT, X12, etc.)
+- Can function as an intelligent middleware layer in front of legacy EHRs or in new applications
+- Enables **graph analytics**, **risk modeling**, **explainable AI**, and **audit trails**
+
+---
+
+## 🧩 Architecture
+
+```
+graphdb-cli  (interactive + scriptable)
+    |
+    ├── Parses CLI input and transforms queries
+    ├── Talks to daemonized server via gRPC / REST
+    ↓
+graphdb-daemon (daemon)
+    ├── Accepts and serves incoming requests
+    ├── Performs language transformation → Cypher
+    ├── Uses graphdb-lib to model/query graph
+    └── Stores into modular backends (Postgres, Redis, RocksDB, Sled)
+```
+
+- **Medical domain layer**: Models entities like patients, doctors, labs, meds, visits, diagnoses
+- **Query parser**: Supports Cypher, GraphQL, SQL, and future high-level "contextual" query DSL
+- **Shared memory + IPC**: Ensures inter-process communication for stateful operations
+
+---
+
+## 🛠️ How It Works
+
+- **Language transformation**: Free-text queries (or CLI args) are parsed and mapped to internal graph traversals
+- **Daemon mode**: The daemon can run standalone, process API/gRPC requests from your EHR or analytics system
+- **Shared memory model**: Ensures fast lookup and IPC, storing daemon state and KV pairs for efficient command execution
+- **CLI**: Launch `graphdb-cli --cli` to explore and prototype queries interactively
+
+---
+
+## 🔌 Complementing Existing EHRs
+
+GraphDB is not a replacement—but a powerful **overlay** or **extension layer** for:
+- Legacy EHR platforms (e.g., Epic, Cerner) that export data into structured formats
+- Modern FHIR APIs that expose resources but lack real graph traversals
+- Custom healthcare analytics or NLP pipelines needing contextual joins
+
+It enables **low-friction augmentation**:
+- Load data from Postgres, CSV, or HL7 feed
+- Convert to graph structure with Python, C#, or Rust ingestion tools
+- Query across time, space, events, and categories
+
+---
+
+## 🧪 Example Use Cases
+
+- **Clinical Decision Support**: Show possible interactions between prescribed meds and patient’s allergy + diagnosis history
+- **Revenue Optimization**: Correlate CPT codes with diagnosis patterns for missed billing opportunities
+- **Patient Risk Graphs**: Build a temporal graph of lifestyle, clinical, and claim data to assess readmission risk
+- **Auditing**: Graph of users, edits, access logs across time for HIPAA compliance
+
+---
+
+## 🚀 Getting Started
+
+```bash
+# Build and launch
+cargo build --release --bin graphdb-cli
+./graphdb-cli --cli
+
+# View available commands
+./graphdb-cli --help
+
+# Start daemon
+./graphdb-cli start
+
+# Execute contextual query
+./graphdb-cli view-graph --graph-id 42
+```
+
+---
+
+## 📂 File Structure
+
+- `graphdb-lib/` — Core library: data models, parsers, engines
+- `graphdb-cli/` — CLI frontend
+- `graphdb-daemon/` — Server backend
+- `models/medical/` — Vertices/edges for domain modeling
+
+---
+
+## 🧬 Medical Ontology Support
+
+- FHIR/STU3/STU4 resources
+- HL7v2 / HL7v3 messages
+- CPT/ICD/LOINC/SNOMED mappings
+- Claims (837P/837I), EOBs (835), X12
+- Future plugins: NLP, RAG pipelines, EKG/EEG time series
+
+---
+
+## 📢 Contributing
+
+- [x] Support Cypher queries
+- [ ] Add more medical vocabularies
+- [ ] NLP for note parsing
+- [ ] gRPC API enhancements
+- [ ] Advanced CLI search/filter tools
+
+PRs welcome!
+
+---
+
+## 📜 License
+
+MIT License
+
+---
+
+## 🌐 Links
+
+- GitHub: [https://github.com/dmitryro/graphdb](https://github.com/dmitryro/graphdb)
+- Issues: [https://github.com/dmitryro/graphdb/issues](https://github.com/dmitryro/graphdb/issues)
 
