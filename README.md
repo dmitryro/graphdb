@@ -1,9 +1,9 @@
 
 # GraphDB
 
-[![Build Status](https://github.com/dmitryro/graphdb/actions/workflows/ci.yml/badge.svg)](https://github.com/dmitryro/graphdb/actions/workflows/ci.yml)
-[![License](https://img.shields.io/github/license/dmitryro/graphdb)](./LICENSE)
-[![Version](https://img.shields.io/github/v/release/dmitryro/graphdb)](https://github.com/dmitryro/graphdb/releases/latest)
+[![Rust](https://img.shields.io/badge/Rust-1.72-orange?logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![License](https://img.shields.io/badge/License-MIT-green)](./LICENSE)
+[![Status](https://img.shields.io/badge/Status-Stable-yellow)](https://github.com/dmitryro/graphdb)
 
 GraphDB is an experimental graph database engine and command-line interface (CLI) optimized for medical and healthcare applications. It allows developers, researchers, and integrators to build, query, and reason about interconnected medical data with high context-awareness.
 
