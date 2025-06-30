@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::errors::{Error, Result};
 use crate::util;
-use crate::{Database, Datastore, DynIter, Edge, Identifier, Json, Transaction, Vertex};
+use crate::{Database, Datastore, DynIter, Transaction};
+use crate::models::{Edge, Identifier, Json, Vertex};
 
 use rmp_serde::decode::Error as RmpDecodeError;
 use serde::{Deserialize, Serialize};

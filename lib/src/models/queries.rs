@@ -1,6 +1,6 @@
 use std::str::FromStr;
-
 use crate::{errors, Edge, Identifier, Json};
+use crate::models::{Vertex, VertexProperties, EdgeProperties};
 
 use uuid::Uuid;
 
@@ -716,15 +716,15 @@ impl CountQuery {
 #[derive(Clone, Debug, PartialEq)]
 pub enum QueryOutputValue {
     /// Vertices.
-    Vertices(Vec<crate::Vertex>),
+    Vertices(Vec<Vertex>),
     /// Edges.
     Edges(Vec<crate::Edge>),
     /// A Count.
     Count(u64),
     /// Vertex properties.
-    VertexProperties(Vec<crate::VertexProperties>),
+    VertexProperties(Vec<VertexProperties>), 
     /// Edge properties.
-    EdgeProperties(Vec<crate::EdgeProperties>),
+    EdgeProperties(Vec<EdgeProperties>),
 }
 
 #[cfg(test)]

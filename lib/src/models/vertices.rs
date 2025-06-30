@@ -1,4 +1,5 @@
-use crate::{util::generate_uuid_v1, Identifier};
+use crate::models::Identifier;
+use crate::util::generate_uuid_v1;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use uuid::Uuid;
