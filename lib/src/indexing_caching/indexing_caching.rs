@@ -1,5 +1,8 @@
+// lib/src/indexing_caching/indexing_caching.rs
+// Updated: 2025-06-30 - Added anyhow::Context import and aligned with provided struct.
+
 use std::collections::HashMap;
-use anyhow::{Result};
+use anyhow::{Result, Context}; // <-- ADDED Context
 #[cfg(feature = "with_sled")]
 use sled::Db;
 use petgraph::graph::DiGraph;
@@ -19,7 +22,7 @@ impl IndexingCache {
     ) -> Result<Self> {
         #[cfg(feature = "with_sled")]
         let persistent_cache = sled::open(_persistent_cache_path)
-            .context("Failed to open persistent cache")?;
+            .context("Failed to open persistent cache")?; // <-- This should now work
 
         let graph_index = DiGraph::new();
 
@@ -38,7 +41,7 @@ impl IndexingCache {
     #[cfg(feature = "with_sled")]
     pub fn index_data_persistent(&mut self, key: String, value: String) -> Result<()> {
         self.persistent_cache.insert(key.as_bytes(), value.as_bytes())
-            .context("Failed to index data in persistent cache")?;
+            .context("Failed to index data in persistent cache")?; // <-- This should now work
         Ok(())
     }
 
@@ -84,4 +87,3 @@ pub fn get_cached_node_state(node: &str) -> Option<String> {
     println!("Retrieving cached state for node '{}'", node);
     Some("cached_state".to_string()) // Replace with actual retrieval logic.
 }
-

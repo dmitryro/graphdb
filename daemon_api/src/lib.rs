@@ -1,3 +1,4 @@
+// daemon_api/src/lib.rs
 use serde::{Serialize, Deserialize};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -10,6 +11,8 @@ use graphdb_daemon::{DaemonizeBuilder, DaemonizeError};
 use lazy_static::lazy_static;
 use regex::Regex;
 use std::net::ToSocketAddrs;
+use tokio::net::TcpStream; // Use tokio's TcpStream for async connect
+use tokio::time::{sleep, Duration}; // Use tokio's sleep for async delays
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct DaemonData {
@@ -32,7 +35,7 @@ fn cleanup_existing_daemons(base_process_name: &str) {
         .arg("-f")
         .arg(base_process_name)
         .status();
-    std::thread::sleep(std::time::Duration::from_millis(1000));
+    std::thread::sleep(std::time::Duration::from_millis(1000)); // This is blocking, but for cleanup it might be acceptable.
 }
 
 #[derive(Debug)]
@@ -64,7 +67,7 @@ impl From<config::ConfigError> for DaemonError {
 /// Starts one or more GraphDB daemon processes.
 /// Returns Result<(), DaemonError> for compatibility with code that matches on Result.
 /// Accepts skip_ports: Vec<u16> to avoid binding reserved ports like the REST API port.
-pub fn start_daemon(port: Option<u16>, cluster_range: Option<String>, skip_ports: Vec<u16>) -> Result<(), DaemonError> {
+pub async fn start_daemon(port: Option<u16>, cluster_range: Option<String>, skip_ports: Vec<u16>) -> Result<(), DaemonError> {
     let config_path = "server/src/cli/config.toml";
 
     let mut host_to_use = "127.0.0.1".to_string();
@@ -160,11 +163,10 @@ pub fn start_daemon(port: Option<u16>, cluster_range: Option<String>, skip_ports
                     .ok_or_else(|| DaemonError::InvalidPortRange(format!("No socket for port {}", current_port)))?;
 
                 for _ in 0..max_port_check_attempts {
-                    std::thread::sleep(std::time::Duration::from_millis(port_check_interval_ms));
-                    if std::net::TcpStream::connect_timeout(
-                        &socket_addr,
-                        std::time::Duration::from_millis(100)
-                    ).is_ok() {
+                    sleep(Duration::from_millis(port_check_interval_ms)).await; // Use tokio sleep
+                    if TcpStream::connect(
+                        &socket_addr
+                    ).await.is_ok() { // Use tokio TcpStream and await
                         any_started = true;
                         break;
                     }
