@@ -4,9 +4,10 @@ resolver = "2"
 members = [
     "lib",
     "proto",
+    "security",
     "server",
     "client", 
     "rest_api", 
     "daemon", 
-    "daemon_api", 
+    "daemon_api", "security", 
 ]
