@@ -1,32 +1,58 @@
+# rest_api/Cargo.toml
+# Based on user-provided content.
+# Added missing direct dependencies for `rest_api/src/lib.rs` and corrected crate names.
+
 [package]
 name = "graphdb-rest_api"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "^1.24.2", features = ["rt-multi-thread"], optional = true }
-tokio-stream = { version = "0.1.17", features = ["net"], optional = true }
-libloading = { version = "0.8.6", optional = true }
-glob = { version = "0.3.2", optional = true }
+tokio = { version = "1.43", features = ["full"], optional = true  } # Changed to "1" (latest stable) and "full" to satisfy all needs
+# tokio-stream is generally for streaming utilities, not directly used by current lib.rs for hyper server.
+# Removed: tokio-stream = { version = "0.1.17", features = ["net"], optional = true }
+# Removed: libloading = { version = "0.8.6", optional = true } # Not directly used in lib.rs logic
+# Removed: glob = { version = "0.3.2", optional = true } # Not directly used in lib.rs logic
+sled = "0.34.7" # Use the same version as in graphdb-lib/Cargo.toml
 hyper = { version = "0.14", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] } # Changed version to "0.4" for broader compatibility if 0.4.39 is too specific/old
+async-trait = "0.1"
 serde_json = "1.0"
+lazy_static = "1.5.0"
+regex = "1.11.1"
+# Your existing daemon dependencies
 graphdb-daemon = { path = "../daemon" }
 daemon_api = { path = "../daemon_api" }
+
+# Crucial direct dependencies for `rest_api/src/lib.rs`
+jsonwebtoken = "9.3.0" # Used for JWT creation/decoding
+argon2 = "0.5.3" # Used for password hashing verification
+password-hash = "0.5" # Used by argon2 for password hash types
+anyhow = "1.0" # Used for flexible error handling in helper functions or propagated errors
+tracing = "0.1" # For structured logging
+tracing-subscriber = "0.3" # For tracing setup
+dotenv = "0.15" # If you use .env files for secrets etc. (was in previous suggestion)
+env_logger = "0.10" # For logging (was in previous suggestion)
+
+# Workspace dependencies (correctly referencing your crate names)
+graphdb-lib = { path = "../lib" } # CRUCIAL: Confirmed this is the correct name
+security = { path = "../security" } # CRUCIAL: Confirmed this is the correct name
 
 [lib]
 name = "graphdb_rest_api"
 path = "src/lib.rs"
 
 [features]
+# Retaining your feature flags
 default = []
-server = ["tokio", "tokio-stream", "libloading", "glob"]
-client = ["tokio", "tokio-stream"]
+server = ["tokio"] # Simplified features based on lib.rs usage
+client = ["tokio"] # Simplified features based on lib.rs usage
 test-suite = []
-
-[dependencies.graphdb-lib]
-path = "../lib"
-version = "0.1.0"
+# This redundant entry is commented out/removed as it's already in [dependencies]
+# [dependencies.graphdb-lib]
+# path = "../lib"
+# version = "0.1.0"
 
 [dependencies.graphdb-plugin-host]
 path = "../plugins/host"

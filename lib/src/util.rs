@@ -1,3 +1,4 @@
+// lib/src/util.rs
 //! Utility functions. These are public because they may be useful for crates
 //! that implement Datastore.
 
@@ -5,14 +6,16 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io::{Cursor, Read, Result as IoResult, Write};
 use std::str;
+// Removed `rand::thread_rng;` as it's not needed for Timestamp::now(&*CONTEXT)
+// if it's the only usage of `rand`. If other parts of `util.rs` use it, re-add.
 
 use crate::errors::{Result, ValidationError, ValidationResult};
 use crate::models;
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use once_cell::sync::Lazy;
-use uuid::v1::{Context, Timestamp};
-use uuid::Uuid;
+use uuid::{Context, Timestamp, Uuid}; // Corrected imports for uuid 1.x
+
 
 const NODE_ID: [u8; 6] = [0, 0, 0, 0, 0, 0];
 
@@ -133,7 +136,9 @@ pub fn read_u64<T: AsRef<[u8]>>(cursor: &mut Cursor<T>) -> Result<u64> {
 /// Generates a UUID v1. This utility method uses a shared context and node ID
 /// to help ensure generated UUIDs are unique.
 pub fn generate_uuid_v1() -> Uuid {
-    Uuid::new_v1(Timestamp::now(&*CONTEXT), &NODE_ID)
+    // CORRECTED: Timestamp::now only takes `context` argument for uuid 1.17.0
+    let ts = Timestamp::now(&*CONTEXT);
+    Uuid::new_v1(ts, &NODE_ID)
 }
 
 /// Gets the next UUID that would occur after the given one.

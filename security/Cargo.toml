@@ -1,23 +1,29 @@
+# security/Cargo.toml
 [package]
 name = "security"
 version = "0.1.0"
-edition = "2024"
+edition = "2024" # Keeping your edition
 authors = ["Dmitry R <you@example.com>"]
 description = "RBAC Security module for GraphDB with JWT support"
 license = "MIT"
 
 [dependencies]
-jsonwebtoken = "9"
+jsonwebtoken = "8" # Adjusted to "8" for consistency with the provided lib.rs example
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9" # For YAML config
 anyhow = "1.0.95"
-actix-web = { version = "4", optional = true }
 oauth2 = { version = "4", optional = true }
 chrono = { version = "0.4.39", features = ["serde"] }
-# Add your web/server framework as needed
 
-[features]
-default = []
-actix = ["dep:actix-web"]
-oauth2 = ["dep:oauth2"]
+# Add Actix Web and Futures explicitly (keeping your existing dependencies)
+actix-web = "4.11.0" # Use the same version as in graphdb-lib
+futures = "0.3.31"   # A common compatible version
+
+# NEW: Dependencies for user storage and password hashing
+graphdb-lib = { path = "../lib" } # IMPORTANT: Adjust this path if different in your project structure
+sled = "0.34.7" # Or your preferred version for Sled
+argon2 = "0.5" # For secure password hashing
+rand_core = { version = "0.6", features = ["std"] } # For Argon2 salt generation
+lazy_static = "1.4" # For global user store
+tokio = { version = "1.43", features = ["macros", "rt-multi-thread", "sync", "time", "rt"] } # Add rt feature for tokio::spawn_blocking when building a runtime
