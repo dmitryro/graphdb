@@ -1,6 +1,5 @@
 # GraphDB
-
-[![Build Status](https://github.com/dmitryro/graphdb/actions/workflows/ci.yml/badge.svg)](https://github.com/dmitryro/graphdb/actions/workflows/ci.yml)
+[![Build Status](https://github.com/dmitryro/graphdb/actions/workflows/ci.yaml/badge.svg)](https://github.com/dmitryro/graphdb/actions/workflows/ci.yaml)
 [![Rust](https://img.shields.io/badge/Rust-1.72-orange?logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![Crates.io](https://img.shields.io/crates/v/graphdb.svg)](https://crates.io/crates/graphdb)
 [![Docs.rs](https://docs.rs/graphdb/badge.svg)](https://docs.rs/graphdb)
