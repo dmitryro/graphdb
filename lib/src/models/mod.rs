@@ -1,18 +1,24 @@
-mod bulk_insert;
-mod edges;
-mod identifiers;
-mod json;
-mod properties;
-mod queries;
-mod vertices;
-mod to_vertex;
-mod medical;
+pub mod bulk_insert;
+pub mod edges;
+pub mod identifiers;
+pub mod json;
+pub mod properties;
+pub mod queries;
+pub mod vertices;
+pub mod to_vertex;
+pub mod medical;
 
 pub use self::bulk_insert::BulkInsertItem;
 pub use self::edges::Edge;
 pub use self::identifiers::Identifier;
 pub use self::json::Json;
-pub use self::properties::{EdgeProperties, EdgeProperty, NamedProperty, VertexProperties, VertexProperty};
+pub use self::properties::{
+    EdgeProperties,
+    EdgeProperty,
+    NamedProperty,
+    VertexProperties,
+    VertexProperty,
+};
 pub use self::queries::*;
 pub use self::vertices::Vertex;
 pub use self::to_vertex::ToVertex;
@@ -67,3 +73,4 @@ pub use self::medical::{
     FacilityUnit,
     StaffAssignment,
 };
+

@@ -4,7 +4,9 @@ use std::sync::{Arc, RwLock};
 
 use super::managers::*;
 use crate::errors::Result;
-use crate::{BulkInsertItem, Database, Datastore, DynIter, Edge, Identifier, Json, Transaction, Vertex};
+use crate::{Database, Datastore, DynIter, Transaction};
+use crate::models::{Edge, Identifier, Json, Vertex};
+use crate::models::BulkInsertItem;
 
 use rocksdb::{DBCompactionStyle, Options, WriteBatch, DB};
 use uuid::Uuid;

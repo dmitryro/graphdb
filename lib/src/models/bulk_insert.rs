@@ -1,4 +1,4 @@
-use crate::{Edge, Identifier, Json, Vertex};
+use crate::models::{Edge, Identifier, Json, Vertex};
 
 use uuid::Uuid;
 
