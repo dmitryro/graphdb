@@ -22,7 +22,7 @@ pub use storage_client::StorageClient;
 pub struct StorageRequest {
     pub key: String,
     pub value: Option<String>, // Value is optional for Get, required for Put
-    pub operation: String,     // e.g., "GET", "PUT", "DELETE"
+    pub operation: String,       // e.g., "GET", "PUT", "DELETE"
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,13 +57,23 @@ pub async fn start_storage_daemon_server_real(
 
     // --- ACTUAL STORAGE DAEMON SERVER INITIALIZATION GOES HERE ---
     // Example: Bind to port, start gRPC server, initialize internal state, etc.
-    // let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
+    // THIS IS THE CRITICAL LINE THAT WAS COMMENTED OUT!
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await
+        .with_context(|| format!("Failed to bind storage daemon to port {}", port))?;
+
+    println!("[Storage Daemon] Successfully bound to port {}. Now listening for connections.", port);
+
+    // In a real gRPC or HTTP server, you would typically serve connections here.
+    // For now, we'll just wait for the shutdown signal after binding successfully.
+    // If you're using tonic, this is where you'd call .serve_with_shutdown.
+    // Example (if using tonic):
     // tonic::transport::Server::builder()
-    //      .add_service(YourStorageServiceServer::new(YourServiceImpl))
-    //      .serve_with_shutdown(listener, async {
-    //           shutdown_rx.await.ok(); // Wait for shutdown signal
-    //      })
-    //      .await?;
+    //     .add_service(YourStorageServiceServer::new(YourServiceImpl)) // Replace with your actual service
+    //     .serve_with_shutdown(listener.into_incoming(), async {
+    //         shutdown_rx.await.ok(); // Wait for shutdown signal
+    //     })
+    //     .await?;
+
 
     println!("[Storage Daemon] Running. Waiting for shutdown signal...");
     
@@ -142,7 +152,7 @@ struct StorageSettingsWrapper {
 /// defined in `StorageSettings::default()`.
 pub fn get_default_storage_port_from_config() -> u16 {
     // Assuming 'storage_config.yaml' is relative to the executable's current working directory.
-    let config_path = PathBuf::from("storage_config.yaml"); 
+    let config_path = PathBuf::from("storage_config.yaml");    
 
     match StorageSettings::load_from_yaml(&config_path) {
         Ok(settings) => {
@@ -211,3 +221,4 @@ pub async fn run_storage_daemon(
 
     Ok(())
 }
+
