@@ -4,16 +4,13 @@ use sled::{Db, Tree, IVec, Batch};
 use std::collections::HashMap;
 use bincode::{
     config::{self, Configuration, BigEndian, Fixint}, // Import BigEndian and Fixint
-    // FIX: Import decode_from_slice and encode_to_vec from bincode::serde
     serde::{decode_from_slice, encode_to_vec},
 };
 
 // Import from models crate
-// Correctly import GraphResult from models::errors
 use models::errors::GraphResult as ModelsResult; // Alias to prevent conflict
-// Correctly import GraphError and Result from your lib's errors module
 use crate::errors::{GraphError, Result}; // Your lib's error type
-use models::identifiers::Identifier;
+use models::identifiers::{Identifier, SerializableUuid};
 use models::json::Json;
 use models::edges::Edge;
 use models::vertices::Vertex;
@@ -27,13 +24,11 @@ pub struct SledReadResult {
 }
 
 // Updated bincode_config for new bincode API
-// FIX: Specify the exact return type of Configuration
 fn bincode_config() -> Configuration<BigEndian, Fixint> {
     config::standard()
         .with_big_endian()
-        .with_fixed_int_encoding() // FIX: Corrected typo here
+        .with_fixed_int_encoding()
 }
-
 
 fn take_with_prefix_sled(iterator: sled::Iter, prefix: Vec<u8>) -> impl Iterator<Item = SledReadResult> {
     iterator
@@ -48,10 +43,8 @@ fn take_with_prefix_sled(iterator: sled::Iter, prefix: Vec<u8>) -> impl Iterator
         .map(|(key, value)| SledReadResult { key, value })
 }
 
-
 pub struct SledManager {
     tree: Tree,
-    // FIX: Declare bincode_conf with the specific Configuration type
     bincode_conf: Configuration<BigEndian, Fixint>,
 }
 
@@ -60,7 +53,7 @@ impl SledManager {
         let tree = db.open_tree(tree_name)?;
         Ok(Self {
             tree,
-            bincode_conf: bincode_config(), // Initialize with the specific config
+            bincode_conf: bincode_config(),
         })
     }
 
@@ -68,10 +61,8 @@ impl SledManager {
     pub fn add_vertex(&self, vertex: &Vertex) -> Result<IVec> {
         let key = util::build(&[
             util::Component::Identifier(vertex.label().clone()),
-            util::Component::Uuid(vertex.id),
+            util::Component::Uuid(vertex.id.into()),
         ]);
-        // Note: serde_json::to_vec is used here, not bincode's encode_to_vec.
-        // This is consistent with your current code.
         let value_json = serde_json::to_vec(&vertex)?;
 
         let mut batch = sled::Batch::default();
@@ -79,7 +70,7 @@ impl SledManager {
         self.tree.apply_batch(batch)?;
         Ok(IVec::from(util::build(&[
             util::Component::Identifier(vertex.label().clone()),
-            util::Component::Uuid(vertex.id),
+            util::Component::Uuid(vertex.id.into()),
         ])))
     }
 
@@ -91,8 +82,6 @@ impl SledManager {
         let result = self.tree.get(&key)?;
         match result {
             Some(ivec) => {
-                // Note: serde_json::from_slice is used here, not bincode's decode_from_slice.
-                // This is consistent with your current code.
                 let vertex: Vertex = serde_json::from_slice(&ivec)?;
                 Ok(Some(vertex))
             }
@@ -103,9 +92,8 @@ impl SledManager {
     pub fn update_vertex(&self, vertex: &Vertex) -> Result<IVec> {
         let key = util::build(&[
             util::Component::Identifier(vertex.label().clone()),
-            util::Component::Uuid(vertex.id),
+            util::Component::Uuid(vertex.id.into()),
         ]);
-        // Note: serde_json::to_vec is used here.
         let value_json = serde_json::to_vec(&vertex)?;
 
         let mut batch = sled::Batch::default();
@@ -113,7 +101,7 @@ impl SledManager {
         self.tree.apply_batch(batch)?;
         Ok(IVec::from(util::build(&[
             util::Component::Identifier(vertex.label().clone()),
-            util::Component::Uuid(vertex.id),
+            util::Component::Uuid(vertex.id.into()),
         ])))
     }
 
@@ -132,10 +120,9 @@ impl SledManager {
     pub fn add_edge(&self, edge: &Edge) -> Result<IVec> {
         let key = util::build(&[
             util::Component::Identifier(edge.t.clone()),
-            util::Component::Uuid(edge.outbound_id),
-            util::Component::Uuid(edge.inbound_id),
+            util::Component::Uuid(edge.outbound_id.into()),
+            util::Component::Uuid(edge.inbound_id.into()),
         ]);
-        // Note: serde_json::to_vec is used here.
         let value_json = serde_json::to_vec(&edge)?;
 
         let mut batch = sled::Batch::default();
@@ -143,8 +130,8 @@ impl SledManager {
         self.tree.apply_batch(batch)?;
         Ok(IVec::from(util::build(&[
             util::Component::Identifier(edge.t.clone()),
-            util::Component::Uuid(edge.outbound_id),
-            util::Component::Uuid(edge.inbound_id),
+            util::Component::Uuid(edge.outbound_id.into()),
+            util::Component::Uuid(edge.inbound_id.into()),
         ])))
     }
 
@@ -157,7 +144,6 @@ impl SledManager {
         let result = self.tree.get(&key)?;
         match result {
             Some(ivec) => {
-                // Note: serde_json::from_slice is used here.
                 let edge: Edge = serde_json::from_slice(&ivec)?;
                 Ok(Some(edge))
             }
@@ -168,10 +154,9 @@ impl SledManager {
     pub fn update_edge(&self, edge: &Edge) -> Result<IVec> {
         let key = util::build(&[
             util::Component::Identifier(edge.t.clone()),
-            util::Component::Uuid(edge.outbound_id),
-            util::Component::Uuid(edge.inbound_id),
+            util::Component::Uuid(edge.outbound_id.into()),
+            util::Component::Uuid(edge.inbound_id.into()),
         ]);
-        // Note: serde_json::to_vec is used here.
         let value_json = serde_json::to_vec(&edge)?;
 
         let mut batch = sled::Batch::default();
@@ -179,8 +164,8 @@ impl SledManager {
         self.tree.apply_batch(batch)?;
         Ok(IVec::from(util::build(&[
             util::Component::Identifier(edge.t.clone()),
-            util::Component::Uuid(edge.outbound_id),
-            util::Component::Uuid(edge.inbound_id),
+            util::Component::Uuid(edge.outbound_id.into()),
+            util::Component::Uuid(edge.inbound_id.into()),
         ])))
     }
 
@@ -203,7 +188,6 @@ impl SledManager {
         let mut vertices = Vec::new();
         for result in iter {
             let sled_result = result;
-            // Note: serde_json::from_slice is used here.
             let vertex: Vertex = serde_json::from_slice(&sled_result.value)?;
             vertices.push(vertex);
         }
@@ -217,7 +201,6 @@ impl SledManager {
         let mut edges = Vec::new();
         for result in iter {
             let sled_result = result;
-            // Note: serde_json::from_slice is used here.
             let edge: Edge = serde_json::from_slice(&sled_result.value)?;
             edges.push(edge);
         }

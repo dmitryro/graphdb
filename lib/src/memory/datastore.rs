@@ -6,17 +6,74 @@ use std::path::PathBuf;
 use std::result::Result as StdResult;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::errors::{GraphError, Result};
+use models::errors::{GraphError, GraphResult as Result};
 use crate::util;
 use crate::util::next_uuid;
-use crate::{Database, Datastore, DynIter, Transaction};
 use models::{Edge, Identifier, Json, Vertex};
 use models::bulk_insert::BulkInsertItem;
+use models::identifiers::SerializableUuid;
 
 use rmp_serde::decode::Error as RmpDecodeError;
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use uuid::Uuid;
+
+pub trait Datastore {
+    type Transaction<'a>
+    where
+        Self: 'a;
+    fn transaction(&'_ self) -> Self::Transaction<'_>;
+}
+
+pub trait Transaction<'a>: Sized {
+    fn vertex_count(&self) -> u64;
+    fn all_vertices(&'a self) -> Result<DynIter<'a, Vertex>>;
+    fn range_vertices(&'a self, offset: Uuid) -> Result<DynIter<'a, Vertex>>;
+    fn specific_vertices(&'a self, ids: Vec<Uuid>) -> Result<DynIter<'a, Vertex>>;
+    fn vertex_ids_with_property(&'a self, name: Identifier) -> Result<Option<DynIter<'a, Uuid>>>;
+    fn vertex_ids_with_property_value(&'a self, name: Identifier, value: &Json) -> Result<Option<DynIter<'a, Uuid>>>;
+    fn edge_count(&self) -> u64;
+    fn all_edges(&'a self) -> Result<DynIter<'a, Edge>>;
+    fn range_edges(&'a self, offset: Edge) -> Result<DynIter<'a, Edge>>;
+    fn range_reversed_edges(&'a self, offset: Edge) -> Result<DynIter<'a, Edge>>;
+    fn specific_edges(&'a self, edges: Vec<Edge>) -> Result<DynIter<'a, Edge>>;
+    fn edges_with_property(&'a self, name: Identifier) -> Result<Option<DynIter<'a, Edge>>>;
+    fn edges_with_property_value(&'a self, name: Identifier, value: &Json) -> Result<Option<DynIter<'a, Edge>>>;
+    fn vertex_property(&self, vertex: &Vertex, name: Identifier) -> Result<Option<Json>>;
+    fn all_vertex_properties_for_vertex(&'a self, vertex: &Vertex) -> Result<DynIter<'a, (Identifier, Json)>>;
+    fn edge_property(&self, edge: &Edge, name: Identifier) -> Result<Option<Json>>;
+    fn all_edge_properties_for_edge(&'a self, edge: &Edge) -> Result<DynIter<'a, (Identifier, Json)>>;
+    fn delete_vertices(&mut self, vertices: Vec<Vertex>) -> Result<()>;
+    fn delete_edges(&mut self, edges: Vec<Edge>) -> Result<()>;
+    fn delete_vertex_properties(&mut self, props: Vec<(Uuid, Identifier)>) -> Result<()>;
+    fn delete_edge_properties(&mut self, props: Vec<(Edge, Identifier)>) -> Result<()>;
+    fn sync(&self) -> Result<()>;
+    fn create_vertex(&mut self, vertex: &Vertex) -> Result<bool>;
+    fn create_edge(&mut self, edge: &Edge) -> Result<bool>;
+    fn bulk_insert(&mut self, items: Vec<BulkInsertItem>) -> Result<()>;
+    fn index_property(&mut self, name: Identifier) -> Result<()>;
+    fn set_vertex_properties(&mut self, vertices: Vec<Uuid>, name: Identifier, value: &Json) -> Result<()>;
+    fn set_edge_properties(&mut self, edges: Vec<Edge>, name: Identifier, value: &Json) -> Result<()>;
+}
+
+pub type DynIter<'a, T> = Box<dyn Iterator<Item = Result<T>> + 'a>;
+
+#[derive(Debug)]
+pub struct Database<D: Datastore> {
+    datastore: D,
+}
+
+impl<D: Datastore> Database<D> {
+    pub fn new(datastore: D) -> Self {
+        Self { datastore }
+    }
+    pub fn read_txn(&self) -> D::Transaction<'_> {
+        self.datastore.transaction()
+    }
+    pub fn write_txn(&mut self) -> D::Transaction<'_> {
+        self.datastore.transaction()
+    }
+}
 
 #[derive(Eq, PartialEq, Hash, Serialize, Deserialize, Debug)]
 enum IndexedPropertyMember {
@@ -24,10 +81,6 @@ enum IndexedPropertyMember {
     Edge(Edge),
 }
 
-// All of the data is actually stored in this struct, which is stored
-// internally to the datastore itself. This way, we can wrap a mutex around
-// the entire datastore, rather than on a per-data structure basis, as the
-// latter approach would risk deadlocking without extreme care.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct InternalMemory {
     vertices: BTreeMap<Uuid, Identifier>,
@@ -49,29 +102,18 @@ impl<'a> Transaction<'a> for MemoryTransaction<'a> {
     }
 
     fn all_vertices(&'a self) -> Result<DynIter<'a, Vertex>> {
-        let iter = self
-            .internal
-            .vertices
-            .iter()
-            .map(|(id, label)| Ok(Vertex::new_with_id(*id, label.clone())));
+        let iter = self.internal.vertices.iter().map(|(id, label)| Ok(Vertex::new_with_id(*id, label.clone())));
         Ok(Box::new(iter))
     }
 
     fn range_vertices(&'a self, offset: Uuid) -> Result<DynIter<'a, Vertex>> {
-        let iter = self
-            .internal
-            .vertices
-            .range(offset..)
-            .map(|(id, label)| Ok(Vertex::new_with_id(*id, label.clone())));
+        let iter = self.internal.vertices.range(offset..).map(|(id, label)| Ok(Vertex::new_with_id(*id, label.clone())));
         Ok(Box::new(iter))
     }
 
     fn specific_vertices(&'a self, ids: Vec<Uuid>) -> Result<DynIter<'a, Vertex>> {
         let iter = ids.into_iter().filter_map(move |id| {
-            self.internal
-                .vertices
-                .get(&id)
-                .map(|label| Ok(Vertex::new_with_id(id, label.clone())))
+            self.internal.vertices.get(&id).map(|label| Ok(Vertex::new_with_id(id, label.clone())))
         });
         Ok(Box::new(iter))
     }
@@ -129,10 +171,7 @@ impl<'a> Transaction<'a> for MemoryTransaction<'a> {
     }
 
     fn specific_edges(&'a self, edges: Vec<Edge>) -> Result<DynIter<'a, Edge>> {
-        let iter = edges
-            .into_iter()
-            .filter(move |edge| self.internal.edges.contains(edge))
-            .map(Ok);
+        let iter = edges.into_iter().filter(move |edge| self.internal.edges.contains(edge)).map(Ok);
         Ok(Box::new(iter))
     }
 
@@ -170,7 +209,7 @@ impl<'a> Transaction<'a> for MemoryTransaction<'a> {
     }
 
     fn vertex_property(&self, vertex: &Vertex, name: Identifier) -> Result<Option<Json>> {
-        if let Some(value) = self.internal.vertex_properties.get(&(vertex.id, name.clone())) {
+        if let Some(value) = self.internal.vertex_properties.get(&(Uuid::from(vertex.id), name.clone())) {
             Ok(Some(value.clone()))
         } else {
             Ok(None)
@@ -179,12 +218,9 @@ impl<'a> Transaction<'a> for MemoryTransaction<'a> {
 
     fn all_vertex_properties_for_vertex(&'a self, vertex: &Vertex) -> Result<DynIter<'a, (Identifier, Json)>> {
         let mut vertex_properties = Vec::new();
-        // Using new_unchecked for range bounds, as Identifier does not implement Default
-        let from = &(vertex.id, unsafe { Identifier::new_unchecked("".to_string()) });
-        // FIX: Use next_uuid here
-        let to = &(next_uuid(vertex.id), unsafe { Identifier::new_unchecked("".to_string()) });
+        let from = &(Uuid::from(vertex.id), unsafe { Identifier::new_unchecked("".to_string()) });
+        let to = &(next_uuid(Uuid::from(vertex.id)), unsafe { Identifier::new_unchecked("".to_string()) });
         for ((_prop_vertex_id, prop_name), prop_value) in self.internal.vertex_properties.range(from..to) {
-            // FIX: Clone prop_name here
             vertex_properties.push((prop_name.clone(), prop_value.clone()));
         }
         Ok(Box::new(vertex_properties.into_iter().map(Ok)))
@@ -200,13 +236,11 @@ impl<'a> Transaction<'a> for MemoryTransaction<'a> {
 
     fn all_edge_properties_for_edge(&'a self, edge: &Edge) -> Result<DynIter<'a, (Identifier, Json)>> {
         let mut edge_properties = Vec::new();
-        // Using new_unchecked for range bounds, as Identifier does not implement Default
         let from = &(edge.clone(), unsafe { Identifier::new_unchecked("".to_string()) });
         for ((prop_edge, prop_name), prop_value) in self.internal.edge_properties.range(from..) {
             if prop_edge != edge {
                 break;
             }
-            // FIX: Clone prop_name here
             edge_properties.push((prop_name.clone(), prop_value.clone()));
         }
         Ok(Box::new(edge_properties.into_iter().map(Ok)))
@@ -214,22 +248,16 @@ impl<'a> Transaction<'a> for MemoryTransaction<'a> {
 
     fn delete_vertices(&mut self, vertices: Vec<Vertex>) -> Result<()> {
         for vertex in vertices {
-            self.internal.vertices.remove(&vertex.id);
+            self.internal.vertices.remove(&Uuid::from(vertex.id));
 
             let mut deletable_vertex_properties: Vec<(Uuid, Identifier)> = Vec::new();
-            // Using new_unchecked for range bounds, as Identifier does not implement Default
-            let start_range = (vertex.id, unsafe { Identifier::new_unchecked("".to_string()) });
-            // FIX: Use next_uuid here
-            let end_range = (next_uuid(vertex.id), unsafe { Identifier::new_unchecked("".to_string()) });
+            let start_range = (Uuid::from(vertex.id), unsafe { Identifier::new_unchecked("".to_string()) });
+            let end_range = (next_uuid(Uuid::from(vertex.id)), unsafe { Identifier::new_unchecked("".to_string()) });
 
-            for (property_key, _) in self
-                .internal
-                .vertex_properties
-                .range(start_range..end_range)
-            {
+            for (property_key, _) in self.internal.vertex_properties.range(start_range..end_range) {
                 let (property_vertex_id, _) = property_key;
 
-                if &vertex.id != property_vertex_id {
+                if &Uuid::from(vertex.id) != property_vertex_id {
                     break;
                 }
 
@@ -239,7 +267,7 @@ impl<'a> Transaction<'a> for MemoryTransaction<'a> {
 
             let mut deletable_edges: Vec<Edge> = Vec::new();
             for edge in self.internal.edges.iter() {
-                if edge.outbound_id == vertex.id || edge.inbound_id == vertex.id {
+                if Uuid::from(edge.outbound_id) == Uuid::from(vertex.id) || Uuid::from(edge.inbound_id) == Uuid::from(vertex.id) {
                     deletable_edges.push(edge.clone());
                 }
             }
@@ -254,13 +282,8 @@ impl<'a> Transaction<'a> for MemoryTransaction<'a> {
             self.internal.reversed_edges.remove(&edge.reversed());
 
             let mut deletable_edge_properties: Vec<(Edge, Identifier)> = Vec::new();
-            // Using new_unchecked for range bounds, as Identifier does not implement Default
             let start_range = (edge.clone(), unsafe { Identifier::new_unchecked("".to_string()) });
-            for (property_key, _) in self
-                .internal
-                .edge_properties
-                .range(start_range..)
-            {
+            for (property_key, _) in self.internal.edge_properties.range(start_range..) {
                 let (property_edge, _) = property_key;
 
                 if &edge != property_edge {
@@ -283,11 +306,6 @@ impl<'a> Transaction<'a> for MemoryTransaction<'a> {
                         .get_mut(&property_value)
                         .unwrap()
                         .remove(&IndexedPropertyMember::Vertex(property_vertex_id)));
-                } else {
-                    // This case indicates an inconsistency where a property existed for a vertex
-                    // but not in the global property_values index. This could happen if a property
-                    // was deleted from the index but not from vertex_properties.
-                    // For now, we'll just allow it, but a robust system might log or correct this.
                 }
             }
         }
@@ -303,45 +321,38 @@ impl<'a> Transaction<'a> for MemoryTransaction<'a> {
                         .get_mut(&property_value)
                         .unwrap()
                         .remove(&IndexedPropertyMember::Edge(property_edge)));
-                } else {
-                    // See comment in delete_vertex_properties for handling inconsistencies.
                 }
             }
         }
         Ok(())
     }
 
-
     fn sync(&self) -> Result<()> {
         if let Some(ref persist_path) = self.path {
-            // FIX: Use GraphError::IoError
-            let temp_path = NamedTempFile::new().map_err(GraphError::IoError)?;
+            let temp_path = NamedTempFile::new().map_err(|e| GraphError::Io(e.into()))?;
             {
                 let mut buf = BufWriter::new(temp_path.as_file());
                 rmp_serde::encode::write(&mut buf, &*self.internal)?;
             }
             temp_path
-                // FIX: Use GraphError::IoError
                 .persist(persist_path)
-                .map_err(|e| GraphError::IoError(e.error))?;
+                .map_err(|e| GraphError::Io(e.error.into()))?;
         }
         Ok(())
     }
 
     fn create_vertex(&mut self, vertex: &Vertex) -> Result<bool> {
         let mut inserted = false;
-
-        self.internal.vertices.entry(vertex.id).or_insert_with(|| {
+        self.internal.vertices.entry(Uuid::from(vertex.id)).or_insert_with(|| {
             inserted = true;
             vertex.label().clone()
         });
-
         Ok(inserted)
     }
 
     fn create_edge(&mut self, edge: &Edge) -> Result<bool> {
-        if !self.internal.vertices.contains_key(&edge.outbound_id)
-            || !self.internal.vertices.contains_key(&edge.inbound_id)
+        if !self.internal.vertices.contains_key(&Uuid::from(edge.outbound_id))
+            || !self.internal.vertices.contains_key(&Uuid::from(edge.inbound_id))
         {
             return Ok(false);
         }
@@ -356,16 +367,16 @@ impl<'a> Transaction<'a> for MemoryTransaction<'a> {
             match item {
                 BulkInsertItem::Vertex(vertex) => {
                     self.create_vertex(&vertex)?;
-                },
+                }
                 BulkInsertItem::Edge(edge) => {
                     self.create_edge(&edge)?;
-                },
+                }
                 BulkInsertItem::VertexProperty(id, name, value) => {
                     self.set_vertex_properties(vec![id], name, &value)?;
-                },
+                }
                 BulkInsertItem::EdgeProperty(edge, name, value) => {
                     self.set_edge_properties(vec![edge], name, &value)?;
-                },
+                }
             }
         }
         Ok(())
@@ -377,18 +388,12 @@ impl<'a> Transaction<'a> for MemoryTransaction<'a> {
         let mut property_container: HashMap<Json, HashSet<IndexedPropertyMember>> = HashMap::new();
         for id in self.internal.vertices.keys() {
             if let Some(value) = self.internal.vertex_properties.get(&(*id, name_for_loops.clone())) {
-                property_container
-                    .entry(value.clone())
-                    .or_default()
-                    .insert(IndexedPropertyMember::Vertex(*id));
+                property_container.entry(value.clone()).or_default().insert(IndexedPropertyMember::Vertex(*id));
             }
         }
         for edge in self.internal.edges.iter() {
             if let Some(value) = self.internal.edge_properties.get(&(edge.clone(), name_for_loops.clone())) {
-                property_container
-                    .entry(value.clone())
-                    .or_default()
-                    .insert(IndexedPropertyMember::Edge(edge.clone()));
+                property_container.entry(value.clone()).or_default().insert(IndexedPropertyMember::Edge(edge.clone()));
             }
         }
 
@@ -399,7 +404,6 @@ impl<'a> Transaction<'a> for MemoryTransaction<'a> {
                 existing_members.insert(member);
             }
         }
-
         Ok(())
     }
 
@@ -413,9 +417,7 @@ impl<'a> Transaction<'a> for MemoryTransaction<'a> {
         self.delete_vertex_properties(deletable_vertex_properties)?;
 
         for vertex_id in &vertex_ids {
-            self.internal
-                .vertex_properties
-                .insert((*vertex_id, name_for_ops.clone()), value.clone());
+            self.internal.vertex_properties.insert((*vertex_id, name_for_ops.clone()), value.clone());
         }
 
         let property_container_for_name = self.internal.property_values.entry(name).or_default();
@@ -423,7 +425,6 @@ impl<'a> Transaction<'a> for MemoryTransaction<'a> {
         for vertex_id in vertex_ids.into_iter() {
             property_container.insert(IndexedPropertyMember::Vertex(vertex_id));
         }
-
         Ok(())
     }
 
@@ -437,9 +438,7 @@ impl<'a> Transaction<'a> for MemoryTransaction<'a> {
         self.delete_edge_properties(deletable_edge_properties)?;
 
         for edge in &edges {
-            self.internal
-                .edge_properties
-                .insert((edge.clone(), name_for_ops.clone()), value.clone());
+            self.internal.edge_properties.insert((edge.clone(), name_for_ops.clone()), value.clone());
         }
 
         let property_container_for_name = self.internal.property_values.entry(name).or_default();
@@ -447,12 +446,10 @@ impl<'a> Transaction<'a> for MemoryTransaction<'a> {
         for edge in edges.into_iter() {
             property_container.insert(IndexedPropertyMember::Edge(edge));
         }
-
         Ok(())
     }
 }
 
-/// An in-memory datastore.
 #[derive(Debug, Clone)]
 pub struct MemoryDatastore {
     internal: Arc<Mutex<InternalMemory>>,
@@ -460,19 +457,12 @@ pub struct MemoryDatastore {
 }
 
 impl MemoryDatastore {
-    /// Creates a new in-memory database with no persistence.
     pub fn new_db() -> Database<MemoryDatastore> {
         Database::new(MemoryDatastore {
             internal: Arc::new(Mutex::new(InternalMemory::default())),
             path: None,
         })
     }
-
-    /// Reads a persisted image from disk. Calls to sync will overwrite the
-    /// file at the specified path.
-    ///
-    /// # Arguments
-    /// * `path`: The path to the persisted image.
     pub fn read_msgpack_db<P: Into<PathBuf>>(path: P) -> StdResult<Database<MemoryDatastore>, RmpDecodeError> {
         let path = path.into();
         let f = File::open(&path).map_err(RmpDecodeError::InvalidDataRead)?;
@@ -483,13 +473,6 @@ impl MemoryDatastore {
             path: Some(path),
         }))
     }
-
-    /// Creates a new datastore. Calls to sync will overwrite the file at the
-    /// specified path, but as opposed to `read`, this will not read the file
-    /// first.
-    ///
-    /// # Arguments
-    /// * `path`: The path to the persisted image.
     pub fn create_msgpack_db<P: Into<PathBuf>>(path: P) -> Database<MemoryDatastore> {
         Database::new(MemoryDatastore {
             internal: Arc::new(Mutex::new(InternalMemory::default())),

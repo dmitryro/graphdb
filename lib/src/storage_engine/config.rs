@@ -1,22 +1,34 @@
-// src/storage_engine/config.rs
+// lib/src/storage_engine/config.rs
 
-use serde::Deserialize;
-use std::fs::File;
-use std::io::Read;
+use serde::{Serialize, Deserialize};
 
-#[derive(Deserialize)]
-pub struct StorageConfig {
-    pub engine: String,
-    pub connection_string: String,
+/// Enum to specify the type of storage engine to use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StorageEngineType {
+    Sled,
+    RocksDB,
+    // Add other storage types like PostgreSQL, Redis, etc., as needed
 }
 
-impl StorageConfig {
-    pub fn load_from_file(file_path: &str) -> Result<Self, String> {
-        let mut file = File::open(file_path).map_err(|e| e.to_string())?;
-        let mut contents = String::new();
-        file.read_to_string(&mut contents)
-            .map_err(|e| e.to_string())?;
-        toml::de::from_str(&contents).map_err(|e| e.to_string())
+/// Configuration for the storage engine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageConfig {
+    /// The type of storage engine to use (e.g., Sled, RocksDB).
+    pub engine_type: StorageEngineType,
+    /// The path to the directory where the database files will be stored.
+    pub data_path: String,
+    /// Optional: Any specific configuration parameters for the chosen engine.
+    /// This could be a JSON string or a more structured enum/struct later.
+    pub engine_specific_config: Option<String>,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        StorageConfig {
+            engine_type: StorageEngineType::Sled, // Default to Sled
+            data_path: "./data/graphdb_storage".to_string(), // Default data path
+            engine_specific_config: None,
+        }
     }
 }
 

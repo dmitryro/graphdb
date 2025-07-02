@@ -1,4 +1,3 @@
-// models/src/util.rs
 //! Utility functions. These are public because they may be useful for crates
 //! that implement Datastore.
 
@@ -7,20 +6,16 @@ use std::hash::{Hash, Hasher};
 use std::io::{Cursor, Read, Result as IoResult, Write};
 use std::str;
 
-// Corrected import: We now need GraphResult as well.
 use crate::errors::{GraphResult, ValidationError, ValidationResult};
-
-// All other necessary types that were causing "cannot find type" errors.
 use crate::{
     edges::Edge,
-    identifiers::Identifier,
+    identifiers::{Identifier, SerializableInternString, SerializableUuid},
     json::Json,
-    properties::{EdgeProperties, VertexProperties}, // FIX: Removed unused PropertyMap, PropertyValue
+    properties::{EdgeProperties, VertexProperties},
     queries::QueryOutputValue,
     vertices::Vertex,
 };
 
-// FIX: Corrected byteorder imports to directly use the traits
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use once_cell::sync::Lazy;
 use uuid::{Context, Timestamp, Uuid};
@@ -29,8 +24,7 @@ const NODE_ID: [u8; 6] = [0, 0, 0, 0, 0, 0];
 
 static CONTEXT: Lazy<Context> = Lazy::new(|| Context::new(0));
 
-/// A byte-serializable value, frequently employed in the keys of key/value
-/// store.
+/// A byte-serializable value, frequently employed in the keys of key/value store.
 pub enum Component<'a> {
     /// A UUID.
     Uuid(Uuid),
@@ -43,13 +37,12 @@ pub enum Component<'a> {
 }
 
 impl Component<'_> {
-    /// Gets the length of the component. This isn’t called `len` to avoid a
-    /// clippy warning.
+    /// Gets the length of the component. This isn’t called `len` to avoid a clippy warning.
     pub fn byte_len(&self) -> usize {
         match *self {
             Component::Uuid(_) => 16,
             Component::FixedLengthString(s) => s.len(),
-            Component::Identifier(ref t) => t.0.len() + 1,
+            Component::Identifier(ref t) => t.0.0.len() + 1,
             Component::Json(_) => 8,
         }
     }
@@ -60,8 +53,8 @@ impl Component<'_> {
             Component::Uuid(uuid) => cursor.write_all(uuid.as_bytes()),
             Component::FixedLengthString(s) => cursor.write_all(s.as_bytes()),
             Component::Identifier(ref i) => {
-                cursor.write_all(&[i.0.len() as u8])?;
-                cursor.write_all(i.0.as_bytes())
+                cursor.write_all(&[i.0.0.len() as u8])?;
+                cursor.write_all(i.0.0.as_bytes())
             }
             Component::Json(json) => {
                 let mut hasher = DefaultHasher::new();
@@ -90,9 +83,6 @@ pub fn build(components: &[Component]) -> Vec<u8> {
 }
 
 /// Reads a UUID from bytes.
-///
-/// # Arguments
-/// * `cursor`: The bytes to read from.
 pub fn read_uuid<T: AsRef<[u8]>>(cursor: &mut Cursor<T>) -> GraphResult<Uuid> {
     let mut buf: [u8; 16] = [0; 16];
     cursor.read_exact(&mut buf)?;
@@ -102,13 +92,9 @@ pub fn read_uuid<T: AsRef<[u8]>>(cursor: &mut Cursor<T>) -> GraphResult<Uuid> {
 
 /// Reads an identifier from bytes.
 ///
-/// # Arguments
-/// * `cursor`: The bytes to read from.
-///
 /// # Safety
 /// This is used for reading in datastores that already checked the validity
-/// of the data at write-time. Re-validation is skipped in the interest of
-/// performance.
+/// of the data at write-time. Re-validation is skipped in the interest of performance.
 #[allow(unsafe_code)]
 pub unsafe fn read_identifier<T: AsRef<[u8]>>(cursor: &mut Cursor<T>) -> GraphResult<Identifier> {
     let t_len = {
@@ -124,9 +110,6 @@ pub unsafe fn read_identifier<T: AsRef<[u8]>>(cursor: &mut Cursor<T>) -> GraphRe
 }
 
 /// Reads a fixed-length string from bytes.
-///
-/// # Arguments
-/// * `cursor`: The bytes to read from.
 pub fn read_fixed_length_string<T: AsRef<[u8]>>(cursor: &mut Cursor<T>) -> GraphResult<String> {
     let mut buf = String::new();
     cursor.read_to_string(&mut buf)?;
@@ -134,9 +117,6 @@ pub fn read_fixed_length_string<T: AsRef<[u8]>>(cursor: &mut Cursor<T>) -> Graph
 }
 
 /// Reads a `u64` from bytes.
-///
-/// # Arguments
-/// * `cursor`: The bytes to read from.
 pub fn read_u64<T: AsRef<[u8]>>(cursor: &mut Cursor<T>) -> GraphResult<u64> {
     let i = cursor.read_u64::<BigEndian>()?;
     Ok(i)
@@ -151,11 +131,8 @@ pub fn generate_uuid_v1() -> Uuid {
 
 /// Gets the next UUID that would occur after the given one.
 ///
-/// # Arguments
-/// * `uuid`: The input UUID.
-///
 /// # Errors
-/// Returns a `ValidationError` if the input UUID is the great possible value
+/// Returns a `ValidationError` if the input UUID is the greatest possible value
 /// (i.e., FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF)
 pub fn next_uuid(uuid: Uuid) -> ValidationResult<Uuid> {
     let mut bytes = *uuid.as_bytes();
@@ -169,13 +146,10 @@ pub fn next_uuid(uuid: Uuid) -> ValidationResult<Uuid> {
         }
     }
 
-    Err(ValidationError::CannotIncrementUuid) // This error variant will be added to errors.rs
+    Err(ValidationError::CannotIncrementUuid)
 }
 
 /// Extracts vertices from the last query output value, or `None`.
-///
-/// # Arguments
-/// * `output`: The query output.
 pub fn extract_vertices(mut output: Vec<QueryOutputValue>) -> Option<Vec<Vertex>> {
     if let Some(QueryOutputValue::Vertices(vertices)) = output.pop() {
         Some(vertices)
@@ -185,9 +159,6 @@ pub fn extract_vertices(mut output: Vec<QueryOutputValue>) -> Option<Vec<Vertex>
 }
 
 /// Extracts edges from the last query output value, or `None`.
-///
-/// # Arguments
-/// * `output`: The query output.
 pub fn extract_edges(mut output: Vec<QueryOutputValue>) -> Option<Vec<Edge>> {
     if let Some(QueryOutputValue::Edges(edges)) = output.pop() {
         Some(edges)
@@ -197,9 +168,6 @@ pub fn extract_edges(mut output: Vec<QueryOutputValue>) -> Option<Vec<Edge>> {
 }
 
 /// Extracts a count from the last query output value, or `None`.
-///
-/// # Arguments
-/// * `output`: The query output.
 pub fn extract_count(mut output: Vec<QueryOutputValue>) -> Option<u64> {
     if let Some(QueryOutputValue::Count(count)) = output.pop() {
         Some(count)
@@ -209,9 +177,6 @@ pub fn extract_count(mut output: Vec<QueryOutputValue>) -> Option<u64> {
 }
 
 /// Extracts vertex properties from the last query output value, or `None`.
-///
-/// # Arguments
-/// * `output`: The query output.
 pub fn extract_vertex_properties(mut output: Vec<QueryOutputValue>) -> Option<Vec<VertexProperties>> {
     if let Some(QueryOutputValue::VertexProperties(props)) = output.pop() {
         Some(props)
@@ -221,9 +186,6 @@ pub fn extract_vertex_properties(mut output: Vec<QueryOutputValue>) -> Option<Ve
 }
 
 /// Extracts edge properties from the last query output value, or `None`.
-///
-/// # Arguments
-/// * `output`: The query output.
 pub fn extract_edge_properties(mut output: Vec<QueryOutputValue>) -> Option<Vec<EdgeProperties>> {
     if let Some(QueryOutputValue::EdgeProperties(props)) = output.pop() {
         Some(props)
