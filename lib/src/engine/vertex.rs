@@ -1,13 +1,15 @@
+// lib/src/engine/vertex.rs
 use uuid::Uuid;
 use std::collections::BTreeMap;
-use crate::engine::properties::PropertyValue;
+// FIX: Change to use PropertyValue from the 'models' crate
+use models::properties::PropertyValue;
 
 /// A vertex represents an entity in the graph (e.g., a patient, medication, doctor).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Vertex {
     pub id: Uuid,
     pub label: String,  // e.g., "Patient", "Doctor", "Medication"
-    pub properties: BTreeMap<String, PropertyValue>,
+    pub properties: BTreeMap<String, PropertyValue>, // This type now matches models::properties::PropertyValue
 }
 
 impl Vertex {
@@ -45,4 +47,3 @@ impl Vertex {
         self.properties.remove(key)
     }
 }
-

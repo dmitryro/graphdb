@@ -1,8 +1,8 @@
 [package]
-name = "graphdb-plugin-host"
+name = "plugin-host"
 version = "0.1.0"
 build = "build.rs"
-authors = ["Dmitry Roitman <dmitryro@gmail.com>"]
+authors = ["Dmitry R <dmitry@example.com>"]
 description = "A graph database library"
 keywords = ["graph", "database"]
 categories = ["database", "database-implementations"]
@@ -19,6 +19,6 @@ uuid = "^1.2.2"
 [build-dependencies]
 rustc_version = "0.4.1"
 
-[dependencies.graphdb-lib]
+[dependencies.lib]
 path = "../../lib"
 version = "0.1.0"

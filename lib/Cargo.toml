@@ -1,84 +1,77 @@
 # lib/Cargo.toml
-# Updated: 2025-06-30 - Ensuring sled is enabled by default for sled_storage.rs,
-# and correcting password-hash features. Also enabling "v1" and "rng" for uuid.
-# Making `rand` a direct dependency to resolve `thread_rng` issue in util.rs.
+# Updated: 2025-07-01 - Corrected bincode and bcrypt dependency declarations.
+# Harmonized versions across workspace.
 
 [package]
-name = "graphdb-lib"
+name = "lib"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# Existing dependencies from your original Cargo.toml
-ordered-float = "5.0.0"
-rand = "0.8.5" # <-- CRUCIAL: Make rand a direct, non-optional dependency for util.rs
-actix-web = "4.0"
-actix-rt = "2.7"
-dotenv = "0.15"
-tokio = { version = "1.43.0", features = ["macros", "rt-multi-thread"] }
-tracing = "0.1.20"
-tracing-subscriber = "0.3.2"
-env_logger = "0.10"
-serde_json = "1.0"
-tonic = "0.12.3"
-async-std = "1.13.0"
-chrono = { version = "0.4.39", features = ["serde"] }
-serde = { version = "1.0", features = ["derive"] }
-dotenvy = "0.15.7"
-diesel_json = "0.2.1"
-open-cypher = "0.1.1"
-nom = "8.0.0"
-sled = { version= "0.34.7" , optional = true} # Original: optional
-bytes = "1.10.0"
-clap = { version = "4.5.29", features = ["derive"] }
-hashbrown = "0.15.2"
-pest = "2.7.15"
-lalrpop = "0.22.1"
-sqlparser = "0.54.0"
-async-trait = "0.1.86"
-bbolt-rs = "1.3.10"
-rayon = "1.10.0"
-tantivy = "0.22.0"
-async-graphql = "7.0.15"
-libloading = "0.8.6"
-r2d2 = "0.8.10"
-anyhow = "1.0.95"
-crossterm = "0.28.1"
-tokio-stream = "0.1.17"
-petgraph = "0.7.1"
-tokio-test = "0.4.4"
-mockall = "0.13.1"
-graphql-parser = "0.4.1"
-argon2 = "0.5.3"
-base64 = "0.22.1"
-bincode = { version = "^1.3.3", optional = true }
-rocksdb = { version = "0.23.0", features = ["snappy", "lz4", "zstd", "zlib", "bzip2"], optional = true }
-uuid = { version = "1.13.1", features = ["v1", "v4", "rng"] } # <-- CRUCIAL: Added "v1" and "rng" features for uuid v1 generation
-rmp-serde = "1.3.0"
-once_cell = "1.20.3"
-internment = "0.8.6"
-tempfile = "3.16.0"
-byteorder = "1.5.0"
-toml = "0.8.20"
-postgres = "0.19.10"
-redis = "0.28.2"
-
-# NEW/UPDATED: For password hashing/verification in user_storage.rs
-password-hash = { version = "0.5", features = ["rand_core"] }
+ordered-float = "5.0.0" # Consistent
+rand = "0.8.5" # Consistent
+actix-web = "4.11.0" # Crucial: Updated to match security crate's version
+actix-rt = "2.10.0" # Updated to match server crate's version
+dotenv = "0.15.0" # Aligned with server
+tokio = { version = "1.44.2", features = ["macros", "rt-multi-thread"] } # Updated to latest stable
+tracing = "0.1.37" # Updated to latest stable
+tracing-subscriber = "0.3.18" # Updated to latest stable
+env_logger = "0.11.8" # Aligned with storage_daemon_server
+serde_json = "1.0.140" # Aligned with models and rest_api
+tonic = "0.12.0" # Latest stable
+async-std = "1.13.0" # Consistent
+chrono = { version = "0.4.39", features = ["serde"] } # Consistent
+serde = { version = "1.0.219", features = ["derive"] } # Aligned with models and rest_api
+dotenvy = "0.15.7" # Consistent
+diesel_json = "0.2.1" # Consistent
+open-cypher = "0.1.1" # Consistent
+nom = "8.0.0" # Consistent
+sled = { version= "0.34.7" } # Consistent, no longer optional
+bytes = "1.10.0" # Consistent
+clap = { version = "4.5.29", features = ["derive"] } # Consistent
+hashbrown = "0.15.2" # Consistent
+pest = "2.7.15" # Consistent
+lalrpop = "0.22.1" # Consistent
+sqlparser = "0.54.0" # Consistent
+async-trait = "0.1.86" # Consistent with server
+bbolt-rs = "1.3.10" # Consistent
+rayon = "1.10.0" # Consistent
+tantivy = "0.22.0" # Consistent
+async-graphql = "7.0.15" # Consistent
+libloading = "0.8.6" # Consistent
+r2d2 = "0.8.10" # Consistent
+anyhow = "1.0.98" # Aligned with server, rest_api, storage_daemon_server
+crossterm = "0.28.1" # Consistent
+tokio-stream = "0.1.17" # Consistent
+petgraph = "0.7.1" # Consistent
+tokio-test = "0.4.4" # Consistent
+mockall = "0.13.1" # Consistent
+graphql-parser = "0.4.1" # Consistent
+argon2 = "0.5.3" # Aligned with rest_api
+base64 = "0.22.1" # Consistent
+bincode = { version = "2.0.1", features = ["serde"] } # Consistent, no longer optional
+rocksdb = { version = "0.23.0", features = ["snappy", "lz4", "zstd", "zlib", "bzip2"], optional = true } # Consistent and remains optional
+uuid = { version = "1.3.1", features = ["serde", "v4", "v1", "rng"] } # Consistent
+rmp-serde = "1.3.0" # Consistent
+once_cell = "1.20.3" # Consistent
+internment = "0.8.6" # Consistent
+tempfile = "3.16.0" # Consistent
+byteorder = "1.5.0" # Consistent
+toml = "0.8.20" # Consistent
+postgres = "0.19.10" # Consistent
+redis = "0.28.2" # Consistent
+log = "0.4.27" # Consistent
+password-hash = { version = "0.5", features = ["rand_core"] } # Consistent
+moka = { version = "0.12.10", features = ["sync", "future"] } # Consistent
+thiserror = "2.0.12" # Consistent
+models = { path = "../models", features = ["rocksdb-errors", "sled-errors", "bincode-errors"] } # Consistent, features enabled
+bcrypt = "0.15.1" # Aligned with models (highest version)
 
 [features]
-default = ["with_sled"]
-rocksdb-datastore = ["rocksdb", "bincode"]
+default = []
+sled-datastore = [] # No longer needs to list "sled" as sled is always active
+rocksdb-datastore = ["rocksdb"] # Still needs to list rocksdb if it's optional
 test-suite = []
-bench-suite = [] # No need to list "rand" here anymore if it's a direct dep
-with_rocksdb = ["rocksdb"]
-with_sled = ["sled"]
-
-# Specify both lib and bin
-[lib]
-name = "graphdb_lib"
-path = "src/lib.rs"
-
-[[bin]]
-name = "graphdb-lib"
-path = "src/main.rs"
+bench-suite = []
+with-rocksdb = ["rocksdb"] # This feature enables the optional rocksdb crate
+with-sled = [] # No longer needs to list "sled" as sled is always active

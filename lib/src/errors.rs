@@ -1,135 +1,108 @@
+// lib/src/errors.rs
+
 use std::error::Error as StdError;
 use std::fmt;
-use std::io::Error as IoError;
-use std::result::Result as StdResult;
+use thiserror::Error;
 
-#[cfg(feature = "rocksdb-datastore")]
-use bincode::Error as BincodeError;
-use rmp_serde::encode::Error as RmpEncodeError;
-#[cfg(feature = "rocksdb-datastore")]
-use rocksdb::Error as RocksDbError;
-use serde_json::Error as JsonError;
+use bincode::error::{DecodeError, EncodeError};
+use bcrypt::BcryptError;
+use uuid::Error as UuidError;
+use serde_json::Error as SerdeJsonError;
+use std::string::FromUtf8Error;
+use rmp_serde::encode::Error as RmpEncodeError; // NEW: Add this import
 
-/// An error triggered by the datastore.
-#[non_exhaustive]
-#[derive(Debug)]
-pub enum Error {
-    /// The requested UUID is already taken.
-    UuidTaken,
 
-    /// An error occurred in the underlying datastore.
-    Datastore(Box<dyn StdError + Send + Sync>),
+#[derive(Debug, Error)]
+pub enum GraphError {
+    #[error("Database operation failed: {0}")]
+    DatabaseError(String),
 
-    /// A generic I/O error occurred.
-    Io(IoError),
+    #[error("Serialization/Deserialization error: {0}")]
+    SerializationError(String),
 
-    /// A query occurred on a property that isn't indexed.
-    NotIndexed,
+    #[error("Invalid input or data: {0}")]
+    InvalidData(String),
 
-    /// For functionality that isn't supported.
-    Unsupported,
+    #[error("Not Found: {0}")]
+    NotFound(String),
 
-    /// A validation error occurred.
-    Invalid(ValidationError),
+    #[error("Already Exists: {0}")]
+    AlreadyExists(String),
 
-    /// The operation cannot work with the given query, based off it's output
-    /// type (e.g. attempting to delete using a query that outputs a count.)
-    OperationOnQuery,
+    #[error("Authentication failed: {0}")]
+    AuthenticationError(String),
+
+    #[error("Permission denied: {0}")]
+    PermissionDenied(String),
+
+    #[error("Network error: {0}")]
+    NetworkError(String),
+
+    #[error("Internal server error: {0}")]
+    InternalError(String),
+
+    #[error("Feature not implemented: {0}")]
+    NotImplemented(String),
+
+    #[error("Lock acquisition failed: {0}")]
+    LockError(String),
+
+    #[error("Timeout: {0}")]
+    Timeout(String),
+
+    #[error("Configuration error: {0}")]
+    ConfigurationError(String),
+
+    #[error("GraphQL error: {0}")]
+    GraphQLError(String),
+
+    #[error("File I/O error: {0}")]
+    IoError(#[from] std::io::Error),
+
+    #[error("Bincode decode error: {0}")]
+    BincodeDecode(#[from] DecodeError),
+    #[error("Bincode encode error: {0}")]
+    BincodeEncode(#[from] EncodeError),
+
+    #[error("Password hashing error: {0}")]
+    PasswordHashingError(#[from] BcryptError),
+
+    #[error("Invalid password hash: {0}")]
+    InvalidPasswordHash(String),
+
+    #[error("UUID error: {0}")]
+    UuidError(#[from] UuidError),
+
+    #[error("JSON serialization/deserialization error: {0}")]
+    JsonError(#[from] SerdeJsonError),
+
+    #[error("UTF-8 conversion error: {0}")]
+    FromUtf8(#[from] FromUtf8Error),
+
+    // NEW: This variant handles rmp_serde::encode::Error
+    #[error("MessagePack encoding error: {0}")]
+    RmpSerdeEncode(#[from] RmpEncodeError),
+
+    #[error("Custom error: {0}")]
+    Custom(String),
 }
 
-impl StdError for Error {
-    fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        match *self {
-            Error::Datastore(ref err) => Some(&**err),
-            Error::Io(ref err) => Some(err),
-            Error::Invalid(ref err) => Some(err),
-            _ => None,
-        }
+pub type Result<T> = std::result::Result<T, GraphError>;
+
+impl From<sled::Error> for GraphError {
+    fn from(err: sled::Error) -> Self {
+        GraphError::DatabaseError(err.to_string())
     }
 }
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            Error::UuidTaken => write!(f, "UUID already taken"),
-            Error::Datastore(ref err) => write!(f, "error in the underlying datastore: {err}"),
-            Error::Io(ref err) => write!(f, "I/O error: {err}"),
-            Error::NotIndexed => write!(f, "query attempted on a property that isn't indexed"),
-            Error::Unsupported => write!(f, "functionality not supported"),
-            Error::Invalid(ref err) => write!(f, "{err}"),
-            Error::OperationOnQuery => write!(f, "the operation cannot work with the given query"),
-        }
+impl From<tokio::task::JoinError> for GraphError {
+    fn from(err: tokio::task::JoinError) -> Self {
+        GraphError::InternalError(format!("Async task join error: {}", err))
     }
 }
 
-impl From<JsonError> for Error {
-    fn from(err: JsonError) -> Self {
-        Error::Datastore(Box::new(err))
+impl From<anyhow::Error> for GraphError {
+    fn from(err: anyhow::Error) -> Self {
+        GraphError::InternalError(format!("An internal error occurred: {}", err))
     }
 }
-
-impl From<IoError> for Error {
-    fn from(err: IoError) -> Self {
-        Error::Io(err)
-    }
-}
-
-#[cfg(feature = "rocksdb-datastore")]
-impl From<BincodeError> for Error {
-    fn from(err: BincodeError) -> Self {
-        Error::Datastore(Box::new(err))
-    }
-}
-
-impl From<RmpEncodeError> for Error {
-    fn from(err: RmpEncodeError) -> Self {
-        Error::Datastore(Box::new(err))
-    }
-}
-
-#[cfg(feature = "rocksdb-datastore")]
-impl From<RocksDbError> for Error {
-    fn from(err: RocksDbError) -> Self {
-        Error::Datastore(Box::new(err))
-    }
-}
-
-impl From<ValidationError> for Error {
-    fn from(err: ValidationError) -> Self {
-        Error::Invalid(err)
-    }
-}
-
-/// A result that might be an `Error`.
-pub type Result<T> = StdResult<T, Error>;
-
-/// A validation error
-#[derive(Debug)]
-pub enum ValidationError {
-    /// The value is invalid.
-    InvalidValue,
-    /// The value is too long.
-    ValueTooLong,
-    /// The input UUID is the maximum value, and cannot be incremented.
-    CannotIncrementUuid,
-    /// The given query combination cannot be nested (e.g. attempting to build
-    /// a query that gets vertex properties from a query that outputs a
-    /// count.)
-    InnerQuery,
-}
-
-impl StdError for ValidationError {}
-
-impl fmt::Display for ValidationError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            ValidationError::InvalidValue => write!(f, "invalid value"),
-            ValidationError::ValueTooLong => write!(f, "value too long"),
-            ValidationError::CannotIncrementUuid => write!(f, "could not increment the UUID"),
-            ValidationError::InnerQuery => write!(f, "the given query combination cannot be nested"),
-        }
-    }
-}
-
-/// A result that might be a `ValidationError`.
-pub type ValidationResult<T> = StdResult<T, ValidationError>;

@@ -1,105 +1,148 @@
 // lib/src/storage_engine/user_storage.rs
-// Updated: 2025-06-30 - Fixing argon2::Version to use default.
-// Updated: 2025-06-30 - Added Send + Sync to UserStorageEngine trait.
-// Updated: 2025-06-30 - Fixed argon2::Version, StdError for password_hash::Error, and unused imports/mut.
-
-use anyhow::{Context, Result}; // Removed 'anyhow' from import as it's unused
-use sled::{Db, Tree};
 use async_trait::async_trait;
-
-use argon2::{
-    Algorithm, Argon2, Params, Version,
-};
-use password_hash::{
-    PasswordHash, PasswordHasher, PasswordVerifier,
-    rand_core::OsRng,
-    SaltString,
+use sled::{Db, Tree, Batch};
+use uuid::Uuid;
+use bincode::{
+    config::{self, Configuration, BigEndian, Fixint},
+    serde::{decode_from_slice, encode_to_vec},
 };
 
-// Use the full path for User and Login models
-use crate::models::medical::{User, Login};
+use models::errors::GraphResult as ModelsResult;
+use crate::errors::{GraphError, Result};
+use models::identifiers::Identifier;
+use models::medical::{Login, User};
+use models::util;
+
 
 #[async_trait]
-pub trait UserStorageEngine: Send + Sync {
-    async fn create_user(&self, user: &User) -> Result<User>;
-    async fn get_user_by_id(&self, user_id: &str) -> Result<Option<User>>;
+pub trait UserStorageEngine: Send + Sync + 'static {
+    /// Adds a new user to the storage.
+    async fn add_user(&self, user: &User) -> Result<()>;
+    /// Updates an existing user in the storage.
+    async fn update_user(&self, user: &User) -> Result<()>;
+    /// Deletes a user by their username.
+    async fn delete_user(&self, username: &str) -> Result<()>;
+    /// Retrieves a user by their username.
     async fn get_user_by_username(&self, username: &str) -> Result<Option<User>>;
+    /// Retrieves a user by their unique ID.
+    /// Note: This can be inefficient for Sled if not using a secondary index.
+    async fn get_user_by_id(&self, id: &Uuid) -> Result<Option<User>>;
+    /// Authenticates a user based on their login credentials.
     async fn authenticate_user(&self, login: &Login) -> Result<Option<User>>;
-    async fn update_user(&self, user: &User) -> Result<User>;
-    async fn delete_user(&self, user_id: &str) -> Result<()>;
 }
 
-// SledUserStorage implementation
-#[derive(Debug, Clone)]
+/// Sled-backed implementation of the `UserStorageEngine` trait.
 pub struct SledUserStorage {
-    db: Db,
-    users_tree: Tree,
+    tree: Tree,
+    config: Configuration<BigEndian, Fixint>,
 }
 
 impl SledUserStorage {
-    pub fn new(db: Db) -> Self {
-        let users_tree = db.open_tree("users").expect("Failed to open users tree");
-        SledUserStorage { db, users_tree }
+    /// Creates a new `SledUserStorage` instance.
+    /// Opens a specific Sled tree named "users".
+    pub fn new(db: &Db) -> Result<Self> {
+        let tree = db.open_tree("users")?;
+        Ok(Self {
+            tree,
+            config: bincode_config(),
+        })
     }
+}
 
-    fn hash_password(&self, password: &str) -> Result<String> {
-        let salt = SaltString::generate(&mut OsRng);
-        let argon2 = Argon2::new(
-            Algorithm::Argon2id,
-            Version::default(), // <-- CHANGED: Use Version::default() or Version::V19
-            Params::new(15000, 2, 1, None).unwrap(), // Using default params for simplicity
-        );
-        let password_hash = argon2.hash_password(password.as_bytes(), &salt)
-            .map_err(|e| anyhow::anyhow!("Failed to hash password: {}", e))? // <-- FIXED: Convert error to anyhow::Error
-            .to_string();
-        Ok(password_hash)
-    }
-
-    fn verify_password(&self, password: &str, password_hash: &str) -> Result<bool> {
-        let parsed_hash = PasswordHash::new(password_hash)
-            .map_err(|e| anyhow::anyhow!("Failed to parse password hash: {}", e))?; // <-- FIXED: Convert error to anyhow::Error
-        Ok(Argon2::default().verify_password(password.as_bytes(), &parsed_hash).is_ok())
-    }
+/// Provides a standard bincode configuration.
+fn bincode_config() -> Configuration<BigEndian, Fixint> {
+    config::standard()
+        .with_big_endian()
+        .with_fixed_int_encoding()
 }
 
 #[async_trait]
 impl UserStorageEngine for SledUserStorage {
-    async fn create_user(&self, user: &User) -> Result<User> { // <-- FIXED: Removed `mut` from `user`
-        let hashed_password = self.hash_password(&user.password)?;
-        let mut new_user = user.clone(); // Clone to make it mutable
-        new_user.password_hash = hashed_password;
-        new_user.password = String::new(); // Clear plaintext password
+    async fn add_user(&self, user: &User) -> Result<()> {
+        let key = util::build(&[
+            util::Component::Identifier(
+                Identifier::new(user.username.clone())
+                    // FIX: Map Validation error to InvalidData
+                    .map_err(|e| GraphError::InvalidData(format!("Invalid username: {}", e)))?
+            ),
+            util::Component::Uuid(
+                Uuid::parse_str(&user.id)
+                    // FIX: Map Conversion error to InvalidData
+                    .map_err(|e| GraphError::InvalidData(format!("Invalid UUID format: {}", e)))?
+            ),
+        ]);
+        let user_bytes = encode_to_vec(user, self.config.clone())?;
 
-        let user_id = uuid::Uuid::new_v4().to_string();
-        new_user.id = Some(user_id.clone());
-
-        let user_data = serde_json::to_vec(&new_user)
-            .context("Failed to serialize user data")?;
-
-        self.users_tree.insert(user_id.as_bytes(), user_data)
-            .context("Failed to insert user into Sled")?;
-
-        Ok(new_user)
+        let mut batch = sled::Batch::default();
+        batch.insert(key, user_bytes.as_slice());
+        self.tree.apply_batch(batch)?;
+        Ok(())
     }
 
-    async fn get_user_by_id(&self, user_id: &str) -> Result<Option<User>> {
-        let user_data_ivec = self.users_tree.get(user_id.as_bytes())
-            .context("Failed to retrieve user by ID from Sled")?;
-        
-        user_data_ivec.map(|ivec| {
-            serde_json::from_slice(&ivec)
-                .context("Failed to deserialize user data")
-        }).transpose()
+    async fn update_user(&self, user: &User) -> Result<()> {
+        let key = util::build(&[
+            util::Component::Identifier(
+                Identifier::new(user.username.clone())
+                    // FIX: Map Validation error to InvalidData
+                    .map_err(|e| GraphError::InvalidData(format!("Invalid username: {}", e)))?
+            ),
+            util::Component::Uuid(
+                Uuid::parse_str(&user.id)
+                    // FIX: Map Conversion error to InvalidData
+                    .map_err(|e| GraphError::InvalidData(format!("Invalid UUID format: {}", e)))?
+            ),
+        ]);
+        let user_bytes = encode_to_vec(user, self.config.clone())?;
+
+        let mut batch = sled::Batch::default();
+        batch.insert(key, user_bytes.as_slice());
+        self.tree.apply_batch(batch)?;
+        Ok(())
+    }
+
+    async fn delete_user(&self, username: &str) -> Result<()> {
+        let low_key_prefix = util::build(&[
+            util::Component::Identifier(
+                Identifier::new(username.to_string())
+                    // FIX: Map Validation error to InvalidData
+                    .map_err(|e| GraphError::InvalidData(format!("Invalid username: {}", e)))?
+            )
+        ]);
+        let iter = self.tree.scan_prefix(&low_key_prefix);
+        let mut batch = sled::Batch::default();
+
+        for item in iter {
+            let (key_ivec, _) = item?;
+            batch.remove(&key_ivec);
+        }
+        self.tree.apply_batch(batch)?;
+        Ok(())
     }
 
     async fn get_user_by_username(&self, username: &str) -> Result<Option<User>> {
-        // Iterate through the tree to find the user by username.
-        // In a real-world scenario with Sled, you might use secondary indices for this.
-        for item_result in self.users_tree.iter() {
-            let item = item_result.context("Failed to iterate user tree")?;
-            let user: User = serde_json::from_slice(&item.1)
-                .context("Failed to deserialize user data during username lookup")?;
-            if user.username == username {
+        let low_key_prefix = util::build(&[
+            util::Component::Identifier(
+                Identifier::new(username.to_string())
+                    // FIX: Map Validation error to InvalidData
+                    .map_err(|e| GraphError::InvalidData(format!("Invalid username: {}", e)))?
+            )
+        ]);
+        if let Some(result) = self.tree.scan_prefix(&low_key_prefix).next() {
+            let (_key_ivec, value_ivec) = result?;
+            let (user, _): (User, usize) = decode_from_slice(&value_ivec, self.config.clone())?;
+            Ok(Some(user))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn get_user_by_id(&self, id: &Uuid) -> Result<Option<User>> {
+        for item in self.tree.iter() {
+            let (_key_ivec, value_ivec) = item?;
+            let (user, _): (User, usize) = decode_from_slice(&value_ivec, self.config.clone())?;
+            if Uuid::parse_str(&user.id)
+                // FIX: Map Conversion error to InvalidData
+                .map_err(|e| GraphError::InvalidData(format!("Invalid UUID format: {}", e)))? == *id {
                 return Ok(Some(user));
             }
         }
@@ -108,34 +151,23 @@ impl UserStorageEngine for SledUserStorage {
 
     async fn authenticate_user(&self, login: &Login) -> Result<Option<User>> {
         if let Some(user) = self.get_user_by_username(&login.username).await? {
-            if self.verify_password(&login.password, &user.password_hash)? {
-                // Update last_login timestamp upon successful authentication
-                let mut authenticated_user = user.clone();
-                authenticated_user.last_login = Some(chrono::Utc::now().timestamp());
-                // No need to persist this immediately as `create_user` or `update_user`
-                // would handle persistence. For a `last_login` update, you might want a
-                // dedicated lightweight update method or integrate into `update_user`.
-                // For now, we return the updated user object.
-                return Ok(Some(authenticated_user));
+            match User::verify_password(&login.password, &user.password_hash) {
+                Ok(is_valid) => {
+                    if is_valid {
+                        Ok(Some(user))
+                    } else {
+                        // Passwords do not match, but user exists. This is an authentication failure.
+                        Err(GraphError::AuthenticationError("Incorrect password.".to_string()))
+                    }
+                },
+                // FIX: Map bcrypt::BcryptError to AuthenticationError or PasswordHashingError
+                // PasswordHashingError is more specific to the cause if the hash itself is bad.
+                // AuthenticationError is more general for failed login. Let's use AuthenticationError
+                // as it's the result of the login attempt.
+                Err(e) => Err(GraphError::AuthenticationError(format!("Password verification failed: {}", e))),
             }
+        } else {
+            Ok(None) // User not found, so no authentication possible
         }
-        Ok(None)
-    }
-
-    async fn update_user(&self, user: &User) -> Result<User> {
-        let user_id = user.id.as_ref().context("User ID is required for update")?;
-        let user_data = serde_json::to_vec(user)
-            .context("Failed to serialize user data for update")?;
-
-        self.users_tree.insert(user_id.as_bytes(), user_data)
-            .context("Failed to update user in Sled")?;
-        
-        Ok(user.clone())
-    }
-
-    async fn delete_user(&self, user_id: &str) -> Result<()> {
-        self.users_tree.remove(user_id.as_bytes())
-            .context("Failed to delete user from Sled")?;
-        Ok(())
     }
 }

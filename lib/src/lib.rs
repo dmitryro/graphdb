@@ -1,5 +1,5 @@
 // lib/src/lib.rs
-// Updated: 2025-06-30 - Corrected pub mod declarations based on actual file existence.
+// Updated: 2025-06-30 - Refactored to use the new 'models' crate for shared types.
 
 #![cfg_attr(feature = "bench-suite", feature(test))]
 
@@ -10,7 +10,7 @@ pub mod network_interfaces;
 pub mod plugin_system;
 pub mod database;
 pub mod memory;
-pub mod models;
+// REMOVED: pub mod models; // Models are now in a separate crate!
 pub mod errors;
 pub mod query_exec_engine;
 pub mod storage_engine; // This declares the directory `storage_engine`
@@ -18,22 +18,17 @@ pub mod transact_indexing;
 pub mod indexing_caching;
 pub mod util;
 
-// REMOVED: pub mod security; // This is a separate crate, not a module within lib/src/
-// REMOVED: pub mod startup;
-// REMOVED: pub mod schema;
-// REMOVED: pub mod data_processing;
-// REMOVED: pub mod api; // This is defined later inline as `pub mod api { ... }`
-// REMOVED: pub mod telemetry;
-// REMOVED: pub mod constants;
+// Now, import directly from the 'models' crate.
+// Ensure these are correctly named based on what `models/src/lib.rs` re-exports.
+// For instance, if models::edges::Edge is simply re-exported as models::Edge, then `models::Edge` is correct.
+pub use models::{Edge, Identifier, Json};
 
-
-pub use crate::models::{Edge, Identifier, Json};
-
-#[cfg(feature = "with_rocksdb")]
-mod rocksdb_storage; // Assumes rocksdb_storage.rs is directly in lib/src/
-
-#[cfg(feature = "with_sled")]
-// use storage_engine::sled_storage; // Removed as it's redundant and causes "unused import"
+// Fix the imports by specifying the correct sub-modules
+pub use models::bulk_insert::BulkInsertItem;
+pub use models::queries::EdgeDirection; // CORRECTED PATH (as per previous fix)
+pub use models::properties::{EdgeProperties, NamedProperty, PropertyValue, VertexProperties}; // Keep this one for PropertyValue
+pub use models::queries::{Query, QueryOutputValue};
+pub use models::medical::{Login, User};
 
 #[cfg(feature = "bench-suite")]
 extern crate test;
@@ -51,24 +46,25 @@ pub use crate::indexing_caching::{index_node, cache_node_state, get_cached_node_
 pub use crate::database::*;
 pub use crate::errors::*;
 pub use crate::memory::*;
-pub use crate::engine::properties::PropertyValue;
+// REMOVED: pub use models::PropertyValue; // <-- REMOVED THIS DUPLICATE LINE
 
-// Re-export User and Login from medical models for convenience
-pub use crate::models::medical::{User, Login};
 // Re-export from storage_engine/mod.rs
 pub use crate::storage_engine::{SledUserStorage, UserStorageEngine, open_sled_db, StorageEngine, GraphStorageEngine};
 
 
 // Do NOT glob-import engine and models together to avoid ambiguity
 // Instead, re-export them under namespaces
-pub mod api { // This is the correct, inline definition of the 'api' module
+pub mod api {
     pub use crate::engine::{
         Graph,
         Edge as EngineEdge,
         Vertex as EngineVertex,
-        properties::PropertyValue
+        // CHECK THIS: If `engine::properties::PropertyValue` is distinct from `models::properties::PropertyValue`
+        // and needs to be exposed here. If not, consider removing or aliasing appropriately.
+        properties::PropertyValue as EnginePropertyValue // Aliased to avoid conflict if both exist
     };
-    pub use crate::models::{
+    // Now, import ModelEdge, ModelVertex, Identifier, Json from the new `models` crate
+    pub use models::{ // Already imported at the top, just re-exporting under `api`
         Edge as ModelEdge,
         Vertex as ModelVertex,
         Identifier,
@@ -76,8 +72,19 @@ pub mod api { // This is the correct, inline definition of the 'api' module
     };
 }
 
-#[cfg(feature = "rocksdb-datastore")]
-mod rdb;
+#[cfg(feature = "sled-datastore")]
+pub mod sled; // This declares the 'sled' module, referring to src/sled/managers.rs (implicitly)
 
-#[cfg(feature = "rocksdb-datastore")]
-pub use crate::rdb::RocksdbDatastore;
+#[cfg(feature = "sled-datastore")]
+// Assuming your main Sled manager struct is named SledManager
+// and you want to re-export it as 'SledDatastore' for consistency with the previous name
+pub use crate::sled::managers::SledManager as SledDatastore;
+
+// If you had a mechanism to choose between datastores based on feature,
+// you might then have a type alias or a trait implementation somewhere that uses it:
+
+// #[cfg(feature = "rocksdb-datastore")]
+// pub type CurrentDatastore = RocksdbDatastore;
+
+#[cfg(feature = "sled-datastore")]
+pub type CurrentDatastore = SledDatastore;

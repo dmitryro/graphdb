@@ -1,3 +1,4 @@
+// lib/src/rdb/datastore.rs
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
@@ -444,7 +445,7 @@ impl RocksdbDatastore {
     ///
     /// # Arguments
     /// * `max_open_files`: The maximum number of open files to have. If
-    ///   `None`, the default will be used.
+    ///  `None`, the default will be used.
     pub fn get_options(max_open_files: Option<i32>) -> Options {
         // Current tuning based off of the total ordered example, flash
         // storage example on
