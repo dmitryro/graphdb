@@ -1,21 +1,16 @@
 // lib/src/storage_engine/mod.rs
-// Updated: 2025-06-30 - Defined the general `StorageEngine` trait and made it public.
+// Corrected: 2025-07-02 - Fixed module re-exports to resolve import errors.
 
-pub mod user_storage;
+pub mod storage_engine; // Declares the module defined in storage_engine.rs
 pub mod sled_storage;
+#[cfg(feature = "with-rocksdb")]
+pub mod rocksdb_storage;
+pub mod config;
 
-// --- ADDED: Definition of the general StorageEngine trait ---
-pub trait StorageEngine: Send + Sync {
-    // Add common methods here that all storage engines should implement, e.g.:
-    // async fn initialize(&self) -> Result<()>;
-    // async fn shutdown(&self) -> Result<()>;
-    // fn get_name(&self) -> &'static str;
-    // For now, it can be an empty trait if it's just a marker or a base for other traits.
-}
+// Re-export key traits and structs for easier access from `crate::storage_engine::*`
+pub use self::storage_engine::{StorageEngine, GraphStorageEngine};
+pub use self::sled_storage::{SledGraphStorage, open_sled_db}; // SledGraphStorage is the actual implementation struct
+#[cfg(feature = "with-rocksdb")]
+pub use self::rocksdb_storage::RocksDBStorage;
+pub use self::config::{StorageConfig, StorageEngineType};
 
-
-pub use user_storage::{SledUserStorage, UserStorageEngine};
-pub use sled_storage::{GraphStorageEngine, SledGraphStorage, open_sled_db};
-
-// `StorageEngine` is now directly defined in this module,
-// so `lib/src/lib.rs` can import it directly from `crate::storage_engine`.

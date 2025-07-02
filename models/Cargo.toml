@@ -10,9 +10,11 @@ serde_json = "1.0.140" # Retained as the highest and consistent
 chrono = { version = "0.4.39", features = ["serde"] } # Consistent
 uuid = { version = "1.3.1", features = ["serde", "v4", "v1", "rng"] } # Consistent
 thiserror = "2.0.12" # Consistent
+anyhow = "1.0.98" # Aligned with rest_api and storage_daemon_server
 
 # FIX: Set bincode to 2.0.1 (stable) with "serde" feature
 bincode = { version = "2.0.1", features = ["serde"], optional = true } # Correct, and optional for feature gating
+rmp-serde = "1.3.0" # ADDED: Required for rmp_serde::encode::Error and rmp_serde::decode::Error
 bcrypt = "0.15.1" # Aligned with the version found in models, higher than lib's 0.15
 
 once_cell = "1.20.3" # Consistent

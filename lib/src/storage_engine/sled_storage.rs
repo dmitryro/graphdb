@@ -1,121 +1,228 @@
 // lib/src/storage_engine/sled_storage.rs
-// Updated: 2025-06-30 - Made GraphStorageEngine trait public.
+// Corrected: 2025-07-02 - Fixed bincode serialization/deserialization imports and usage, and module imports.
 
-use anyhow::{Context, Result};
 use async_trait::async_trait;
 use sled::{Db, IVec};
-use std::sync::Arc; // Needed for Arc<Self> in the trait definition
-use tokio::sync::Mutex; // Assuming you might use this for internal state locking
+use std::path::Path;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
-// Function to open the Sled database
-pub fn open_sled_db(path: &str) -> Result<Db> {
-    sled::open(path).context("Failed to open Sled database")
+use super::{GraphStorageEngine, StorageEngine};
+use models::{Edge, Identifier, Json, Vertex};
+use models::errors::{GraphError, GraphResult};
+use serde_json::Value;
+use bincode::{encode_to_vec, decode_from_slice, config};
+use models::identifiers::SerializableUuid;
+
+// Helper function to open a Sled database
+pub fn open_sled_db<P: AsRef<Path>>(path: P) -> GraphResult<Db> {
+    sled::open(path).map_err(|e| GraphError::StorageError(format!("Failed to open Sled DB: {}", e)))
 }
 
-// Define the GraphStorageEngine trait
+#[derive(Debug)]
+pub struct SledStorage {
+    db: Arc<Db>,
+}
+
+impl SledStorage {
+    pub fn new(db: Db) -> GraphResult<Self> {
+        Ok(SledStorage { db: Arc::new(db) })
+    }
+}
+
 #[async_trait]
-pub trait GraphStorageEngine: Send + Sync + 'static { // <-- ADDED 'pub' here
-    fn get_type(&self) -> &'static str;
-    fn is_running(&self) -> bool;
-    async fn start(&self) -> Result<()>;
-    async fn stop(&self) -> Result<()>;
+impl StorageEngine for SledStorage {
+    async fn start(&self) -> GraphResult<()> {
+        Ok(())
+    }
 
-    // Placeholder for a generic query method
-    async fn query(&self, query_string: &str) -> Result<serde_json::Value>;
+    async fn stop(&self) -> GraphResult<()> {
+        self.db.flush().map_err(|e| GraphError::Io(e.into()))?;
+        Ok(())
+    }
 
-    // Basic CRUD operations placeholders
-    async fn insert_data(&self, key: &str, value: &str) -> Result<()>;
-    async fn get_data(&self, key: &str) -> Result<Option<String>>;
-    async fn delete_data(&self, key: &str) -> Result<()>;
+    fn get_type(&self) -> &'static str {
+        "Sled"
+    }
+
+    fn is_running(&self) -> bool {
+        true
+    }
+
+    async fn set(&self, key: &[u8], value: &[u8]) -> GraphResult<()> {
+        self.db.insert(key, value).map_err(|e| GraphError::StorageError(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get(&self, key: &[u8]) -> GraphResult<Option<Vec<u8>>> {
+        self.db.get(key)
+            .map(|opt_ivec| opt_ivec.map(|ivec| ivec.to_vec()))
+            .map_err(|e| GraphError::StorageError(e.to_string()))
+    }
+
+    async fn delete(&self, key: &[u8]) -> GraphResult<()> {
+        self.db.remove(key).map_err(|e| GraphError::StorageError(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn flush(&self) -> GraphResult<()> {
+        self.db.flush().map_err(|e| GraphError::Io(e.into()))?;
+        Ok(())
+    }
 }
 
-// SledGraphStorage implementation
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SledGraphStorage {
-    db: Db,
-    // You might have specific trees for nodes, edges, properties if this were a full graph DB
-    // For now, let's just use a generic 'graph_data' tree
-    graph_data_tree: sled::Tree,
-    is_started: Arc<Mutex<bool>>, // Track if the storage is "started"
+    db: Arc<Db>,
+    vertex_tree: sled::Tree,
+    edge_tree: sled::Tree,
 }
 
 impl SledGraphStorage {
-    pub fn new(db: Db) -> Self {
-        let graph_data_tree = db.open_tree("graph_data").expect("Failed to open graph_data tree");
-        SledGraphStorage {
-            db,
-            graph_data_tree,
-            is_started: Arc::new(Mutex::new(false)),
-        }
+    pub fn new(db: Db) -> GraphResult<Self> {
+        let db_arc = Arc::new(db);
+        let vertex_tree = db_arc.open_tree("vertices")
+            .map_err(|e| GraphError::StorageError(format!("Failed to open vertex tree: {}", e)))?;
+        let edge_tree = db_arc.open_tree("edges")
+            .map_err(|e| GraphError::StorageError(format!("Failed to open edge tree: {}", e)))?;
+
+        Ok(SledGraphStorage {
+            db: db_arc,
+            vertex_tree,
+            edge_tree,
+        })
+    }
+
+    fn serialize_vertex(vertex: &Vertex) -> GraphResult<Vec<u8>> {
+        encode_to_vec(vertex, config::standard())
+            .map_err(|e| GraphError::SerializationError(e.to_string()))
+    }
+
+    fn deserialize_vertex(bytes: &[u8]) -> GraphResult<Vertex> {
+        decode_from_slice(bytes, config::standard())
+            .map(|(val, _)| val)
+            .map_err(|e| GraphError::DeserializationError(e.to_string()))
+    }
+
+    fn serialize_edge(edge: &Edge) -> GraphResult<Vec<u8>> {
+        encode_to_vec(edge, config::standard())
+            .map_err(|e| GraphError::SerializationError(e.to_string()))
+    }
+
+    fn deserialize_edge(bytes: &[u8]) -> GraphResult<Edge> {
+        decode_from_slice(bytes, config::standard())
+            .map(|(val, _)| val)
+            .map_err(|e| GraphError::DeserializationError(e.to_string()))
+    }
+
+    fn create_edge_key(outbound_id: &SerializableUuid, edge_type: &Identifier, inbound_id: &SerializableUuid) -> Vec<u8> {
+        let mut key = Vec::new();
+        key.extend_from_slice(outbound_id.0.as_bytes());
+        key.extend_from_slice(edge_type.as_bytes());
+        key.extend_from_slice(inbound_id.0.as_bytes());
+        key
     }
 }
 
 #[async_trait]
 impl GraphStorageEngine for SledGraphStorage {
+    async fn start(&self) -> GraphResult<()> {
+        Ok(())
+    }
+
+    async fn stop(&self) -> GraphResult<()> {
+        self.db.flush().map_err(|e| GraphError::Io(e.into()))?;
+        Ok(())
+    }
+
     fn get_type(&self) -> &'static str {
-        "SledGraphStorage"
+        "SledGraph"
     }
 
     fn is_running(&self) -> bool {
-        *self.is_started.blocking_lock() // Use blocking_lock for sync access in a non-async context here
+        true
     }
 
-    async fn start(&self) -> Result<()> {
-        let mut started = self.is_started.lock().await;
-        if *started {
-            println!("SledGraphStorage already started.");
-            return Ok(());
-        }
-        *started = true;
-        println!("SledGraphStorage started.");
+    async fn create_vertex(&self, vertex: Vertex) -> GraphResult<()> {
+        let key = vertex.id.0.as_bytes();
+        let value = Self::serialize_vertex(&vertex)?;
+        self.vertex_tree.insert(key, value.as_slice())
+            .map_err(|e| GraphError::StorageError(e.to_string()))?;
         Ok(())
     }
 
-    async fn stop(&self) -> Result<()> {
-        let mut started = self.is_started.lock().await;
-        if !*started {
-            println!("SledGraphStorage already stopped.");
-            return Ok(());
-        }
-        // In a real Sled application, stopping might involve flushing or closing the DB
-        // Sled DBs are generally managed at application lifecycle level.
-        // For graceful shutdown, you might want to ensure all writes are flushed.
-        self.db.flush_async().await.context("Failed to flush Sled DB on stop")?;
-        *started = false;
-        println!("SledGraphStorage stopped.");
+    async fn get_vertex(&self, id: &uuid::Uuid) -> GraphResult<Option<Vertex>> {
+        let key = id.as_bytes();
+        let result = self.vertex_tree.get(key)
+            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+        result.map(|ivec| Self::deserialize_vertex(&ivec)).transpose()
+    }
+
+    async fn update_vertex(&self, vertex: Vertex) -> GraphResult<()> {
+        self.create_vertex(vertex).await
+    }
+
+    async fn delete_vertex(&self, id: &uuid::Uuid) -> GraphResult<()> {
+        let key = id.as_bytes();
+        self.vertex_tree.remove(key)
+            .map_err(|e| GraphError::StorageError(e.to_string()))?;
         Ok(())
     }
 
-    async fn query(&self, query_string: &str) -> Result<serde_json::Value> {
-        // This is a very basic placeholder.
-        // A real graph query engine would parse the query,
-        // traverse the graph, and return structured results.
-        println!("Executing SledGraphStorage query: {}", query_string);
+    async fn get_all_vertices(&self) -> GraphResult<Vec<Vertex>> {
+        let mut vertices = Vec::new();
+        for item in self.vertex_tree.iter() {
+            let (_key, value) = item.map_err(|e| GraphError::StorageError(e.to_string()))?;
+            vertices.push(Self::deserialize_vertex(&value)?);
+        }
+        Ok(vertices)
+    }
 
-        // Example: Simple echo for demonstration
+    async fn create_edge(&self, edge: Edge) -> GraphResult<()> {
+        let key = Self::create_edge_key(&edge.outbound_id, &edge.t, &edge.inbound_id);
+        let value = Self::serialize_edge(&edge)?;
+        self.edge_tree.insert(key, value.as_slice())
+            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_edge(&self, outbound_id: &uuid::Uuid, edge_type: &Identifier, inbound_id: &uuid::Uuid) -> GraphResult<Option<Edge>> {
+        let outbound_id = SerializableUuid(*outbound_id);
+        let inbound_id = SerializableUuid(*inbound_id);
+        let key = Self::create_edge_key(&outbound_id, edge_type, &inbound_id);
+        let result = self.edge_tree.get(key)
+            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+        result.map(|ivec| Self::deserialize_edge(&ivec)).transpose()
+    }
+
+    async fn update_edge(&self, edge: Edge) -> GraphResult<()> {
+        self.create_edge(edge).await
+    }
+
+    async fn delete_edge(&self, outbound_id: &uuid::Uuid, edge_type: &Identifier, inbound_id: &uuid::Uuid) -> GraphResult<()> {
+        let outbound_id = SerializableUuid(*outbound_id);
+        let inbound_id = SerializableUuid(*inbound_id);
+        let key = Self::create_edge_key(&outbound_id, edge_type, &inbound_id);
+        self.edge_tree.remove(key)
+            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_all_edges(&self) -> GraphResult<Vec<Edge>> {
+        let mut edges = Vec::new();
+        for item in self.edge_tree.iter() {
+            let (_key, value) = item.map_err(|e| GraphError::StorageError(e.to_string()))?;
+            edges.push(Self::deserialize_edge(&value)?);
+        }
+        Ok(edges)
+    }
+
+    async fn query(&self, query_string: &str) -> GraphResult<Value> {
+        println!("Executing query: {}", query_string);
         Ok(serde_json::json!({
             "status": "success",
-            "query_executed": query_string,
-            "result_type": "placeholder",
-            "data": "Simulated query result from SledGraphStorage"
+            "query": query_string,
+            "result": "query execution placeholder"
         }))
-    }
-
-    async fn insert_data(&self, key: &str, value: &str) -> Result<()> {
-        self.graph_data_tree.insert(key, value)
-            .context("Failed to insert data into Sled graph_data tree")?;
-        Ok(())
-    }
-
-    async fn get_data(&self, key: &str) -> Result<Option<String>> {
-        let ivec = self.graph_data_tree.get(key)
-            .context("Failed to retrieve data from Sled graph_data tree")?;
-        Ok(ivec.map(|i| String::from_utf8_lossy(&i).into_owned()))
-    }
-
-    async fn delete_data(&self, key: &str) -> Result<()> {
-        self.graph_data_tree.remove(key)
-            .context("Failed to delete data from Sled graph_data tree")?;
-        Ok(())
     }
 }

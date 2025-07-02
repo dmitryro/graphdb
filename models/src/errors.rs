@@ -1,18 +1,34 @@
+// models/src/errors.rs
+
 use std::io;
-pub use thiserror::Error; // Make the derive macro visible, though usually it's just `use thiserror::Error` for the derive.
-                          // The `#[derive(Error)]` is what uses it.
-                          // It's more about the enum itself being `pub`.
+pub use thiserror::Error;
 use uuid;
 use bincode::error::{DecodeError, EncodeError}; // bincode needs to be in models/Cargo.toml
+use anyhow::Error as AnyhowError; // Added: Import anyhow::Error
 
-use crate::{identifiers::Identifier, properties::PropertyMap, PropertyValue};
+use crate::{identifiers::Identifier, properties::PropertyMap, PropertyValue}; // PropertyMap and PropertyValue might not be directly used in GraphError, but are part of the crate.
 
 #[derive(Debug, Error)]
 pub enum GraphError {
+    #[error("Storage error: {0}")]
+    StorageError(String), // General storage operation error
+    #[error("Serialization error: {0}")]
+    SerializationError(String), // Error during data serialization
+    #[error("Deserialization error: {0}")]
+    DeserializationError(String), // Error during data deserialization
+    #[error("Invalid query: {0}")]
+    QueryError(String), // Error during query parsing or execution logic
+    #[error("Database connection error: {0}")]
+    ConnectionError(String), // Error connecting to the database
+    #[error("Transaction error: {0}")]
+    TransactionError(String), // Error specific to transaction management
+    #[error("Configuration error: {0}")]
+    ConfigError(String), // Error with configuration loading or validation
+
     #[error("entity with identifier {0} was not found")]
     NotFound(Identifier),
     #[error(transparent)]
-    Io(#[from] io::Error),
+    Io(#[from] io::Error), // Correctly defined Io variant
     #[error(transparent)]
     Validation(#[from] ValidationError),
     #[cfg(feature = "rocksdb-errors")]
@@ -31,15 +47,42 @@ pub enum GraphError {
     Uuid(#[from] uuid::Error),
     #[error("An unknown error occurred.")]
     Unknown,
-    // Add a conversion for bcrypt::BcryptError if you want it to propagate into GraphError
     #[error("Authentication error: {0}")]
-    Auth(String), // Add a general authentication error
+    Auth(String), // General authentication error
 }
+
+// Implement From for serde_json::Error to convert into GraphError variants.
+impl From<serde_json::Error> for GraphError {
+    fn from(err: serde_json::Error) -> Self {
+        GraphError::SerializationError(format!("JSON processing error: {}", err))
+    }
+}
+
+// Added: Implement From for rmp_serde::encode::Error
+impl From<rmp_serde::encode::Error> for GraphError {
+    fn from(err: rmp_serde::encode::Error) -> Self {
+        GraphError::SerializationError(format!("MessagePack encode error: {}", err))
+    }
+}
+
+// Added: Implement From for rmp_serde::decode::Error
+impl From<rmp_serde::decode::Error> for GraphError {
+    fn from(err: rmp_serde::decode::Error) -> Self {
+        GraphError::DeserializationError(format!("MessagePack decode error: {}", err))
+    }
+}
+
+// Added: Implement From for anyhow::Error
+impl From<AnyhowError> for GraphError {
+    fn from(err: AnyhowError) -> Self {
+        GraphError::StorageError(format!("Underlying storage operation failed: {}", err))
+    }
+}
+
 
 /// A validation error.
 #[derive(Debug, Error, PartialEq)]
 pub enum ValidationError {
-    // ... (rest of your ValidationError enum)
     /// An invalid value was provided where a specific value or format was expected.
     #[error("invalid value provided")]
     InvalidValue,
@@ -101,3 +144,4 @@ pub type GraphResult<T> = Result<T, GraphError>;
 
 /// A type alias for a `Result` that returns a `ValidationError` on failure.
 pub type ValidationResult<T> = Result<T, ValidationError>;
+

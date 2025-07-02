@@ -1,7 +1,5 @@
-// models/src/medical/address.rs
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-
 use crate::{
     edges::Edge, // Keep if edges are used for relationships involving Address
     identifiers::Identifier,
@@ -61,23 +59,20 @@ impl Address {
     }
 
     pub fn from_vertex(vertex: &Vertex) -> Option<Self> {
-        // FIX: The `label()` method on Vertex returns `&Identifier`. `as_ref()` on `&Identifier` gives `&str`.
+        // The `label()` method on Vertex returns `&Identifier`. `as_ref()` on `&Identifier` gives `&str`.
         if vertex.label().as_ref() != "Address" {
             return None;
         }
 
-        // FIX: The error "field, not a method" for `vertex.id()` means `id` is a public field.
-        // We need to access it directly and then clone its value.
-        let id = vertex.id.clone(); // Access `id` field directly, then clone the Uuid
+        // The id field is of type SerializableUuid, convert to Uuid.
+        let id = vertex.id.clone().into();
 
-        // FIX: `get_property` is assumed to return `Option<&str>`.
-        // The `?` operator works on `Option<&str>`, and `.to_string()` converts `&str` to `String`.
+        // get_property returns Option<&str>.
         let address_line1 = vertex.get_property("address_line1")?.to_string();
         let address_line2 = vertex.get_property("address_line2").map(|s| s.to_string());
         let city = vertex.get_property("city")?.to_string();
 
         let state_province_str = vertex.get_property("state_province_id")?.to_string();
-        // Identifier::new returns a Result, so use .ok()? to convert to Option and propagate None on error.
         let state_province = Identifier::new(state_province_str).ok()?;
 
         let postal_code = vertex.get_property("postal_code")?.to_string();
