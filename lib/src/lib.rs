@@ -1,5 +1,6 @@
 // lib/src/lib.rs
-// Updated: 2025-06-30 - Refactored to use the new 'models' crate for shared types.
+// Updated: 2025-07-02 - Refactored to use the new 'models' crate for shared types.
+// Corrected unresolved imports for SledUserStorage and UserStorageEngine.
 
 #![cfg_attr(feature = "bench-suite", feature(test))]
 
@@ -49,7 +50,10 @@ pub use crate::memory::*;
 // REMOVED: pub use models::PropertyValue; // <-- REMOVED THIS DUPLICATE LINE
 
 // Re-export from storage_engine/mod.rs
-pub use crate::storage_engine::{SledUserStorage, UserStorageEngine, open_sled_db, StorageEngine, GraphStorageEngine};
+// Removed SledUserStorage and UserStorageEngine as their definitions/re-exports are not available.
+// If these are needed, ensure they are correctly defined and re-exported in storage_engine/mod.rs
+// and storage_engine/user_storage.rs
+pub use crate::storage_engine::{open_sled_db, StorageEngine, GraphStorageEngine};
 
 
 // Do NOT glob-import engine and models together to avoid ambiguity
@@ -88,3 +92,4 @@ pub use crate::sled::managers::SledManager as SledDatastore;
 
 #[cfg(feature = "sled-datastore")]
 pub type CurrentDatastore = SledDatastore;
+

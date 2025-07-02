@@ -1,5 +1,5 @@
 // server/src/cli/cli.rs
-// Corrected: 2025-06-30 - Removed all file system interactions, including logging and config loading.
+// Corrected: 2025-07-02 - Added storage_engine_type to StorageConfig for YAML parsing.
 
 use tokio::io::{self, AsyncBufReadExt, BufReader};
 use tokio::sync::oneshot;
@@ -102,6 +102,7 @@ pub struct StorageConfig {
     pub max_disk_space_gb: u64,
     pub min_disk_space_gb: u64,
     pub use_raft_for_scale: bool,
+    pub storage_engine_type: String, // Added this field for engine selection
 }
 
 // Define a wrapper struct to match the 'storage:' key in the YAML config.
@@ -490,7 +491,7 @@ async fn handle_command(
                 if let Some((_, tx)) = handles.remove(&port) {
                     println!("Sending stop signal to daemon on port {}...", port);
                     if tx.send(()).is_err() {
-                        eprintln!("Failed to send shutdown signal to daemon on port {}. It might have already stopped.", port);
+                        eprintln!("Warning: Daemon on port {} already stopped or signal failed.", port);
                         failed_count += 1;
                     } else {
                         stopped_count += 1;
@@ -1149,6 +1150,7 @@ pub fn start_cli() {
                                     println!("    Max Disk Space: {} GB", cfg.max_disk_space_gb);
                                     println!("    Min Disk Space: {} GB", cfg.min_disk_space_gb);
                                     println!("    Use Raft for Scale: {}", cfg.use_raft_for_scale);
+                                    println!("    Storage Engine Type: {}", cfg.storage_engine_type); // Display the engine type
                                 }
                                 Err(e) => {
                                     eprintln!("Error loading storage config for CLI display: {:?}", e);
@@ -1243,6 +1245,7 @@ pub fn start_cli() {
                             println!("    Max Disk Space: {} GB", cfg.max_disk_space_gb);
                             println!("    Min Disk Space: {} GB", cfg.min_disk_space_gb);
                             println!("    Use Raft for Scale: {}", cfg.use_raft_for_scale);
+                            println!("    Storage Engine Type: {}", cfg.storage_engine_type); // Display the engine type
                         }
                         Err(e) => {
                             eprintln!("Error loading default storage config for CLI display: {:?}", e);

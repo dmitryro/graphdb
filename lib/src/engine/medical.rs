@@ -6,6 +6,7 @@ use models::Identifier;
 use models::ToVertex;
 use models::vertices::Vertex as ModelVertex; // Alias to avoid conflict with EngineVertex
 use uuid::Uuid;
+use models::identifiers::SerializableUuid;
 // This import is correct for models::properties::PropertyValue
 use models::properties::PropertyValue;
 
@@ -14,10 +15,9 @@ fn convert_model_vertex_to_engine_vertex(v: &ModelVertex) -> crate::engine::vert
     use std::collections::BTreeMap;
 
     let mut eng_vertex = crate::engine::vertex::Vertex::new(v.label.to_string());
-    eng_vertex.id = v.id;
+    eng_vertex.id = Uuid::from(v.id); // Convert SerializableUuid to Uuid
     eng_vertex.properties = v.properties.iter()
-        .map(|(k, prop_val)| { // prop_val is &models::properties::PropertyValue
-            // This match correctly extracts String from models::properties::PropertyValue::String
+        .map(|(k, prop_val)| {
             let string_value = match prop_val {
                 PropertyValue::String(s) => s.clone(),
                 // Add conversion logic for other PropertyValue variants if needed
@@ -26,11 +26,8 @@ fn convert_model_vertex_to_engine_vertex(v: &ModelVertex) -> crate::engine::vert
                     "UNSUPPORTED_PROPERTY_TYPE".to_string()
                 },
             };
-            // This line *produces* models::properties::PropertyValue::String
             (k.clone(), PropertyValue::String(string_value))
         })
-        // This collect now produces a BTreeMap with models::properties::PropertyValue,
-        // which will match eng_vertex.properties after the fix in lib/src/engine/vertex.rs
         .collect::<BTreeMap<String, PropertyValue>>();
     eng_vertex
 }

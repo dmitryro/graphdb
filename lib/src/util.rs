@@ -1,8 +1,7 @@
-// lib/src/util.rs
 use std::io::{Cursor, Read, Write};
 use uuid::Uuid;
 use crate::errors::Result;
-use models::identifiers::Identifier;
+use models::identifiers::{Identifier, SerializableInternString};
 use models::json::Json;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use std::hash::{Hash, Hasher};
@@ -23,14 +22,14 @@ pub fn calculate_json_hash(json: &Json) -> u64 {
     hasher.finish()
 }
 
-
 pub fn build(components: &[Component<'_>]) -> Vec<u8> {
     let mut vec = Vec::new();
     for component in components {
         match component {
             Component::Uuid(id) => vec.write_all(id.as_bytes()).unwrap(),
             Component::Identifier(identifier) => {
-                vec.write_all(identifier.0.as_bytes()).unwrap();
+                // FIX: identifier.0 is SerializableInternString, get .0 (String) then as_bytes()
+                vec.write_all(identifier.0 .0.as_bytes()).unwrap();
                 vec.write_u8(0x00).unwrap(); // Null terminator for Identifier strings
             },
             Component::Json(json_value) => {

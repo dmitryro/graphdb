@@ -13,7 +13,7 @@ rand = "0.8.5" # Consistent
 actix-web = "4.11.0" # Crucial: Updated to match security crate's version
 actix-rt = "2.10.0" # Updated to match server crate's version
 dotenv = "0.15.0" # Aligned with server
-tokio = { version = "1.44.2", features = ["macros", "rt-multi-thread"] } # Updated to latest stable
+tokio = { version = "1.44.2", features = ["full"] } # Updated to latest stable
 tracing = "0.1.37" # Updated to latest stable
 tracing-subscriber = "0.3.18" # Updated to latest stable
 env_logger = "0.11.8" # Aligned with storage_daemon_server
