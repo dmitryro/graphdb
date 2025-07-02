@@ -66,6 +66,7 @@ moka = { version = "0.12.10", features = ["sync", "future"] } # Consistent
 thiserror = "2.0.12" # Consistent
 models = { path = "../models", features = ["rocksdb-errors", "sled-errors", "bincode-errors"] } # Consistent, features enabled
 bcrypt = "0.15.1" # Aligned with models (highest version)
+regex = "1.11.1" # Consistent
 
 [features]
 default = []

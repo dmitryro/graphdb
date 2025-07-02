@@ -20,6 +20,10 @@ pub struct StorageConfig {
     /// Optional: Any specific configuration parameters for the chosen engine.
     /// This could be a JSON string or a more structured enum/struct later.
     pub engine_specific_config: Option<String>,
+    /// Optional: Maximum number of open files for RocksDB.
+    /// This field is specifically used by the RocksDB storage engine.
+    #[serde(default)] // Allows this field to be optional in config files, defaulting to None
+    pub max_open_files: Option<i32>,
 }
 
 impl Default for StorageConfig {
@@ -28,6 +32,7 @@ impl Default for StorageConfig {
             engine_type: StorageEngineType::Sled, // Default to Sled
             data_path: "./data/graphdb_storage".to_string(), // Default data path
             engine_specific_config: None,
+            max_open_files: None, // Default to None for max_open_files
         }
     }
 }

@@ -1,13 +1,16 @@
 // lib/src/database.rs
 // Corrected: 2025-07-02 - Final version ensuring correct trait usage and error handling.
-// Fixed models import path and conditional RocksDBStorage import.
+// Fixed: 2025-07-02 - Corrected import for SledStorage and RocksDBStorage, and models crate.
 
 use std::sync::Arc;
-// Conditionally import RocksDBStorage
-#[cfg(feature = "with-rocksdb")]
-use crate::storage_engine::RocksDBStorage;
-use crate::storage_engine::{GraphStorageEngine, SledGraphStorage, StorageConfig, StorageEngineType, open_sled_db};
-use models::{Vertex, Edge, Identifier}; // Corrected: Removed `crate::` prefix
+// Corrected imports for SledStorage and RocksDBStorage to use their full paths
+use crate::storage_engine::{GraphStorageEngine, StorageConfig, StorageEngineType, open_sled_db};
+use crate::storage_engine::sled_storage::SledStorage; // Explicitly import SledStorage
+#[cfg(feature = "with-rocksdb")] // Apply cfg to the import itself
+use crate::storage_engine::rocksdb_storage::RocksDBStorage; // Explicitly import RocksDBStorage
+
+// Corrected import for models crate (it's a separate crate, not a module within `crate`)
+use models::{Vertex, Edge, Identifier};
 use models::errors::{GraphError, GraphResult}; // Use GraphResult directly
 use uuid::Uuid;
 use serde_json::Value; // For query results
@@ -35,9 +38,9 @@ impl Database {
     pub async fn new(config: StorageConfig) -> GraphResult<Self> {
         let storage_engine: Arc<dyn GraphStorageEngine> = match config.engine_type {
             StorageEngineType::Sled => {
-                // Open Sled DB and create SledGraphStorage
+                // Open Sled DB and create SledStorage
                 let db = open_sled_db(&config.data_path)?;
-                Arc::new(SledGraphStorage::new(db)?)
+                Arc::new(SledStorage::new(db)?)
             },
             StorageEngineType::RocksDB => {
                 // Conditionally compile RocksDB initialization if the feature is enabled
