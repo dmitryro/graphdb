@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 use uuid::Uuid;
 use crate::engine::properties::PropertyValue;
-use crate::models::identifiers::Identifier; // Ensure this is imported
+// FIX: Change `crate::models::identifiers::Identifier` to `models::identifiers::Identifier`
+use models::identifiers::Identifier; // Ensure this is imported
 
 /// A directed, typed edge connecting two vertices.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -31,4 +32,3 @@ impl Edge {
         self
     }
 }
-

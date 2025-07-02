@@ -1,20 +1,48 @@
+// lib/src/rdb/managers.rs
+
 use std::collections::HashSet;
 use std::io::Cursor;
 use std::ops::Deref;
 use std::result::Result as StdResult;
 
 use crate::errors::Result;
-use crate::models;
+use crate::models; // Import the entire models crate
 use crate::util;
 
 use rocksdb::{ColumnFamilyRef, DBIterator, Direction, IteratorMode, WriteBatch, DB};
 use uuid::Uuid;
 
+// FIX: Correct bincode imports for v2.0.1 with serde integration
+use bincode::{options, encode, decode}; // Import `options`, `encode`, `decode` directly
+use bincode::config; // Only needed if you use `config::standard()` directly, otherwise `options()` is preferred.
+
+// Assuming these types are correctly defined and exposed in your models crate:
+// models::Identifier (for general identifiers like NodeKind, PropertyName)
+// models::Edge
+// models::Vertex
+// models::Json (for property values)
+// models::identifiers::ResourceID (if distinct from models::Identifier for node IDs)
+// models::identifiers::PropertyID (if distinct from models::Identifier for property names)
+// models::identifiers::EdgeID (if distinct from models::Identifier for edge IDs)
+// models::properties::PropertyValue (if Json is not always the direct value)
+
+// Re-evaluate these types based on your actual `models` crate structure.
+// For now, I'll assume `models::Identifier` is used for `PropertyID` and `EdgeID`,
+// and `models::Json` for `PropertyValue` where applicable.
+// If your models crate has `ResourceID`, `PropertyID`, `EdgeID`, `PropertyValue` structs,
+// you should use those instead of `Identifier` or `Json` if they are distinct.
 pub type OwnedPropertyItem = (Uuid, models::Identifier, models::Json);
 pub type EdgePropertyItem = (models::Edge, models::Identifier, models::Json);
 pub type VertexPropertyValueKey = (models::Identifier, u64, Uuid);
 pub type EdgePropertyValueKey = (models::Identifier, u64, models::Edge);
 type RocksReadResult = StdResult<(Box<[u8]>, Box<[u8]>), rocksdb::Error>;
+
+// Helper for bincode configuration (consistent with storage_daemon_server)
+fn bincode_config() -> bincode::Config {
+    options()
+        .with_serde()
+        .with_fixed_int_encoding()
+}
 
 fn take_with_prefix(iterator: DBIterator<'_>, prefix: Vec<u8>) -> impl Iterator<Item = RocksReadResult> + '_ {
     iterator.take_while(move |item| -> bool {
@@ -40,6 +68,7 @@ impl<'a> VertexManager<'a> {
     }
 
     fn key(&self, id: Uuid) -> Vec<u8> {
+        // FIX: Use util::Component::Uuid
         util::build(&[util::Component::Uuid(id)])
     }
 
@@ -51,6 +80,7 @@ impl<'a> VertexManager<'a> {
         match self.db.get_cf(&self.cf, self.key(id))? {
             Some(value_bytes) => {
                 let mut cursor = Cursor::new(value_bytes.deref());
+                // FIX: Wrap unsafe call in unsafe block
                 unsafe { Ok(Some(util::read_identifier(&mut cursor)?)) }
             }
             None => Ok(None),
@@ -58,6 +88,7 @@ impl<'a> VertexManager<'a> {
     }
 
     pub fn iterate_for_range(&'a self, id: Uuid) -> impl Iterator<Item = Result<models::Vertex>> + 'a {
+        // FIX: Use util::Component::Uuid
         let low_key = util::build(&[util::Component::Uuid(id)]);
         let iter = self
             .db
@@ -68,7 +99,8 @@ impl<'a> VertexManager<'a> {
             let id = {
                 debug_assert_eq!(k.len(), 16);
                 let mut cursor = Cursor::new(k);
-                util::read_uuid(&mut cursor)?
+                // FIX: Wrap unsafe call in unsafe block
+                unsafe { util::read_uuid(&mut cursor)? }
             };
 
             let mut cursor = Cursor::new(v);
@@ -79,7 +111,8 @@ impl<'a> VertexManager<'a> {
 
     pub fn create(&self, batch: &mut WriteBatch, vertex: &models::Vertex) -> Result<()> {
         let key = self.key(vertex.id);
-        batch.put_cf(&self.cf, &key, util::build(&[util::Component::Identifier(vertex.t)]));
+        // FIX: Use util::Component::Identifier
+        batch.put_cf(&self.cf, &key, &util::build(&[util::Component::Identifier(vertex.t)]));
         Ok(())
     }
 
@@ -199,6 +232,7 @@ impl<'a> EdgeRangeManager<'a> {
 
     fn key(&self, edge: &models::Edge) -> Vec<u8> {
         util::build(&[
+            // FIX: Use util::Component variants
             util::Component::Uuid(edge.outbound_id),
             util::Component::Identifier(edge.t),
             util::Component::Uuid(edge.inbound_id),
@@ -212,9 +246,9 @@ impl<'a> EdgeRangeManager<'a> {
         iterator.map(move |item| -> Result<models::Edge> {
             let (k, _) = item?;
             let mut cursor = Cursor::new(k);
-            let first_id = util::read_uuid(&mut cursor)?;
-            let t = unsafe { util::read_identifier(&mut cursor)? };
-            let second_id = util::read_uuid(&mut cursor)?;
+            let first_id = unsafe { util::read_uuid(&mut cursor)? }; // FIX: unsafe block
+            let t = unsafe { util::read_identifier(&mut cursor)? }; // FIX: unsafe block
+            let second_id = unsafe { util::read_uuid(&mut cursor)? }; // FIX: unsafe block
             Ok(models::Edge::new(first_id, t, second_id))
         })
     }
@@ -230,6 +264,7 @@ impl<'a> EdgeRangeManager<'a> {
     ) -> Result<Box<dyn Iterator<Item = Result<models::Edge>> + 'a>> {
         let (prefix, iter) = match t {
             Some(t) => {
+                // FIX: Use util::Component variants
                 let prefix = util::build(&[util::Component::Uuid(id), util::Component::Identifier(t)]);
                 let low_key = util::build(&[util::Component::Uuid(id), util::Component::Identifier(t)]);
                 let iter = self
@@ -238,6 +273,7 @@ impl<'a> EdgeRangeManager<'a> {
                 (prefix, iter)
             }
             None => {
+                // FIX: Use util::Component::Uuid
                 let prefix = util::build(&[util::Component::Uuid(id)]);
                 let iter = self
                     .db
@@ -257,6 +293,7 @@ impl<'a> EdgeRangeManager<'a> {
         second_id: Uuid,
     ) -> Result<Box<dyn Iterator<Item = Result<models::Edge>> + 'a>> {
         let low_key = util::build(&[
+            // FIX: Use util::Component variants
             util::Component::Uuid(first_id),
             util::Component::Identifier(t),
             util::Component::Uuid(second_id),
@@ -304,8 +341,9 @@ impl<'a> VertexPropertyManager<'a> {
 
     fn key(&self, vertex_id: Uuid, name: models::Identifier) -> Vec<u8> {
         util::build(&[
+            // FIX: Use util::Component variants
             util::Component::Uuid(vertex_id),
-            util::Component::FixedLengthString(&name.0),
+            util::Component::Identifier(name), // Changed from FixedLengthString
         ])
     }
 
@@ -313,6 +351,7 @@ impl<'a> VertexPropertyManager<'a> {
         &'a self,
         vertex_id: Uuid,
     ) -> Result<impl Iterator<Item = Result<OwnedPropertyItem>> + 'a> {
+        // FIX: Use util::Component::Uuid
         let prefix = util::build(&[util::Component::Uuid(vertex_id)]);
 
         let iterator = self
@@ -324,10 +363,10 @@ impl<'a> VertexPropertyManager<'a> {
         Ok(filtered.map(move |item| -> Result<OwnedPropertyItem> {
             let (k, v) = item?;
             let mut cursor = Cursor::new(k);
-            let owner_id = util::read_uuid(&mut cursor)?;
+            let owner_id = unsafe { util::read_uuid(&mut cursor)? }; // FIX: unsafe block
             debug_assert_eq!(vertex_id, owner_id);
-            let name_str = util::read_fixed_length_string(&mut cursor)?;
-            let name = unsafe { models::Identifier::new_unchecked(name_str) };
+            // FIX: Use read_identifier for Identifier type
+            let name = unsafe { util::read_identifier(&mut cursor)? }; // Changed from read_fixed_length_string
             let value = serde_json::from_slice(&v)?;
             Ok((owner_id, name, value))
         }))
@@ -400,10 +439,11 @@ impl<'a> EdgePropertyManager<'a> {
 
     fn key(&self, edge: &models::Edge, name: models::Identifier) -> Vec<u8> {
         util::build(&[
+            // FIX: Use util::Component variants
             util::Component::Uuid(edge.outbound_id),
             util::Component::Identifier(edge.t),
             util::Component::Uuid(edge.inbound_id),
-            util::Component::FixedLengthString(&name.0),
+            util::Component::Identifier(name), // Changed from FixedLengthString
         ])
     }
 
@@ -412,6 +452,7 @@ impl<'a> EdgePropertyManager<'a> {
         edge: &'a models::Edge,
     ) -> Result<Box<dyn Iterator<Item = Result<EdgePropertyItem>> + 'a>> {
         let prefix = util::build(&[
+            // FIX: Use util::Component variants
             util::Component::Uuid(edge.outbound_id),
             util::Component::Identifier(edge.t),
             util::Component::Uuid(edge.inbound_id),
@@ -427,17 +468,17 @@ impl<'a> EdgePropertyManager<'a> {
             let (k, v) = item?;
             let mut cursor = Cursor::new(k);
 
-            let edge_property_out_id = util::read_uuid(&mut cursor)?;
+            let edge_property_out_id = unsafe { util::read_uuid(&mut cursor)? }; // FIX: unsafe block
             debug_assert_eq!(edge_property_out_id, edge.outbound_id);
 
-            let edge_property_t = unsafe { util::read_identifier(&mut cursor)? };
+            let edge_property_t = unsafe { util::read_identifier(&mut cursor)? }; // FIX: unsafe block
             debug_assert_eq!(edge_property_t, edge.t);
 
-            let edge_property_in_id = util::read_uuid(&mut cursor)?;
+            let edge_property_in_id = unsafe { util::read_uuid(&mut cursor)? }; // FIX: unsafe block
             debug_assert_eq!(edge_property_in_id, edge.inbound_id);
 
-            let edge_property_name_str = util::read_fixed_length_string(&mut cursor)?;
-            let edge_property_name = unsafe { models::Identifier::new_unchecked(edge_property_name_str) };
+            // FIX: Use read_identifier for Identifier type
+            let edge_property_name = unsafe { util::read_identifier(&mut cursor)? }; // Changed from read_fixed_length_string
 
             let value = serde_json::from_slice(&v)?;
             let edge_property_edge = models::Edge::new(edge_property_out_id, edge_property_t, edge_property_in_id);
@@ -514,6 +555,7 @@ impl<'a> VertexPropertyValueManager<'a> {
 
     fn key(&self, property_name: models::Identifier, property_value: &models::Json, vertex_id: Uuid) -> Vec<u8> {
         util::build(&[
+            // FIX: Use util::Component variants
             util::Component::Identifier(property_name),
             util::Component::Json(property_value),
             util::Component::Uuid(vertex_id),
@@ -530,9 +572,9 @@ impl<'a> VertexPropertyValueManager<'a> {
         filtered.map(move |item| -> Result<VertexPropertyValueKey> {
             let (k, _) = item?;
             let mut cursor = Cursor::new(k);
-            let name = unsafe { util::read_identifier(&mut cursor)? };
+            let name = unsafe { util::read_identifier(&mut cursor)? }; // FIX: unsafe block
             let value_hash = util::read_u64(&mut cursor)?;
-            let vertex_id = util::read_uuid(&mut cursor)?;
+            let vertex_id = unsafe { util::read_uuid(&mut cursor)? }; // FIX: unsafe block
             Ok((name, value_hash, vertex_id))
         })
     }
@@ -541,6 +583,7 @@ impl<'a> VertexPropertyValueManager<'a> {
         &'a self,
         property_name: models::Identifier,
     ) -> impl Iterator<Item = Result<VertexPropertyValueKey>> + 'a {
+        // FIX: Use util::Component::Identifier
         let prefix = util::build(&[util::Component::Identifier(property_name)]);
         let iter = self
             .db
@@ -554,6 +597,7 @@ impl<'a> VertexPropertyValueManager<'a> {
         property_value: &models::Json,
     ) -> impl Iterator<Item = Result<VertexPropertyValueKey>> + 'a {
         let prefix = util::build(&[
+            // FIX: Use util::Component variants
             util::Component::Identifier(property_name),
             util::Component::Json(property_value),
         ]);
@@ -606,6 +650,7 @@ impl<'a> EdgePropertyValueManager<'a> {
 
     fn key(&self, property_name: models::Identifier, property_value: &models::Json, edge: &models::Edge) -> Vec<u8> {
         util::build(&[
+            // FIX: Use util::Component variants
             util::Component::Identifier(property_name),
             util::Component::Json(property_value),
             util::Component::Uuid(edge.outbound_id),
@@ -624,11 +669,11 @@ impl<'a> EdgePropertyValueManager<'a> {
         filtered.map(move |item| -> Result<EdgePropertyValueKey> {
             let (k, _) = item?;
             let mut cursor = Cursor::new(k);
-            let name = unsafe { util::read_identifier(&mut cursor)? };
+            let name = unsafe { util::read_identifier(&mut cursor)? }; // FIX: unsafe block
             let value_hash = util::read_u64(&mut cursor)?;
-            let out_id = util::read_uuid(&mut cursor)?;
-            let t = unsafe { util::read_identifier(&mut cursor)? };
-            let in_id = util::read_uuid(&mut cursor)?;
+            let out_id = unsafe { util::read_uuid(&mut cursor)? }; // FIX: unsafe block
+            let t = unsafe { util::read_identifier(&mut cursor)? }; // FIX: unsafe block
+            let in_id = unsafe { util::read_uuid(&mut cursor)? }; // FIX: unsafe block
             Ok((name, value_hash, models::Edge::new(out_id, t, in_id)))
         })
     }
@@ -637,6 +682,7 @@ impl<'a> EdgePropertyValueManager<'a> {
         &'a self,
         property_name: models::Identifier,
     ) -> impl Iterator<Item = Result<EdgePropertyValueKey>> + 'a {
+        // FIX: Use util::Component::Identifier
         let prefix = util::build(&[util::Component::Identifier(property_name)]);
         let iter = self
             .db
@@ -650,6 +696,7 @@ impl<'a> EdgePropertyValueManager<'a> {
         property_value: &models::Json,
     ) -> impl Iterator<Item = Result<EdgePropertyValueKey>> + 'a {
         let prefix = util::build(&[
+            // FIX: Use util::Component variants
             util::Component::Identifier(property_name),
             util::Component::Json(property_value),
         ]);
@@ -701,14 +748,16 @@ impl<'a> MetadataManager<'a> {
     }
 
     pub fn get_indexed_properties(&self) -> Result<HashSet<models::Identifier>> {
+        let bincode_config = bincode_config(); // Get the config
         match self.db.get_cf(&self.cf, "indexed_properties")? {
-            Some(value_bytes) => Ok(bincode::deserialize(&value_bytes)?),
+            Some(value_bytes) => Ok(bincode_config.decode(&value_bytes)?), // Use config.decode()
             None => Ok(HashSet::default()),
         }
     }
 
     pub fn set_indexed_properties(&self, batch: &mut WriteBatch, indices: &HashSet<models::Identifier>) -> Result<()> {
-        let value_bytes = bincode::serialize(&indices)?;
+        let bincode_config = bincode_config(); // Get the config
+        let value_bytes = bincode_config.encode(&indices)?; // Use config.encode()
         batch.put_cf(&self.cf, "indexed_properties", &value_bytes);
         Ok(())
     }

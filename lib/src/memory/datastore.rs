@@ -1,3 +1,4 @@
+// lib/src/memory/datastore.rs
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
@@ -5,10 +6,12 @@ use std::path::PathBuf;
 use std::result::Result as StdResult;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::errors::{Error, Result};
+use crate::errors::{GraphError, Result};
 use crate::util;
+use crate::util::next_uuid;
 use crate::{Database, Datastore, DynIter, Transaction};
-use crate::models::{Edge, Identifier, Json, Vertex};
+use models::{Edge, Identifier, Json, Vertex};
+use models::bulk_insert::BulkInsertItem;
 
 use rmp_serde::decode::Error as RmpDecodeError;
 use serde::{Deserialize, Serialize};
@@ -50,7 +53,7 @@ impl<'a> Transaction<'a> for MemoryTransaction<'a> {
             .internal
             .vertices
             .iter()
-            .map(|(id, t)| Ok(Vertex::with_id(*id, *t)));
+            .map(|(id, label)| Ok(Vertex::new_with_id(*id, label.clone())));
         Ok(Box::new(iter))
     }
 
@@ -59,7 +62,7 @@ impl<'a> Transaction<'a> for MemoryTransaction<'a> {
             .internal
             .vertices
             .range(offset..)
-            .map(|(id, t)| Ok(Vertex::with_id(*id, *t)));
+            .map(|(id, label)| Ok(Vertex::new_with_id(*id, label.clone())));
         Ok(Box::new(iter))
     }
 
@@ -68,7 +71,7 @@ impl<'a> Transaction<'a> for MemoryTransaction<'a> {
             self.internal
                 .vertices
                 .get(&id)
-                .map(|value| Ok(Vertex::with_id(id, *value)))
+                .map(|label| Ok(Vertex::new_with_id(id, label.clone())))
         });
         Ok(Box::new(iter))
     }
@@ -167,7 +170,7 @@ impl<'a> Transaction<'a> for MemoryTransaction<'a> {
     }
 
     fn vertex_property(&self, vertex: &Vertex, name: Identifier) -> Result<Option<Json>> {
-        if let Some(value) = self.internal.vertex_properties.get(&(vertex.id, name)) {
+        if let Some(value) = self.internal.vertex_properties.get(&(vertex.id, name.clone())) {
             Ok(Some(value.clone()))
         } else {
             Ok(None)
@@ -176,16 +179,19 @@ impl<'a> Transaction<'a> for MemoryTransaction<'a> {
 
     fn all_vertex_properties_for_vertex(&'a self, vertex: &Vertex) -> Result<DynIter<'a, (Identifier, Json)>> {
         let mut vertex_properties = Vec::new();
-        let from = &(vertex.id, Identifier::default());
-        let to = &(util::next_uuid(vertex.id).unwrap(), Identifier::default());
+        // Using new_unchecked for range bounds, as Identifier does not implement Default
+        let from = &(vertex.id, unsafe { Identifier::new_unchecked("".to_string()) });
+        // FIX: Use next_uuid here
+        let to = &(next_uuid(vertex.id), unsafe { Identifier::new_unchecked("".to_string()) });
         for ((_prop_vertex_id, prop_name), prop_value) in self.internal.vertex_properties.range(from..to) {
-            vertex_properties.push((*prop_name, prop_value.clone()));
+            // FIX: Clone prop_name here
+            vertex_properties.push((prop_name.clone(), prop_value.clone()));
         }
         Ok(Box::new(vertex_properties.into_iter().map(Ok)))
     }
 
     fn edge_property(&self, edge: &Edge, name: Identifier) -> Result<Option<Json>> {
-        if let Some(value) = self.internal.edge_properties.get(&(edge.clone(), name)) {
+        if let Some(value) = self.internal.edge_properties.get(&(edge.clone(), name.clone())) {
             Ok(Some(value.clone()))
         } else {
             Ok(None)
@@ -194,12 +200,14 @@ impl<'a> Transaction<'a> for MemoryTransaction<'a> {
 
     fn all_edge_properties_for_edge(&'a self, edge: &Edge) -> Result<DynIter<'a, (Identifier, Json)>> {
         let mut edge_properties = Vec::new();
-        let from = &(edge.clone(), Identifier::default());
+        // Using new_unchecked for range bounds, as Identifier does not implement Default
+        let from = &(edge.clone(), unsafe { Identifier::new_unchecked("".to_string()) });
         for ((prop_edge, prop_name), prop_value) in self.internal.edge_properties.range(from..) {
             if prop_edge != edge {
                 break;
             }
-            edge_properties.push((*prop_name, prop_value.clone()));
+            // FIX: Clone prop_name here
+            edge_properties.push((prop_name.clone(), prop_value.clone()));
         }
         Ok(Box::new(edge_properties.into_iter().map(Ok)))
     }
@@ -209,10 +217,15 @@ impl<'a> Transaction<'a> for MemoryTransaction<'a> {
             self.internal.vertices.remove(&vertex.id);
 
             let mut deletable_vertex_properties: Vec<(Uuid, Identifier)> = Vec::new();
+            // Using new_unchecked for range bounds, as Identifier does not implement Default
+            let start_range = (vertex.id, unsafe { Identifier::new_unchecked("".to_string()) });
+            // FIX: Use next_uuid here
+            let end_range = (next_uuid(vertex.id), unsafe { Identifier::new_unchecked("".to_string()) });
+
             for (property_key, _) in self
                 .internal
                 .vertex_properties
-                .range((vertex.id, Identifier::default())..)
+                .range(start_range..end_range)
             {
                 let (property_vertex_id, _) = property_key;
 
@@ -220,7 +233,7 @@ impl<'a> Transaction<'a> for MemoryTransaction<'a> {
                     break;
                 }
 
-                deletable_vertex_properties.push(*property_key);
+                deletable_vertex_properties.push(property_key.clone());
             }
             self.delete_vertex_properties(deletable_vertex_properties)?;
 
@@ -241,10 +254,12 @@ impl<'a> Transaction<'a> for MemoryTransaction<'a> {
             self.internal.reversed_edges.remove(&edge.reversed());
 
             let mut deletable_edge_properties: Vec<(Edge, Identifier)> = Vec::new();
+            // Using new_unchecked for range bounds, as Identifier does not implement Default
+            let start_range = (edge.clone(), unsafe { Identifier::new_unchecked("".to_string()) });
             for (property_key, _) in self
                 .internal
                 .edge_properties
-                .range((edge.clone(), Identifier::default())..)
+                .range(start_range..)
             {
                 let (property_edge, _) = property_key;
 
@@ -268,6 +283,11 @@ impl<'a> Transaction<'a> for MemoryTransaction<'a> {
                         .get_mut(&property_value)
                         .unwrap()
                         .remove(&IndexedPropertyMember::Vertex(property_vertex_id)));
+                } else {
+                    // This case indicates an inconsistency where a property existed for a vertex
+                    // but not in the global property_values index. This could happen if a property
+                    // was deleted from the index but not from vertex_properties.
+                    // For now, we'll just allow it, but a robust system might log or correct this.
                 }
             }
         }
@@ -283,22 +303,27 @@ impl<'a> Transaction<'a> for MemoryTransaction<'a> {
                         .get_mut(&property_value)
                         .unwrap()
                         .remove(&IndexedPropertyMember::Edge(property_edge)));
+                } else {
+                    // See comment in delete_vertex_properties for handling inconsistencies.
                 }
             }
         }
         Ok(())
     }
 
+
     fn sync(&self) -> Result<()> {
         if let Some(ref persist_path) = self.path {
-            let temp_path = NamedTempFile::new().map_err(|err| Error::Datastore(Box::new(err)))?;
+            // FIX: Use GraphError::IoError
+            let temp_path = NamedTempFile::new().map_err(GraphError::IoError)?;
             {
                 let mut buf = BufWriter::new(temp_path.as_file());
                 rmp_serde::encode::write(&mut buf, &*self.internal)?;
             }
             temp_path
+                // FIX: Use GraphError::IoError
                 .persist(persist_path)
-                .map_err(|err| Error::Datastore(Box::new(err)))?;
+                .map_err(|e| GraphError::IoError(e.error))?;
         }
         Ok(())
     }
@@ -308,7 +333,7 @@ impl<'a> Transaction<'a> for MemoryTransaction<'a> {
 
         self.internal.vertices.entry(vertex.id).or_insert_with(|| {
             inserted = true;
-            vertex.t
+            vertex.label().clone()
         });
 
         Ok(inserted)
@@ -326,10 +351,32 @@ impl<'a> Transaction<'a> for MemoryTransaction<'a> {
         Ok(true)
     }
 
+    fn bulk_insert(&mut self, items: Vec<BulkInsertItem>) -> Result<()> {
+        for item in items {
+            match item {
+                BulkInsertItem::Vertex(vertex) => {
+                    self.create_vertex(&vertex)?;
+                },
+                BulkInsertItem::Edge(edge) => {
+                    self.create_edge(&edge)?;
+                },
+                BulkInsertItem::VertexProperty(id, name, value) => {
+                    self.set_vertex_properties(vec![id], name, &value)?;
+                },
+                BulkInsertItem::EdgeProperty(edge, name, value) => {
+                    self.set_edge_properties(vec![edge], name, &value)?;
+                },
+            }
+        }
+        Ok(())
+    }
+
     fn index_property(&mut self, name: Identifier) -> Result<()> {
+        let name_for_loops = name.clone();
+
         let mut property_container: HashMap<Json, HashSet<IndexedPropertyMember>> = HashMap::new();
         for id in self.internal.vertices.keys() {
-            if let Some(value) = self.internal.vertex_properties.get(&(*id, name)) {
+            if let Some(value) = self.internal.vertex_properties.get(&(*id, name_for_loops.clone())) {
                 property_container
                     .entry(value.clone())
                     .or_default()
@@ -337,7 +384,7 @@ impl<'a> Transaction<'a> for MemoryTransaction<'a> {
             }
         }
         for edge in self.internal.edges.iter() {
-            if let Some(value) = self.internal.edge_properties.get(&(edge.clone(), name)) {
+            if let Some(value) = self.internal.edge_properties.get(&(edge.clone(), name_for_loops.clone())) {
                 property_container
                     .entry(value.clone())
                     .or_default()
@@ -357,46 +404,48 @@ impl<'a> Transaction<'a> for MemoryTransaction<'a> {
     }
 
     fn set_vertex_properties(&mut self, vertex_ids: Vec<Uuid>, name: Identifier, value: &Json) -> Result<()> {
+        let name_for_ops = name.clone();
+
         let mut deletable_vertex_properties = Vec::new();
         for vertex_id in &vertex_ids {
-            deletable_vertex_properties.push((*vertex_id, name));
+            deletable_vertex_properties.push((*vertex_id, name_for_ops.clone()));
         }
         self.delete_vertex_properties(deletable_vertex_properties)?;
 
         for vertex_id in &vertex_ids {
             self.internal
                 .vertex_properties
-                .insert((*vertex_id, name), value.clone());
+                .insert((*vertex_id, name_for_ops.clone()), value.clone());
         }
 
-        if let Some(property_container) = self.internal.property_values.get_mut(&name) {
-            let property_container = property_container.entry(value.clone()).or_insert_with(HashSet::new);
-            for vertex_id in vertex_ids.into_iter() {
-                property_container.insert(IndexedPropertyMember::Vertex(vertex_id));
-            }
+        let property_container_for_name = self.internal.property_values.entry(name).or_default();
+        let property_container = property_container_for_name.entry(value.clone()).or_insert_with(HashSet::new);
+        for vertex_id in vertex_ids.into_iter() {
+            property_container.insert(IndexedPropertyMember::Vertex(vertex_id));
         }
 
         Ok(())
     }
 
     fn set_edge_properties(&mut self, edges: Vec<Edge>, name: Identifier, value: &Json) -> Result<()> {
+        let name_for_ops = name.clone();
+
         let mut deletable_edge_properties = Vec::new();
         for edge in &edges {
-            deletable_edge_properties.push((edge.clone(), name));
+            deletable_edge_properties.push((edge.clone(), name_for_ops.clone()));
         }
         self.delete_edge_properties(deletable_edge_properties)?;
 
         for edge in &edges {
             self.internal
                 .edge_properties
-                .insert((edge.clone(), name), value.clone());
+                .insert((edge.clone(), name_for_ops.clone()), value.clone());
         }
 
-        if let Some(property_container) = self.internal.property_values.get_mut(&name) {
-            let property_container = property_container.entry(value.clone()).or_insert_with(HashSet::new);
-            for edge in edges.into_iter() {
-                property_container.insert(IndexedPropertyMember::Edge(edge));
-            }
+        let property_container_for_name = self.internal.property_values.entry(name).or_default();
+        let property_container = property_container_for_name.entry(value.clone()).or_insert_with(HashSet::new);
+        for edge in edges.into_iter() {
+            property_container.insert(IndexedPropertyMember::Edge(edge));
         }
 
         Ok(())

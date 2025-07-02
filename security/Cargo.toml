@@ -2,28 +2,27 @@
 [package]
 name = "security"
 version = "0.1.0"
-edition = "2024" # Keeping your edition
+edition = "2024"
 authors = ["Dmitry R <you@example.com>"]
 description = "RBAC Security module for GraphDB with JWT support"
 license = "MIT"
 
 [dependencies]
-jsonwebtoken = "8" # Adjusted to "8" for consistency with the provided lib.rs example
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-serde_yaml = "0.9" # For YAML config
-anyhow = "1.0.95"
+jsonwebtoken = "9.3.0" # Crucial: Aligned with rest_api (highest version)
+serde = { version = "1.0.219", features = ["derive"] } # Aligned with models and lib
+serde_json = "1.0.140" # Aligned with models and lib
+serde_yaml = "0.9.34" # Aligned with storage_daemon_server
+anyhow = "1.0.98" # Aligned with rest_api and storage_daemon_server
 oauth2 = { version = "4", optional = true }
-chrono = { version = "0.4.39", features = ["serde"] }
-
-# Add Actix Web and Futures explicitly (keeping your existing dependencies)
-actix-web = "4.11.0" # Use the same version as in graphdb-lib
-futures = "0.3.31"   # A common compatible version
-
-# NEW: Dependencies for user storage and password hashing
-graphdb-lib = { path = "../lib" } # IMPORTANT: Adjust this path if different in your project structure
-sled = "0.34.7" # Or your preferred version for Sled
-argon2 = "0.5" # For secure password hashing
-rand_core = { version = "0.6", features = ["std"] } # For Argon2 salt generation
-lazy_static = "1.4" # For global user store
-tokio = { version = "1.43", features = ["macros", "rt-multi-thread", "sync", "time", "rt"] } # Add rt feature for tokio::spawn_blocking when building a runtime
+chrono = { version = "0.4.39", features = ["serde"] } # Consistent
+uuid = { version = "1.3.1", features = ["serde", "v4", "v1", "rng"] } # Consistent
+storage_daemon_server = { path = "../storage_daemon_server" }
+models = { path = "../models", version = "0.1.0" }
+lib = { path = "../lib" }
+actix-web = "4.11.0" # Retaining highest version, will make server and lib align to this
+futures = "0.3.31"
+sled = "0.34.7" # Consistent
+argon2 = "0.5.3" # Aligned with lib and rest_api
+rand_core = { version = "0.6", features = ["std"] } # Consistent
+lazy_static = "1.5.0" # Aligned with lib
+tokio = { version = "1.44.2", features = ["macros", "rt-multi-thread", "sync", "time", "rt"] } # Updated to latest stable

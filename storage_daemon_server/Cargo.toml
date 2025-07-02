@@ -1,0 +1,20 @@
+# storage_daemon_server/Cargo.toml
+[package]
+name = "storage_daemon_server"
+version = "0.1.0"
+edition = "2024" # Retained as 2024
+
+[dependencies]
+models = { path = "../models" }
+tokio = { version = "1.44.2", features = ["full"] } # Updated to latest stable
+anyhow = "1.0.98" # Aligned with rest_api and server
+log = "0.4.27" # Consistent
+env_logger = "0.11.8" # Retained as the highest version
+chrono = { version = "0.4.39", features = ["serde"] } # Consistent
+sled = "0.34.7" # Consistent
+serde = { version = "1.0.219", features = ["derive"] } # Aligned with models and lib
+serde_yaml = "0.9.34" # Retained as the highest version
+clap = { version = "4.5.29", features = ["derive"], optional = true } # Consistent and optional
+bincode = { version = "2.0.1", features = ["serde"] } # Consistent
+serde_json = "1.0.140" # Aligned with models and lib
+# Remove the [[bin]] section entirely (as per your original prompt's implicit request)

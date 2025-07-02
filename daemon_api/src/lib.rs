@@ -7,7 +7,7 @@ use std::path::Path;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use config::{Config, File as ConfigFile};
-use graphdb_daemon::{DaemonizeBuilder, DaemonizeError};
+use daemon::{DaemonizeBuilder, DaemonizeError};
 use lazy_static::lazy_static;
 use regex::Regex;
 use std::net::ToSocketAddrs;
@@ -21,7 +21,8 @@ pub struct DaemonData {
 }
 
 lazy_static! {
-    static ref SHUTDOWN_FLAG: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    // SHUTDOWN_FLAG uses Arc<Mutex<bool>> to be shared across threads and tasks
+    pub static ref SHUTDOWN_FLAG: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
 }
 
 fn remove_pid_file(pid_file_path: &str) {
@@ -46,6 +47,9 @@ pub enum DaemonError {
     NoDaemonsStarted,
     Io(std::io::Error),
     Config(config::ConfigError),
+    // ADDED THESE VARIANTS
+    ProcessError(String),
+    GeneralError(String),
 }
 
 impl From<DaemonizeError> for DaemonError {
@@ -182,6 +186,87 @@ pub async fn start_daemon(port: Option<u16>, cluster_range: Option<String>, skip
         return Err(DaemonError::NoDaemonsStarted);
     }
     Ok(())
+}
+
+/// Stops a specific daemon instance running on the given port.
+pub fn stop_port_daemon(port: u16) -> Result<(), DaemonError> {
+    println!("Attempting to stop daemon instance on port {}...", port);
+
+    let pid_file_path = format!("/tmp/daemon-{}.pid", port);
+
+    // 1. Try to read PID from a PID file
+    if Path::new(&pid_file_path).exists() {
+        match std::fs::read_to_string(&pid_file_path) {
+            Ok(pid_str) => {
+                if let Ok(pid_val) = pid_str.trim().parse::<u32>() {
+                    println!("Found PID {} in file {}. Attempting to kill...", pid_val, pid_file_path);
+                    if let Err(e) = kill(Pid::from_raw(pid_val as i32), Signal::SIGTERM) {
+                        eprintln!("Failed to send SIGTERM to PID {}: {}. It might already be gone or permissions issue.", pid_val, e);
+                        remove_pid_file(&pid_file_path); // Clean up stale PID file
+                        return Err(DaemonError::ProcessError(format!("Failed to kill process with PID {}: {}", pid_val, e)));
+                    } else {
+                        println!("Successfully sent SIGTERM to daemon on port {}.", port);
+                        remove_pid_file(&pid_file_path); // Clean up PID file on success
+                        return Ok(());
+                    }
+                } else {
+                    eprintln!("Invalid PID found in file {}: {}", pid_file_path, pid_str);
+                    remove_pid_file(&pid_file_path); // Remove corrupted PID file
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to read PID file {}: {}", pid_file_path, e);
+            }
+        }
+    }
+
+    // 2. If PID file doesn't exist or failed, try to find by process name and port
+    // This assumes your daemon's command line arguments or `ps` output would contain the port.
+    // Example: `graphdb --port 8080`
+    let pgrep_arg = format!("graphdb --port {}", port); // Adjust this regex if your daemon uses a different argument structure
+
+    let pgrep_result = Command::new("pgrep")
+        .arg("-f")
+        .arg(&pgrep_arg)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|child| child.wait_with_output());
+
+    match pgrep_result {
+        Ok(output) => {
+            let pids_str = String::from_utf8_lossy(&output.stdout);
+            let pids: Vec<u32> = pids_str.lines()
+                .filter_map(|line| line.trim().parse::<u32>().ok())
+                .collect();
+
+            if pids.is_empty() {
+                println!("No daemon found running with command line matching '{}'.", pgrep_arg);
+                return Err(DaemonError::GeneralError(format!("No daemon found on port {}", port)));
+            } else {
+                for pid in pids {
+                    // Double check to ensure we're killing the right process if needed,
+                    // but `pgrep -f` with a specific argument is usually quite precise.
+                    println!("Found PID {} matching '{}'. Attempting to kill...", pid, pgrep_arg);
+                    if let Err(e) = kill(Pid::from_raw(pid as i32), Signal::SIGTERM) {
+                        eprintln!("Failed to send SIGTERM to PID {}: {}. It might already be gone or permissions issue.", pid, e);
+                        return Err(DaemonError::ProcessError(format!("Failed to kill process with PID {}: {}", pid, e)));
+                    } else {
+                        println!("Successfully sent SIGTERM to daemon on port {}.", port);
+                        remove_pid_file(&pid_file_path); // Clean up PID file even if found by pgrep
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to execute `pgrep` command for port {}: {}. Please ensure `pgrep` is installed and in your PATH.", port, e);
+            return Err(DaemonError::ProcessError(format!("Failed to execute `pgrep`: {}", e)));
+        }
+    }
+
+    // If we reach here, no daemon was found or successfully stopped.
+    Err(DaemonError::GeneralError(format!("Could not find or stop daemon on port {}", port)))
 }
 
 /// Stops all daemons, returns Result<(), DaemonError> for compatibility.
