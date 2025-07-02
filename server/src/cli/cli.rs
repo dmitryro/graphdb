@@ -91,7 +91,8 @@ fn check_process_status_by_port(process_name: &str, port: u16) -> bool { // Re-a
     false
 }
 
-// Define the StorageConfig struct to mirror storage_config.yaml
+// Define the StorageConfig struct to mirror the content under 'storage:' in storage_config.yaml.
+// This struct is now the inner representation of the storage configuration.
 #[derive(Debug, Deserialize)]
 pub struct StorageConfig {
     pub data_directory: String,
@@ -103,7 +104,15 @@ pub struct StorageConfig {
     pub use_raft_for_scale: bool,
 }
 
+// Define a wrapper struct to match the 'storage:' key in the YAML config.
+// This will be used by the CLI to correctly parse the YAML.
+#[derive(Debug, Deserialize)]
+struct StorageConfigWrapper {
+    storage: StorageConfig,
+}
+
 /// Loads the Storage daemon configuration from `storage_daemon_server/storage_config.yaml`.
+/// This function now correctly handles the top-level `storage:` key.
 pub fn load_storage_config(config_file_path: Option<PathBuf>) -> Result<StorageConfig, anyhow::Error> {
     let default_config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent() // Go up to the workspace root of the server crate
@@ -116,10 +125,11 @@ pub fn load_storage_config(config_file_path: Option<PathBuf>) -> Result<StorageC
     let config_content = fs::read_to_string(&path_to_use)
         .map_err(|e| anyhow::anyhow!("Failed to read storage config file {}: {}", path_to_use.display(), e))?;
 
-    let config: StorageConfig = serde_yaml::from_str(&config_content)
+    // Parse into the wrapper struct which correctly handles the 'storage:' key
+    let wrapper: StorageConfigWrapper = serde_yaml::from_str(&config_content)
         .map_err(|e| anyhow::anyhow!("Failed to parse storage config file {}: {}", path_to_use.display(), e))?;
 
-    Ok(config)
+    Ok(wrapper.storage) // Return the inner StorageConfig
 }
 
 
@@ -550,17 +560,21 @@ async fn handle_command(
             let wait_timeout = Duration::from_secs(3);
             let poll_interval = Duration::from_millis(100);
             let mut port_freed = false;
-            while start_time.elapsed() < wait_timeout {
-                match std::net::TcpListener::bind(&addr) {
-                    Ok(_) => {
-                        port_freed = true;
-                        break;
-                    }
-                    Err(_) => {
-                        std::thread::sleep(poll_interval);
+            // Wrap the port freeing logic in a block_on to allow async sleep
+            tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime for port check").block_on(async {
+                while start_time.elapsed() < wait_timeout {
+                    match tokio::net::TcpListener::bind(&addr).await { // Added .await here
+                        Ok(_) => {
+                            port_freed = true;
+                            break;
+                        }
+                        Err(_) => {
+                            tokio::time::sleep(poll_interval).await;
+                        }
                     }
                 }
-            }
+            });
+
             if !port_freed {
                 eprintln!("Failed to free up port {} after killing processes. Try again.", rest_port);
                 return;
@@ -570,27 +584,27 @@ async fn handle_command(
 
             // Daemonize REST API server
             let mut daemonize_builder = DaemonizeBuilder::new()
-                .working_directory("/tmp") // This is acceptable as a temporary working directory for the daemon process, not direct file access for data storage
-                .umask(0o027)
-                .process_name(&format!("rest-api-{}", rest_port))
-                .host("127.0.0.1")
-                .port(rest_port)
-                .skip_ports(vec![]); // REST API server should bind this port
+                                .working_directory("/tmp") // This is acceptable as a temporary working directory for the daemon process, not direct file access for data storage
+                                .umask(0o027)
+                                .process_name(&format!("rest-api-{}", rest_port))
+                                .host("127.0.0.1")
+                                .port(rest_port)
+                                .skip_ports(vec![]); // REST API server should bind this port
 
             match daemonize_builder.fork_only() {
                 Ok(child_pid) => {
                     if child_pid == 0 {
-                        // In REST API child daemon process
+                        // In REST API child daemon: RUN THE REST API SERVER!
                         let child_rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime for REST API daemon child");
-                        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel(); // Dummy channel for daemon child
+                        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
                         let result = child_rt.block_on(start_rest_server(rest_port, shutdown_rx, "".to_string()));
                         if let Err(e) = result {
                             eprintln!("REST API server failed: {:?}", e);
-                            std::process::exit(1);
+                            std::process::exit(1); // Exit child process on failure
                         }
-                        std::process::exit(0);
+                        std::process::exit(0); // Exit child process on success
                     } else {
-                        // In parent CLI process
+                        println!("REST API server daemonized with PID {}", child_pid);
                         let (tx, rx) = oneshot::channel();
                         *rest_tx_guard = Some(tx);
                         *rest_api_port_guard = Some(rest_port); // Store the actual port it's running on
@@ -599,15 +613,13 @@ async fn handle_command(
                             let _ = rx.await; // This will just wait indefinitely unless tx is dropped
                         });
                         *rest_handle_guard = Some(handle);
-
-                        println!("REST API server daemonized with PID {}", child_pid);
                     }
                 }
                 Err(e) => {
                     eprintln!("Failed to daemonize REST API server: {:?}", e);
                 }
             }
-        }
+        } // This closing brace correctly closes the CommandType::RestApiStart match arm
         CommandType::RestApiStop => {
             let mut rest_tx_guard = rest_api_shutdown_tx_opt.lock().await;
             let mut rest_handle_guard = rest_api_handle.lock().await;
@@ -730,7 +742,7 @@ fn print_help() {
     println!("  rest health                - (Use HTTP client) Check REST API health.");
     println!("  rest version               - (Use HTTP client) Get REST API version.");
     println!("  rest register-user         - (Use HTTP client) Register a new user via REST API.");
-    println!("  rest authenticate          - (Use HTTP client) Authenticate a user via REST API.");
+    println!("  rest authenticate         - (Use HTTP client) Authenticate a user via REST API.");
     println!("  rest graph-query           - (Use HTTP client) Send a graph query to the REST API.");
     println!("  rest storage-query         - (Use HTTP client) Send a storage query to the REST API.");
     println!("");
@@ -747,7 +759,7 @@ fn print_help() {
 async fn main_loop() {
     let daemon_handles: Arc<Mutex<HashMap<u16, (tokio::task::JoinHandle<()>, oneshot::Sender<()>)>>> = Arc::new(Mutex::new(HashMap::new()));
     let rest_api_shutdown_tx_opt: Arc<Mutex<Option<oneshot::Sender<()>>>> = Arc::new(Mutex::new(None));
-    let rest_api_port_arc: Arc<Mutex<Option<u16>>> = Arc::new(Mutex::new(None)); // Tracks the port if REST API is running
+    let rest_api_port_arc: Arc<Mutex<Option<u16>>> = Arc::new(Mutex::<Option<u16>>::new(None)); // Tracks the port if REST API is running
     let rest_api_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
 
 
@@ -801,7 +813,7 @@ async fn main_loop() {
 
         // Signal the spawned task (if it's still waiting)
         if let Some(tx) = rest_tx_guard.take() {
-            let _ = tx.send(());
+            let _ = tx.send(()); // Signal the handle if it's waiting
         }
 
         // Attempt to kill the process directly using lsof/kill
@@ -1013,17 +1025,22 @@ pub fn start_cli() {
                         let wait_timeout = Duration::from_secs(3);
                         let poll_interval = Duration::from_millis(100);
                         let mut port_freed = false;
-                        while start_time.elapsed() < wait_timeout {
-                            match std::net::TcpListener::bind(&addr) {
-                                Ok(_) => {
-                                    port_freed = true;
-                                    break;
-                                }
-                                Err(_) => {
-                                    std::thread::sleep(poll_interval);
+                        // Wrap the port freeing logic in a block_on to allow async sleep
+                        rt.block_on(async { // Moved this block_on to wrap the entire port freeing logic
+                            while start_time.elapsed() < wait_timeout {
+                                match tokio::net::TcpListener::bind(&addr).await { // Added .await here
+                                    Ok(_) => {
+                                        port_freed = true;
+                                        break;
+                                    }
+                                    Err(_) => {
+                                        tokio::time::sleep(poll_interval).await;
+                                    }
                                 }
                             }
-                        }
+                        });
+
+
                         if !port_freed {
                             eprintln!("Failed to free up port {} after killing processes. Try again.", rest_port);
                             rest_api_status_msg = format!("Failed to free up port {}.", rest_port);
@@ -1098,22 +1115,28 @@ pub fn start_cli() {
                         let wait_timeout = Duration::from_secs(3);
                         let poll_interval = Duration::from_millis(100);
                         let mut port_freed = false;
-                        while start_time.elapsed() < wait_timeout {
-                            match std::net::TcpListener::bind(&addr) {
-                                Ok(_) => {
-                                    port_freed = true;
-                                    break;
-                                }
-                                Err(_) => {
-                                    std::thread::sleep(poll_interval);
+                        // Wrap the port freeing logic in a block_on to allow async sleep
+                        rt.block_on(async { // Moved this block_on to wrap the entire port freeing logic
+                            while start_time.elapsed() < wait_timeout {
+                                match tokio::net::TcpListener::bind(&addr).await { // Added .await here
+                                    Ok(_) => {
+                                        port_freed = true;
+                                        break;
+                                    }
+                                    Err(_) => {
+                                        tokio::time::sleep(poll_interval).await;
+                                    }
                                 }
                             }
-                        }
+                        });
+
                         if !port_freed {
                             eprintln!("Failed to free up storage port {} after killing processes. Try again.", s_port);
                             storage_status_msg = format!("Failed to free up port {}.", s_port);
                         } else {
                             println!("Starting Storage daemon on port {}...", s_port);
+                            // The CLI's load_storage_config is for displaying metrics, not for the daemon's actual startup.
+                            // We attempt to load it here to provide immediate feedback on the config file's format.
                             let loaded_storage_config = load_storage_config(storage_config_file.clone());
                             match loaded_storage_config {
                                 Ok(cfg) => {
@@ -1128,7 +1151,8 @@ pub fn start_cli() {
                                     println!("    Use Raft for Scale: {}", cfg.use_raft_for_scale);
                                 }
                                 Err(e) => {
-                                    eprintln!("Error loading storage config: {:?}", e);
+                                    eprintln!("Error loading storage config for CLI display: {:?}", e);
+                                    // Do not exit, allow daemonization to proceed, as the daemon will load its own config.
                                 }
                             }
 
@@ -1143,7 +1167,7 @@ pub fn start_cli() {
 
                             // Daemonize Storage daemon
                             let mut daemonize_builder = DaemonizeBuilder::new()
-                                .working_directory("/tmp") // Temporary working directory for the daemon process
+                                .working_directory("/tmp") // Temporary working directory for the daemon process, not direct file access for data storage
                                 .umask(0o027)
                                 .process_name(&format!("storage-daemon-{}", s_port))
                                 .host("127.0.0.1")
@@ -1156,7 +1180,8 @@ pub fn start_cli() {
                                         // In Storage daemon child process: RUN THE STORAGE SERVER!
                                         let child_rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime for Storage daemon child");
                                         // The run_storage_daemon function handles its own Ctrl+C listener and shutdown channel.
-                                        let result = child_rt.block_on(start_storage_server(Some(s_port), actual_storage_config_path)); // Corrected arguments
+                                        // It expects `Option<u16>` for port and `PathBuf` for config file.
+                                        let result = child_rt.block_on(start_storage_server(Some(s_port), actual_storage_config_path));
                                         if let Err(e) = result {
                                             eprintln!("Storage daemon failed: {:?}", e);
                                             std::process::exit(1); // Exit child process on failure
@@ -1164,7 +1189,36 @@ pub fn start_cli() {
                                         std::process::exit(0); // Exit child process on success
                                     } else {
                                         println!("Storage daemon daemonized with PID {}", child_pid);
-                                        storage_status_msg = format!("Running on port: {}", s_port);
+                                        // --- ADD HEALTH CHECK HERE IN PARENT PROCESS ---
+                                        let addr_check = format!("127.0.0.1:{}", s_port);
+                                        let health_check_timeout = Duration::from_secs(5); // Give it a few seconds
+                                        let poll_interval = Duration::from_millis(200);
+                                        let mut started_ok = false;
+                                        let start_time = Instant::now();
+
+                                        // Use rt.block_on to run the async TCP connect in the sync context
+                                        rt.block_on(async {
+                                            while start_time.elapsed() < health_check_timeout {
+                                                match tokio::net::TcpStream::connect(&addr_check).await { // Added .await here
+                                                    Ok(_) => {
+                                                        println!("Storage daemon on port {} responded to health check.", s_port);
+                                                        started_ok = true;
+                                                        break;
+                                                    }
+                                                    Err(_) => {
+                                                        tokio::time::sleep(poll_interval).await;
+                                                    }
+                                                }
+                                            }
+                                        });
+
+                                        if started_ok {
+                                            storage_status_msg = format!("Running on port: {}", s_port);
+                                        } else {
+                                            eprintln!("Warning: Storage daemon daemonized with PID {} but did not become reachable on port {} within {:?}. This might indicate an internal startup failure.",
+                                                      child_pid, s_port, health_check_timeout);
+                                            storage_status_msg = format!("Daemonized but failed to become reachable on port {}", s_port);
+                                        }
                                     }
                                 }
                                 Err(e) => {
@@ -1191,8 +1245,8 @@ pub fn start_cli() {
                             println!("    Use Raft for Scale: {}", cfg.use_raft_for_scale);
                         }
                         Err(e) => {
-                            eprintln!("Error loading default storage config: {:?}", e);
-                            storage_status_msg = format!("Failed to load default config ({:?})", e);
+                            eprintln!("Error loading default storage config for CLI display: {:?}", e);
+                            storage_status_msg = format!("Failed to load default config for display ({:?})", e);
                         }
                     }
                 }
