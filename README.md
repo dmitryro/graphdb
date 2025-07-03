@@ -62,7 +62,7 @@ GraphDB offers unique advantages for healthcare data management:
 * **Healthcare-Specific Features**: Includes built-in support for medical ontologies (e.g., ICD-10, SNOMED) and planned AI-driven analytics for advanced insights.
 * **Open-Source and Extensible**: MIT-licensed with a pluggable architecture, encouraging community contributions and custom extensions.
 
-## 🛠️ What GraphDB Does
+## 🛠️  What GraphDB Does
 
 GraphDB is designed to handle the complexity of medical data through:
 * **Graph-Native Data Model**: Uses vertices (nodes) and edges (relationships) to capture nuanced connections in medical data, such as patient diagnoses or provider interactions.
