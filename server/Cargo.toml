@@ -66,8 +66,10 @@ daemon_api = { path = "../daemon_api", version = "0.1.0" }
 proto = { path = "../proto", version = "0.1.0", features = ["server"] }
 models = { path = "../models", version = "0.1.0" }
 
-# Conditional dependency for the REST API client in cli.rs
-reqwest = { version = "0.12.5", optional = true }
+# REMOVED: reqwest = { version = "0.12.22", optional = true }
+# ADDED: Make reqwest a direct dependency as it's used unconditionally in cli.rs
+reqwest = { version = "0.12.22", features = ["json"] }
+
 
 [dev-dependencies]
 serde_json = "1.0.140" # Aligned with main dependencies
@@ -82,4 +84,5 @@ path = "src/lib.rs"
 
 [features]
 default = []
-rest_api_client = ["reqwest", "reqwest/json"] # Enables reqwest and its "json" feature when "rest_api_client" is active
+# REMOVED: rest_api_client = ["reqwest", "reqwest/json"] # This feature is no longer needed for reqwest
+
