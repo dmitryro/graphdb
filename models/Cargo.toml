@@ -2,7 +2,7 @@
 [package]
 name = "models"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 serde = { version = "1.0.219", features = ["derive"] } # Retained as the highest and consistent
