@@ -14,7 +14,7 @@ GraphDB is an experimental graph database engine and command-line interface (CLI
 
 * [🚑 Why Medical Practices Need GraphDB](#-why-medical-practices-need-graphdb)
 * [🧠 Key Benefits](#-key-benefits)
-* [🧹 What It Does](#-what-it-does) 
+* [🛠️ What This Product Does](#-what-this-product-does) 
 * [🧹 Quick Example](#-quick-example)
 * [🧹 Architecture](#-architecture)
 * [🔌 How It Works](#-how-it-works)
@@ -62,7 +62,7 @@ GraphDB offers unique advantages for healthcare data management:
 * **Healthcare-Specific Features**: Includes built-in support for medical ontologies (e.g., ICD-10, SNOMED) and planned AI-driven analytics for advanced insights.
 * **Open-Source and Extensible**: MIT-licensed with a pluggable architecture, encouraging community contributions and custom extensions.
 
-## 🧹 What It Does
+## 🛠️ What This Product Does
 
 GraphDB is designed to handle the complexity of medical data through:
 * **Graph-Native Data Model**: Uses vertices (nodes) and edges (relationships) to capture nuanced connections in medical data, such as patient diagnoses or provider interactions.
