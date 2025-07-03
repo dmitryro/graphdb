@@ -16,7 +16,7 @@ GraphDB is an experimental graph database engine and command-line interface (CLI
 * [🧠 Key Benefits](#-key-benefits)
 * [🛠️ What GraphDB Does](#-what-graphdb-does)
 * [🧹 Quick Example](#-quick-example)
-* [🏗️ Architecture](#architecture)
+* [🏗️ Architecture](#-🏗️-architecture)
 * [🔌 How It Works](#-how-it-works)
 * [🌐 Complementing Existing EHRs](#-complementing-existing-ehrs)
 * [🧪 Example Use Cases](#-example-use-cases)
