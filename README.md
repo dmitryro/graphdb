@@ -16,7 +16,7 @@ GraphDB is an experimental graph database engine and command-line interface (CLI
 * [🧠 Key Benefits](#-key-benefits)
 * [🛠️ What GraphDB Does](#-what-graphdb-does)
 * [🧹 Quick Example](#-quick-example)
-* [🏗️ Architecture](#-🏗️-architecture)
+* [🏗️ Architecture](#-architecture)
 * [🔌 How It Works](#-how-it-works)
 * [🌐 Complementing Existing EHRs](#-complementing-existing-ehrs)
 * [🧪 Example Use Cases](#-example-use-cases)
@@ -306,11 +306,11 @@ The project is organized for modularity and maintainability:
 
 GraphDB components run as independent daemons, communicating via defined ports:
 
-| Component                | Default Port | Description                              |
-|--------------------------|--------------|------------------------------------------|
-| `graphdb-daemon`         | 8080         | Core graph processing daemon             |
-| `graphdb-rest_api`       | 8082         | REST API gateway                         |
-| `graphdb-storage-daemon` | 8085         | Persistent storage daemon                |
+| Component             | Default Port | Description                              |
+|-----------------------|--------------|------------------------------------------|
+| `graphdb-daemon`      | 8080         | Core graph processing daemon            |
+| `graphdb-rest_api`    | 8082         | REST API gateway                        |
+| `graphdb-storage-daemon` | 8085      | Persistent storage daemon                |
 
 * **Single Instance**: Suitable for local development or small-scale deployments.
 * **Cluster Mode**: Supports distributed processing across multiple ports (e.g., 9001–9003) for scalability.
