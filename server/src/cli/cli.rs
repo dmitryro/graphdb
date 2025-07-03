@@ -8,6 +8,8 @@
 //      as subcommands of `status`, while `status` alone provides a summary.
 // FIX: Corrected 'anyihow' typo to 'anyhow'.
 // FIX: Corrected 'value' attribute to 'value_name' for clap arg.
+// NEW: Added a visually appealing welcome screen for interactive CLI.
+// NEW: Corrected argument parsing for 'status' subcommands in interactive mode.
 
 use tokio::io::{self, AsyncBufReadExt, BufReader};
 use tokio::sync::oneshot;
@@ -331,7 +333,9 @@ fn parse_command(input: &str) -> (CommandType, Vec<String>) {
     }
 
     let command_str = parts[0].to_lowercase();
-    let args: Vec<String> = parts[1..].iter().map(|&s| s.to_string()).collect();
+    
+    // Default args collection: everything after the first command word
+    let mut args: Vec<String> = parts[1..].iter().map(|&s| s.to_string()).collect();
 
     let cmd_type = match command_str.as_str() {
         "daemon" => match args.first().map(|s| s.to_lowercase()).as_deref() {
@@ -374,13 +378,26 @@ fn parse_command(input: &str) -> (CommandType, Vec<String>) {
         "status" => { // Handle `status` and its subcommands for interactive mode
             if parts.len() > 1 {
                 match parts[1].to_lowercase().as_str() {
-                    "rest" => CommandType::StatusRest,
-                    "daemon" => CommandType::StatusDaemon,
-                    "storage" => CommandType::StatusStorage,
-                    _ => CommandType::StatusSummary, // Fallback to summary if unknown subcommand
+                    "rest" => {
+                        args = parts[2..].iter().map(|&s| s.to_string()).collect(); // Args start after "rest"
+                        CommandType::StatusRest
+                    },
+                    "daemon" => {
+                        args = parts[2..].iter().map(|&s| s.to_string()).collect(); // Args start after "daemon"
+                        CommandType::StatusDaemon
+                    },
+                    "storage" => {
+                        args = parts[2..].iter().map(|&s| s.to_string()).collect(); // Args start after "storage"
+                        CommandType::StatusStorage
+                    },
+                    _ => { // For `status <unknown_subcommand>` or `status <arg>`
+                        args = parts[1..].iter().map(|&s| s.to_string()).collect(); // Args start after "status"
+                        CommandType::StatusSummary
+                    },
                 }
             } else {
-                CommandType::StatusSummary // Default to summary if no subcommand given
+                args = Vec::new(); // No args for `status` alone
+                CommandType::StatusSummary
             }
         }
         "help" => CommandType::Help,
@@ -961,12 +978,12 @@ async fn handle_command(
             }
         }
         CommandType::RestApiRegisterUser => {
-            if args.len() < 3 {
+            if args.len() < 2 { // Changed from 3, as args now only contains username and password
                 println!("Usage: rest register-user <username> <password>");
                 return Ok(());
             }
-            let username = &args[1];
-            let password = &args[2];
+            let username = &args[0]; // Corrected index
+            let password = &args[1]; // Corrected index
             let rest_port = get_default_rest_port_from_config();
             let client = reqwest::Client::new();
             let url = format!("http://127.0.0.1:{}/api/v1/register", rest_port);
@@ -988,12 +1005,12 @@ async fn handle_command(
             }
         }
         CommandType::RestApiAuthenticate => {
-            if args.len() < 3 {
+            if args.len() < 2 { // Changed from 3
                 println!("Usage: rest authenticate <username> <password>");
                 return Ok(());
             }
-            let username = &args[1];
-            let password = &args[2];
+            let username = &args[0]; // Corrected index
+            let password = &args[1]; // Corrected index
             let rest_port = get_default_rest_port_from_config();
             let client = reqwest::Client::new();
             let url = format!("http://127.0.0.1:{}/api/v1/auth", rest_port);
@@ -1015,12 +1032,12 @@ async fn handle_command(
             }
         }
         CommandType::RestApiGraphQuery => {
-            if args.len() < 2 {
+            if args.len() < 1 { // Changed from 2
                 println!("Usage: rest graph-query \"<query_string>\" [persist]");
                 return Ok(());
             }
-            let query_string = &args[1];
-            let persist = args.get(2).map(|s| s.parse::<bool>().unwrap_or(false)).unwrap_or(false);
+            let query_string = &args[0]; // Corrected index
+            let persist = args.get(1).map(|s| s.parse::<bool>().unwrap_or(false)).unwrap_or(false); // Corrected index
 
             let rest_port = get_default_rest_port_from_config();
             let client = reqwest::Client::new();
@@ -1049,7 +1066,8 @@ async fn handle_command(
             eprintln!("Interactive 'storage start' command is deprecated. Please use 'graphdb-cli start --storage-port <port>' for detached daemonization.");
         }
         CommandType::StorageStop => {
-            let port_arg = args.get(1).and_then(|s| s.parse::<u16>().ok());
+            let port_arg = args.get(0).and_then(|s| s.parse::<u16>().ok()) // Corrected index
+                .or_else(|| args.iter().position(|s| s == "--port").map(|i| i + 1).and_then(|idx| args.get(idx)).and_then(|s| s.parse::<u16>().ok()));
             let storage_port = port_arg.unwrap_or(CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS);
             println!("Attempting to stop Storage Daemon on port {}...", storage_port);
             if let Err(e) = stop_process_by_port("Storage Daemon", storage_port) {
@@ -1057,7 +1075,8 @@ async fn handle_command(
             }
         }
         CommandType::StorageStatus => {
-            let port_arg = args.get(1).and_then(|s| s.parse::<u16>().ok());
+            let port_arg = args.get(0).and_then(|s| s.parse::<u16>().ok()) // Corrected index
+                .or_else(|| args.iter().position(|s| s == "--port").map(|i| i + 1).and_then(|idx| args.get(idx)).and_then(|s| s.parse::<u16>().ok()));
             display_storage_daemon_status(port_arg).await;
         }
         CommandType::StatusSummary => {
@@ -1067,17 +1086,17 @@ async fn handle_command(
             display_rest_api_status().await;
         }
         CommandType::StatusDaemon => { // Handle `status daemon`
-            // For interactive mode, the port argument would be the second argument after "status daemon"
+            // For interactive mode, the port argument would be the first argument in `args`
             // e.g., `status daemon 8080` or `status daemon --port 8080`
             let port_arg_index = args.iter().position(|s| s == "--port").map(|i| i + 1)
-                                .or_else(|| args.get(1).map(|_| 1)); // If no --port, assume it's the first arg
+                                .or_else(|| args.get(0).map(|_| 0)); // If no --port, assume it's the first arg
             let port_arg = port_arg_index.and_then(|idx| args.get(idx)).and_then(|s| s.parse::<u16>().ok());
             display_daemon_status(port_arg).await;
         }
         CommandType::StatusStorage => { // Handle `status storage`
-            // For interactive mode, the port argument would be the second argument after "status storage"
+            // For interactive mode, the port argument would be the first argument in `args`
             let port_arg_index = args.iter().position(|s| s == "--port").map(|i| i + 1)
-                                .or_else(|| args.get(1).map(|_| 1));
+                                .or_else(|| args.get(0).map(|_| 0));
             let port_arg = port_arg_index.and_then(|idx| args.get(idx)).and_then(|s| s.parse::<u16>().ok());
             display_storage_daemon_status(port_arg).await;
         }
@@ -1134,6 +1153,17 @@ fn print_help() {
     println!("\nNote: Commands like 'view-graph', 'index-node', etc., are placeholders.");
 }
 
+/// Prints a visually appealing welcome screen for the CLI.
+fn print_welcome_screen() {
+    println!("\n{}", "#".repeat(70));
+    println!("{} {:^66} {}", "#", "GraphDB Command Line Interface", "#");
+    println!("{} {:^66} {}", "#", "Version 0.1.0 (Experimental)", "#");
+    println!("{} {:^66} {}", "#", "", "#");
+    println!("{} {:^66} {}", "#", "Welcome! Type 'help' for a list of commands.", "#");
+    println!("{}", "#".repeat(70));
+    println!(""); // Add an extra newline for spacing
+}
+
 /// Main asynchronous loop for the CLI interactive mode.
 /// This function is called when interactive mode is detected.
 async fn run_cli_interactive() -> Result<()> {
@@ -1142,7 +1172,7 @@ async fn run_cli_interactive() -> Result<()> {
     let rest_api_port_arc: Arc<Mutex<Option<u16>>> = Arc::new(Mutex::<Option<u16>>::new(None)); // Tracks the port if REST API is running
     let rest_api_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
 
-    println!("GraphDB CLI. Type 'help' for commands.");
+    print_welcome_screen(); // Display the welcome screen
 
     let stdin = io::stdin();
     let mut reader = BufReader::new(stdin);
