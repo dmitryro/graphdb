@@ -12,29 +12,29 @@ GraphDB is an experimental graph database engine and command-line interface (CLI
 
 ## 📁 Table of Contents
 
-* [🚑 Why Medical Practices Need GraphDB](#-why-medical-practices-need-graphdb)
-* [🧠 Key Benefits](#-key-benefits)
-* [🛠️ What GraphDB Does](#-what-graphdb-does)
-* [🧹 Quick Example](#-quick-example)
-* [🏗️ Architecture](#-architecture)
-* [🔌 How It Works](#-how-it-works)
-* [🌐 Complementing Existing EHRs](#-complementing-existing-ehrs)
-* [🧪 Example Use Cases](#-example-use-cases)
-* [🚀 Getting Started](#-getting-started)
-  * [📋 Installation Prerequisites](#-installation-prerequisites)
-  * [🛠️ Building GraphDB](#-building-graphdb)
-  * [🚀 Running GraphDB Components](#-running-graphdb-components)
-* [📂 File Structure](#-file-structure)
-* [📦 Crate/Module Details](#-cratemodule-details)
-* [⚡ Ports, Daemons, and Clusters](#-ports-daemons-and-clusters)
-* [💻 Command-Line Interface (CLI) Usage](#-command-line-interface-cli-usage)
-* [🌐 REST API Usage](#-rest-api-usage)
-* [🗄️ Storage Backends](#-storage-backends)
-* [🔮 Future Vision: Advanced Querying & AI Integration](#-future-vision-advanced-querying--ai-integration)
-* [🧬 Medical Ontology Support](#-medical-ontology-support)
-* [📢 Contributing](#-contributing)
-* [📜 License](#-license)
-* [🌐 Links](#-links)
+* [🚑 Why Medical Practices Need GraphDB](#why-medical-practices-need-graphdb)
+* [🧠 Key Benefits](#key-benefits)
+* [🛠️ What GraphDB Does](#what-graphdb-does)
+* [🧹 Quick Example](#quick-example)
+* [🏗️ Architecture](#architecture)
+* [🔌 How It Works](#how-it-works)
+* [🌐 Complementing Existing EHRs](#complementing-existing-ehrs)
+* [🧪 Example Use Cases](#example-use-cases)
+* [🚀 Getting Started](#getting-started)
+  * [📋 Installation Prerequisites](#installation-prerequisites)
+  * [🛠️ Building GraphDB](#building-graphdb)
+  * [🚀 Running GraphDB Components](#running-graphdb-components)
+* [📂 File Structure](#file-structure)
+* [📦 Crate/Module Details](#crate/module-details)
+* [⚡ Ports, Daemons, and Clusters](#ports-daemons-and-clusters)
+* [💻 Command-Line Interface (CLI) Usage](#command-line-interface-cli-usage)
+* [🌐 REST API Usage](#rest-api-usage)
+* [🗄️ Storage Backends](#storage-backends)
+* [🔮 Future Vision: Advanced Querying & AI Integration](#future-vision-advanced-querying--ai-integration)
+* [🧬 Medical Ontology Support](#medical-ontology-support)
+* [📢 Contributing](#contributing)
+* [📜 License](#license)
+* [🌐 Links](#links)
 
 ## 🚑 Why Medical Practices Need GraphDB
 
@@ -75,7 +75,6 @@ GraphDB is designed to handle the complexity of medical data through:
 ## 🧹 Quick Example
 
 Here’s a simple Cypher query to find patients diagnosed with Type 2 Diabetes (ICD-10 code E11):
-
 ```cypher
 MATCH (p:Patient)-[:HAS_DIAGNOSIS]->(d:Diagnosis)
 WHERE d.code = "E11"
@@ -87,7 +86,6 @@ This query traverses the graph to return patient names and ages, demonstrating G
 ## 🏗️ Architecture
 
 GraphDB’s modular, daemonized architecture ensures scalability, performance, and flexibility. Below is a visual representation of its components and their interactions:
-
 ```
 +-------------------------------------------------------------------------+
 |                  graphdb-cli (Interactive & Scriptable Client)          |
@@ -146,7 +144,7 @@ GraphDB enhances, rather than replaces, existing EHR systems by:
 GraphDB’s graph-native approach unlocks powerful healthcare applications:
 * **Clinical Decision Support**: Identify drug-allergy interactions or suggest treatment paths by traversing patient history graphs in real-time. 🩺
 * **Billing Optimization**: Detect missed CPT coding opportunities or fraudulent billing patterns using graph-based anomaly detection. 💰
-* **Patient Risk Modeling**: Build longitudinal graphs of medical, behavioral, and socioeconomic factors for predictive analytics and proactive care. 📊
+* **Patient Risk Modeling**: Build longitudinal graphs of patient medical, behavioral, and socioeconomic factors for predictive analytics and proactive care. 📊
 * **Security and Compliance**: Visualize user access logs as graphs to ensure HIPAA/GDPR compliance and detect unauthorized access. 🔒
 * **Research and Epidemiology**: Analyze disease propagation networks, identify clinical trial cohorts, or study social determinants of health. 🔬
 
@@ -167,13 +165,15 @@ Before building GraphDB, ensure the following are installed:
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/dmitryro/graphdb.git
+   git clone [https://github.com/dmitryro/graphdb.git](https://github.com/dmitryro/graphdb.git)
    cd graphdb
    ```
+
 2. Build the CLI executable:
    ```bash
    cargo build --workspace --release --bin graphdb-cli
    ```
+
    The compiled binary will be located at `./target/release/graphdb-cli`.
 
 ### 🚀 Running GraphDB Components
@@ -188,27 +188,32 @@ GraphDB supports multiple interaction modes:
   ```bash
   ./target/release/graphdb-cli --cli
   ```
+
   Enter commands like `start`, `stop`, `status`, or `rest graph-query`.
 * **Start a Single Graph Daemon**:
   ```bash
   ./target/release/graphdb-cli start --port 9001
   ```
+
   Default port is 8080 if `--port` is omitted.
 * **Start a Daemon Cluster**:
   ```bash
   ./target/release/graphdb-cli start --cluster 9001-9003
   ```
+
   Launches daemons on ports 9001–9003.
 * **Start REST API and Storage Daemon**:
   ```bash
   ./target/release/graphdb-cli start --listen-port 8082 --storage-port 8085
   ```
+
   REST API runs on port 8082, storage daemon on 8085.
 * **Stop Components**:
   * Stop all components:
     ```bash
     ./target/release/graphdb-cli stop
     ```
+
   * Stop specific components:
     ```bash
     ./target/release/graphdb-cli stop rest
@@ -221,13 +226,15 @@ GraphDB supports multiple interaction modes:
   ```bash
   ./target/release/graphdb-cli --query "MATCH (n) RETURN n"
   ```
+
 * **Interactive CLI Query**:
   ```
   graphdb-cli> rest graph-query "MATCH (p:Patient) RETURN p.name LIMIT 5"
   ```
+
 * **REST API Query**:
   ```bash
-  curl -X POST http://127.0.0.1:8082/api/v1/query \
+  curl -X POST [http://127.0.0.1:8082/api/v1/query](http://127.0.0.1:8082/api/v1/query) \
     -H "Content-Type: application/json" \
     -d '{"query":"MATCH (n:Person {name: \"Alice\"}) RETURN n"}'
   ```
@@ -245,14 +252,14 @@ The project is organized for modularity and maintainability:
 
 ## 📦 Crate/Module Details
 
-### graphdb-lib 🧠
+### `graphdb-lib` 🧠
 * **Purpose**: Core graph engine with data structures (nodes, edges), traversal algorithms (BFS, DFS, shortest path), and query parsing for Cypher, SQL, and GraphQL.
 * **Features**:
   * Efficient in-memory graph representation.
   * Schema management for nodes and relationships.
   * Query execution engine with support for multiple query languages.
 
-### server 💻
+### `server` 💻
 * **Purpose**: Houses the `graphdb-cli` binary for interactive and scripted use.
 * **Subcomponents** (`server/src/cli/`):
   * `cli.rs`: Parses command-line arguments and dispatches commands.
@@ -263,11 +270,11 @@ The project is organized for modularity and maintainability:
   * `daemon_management.rs`: Manages daemon lifecycle (spawning, monitoring, stopping).
   * `help_display.rs`: Generates detailed help messages for CLI commands.
 
-### daemon-api ⚙️
+### `daemon-api` ⚙️
 * **Purpose**: Provides programmatic interfaces for controlling `graphdb-daemon` instances.
 * **Features**: Uses gRPC for efficient, language-agnostic communication between components.
 
-### rest-api 🌐
+### `rest-api` 🌐
 * **Purpose**: Exposes RESTful endpoints for programmatic access.
 * **Key Endpoints**:
   * `GET /api/v1/health`: Checks system status.
@@ -279,15 +286,15 @@ The project is organized for modularity and maintainability:
   * `GET /api/v1/nodes/{id}` (Planned): Retrieves a specific node.
   * `GET /api/v1/relationships/{id}` (Planned): Retrieves a specific relationship.
 
-### storage-daemon-server 🗄️
+### `storage-daemon-server` 🗄️
 * **Purpose**: Manages persistent storage with a pluggable architecture.
 * **Supported Backends**: Postgres, Redis, RocksDB, Sled.
 * **Features**: Ensures data durability, indexing, and transactional integrity.
 
-### proto 📦
+### `proto` 📦
 * **Purpose**: Defines gRPC Protobuf messages and services for distributed communication.
 
-### models/medical ⚕️
+### `models/medical` ⚕️
 * **Purpose**: Provides healthcare-specific graph structures and ontologies for context-aware queries.
 
 ## ⚡ Ports, Daemons, and Clusters
@@ -325,10 +332,10 @@ The `graphdb-cli` binary provides flexible interaction options:
 Interact with GraphDB programmatically via the REST API:
 ```bash
 # Check system health
-curl http://127.0.0.1:8082/api/v1/health
+curl [http://127.0.0.1:8082/api/v1/health](http://127.0.0.1:8082/api/v1/health)
 
 # Execute a graph query
-curl -X POST http://127.0.0.1:8082/api/v1/query \
+curl -X POST [http://127.0.0.1:8082/api/v1/query](http://127.0.0.1:8082/api/v1/query) \
   -H "Content-Type: application/json" \
   -d '{"query":"MATCH (n:Person {name: \"Alice\"}) RETURN n"}'
 ```
@@ -379,3 +386,4 @@ MIT License (see [LICENSE](./LICENSE)).
 * **Issues**: [https://github.com/dmitryro/graphdb/issues](https://github.com/dmitryro/graphdb/issues)
 * **Documentation**: [https://docs.rs/graphdb](https://docs.rs/graphdb)
 * **Crates.io**: [https://crates.io/crates/graphdb](https://crates.io/crates/graphdb)
+
