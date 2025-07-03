@@ -1,8 +1,43 @@
 // server/src/cli/config.rs
+// Updated: 2025-07-02 - Added StorageEngineType and StorageConfig for CLI-level storage selection.
 
-use serde::Deserialize;
-use anyhow::Result; // Removed 'anyhow' from the import list as it's not directly used
+use serde::{Deserialize, Serialize};
+use anyhow::{anyhow, Result};
 use std::path::PathBuf;
+use std::str::FromStr; // Required for FromStr trait implementation
+use std::fmt; // Added: Required for Display trait implementation
+
+/// Defines the available storage engine types.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub enum StorageEngineType {
+    Sled,
+    RocksDB,
+    // Add other storage types here as they are implemented
+    // PostgreSQL,
+    // Redis,
+}
+
+impl FromStr for StorageEngineType {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "sled" => Ok(StorageEngineType::Sled),
+            "rocksdb" => Ok(StorageEngineType::RocksDB),
+            _ => Err(anyhow!("Unsupported storage engine type: {}. Available: sled, rocksdb", s)),
+        }
+    }
+}
+
+// Implement the Display trait for StorageEngineType
+impl fmt::Display for StorageEngineType {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            StorageEngineType::Sled => write!(f, "sled"),
+            StorageEngineType::RocksDB => write!(f, "rocksdb"),
+        }
+    }
+}
 
 /// Represents the `[server]` section of the config.toml.
 #[derive(Debug, Deserialize)]
@@ -26,11 +61,23 @@ pub struct DaemonConfig {
     pub group: Option<String>,
 }
 
+/// Represents the `[storage]` section of the config.toml.
+#[derive(Debug, Deserialize)]
+pub struct StorageConfig {
+    /// The default storage engine type. Can be overridden by CLI.
+    pub engine_type: Option<StorageEngineType>,
+    /// The path where storage data is kept.
+    pub data_path: Option<PathBuf>,
+    /// The default port for the storage daemon (if applicable).
+    pub port: Option<u16>,
+}
+
 /// Represents the entire structure of the `config.toml` file.
 #[derive(Debug, Deserialize)]
 pub struct CliConfig {
     pub server: ServerConfig,
     pub daemon: DaemonConfig,
+    pub storage: Option<StorageConfig>, // Make storage config optional
 }
 
 /// Loads the CLI configuration from `server/src/cli/config.toml`.
@@ -53,11 +100,11 @@ pub fn load_cli_config() -> Result<CliConfig, anyhow::Error> {
 
     // Read the content of the config file into a string.
     let config_content = std::fs::read_to_string(&config_path)
-        .map_err(|e| anyhow::anyhow!("Failed to read config file {}: {}", config_path.display(), e))?;
+        .map_err(|e| anyhow!("Failed to read config file {}: {}", config_path.display(), e))?;
 
     // Parse the TOML content into the CliConfig struct.
     let config: CliConfig = toml::from_str(&config_content)
-        .map_err(|e| anyhow::anyhow!("Failed to parse config file {}: {}", config_path.display(), e))?;
+        .map_err(|e| anyhow!("Failed to parse config file {}: {}", config_path.display(), e))?;
 
     Ok(config)
 }
