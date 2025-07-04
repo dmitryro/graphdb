@@ -5,9 +5,9 @@
 // in other modules.
 
 use anyhow::Result;
-use clap::{CommandFactory, Parser}; // Added Parser import
-use std::process; // For process::exit
-// Removed unused import: use std::path::PathBuf;
+use clap::{CommandFactory, Parser};
+use std::process;
+use std::env; // Import std::env for accessing command-line arguments
 
 // Import necessary items from the cli module (which re-exports from its sub-modules)
 use crate::cli::{
@@ -23,6 +23,23 @@ use crate::cli::{
 /// This function parses command-line arguments and dispatches to appropriate handlers.
 #[tokio::main]
 pub async fn start_cli() -> Result<()> {
+    // --- Custom Help Command Handling ---
+    // Manually check for "help" as the first argument to bypass clap's default parsing
+    let args_vec: Vec<String> = env::args().collect();
+    if args_vec.len() > 1 && args_vec[1].to_lowercase() == "help" {
+        let help_command_args: Vec<String> = args_vec.into_iter().skip(2).collect(); // Get args after "graphdb-cli help"
+        let filter_command = if help_command_args.is_empty() {
+            "".to_string() // No filter, show general help
+        } else {
+            help_command_args.join(" ") // Join all subsequent arguments as the filter string
+        };
+        let mut cmd = CliArgs::command(); // Get the top-level Command object for clap's help generation
+        help_display::print_filtered_help_clap_generated(&mut cmd, &filter_command);
+        process::exit(0); // Exit after displaying help
+    }
+    // --- End Custom Help Command Handling ---
+
+
     let args = CliArgs::parse();
 
     // Handle internal daemon runs first. These are special invocations
@@ -135,18 +152,7 @@ pub async fn start_cli() -> Result<()> {
                 // Delegate to the handler module for 'rest' command logic
                 handlers::handle_rest_command(rest_cmd).await?;
             }
-            GraphDbCommands::Help(help_args) => {
-                // Delegate to the help_display module for 'help' display
-                let mut cmd = CliArgs::command(); // Get the top-level Command object for clap's help generation
-                if let Some(command_filter) = help_args.filter_command {
-                    help_display::print_filtered_help_clap_generated(&mut cmd, &command_filter);
-                } else if !help_args.command_path.is_empty() {
-                    let command_filter = help_args.command_path.join(" ");
-                    help_display::print_filtered_help_clap_generated(&mut cmd, &command_filter);
-                } else {
-                    help_display::print_help_clap_generated();
-                }
-            }
+            // The GraphDbCommands::Help variant is removed, as 'help' is now handled manually.
         }
         return Ok(()); // Exit after processing a direct command
     }

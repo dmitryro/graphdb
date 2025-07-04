@@ -3,10 +3,10 @@
 use std::io;
 pub use thiserror::Error;
 use uuid;
-use bincode::error::{DecodeError, EncodeError}; // bincode needs to be in models/Cargo.toml
-use anyhow::Error as AnyhowError; // Added: Import anyhow::Error
+use bincode::error::{DecodeError, EncodeError};
+use anyhow::Error as AnyhowError;
 
-use crate::{identifiers::Identifier, properties::PropertyMap, PropertyValue}; // PropertyMap and PropertyValue might not be directly used in GraphError, but are part of the crate.
+use crate::{identifiers::Identifier, properties::PropertyMap, PropertyValue};
 
 #[derive(Debug, Error)]
 pub enum GraphError {
@@ -24,6 +24,17 @@ pub enum GraphError {
     TransactionError(String), // Error specific to transaction management
     #[error("Configuration error: {0}")]
     ConfigError(String), // Error with configuration loading or validation
+
+    #[error("Failed to acquire lock: {0}")] // Added LockError
+    LockError(String),
+    #[error("Feature not implemented: {0}")] // Added NotImplemented
+    NotImplemented(String),
+    #[error("Entity already exists: {0}")] // Added AlreadyExists
+    AlreadyExists(String),
+    #[error("Invalid data provided: {0}")] // Added InvalidData
+    InvalidData(String),
+    #[error("An internal error occurred: {0}")] // Added InternalError
+    InternalError(String),
 
     #[error("entity with identifier {0} was not found")]
     NotFound(Identifier),

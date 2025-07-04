@@ -1,78 +1,52 @@
 // lib/src/memory/datastore.rs
+// Refactored: 2025-07-04 - Renamed to InMemoryGraphStorage and implemented GraphStorageEngine.
+// Removed generic Database<D: Datastore> struct.
+// Updated: 2025-07-04 - Improved PropertyValue to Json conversion and back.
+// Fixed: 2025-07-04 - Addressed GraphError variants, Identifier::new arguments, and UUID range query bounds.
+// Fixed: 2025-07-04 - Corrected mismatched closing delimiter in new_with_path function.
+// Fixed: 2025-07-04 - Explicitly typed Bound::Unbounded for Identifier in BTreeMap range queries.
+// Fixed: 2025-07-04 - Corrected BTreeMap range syntax for tuple keys and used Identifier::new("".to_string()).unwrap().
+// Fixed: 2025-07-04 - Corrected BTreeMap range bounds for tuple keys to wrap the entire tuple.
+// Fixed: 2025-07-04 - Explicitly passed references to tuple keys within Bound variants for BTreeMap range.
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::path::PathBuf;
 use std::result::Result as StdResult;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::ops::Bound; // Import Bound for range queries
 
-use models::errors::{GraphError, GraphResult as Result};
-use crate::util;
-use crate::util::next_uuid;
+use async_trait::async_trait;
+use serde_json::Value; // For query results
+
+use models::errors::{GraphError, GraphResult};
+use crate::util::next_uuid; // Use next_uuid from lib/src/util.rs
 use models::{Edge, Identifier, Json, Vertex};
 use models::bulk_insert::BulkInsertItem;
-use models::identifiers::SerializableUuid;
+use models::identifiers::SerializableUuid; // Still used by Vertex/Edge structs
+use models::properties::PropertyValue; // Import PropertyValue
+use crate::util::{build as util_build_key, Component as UtilComponent}; // For building keys
 
 use rmp_serde::decode::Error as RmpDecodeError;
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
-pub trait Datastore {
-    type Transaction<'a>
-    where
-        Self: 'a;
-    fn transaction(&'_ self) -> Self::Transaction<'_>;
-}
+// Import GraphStorageEngine and StorageEngine traits
+use crate::storage_engine::{GraphStorageEngine, StorageEngine};
 
-pub trait Transaction<'a>: Sized {
-    fn vertex_count(&self) -> u64;
-    fn all_vertices(&'a self) -> Result<DynIter<'a, Vertex>>;
-    fn range_vertices(&'a self, offset: Uuid) -> Result<DynIter<'a, Vertex>>;
-    fn specific_vertices(&'a self, ids: Vec<Uuid>) -> Result<DynIter<'a, Vertex>>;
-    fn vertex_ids_with_property(&'a self, name: Identifier) -> Result<Option<DynIter<'a, Uuid>>>;
-    fn vertex_ids_with_property_value(&'a self, name: Identifier, value: &Json) -> Result<Option<DynIter<'a, Uuid>>>;
-    fn edge_count(&self) -> u64;
-    fn all_edges(&'a self) -> Result<DynIter<'a, Edge>>;
-    fn range_edges(&'a self, offset: Edge) -> Result<DynIter<'a, Edge>>;
-    fn range_reversed_edges(&'a self, offset: Edge) -> Result<DynIter<'a, Edge>>;
-    fn specific_edges(&'a self, edges: Vec<Edge>) -> Result<DynIter<'a, Edge>>;
-    fn edges_with_property(&'a self, name: Identifier) -> Result<Option<DynIter<'a, Edge>>>;
-    fn edges_with_property_value(&'a self, name: Identifier, value: &Json) -> Result<Option<DynIter<'a, Edge>>>;
-    fn vertex_property(&self, vertex: &Vertex, name: Identifier) -> Result<Option<Json>>;
-    fn all_vertex_properties_for_vertex(&'a self, vertex: &Vertex) -> Result<DynIter<'a, (Identifier, Json)>>;
-    fn edge_property(&self, edge: &Edge, name: Identifier) -> Result<Option<Json>>;
-    fn all_edge_properties_for_edge(&'a self, edge: &Edge) -> Result<DynIter<'a, (Identifier, Json)>>;
-    fn delete_vertices(&mut self, vertices: Vec<Vertex>) -> Result<()>;
-    fn delete_edges(&mut self, edges: Vec<Edge>) -> Result<()>;
-    fn delete_vertex_properties(&mut self, props: Vec<(Uuid, Identifier)>) -> Result<()>;
-    fn delete_edge_properties(&mut self, props: Vec<(Edge, Identifier)>) -> Result<()>;
-    fn sync(&self) -> Result<()>;
-    fn create_vertex(&mut self, vertex: &Vertex) -> Result<bool>;
-    fn create_edge(&mut self, edge: &Edge) -> Result<bool>;
-    fn bulk_insert(&mut self, items: Vec<BulkInsertItem>) -> Result<()>;
-    fn index_property(&mut self, name: Identifier) -> Result<()>;
-    fn set_vertex_properties(&mut self, vertices: Vec<Uuid>, name: Identifier, value: &Json) -> Result<()>;
-    fn set_edge_properties(&mut self, edges: Vec<Edge>, name: Identifier, value: &Json) -> Result<()>;
-}
 
-pub type DynIter<'a, T> = Box<dyn Iterator<Item = Result<T>> + 'a>;
-
-#[derive(Debug)]
-pub struct Database<D: Datastore> {
-    datastore: D,
-}
-
-impl<D: Datastore> Database<D> {
-    pub fn new(datastore: D) -> Self {
-        Self { datastore }
-    }
-    pub fn read_txn(&self) -> D::Transaction<'_> {
-        self.datastore.transaction()
-    }
-    pub fn write_txn(&mut self) -> D::Transaction<'_> {
-        self.datastore.transaction()
-    }
+// Define the internal in-memory storage structure
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct InternalMemory {
+    vertices: BTreeMap<Uuid, Identifier>, // Stores Vertex ID -> Label
+    edges: BTreeSet<Edge>, // Stores actual Edge objects
+    reversed_edges: BTreeSet<Edge>, // Stores reversed Edge objects for efficient traversal
+    vertex_properties: BTreeMap<(Uuid, Identifier), Json>, // (Vertex ID, Property Name) -> Value
+    edge_properties: BTreeMap<(Edge, Identifier), Json>, // (Edge, Property Name) -> Value
+    // Indexed properties for efficient lookups by property value
+    property_values: HashMap<Identifier, HashMap<Json, HashSet<IndexedPropertyMember>>>,
 }
 
 #[derive(Eq, PartialEq, Hash, Serialize, Deserialize, Debug)]
@@ -81,258 +55,68 @@ enum IndexedPropertyMember {
     Edge(Edge),
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct InternalMemory {
-    vertices: BTreeMap<Uuid, Identifier>,
-    edges: BTreeSet<Edge>,
-    reversed_edges: BTreeSet<Edge>,
-    vertex_properties: BTreeMap<(Uuid, Identifier), Json>,
-    edge_properties: BTreeMap<(Edge, Identifier), Json>,
-    property_values: HashMap<Identifier, HashMap<Json, HashSet<IndexedPropertyMember>>>,
+/// In-memory implementation of `GraphStorageEngine`.
+/// This struct manages the in-memory graph data and provides methods for
+/// both generic key-value operations and graph-specific operations.
+#[derive(Debug, Clone)]
+pub struct InMemoryGraphStorage {
+    internal: Arc<Mutex<InternalMemory>>,
+    path: Option<PathBuf>, // For MessagePack persistence
+    is_running_flag: Arc<Mutex<bool>>, // To track if the storage is "running"
 }
 
-pub struct MemoryTransaction<'a> {
-    internal: MutexGuard<'a, InternalMemory>,
-    path: Option<PathBuf>,
-}
-
-impl<'a> Transaction<'a> for MemoryTransaction<'a> {
-    fn vertex_count(&self) -> u64 {
-        self.internal.vertices.len() as u64
-    }
-
-    fn all_vertices(&'a self) -> Result<DynIter<'a, Vertex>> {
-        let iter = self.internal.vertices.iter().map(|(id, label)| Ok(Vertex::new_with_id(*id, label.clone())));
-        Ok(Box::new(iter))
-    }
-
-    fn range_vertices(&'a self, offset: Uuid) -> Result<DynIter<'a, Vertex>> {
-        let iter = self.internal.vertices.range(offset..).map(|(id, label)| Ok(Vertex::new_with_id(*id, label.clone())));
-        Ok(Box::new(iter))
-    }
-
-    fn specific_vertices(&'a self, ids: Vec<Uuid>) -> Result<DynIter<'a, Vertex>> {
-        let iter = ids.into_iter().filter_map(move |id| {
-            self.internal.vertices.get(&id).map(|label| Ok(Vertex::new_with_id(id, label.clone())))
-        });
-        Ok(Box::new(iter))
-    }
-
-    fn vertex_ids_with_property(&'a self, name: Identifier) -> Result<Option<DynIter<'a, Uuid>>> {
-        if let Some(container) = self.internal.property_values.get(&name) {
-            let mut vertex_ids = HashSet::<Uuid>::default();
-            for sub_container in container.values() {
-                for member in sub_container {
-                    if let IndexedPropertyMember::Vertex(id) = member {
-                        vertex_ids.insert(*id);
-                    }
-                }
-            }
-            Ok(Some(Box::new(vertex_ids.into_iter().map(Ok))))
-        } else {
-            Ok(None)
+impl InMemoryGraphStorage {
+    /// Creates a new `InMemoryGraphStorage` instance.
+    pub fn new() -> Self {
+        InMemoryGraphStorage {
+            internal: Arc::new(Mutex::new(InternalMemory::default())),
+            path: None,
+            is_running_flag: Arc::new(Mutex::new(false)),
         }
     }
 
-    fn vertex_ids_with_property_value(&'a self, name: Identifier, value: &Json) -> Result<Option<DynIter<'a, Uuid>>> {
-        if let Some(container) = self.internal.property_values.get(&name) {
-            if let Some(sub_container) = container.get(value) {
-                let iter = Box::new(sub_container.iter().filter_map(move |member| match member {
-                    IndexedPropertyMember::Vertex(id) => Some(Ok(*id)),
-                    _ => None,
-                }));
-                Ok(Some(Box::new(iter)))
-            } else {
-                let iter = Vec::default().into_iter();
-                Ok(Some(Box::new(iter)))
-            }
-        } else {
-            Ok(None)
+    /// Creates a new `InMemoryGraphStorage` instance with a path for MessagePack persistence.
+    pub fn new_with_path<P: Into<PathBuf>>(path: P) -> Self {
+        InMemoryGraphStorage {
+            internal: Arc::new(Mutex::new(InternalMemory::default())),
+            path: Some(path.into()),
+            is_running_flag: Arc::new(Mutex::new(false)),
         }
     }
 
-    fn edge_count(&self) -> u64 {
-        self.internal.edges.len() as u64
+    /// Reads an `InMemoryGraphStorage` from a MessagePack file.
+    pub fn from_msgpack_file<P: Into<PathBuf>>(path: P) -> GraphResult<Self> {
+        let path = path.into();
+        let f = File::open(&path).map_err(GraphError::Io)?;
+        let buf = BufReader::new(f);
+        let internal: InternalMemory = rmp_serde::from_read(buf)
+            .map_err(|e| GraphError::DeserializationError(format!("Failed to decode MessagePack: {}", e)))?;
+        
+        Ok(InMemoryGraphStorage {
+            internal: Arc::new(Mutex::new(internal)),
+            path: Some(path),
+            is_running_flag: Arc::new(Mutex::new(false)),
+        })
     }
 
-    fn all_edges(&'a self) -> Result<DynIter<'a, Edge>> {
-        let iter = self.internal.edges.iter().map(|e| Ok(e.clone()));
-        Ok(Box::new(iter))
+    // Internal helper to get a mutable lock on the data
+    fn get_internal_mut(&self) -> GraphResult<MutexGuard<'_, InternalMemory>> {
+        self.internal.lock().map_err(|e| GraphError::LockError(e.to_string()))
     }
 
-    fn range_edges(&'a self, offset: Edge) -> Result<DynIter<'a, Edge>> {
-        let iter = self.internal.edges.range(offset..).map(|e| Ok(e.clone()));
-        Ok(Box::new(iter))
+    // Internal helper to get a read-only lock on the data
+    fn get_internal_read(&self) -> GraphResult<MutexGuard<'_, InternalMemory>> {
+        self.internal.lock().map_err(|e| GraphError::LockError(e.to_string()))
     }
 
-    fn range_reversed_edges(&'a self, offset: Edge) -> Result<DynIter<'a, Edge>> {
-        let iter = self.internal.reversed_edges.range(offset..).map(|e| Ok(e.clone()));
-        Ok(Box::new(iter))
-    }
-
-    fn specific_edges(&'a self, edges: Vec<Edge>) -> Result<DynIter<'a, Edge>> {
-        let iter = edges.into_iter().filter(move |edge| self.internal.edges.contains(edge)).map(Ok);
-        Ok(Box::new(iter))
-    }
-
-    fn edges_with_property(&'a self, name: Identifier) -> Result<Option<DynIter<'a, Edge>>> {
-        if let Some(container) = self.internal.property_values.get(&name) {
-            let mut edges = HashSet::<Edge>::default();
-            for sub_container in container.values() {
-                for member in sub_container {
-                    if let IndexedPropertyMember::Edge(edge) = member {
-                        edges.insert(edge.clone());
-                    }
-                }
-            }
-            Ok(Some(Box::new(edges.into_iter().map(Ok))))
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn edges_with_property_value(&'a self, name: Identifier, value: &Json) -> Result<Option<DynIter<'a, Edge>>> {
-        if let Some(container) = self.internal.property_values.get(&name) {
-            if let Some(sub_container) = container.get(value) {
-                let iter = Box::new(sub_container.iter().filter_map(move |member| match member {
-                    IndexedPropertyMember::Edge(edge) if self.internal.edges.contains(edge) => Some(edge),
-                    _ => None,
-                }));
-                Ok(Some(Box::new(iter.map(|e| Ok(e.clone())))))
-            } else {
-                let iter = Vec::default().into_iter();
-                Ok(Some(Box::new(iter)))
-            }
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn vertex_property(&self, vertex: &Vertex, name: Identifier) -> Result<Option<Json>> {
-        if let Some(value) = self.internal.vertex_properties.get(&(Uuid::from(vertex.id), name.clone())) {
-            Ok(Some(value.clone()))
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn all_vertex_properties_for_vertex(&'a self, vertex: &Vertex) -> Result<DynIter<'a, (Identifier, Json)>> {
-        let mut vertex_properties = Vec::new();
-        let from = &(Uuid::from(vertex.id), unsafe { Identifier::new_unchecked("".to_string()) });
-        let to = &(next_uuid(Uuid::from(vertex.id)), unsafe { Identifier::new_unchecked("".to_string()) });
-        for ((_prop_vertex_id, prop_name), prop_value) in self.internal.vertex_properties.range(from..to) {
-            vertex_properties.push((prop_name.clone(), prop_value.clone()));
-        }
-        Ok(Box::new(vertex_properties.into_iter().map(Ok)))
-    }
-
-    fn edge_property(&self, edge: &Edge, name: Identifier) -> Result<Option<Json>> {
-        if let Some(value) = self.internal.edge_properties.get(&(edge.clone(), name.clone())) {
-            Ok(Some(value.clone()))
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn all_edge_properties_for_edge(&'a self, edge: &Edge) -> Result<DynIter<'a, (Identifier, Json)>> {
-        let mut edge_properties = Vec::new();
-        let from = &(edge.clone(), unsafe { Identifier::new_unchecked("".to_string()) });
-        for ((prop_edge, prop_name), prop_value) in self.internal.edge_properties.range(from..) {
-            if prop_edge != edge {
-                break;
-            }
-            edge_properties.push((prop_name.clone(), prop_value.clone()));
-        }
-        Ok(Box::new(edge_properties.into_iter().map(Ok)))
-    }
-
-    fn delete_vertices(&mut self, vertices: Vec<Vertex>) -> Result<()> {
-        for vertex in vertices {
-            self.internal.vertices.remove(&Uuid::from(vertex.id));
-
-            let mut deletable_vertex_properties: Vec<(Uuid, Identifier)> = Vec::new();
-            let start_range = (Uuid::from(vertex.id), unsafe { Identifier::new_unchecked("".to_string()) });
-            let end_range = (next_uuid(Uuid::from(vertex.id)), unsafe { Identifier::new_unchecked("".to_string()) });
-
-            for (property_key, _) in self.internal.vertex_properties.range(start_range..end_range) {
-                let (property_vertex_id, _) = property_key;
-
-                if &Uuid::from(vertex.id) != property_vertex_id {
-                    break;
-                }
-
-                deletable_vertex_properties.push(property_key.clone());
-            }
-            self.delete_vertex_properties(deletable_vertex_properties)?;
-
-            let mut deletable_edges: Vec<Edge> = Vec::new();
-            for edge in self.internal.edges.iter() {
-                if Uuid::from(edge.outbound_id) == Uuid::from(vertex.id) || Uuid::from(edge.inbound_id) == Uuid::from(vertex.id) {
-                    deletable_edges.push(edge.clone());
-                }
-            }
-            self.delete_edges(deletable_edges)?;
-        }
-        Ok(())
-    }
-
-    fn delete_edges(&mut self, edges: Vec<Edge>) -> Result<()> {
-        for edge in edges {
-            self.internal.edges.remove(&edge);
-            self.internal.reversed_edges.remove(&edge.reversed());
-
-            let mut deletable_edge_properties: Vec<(Edge, Identifier)> = Vec::new();
-            let start_range = (edge.clone(), unsafe { Identifier::new_unchecked("".to_string()) });
-            for (property_key, _) in self.internal.edge_properties.range(start_range..) {
-                let (property_edge, _) = property_key;
-
-                if &edge != property_edge {
-                    break;
-                }
-
-                deletable_edge_properties.push(property_key.clone());
-            }
-            self.delete_edge_properties(deletable_edge_properties)?;
-        }
-        Ok(())
-    }
-
-    fn delete_vertex_properties(&mut self, props: Vec<(Uuid, Identifier)>) -> Result<()> {
-        for prop in props {
-            if let Some(property_value) = self.internal.vertex_properties.remove(&prop) {
-                let (property_vertex_id, property_name) = prop;
-                if let Some(property_container) = self.internal.property_values.get_mut(&property_name) {
-                    debug_assert!(property_container
-                        .get_mut(&property_value)
-                        .unwrap()
-                        .remove(&IndexedPropertyMember::Vertex(property_vertex_id)));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn delete_edge_properties(&mut self, props: Vec<(Edge, Identifier)>) -> Result<()> {
-        for prop in props {
-            if let Some(property_value) = self.internal.edge_properties.remove(&prop) {
-                let (property_edge, property_name) = prop;
-                if let Some(property_container) = self.internal.property_values.get_mut(&property_name) {
-                    debug_assert!(property_container
-                        .get_mut(&property_value)
-                        .unwrap()
-                        .remove(&IndexedPropertyMember::Edge(property_edge)));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn sync(&self) -> Result<()> {
+    // Helper to serialize data to MessagePack and persist
+    fn sync_internal(&self, internal: &InternalMemory) -> GraphResult<()> {
         if let Some(ref persist_path) = self.path {
             let temp_path = NamedTempFile::new().map_err(|e| GraphError::Io(e.into()))?;
             {
                 let mut buf = BufWriter::new(temp_path.as_file());
-                rmp_serde::encode::write(&mut buf, &*self.internal)?;
+                rmp_serde::encode::write(&mut buf, internal)
+                    .map_err(|e| GraphError::SerializationError(e.to_string()))?;
             }
             temp_path
                 .persist(persist_path)
@@ -340,153 +124,277 @@ impl<'a> Transaction<'a> for MemoryTransaction<'a> {
         }
         Ok(())
     }
+}
 
-    fn create_vertex(&mut self, vertex: &Vertex) -> Result<bool> {
-        let mut inserted = false;
-        self.internal.vertices.entry(Uuid::from(vertex.id)).or_insert_with(|| {
-            inserted = true;
-            vertex.label().clone()
-        });
-        Ok(inserted)
-    }
-
-    fn create_edge(&mut self, edge: &Edge) -> Result<bool> {
-        if !self.internal.vertices.contains_key(&Uuid::from(edge.outbound_id))
-            || !self.internal.vertices.contains_key(&Uuid::from(edge.inbound_id))
-        {
-            return Ok(false);
-        }
-
-        self.internal.edges.insert(edge.clone());
-        self.internal.reversed_edges.insert(edge.reversed());
-        Ok(true)
-    }
-
-    fn bulk_insert(&mut self, items: Vec<BulkInsertItem>) -> Result<()> {
-        for item in items {
-            match item {
-                BulkInsertItem::Vertex(vertex) => {
-                    self.create_vertex(&vertex)?;
-                }
-                BulkInsertItem::Edge(edge) => {
-                    self.create_edge(&edge)?;
-                }
-                BulkInsertItem::VertexProperty(id, name, value) => {
-                    self.set_vertex_properties(vec![id], name, &value)?;
-                }
-                BulkInsertItem::EdgeProperty(edge, name, value) => {
-                    self.set_edge_properties(vec![edge], name, &value)?;
-                }
-            }
-        }
+#[async_trait]
+impl StorageEngine for InMemoryGraphStorage {
+    async fn connect(&self) -> GraphResult<()> {
+        // In-memory storage is always "connected" once instantiated.
         Ok(())
     }
 
-    fn index_property(&mut self, name: Identifier) -> Result<()> {
-        let name_for_loops = name.clone();
-
-        let mut property_container: HashMap<Json, HashSet<IndexedPropertyMember>> = HashMap::new();
-        for id in self.internal.vertices.keys() {
-            if let Some(value) = self.internal.vertex_properties.get(&(*id, name_for_loops.clone())) {
-                property_container.entry(value.clone()).or_default().insert(IndexedPropertyMember::Vertex(*id));
-            }
-        }
-        for edge in self.internal.edges.iter() {
-            if let Some(value) = self.internal.edge_properties.get(&(edge.clone(), name_for_loops.clone())) {
-                property_container.entry(value.clone()).or_default().insert(IndexedPropertyMember::Edge(edge.clone()));
-            }
-        }
-
-        let existing_property_container = self.internal.property_values.entry(name).or_default();
-        for (value, members) in property_container.into_iter() {
-            let existing_members = existing_property_container.entry(value).or_default();
-            for member in members {
-                existing_members.insert(member);
-            }
-        }
-        Ok(())
+    async fn insert(&self, _key: &[u8], _value: &[u8]) -> GraphResult<()> { // Added underscores to unused variables
+        // This generic insert/retrieve is not directly used for graph elements
+        // but could be for other metadata. For simplicity, we'll just store in a dummy map.
+        // In a real scenario, you'd define how raw K/V maps to your internal structure.
+        Err(GraphError::NotImplemented("Generic insert for InMemoryGraphStorage".to_string()))
     }
 
-    fn set_vertex_properties(&mut self, vertex_ids: Vec<Uuid>, name: Identifier, value: &Json) -> Result<()> {
-        let name_for_ops = name.clone();
-
-        let mut deletable_vertex_properties = Vec::new();
-        for vertex_id in &vertex_ids {
-            deletable_vertex_properties.push((*vertex_id, name_for_ops.clone()));
-        }
-        self.delete_vertex_properties(deletable_vertex_properties)?;
-
-        for vertex_id in &vertex_ids {
-            self.internal.vertex_properties.insert((*vertex_id, name_for_ops.clone()), value.clone());
-        }
-
-        let property_container_for_name = self.internal.property_values.entry(name).or_default();
-        let property_container = property_container_for_name.entry(value.clone()).or_insert_with(HashSet::new);
-        for vertex_id in vertex_ids.into_iter() {
-            property_container.insert(IndexedPropertyMember::Vertex(vertex_id));
-        }
-        Ok(())
+    async fn retrieve(&self, _key: &[u8]) -> GraphResult<Option<Vec<u8>>> { // Added underscore to unused variable
+        Err(GraphError::NotImplemented("Generic retrieve for InMemoryGraphStorage".to_string()))
     }
 
-    fn set_edge_properties(&mut self, edges: Vec<Edge>, name: Identifier, value: &Json) -> Result<()> {
-        let name_for_ops = name.clone();
+    async fn delete(&self, _key: &[u8]) -> GraphResult<()> { // Added underscore to unused variable
+        Err(GraphError::NotImplemented("Generic delete for InMemoryGraphStorage".to_string()))
+    }
 
-        let mut deletable_edge_properties = Vec::new();
-        for edge in &edges {
-            deletable_edge_properties.push((edge.clone(), name_for_ops.clone()));
-        }
-        self.delete_edge_properties(deletable_edge_properties)?;
-
-        for edge in &edges {
-            self.internal.edge_properties.insert((edge.clone(), name_for_ops.clone()), value.clone());
-        }
-
-        let property_container_for_name = self.internal.property_values.entry(name).or_default();
-        let property_container = property_container_for_name.entry(value.clone()).or_insert_with(HashSet::new);
-        for edge in edges.into_iter() {
-            property_container.insert(IndexedPropertyMember::Edge(edge));
-        }
-        Ok(())
+    async fn flush(&self) -> GraphResult<()> {
+        let internal = self.get_internal_read()?;
+        self.sync_internal(&internal)
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct MemoryDatastore {
-    internal: Arc<Mutex<InternalMemory>>,
-    path: Option<PathBuf>,
-}
-
-impl MemoryDatastore {
-    pub fn new_db() -> Database<MemoryDatastore> {
-        Database::new(MemoryDatastore {
-            internal: Arc::new(Mutex::new(InternalMemory::default())),
-            path: None,
-        })
+#[async_trait]
+impl GraphStorageEngine for InMemoryGraphStorage {
+    async fn start(&self) -> GraphResult<()> {
+        let mut is_running = self.is_running_flag.lock().map_err(|e| GraphError::LockError(e.to_string()))?;
+        *is_running = true;
+        println!("InMemoryGraphStorage started.");
+        Ok(())
     }
-    pub fn read_msgpack_db<P: Into<PathBuf>>(path: P) -> StdResult<Database<MemoryDatastore>, RmpDecodeError> {
-        let path = path.into();
-        let f = File::open(&path).map_err(RmpDecodeError::InvalidDataRead)?;
-        let buf = BufReader::new(f);
-        let internal: InternalMemory = rmp_serde::from_read(buf)?;
-        Ok(Database::new(MemoryDatastore {
-            internal: Arc::new(Mutex::new(internal)),
-            path: Some(path),
+
+    async fn stop(&self) -> GraphResult<()> {
+        let mut is_running = self.is_running_flag.lock().map_err(|e| GraphError::LockError(e.to_string()))?;
+        *is_running = false;
+        let internal = self.get_internal_read()?;
+        self.sync_internal(&internal)?; // Persist on stop
+        println!("InMemoryGraphStorage stopped.");
+        Ok(())
+    }
+
+    fn get_type(&self) -> &'static str {
+        "InMemory"
+    }
+
+    fn is_running(&self) -> bool {
+        // Corrected: Directly unwrap the MutexGuard and dereference.
+        *self.is_running_flag.lock().unwrap()
+    }
+
+    async fn query(&self, query_string: &str) -> GraphResult<Value> {
+        // This is a placeholder for actual query execution logic.
+        // In a real implementation, you'd parse `query_string` and execute it against `self.internal`.
+        println!("Executing query against InMemoryGraphStorage: {}", query_string);
+        Ok(serde_json::json!({
+            "status": "success",
+            "query": query_string,
+            "result": "InMemory query execution placeholder"
         }))
     }
-    pub fn create_msgpack_db<P: Into<PathBuf>>(path: P) -> Database<MemoryDatastore> {
-        Database::new(MemoryDatastore {
-            internal: Arc::new(Mutex::new(InternalMemory::default())),
-            path: Some(path.into()),
-        })
+
+    async fn create_vertex(&self, vertex: Vertex) -> GraphResult<()> {
+        let mut internal = self.get_internal_mut()?;
+        if internal.vertices.contains_key(&vertex.id.0) {
+            return Err(GraphError::AlreadyExists(format!("Vertex with ID {} already exists.", vertex.id.0)));
+        }
+        internal.vertices.insert(vertex.id.0, vertex.label);
+        // Store properties
+        for (prop_name, prop_value) in vertex.properties {
+            // Corrected: Pass owned String to Identifier::new
+            let identifier = Identifier::new(prop_name)
+                .map_err(|e| GraphError::InvalidData(format!("Invalid property name: {}", e)))?;
+            // Convert PropertyValue to Json for storage in BTreeMap
+            let json_value = serde_json::to_value(prop_value)
+                .map_err(|e| GraphError::SerializationError(format!("Failed to convert PropertyValue to Json: {}", e)))?;
+            internal.vertex_properties.insert((vertex.id.0, identifier), Json::new(json_value));
+        }
+        Ok(())
+    }
+
+    async fn get_vertex(&self, id: &Uuid) -> GraphResult<Option<Vertex>> {
+        let internal = self.get_internal_read()?;
+        if let Some(label) = internal.vertices.get(id) {
+            let mut vertex = Vertex::new_with_id(*id, label.clone());
+            // Retrieve properties
+            // Corrected: Pass a single tuple of Bounds to the range method, using Identifier::new("".to_string()).unwrap()
+            let start_bound_key = (id.clone(), Identifier::new("".to_string()).unwrap());
+            let end_bound_key = (next_uuid(id.clone())?, Identifier::new("".to_string()).unwrap());
+
+            for ((prop_id, prop_name), prop_json_value) in internal.vertex_properties.range((
+                Bound::Included(&start_bound_key), // Pass reference to the tuple
+                Bound::Excluded(&end_bound_key)   // Pass reference to the tuple
+            )) {
+                if prop_id == id {
+                    // Convert Json back to PropertyValue
+                    let prop_value: PropertyValue = serde_json::from_value(prop_json_value.0.as_ref().clone())
+                        .map_err(|e| GraphError::DeserializationError(format!("Failed to convert Json to PropertyValue: {}", e)))?;
+                    // Corrected: Convert Intern<String> to String for HashMap key
+                    vertex.properties.insert(prop_name.0.0.to_string(), prop_value);
+                } else {
+                    break;
+                }
+            }
+            Ok(Some(vertex))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn update_vertex(&self, vertex: Vertex) -> GraphResult<()> {
+        let mut internal = self.get_internal_mut()?;
+        if !internal.vertices.contains_key(&vertex.id.0) {
+            // Corrected: Pass owned String to Identifier::new
+            return Err(GraphError::NotFound(Identifier::new(vertex.id.0.to_string()).unwrap()));
+        }
+        // Remove old properties for this vertex
+        // Corrected: Pass a single tuple of Bounds to the range method, using Identifier::new("".to_string()).unwrap()
+        let mut props_to_remove = Vec::new();
+        let start_bound_key = (vertex.id.0, Identifier::new("".to_string()).unwrap());
+        let end_bound_key = (next_uuid(vertex.id.0)?, Identifier::new("".to_string()).unwrap());
+
+        for ((prop_id, prop_name), _) in internal.vertex_properties.range((
+            Bound::Included(&start_bound_key), // Pass reference to the tuple
+            Bound::Excluded(&end_bound_key)   // Pass reference to the tuple
+        )) {
+            if prop_id == &vertex.id.0 {
+                props_to_remove.push((prop_id.clone(), prop_name.clone()));
+            } else {
+                break;
+            }
+        }
+        for (id, name) in props_to_remove {
+            internal.vertex_properties.remove(&(id, name));
+        }
+
+        // Update label and add new properties
+        internal.vertices.insert(vertex.id.0, vertex.label);
+        for (prop_name, prop_value) in vertex.properties {
+            // Corrected: Pass owned String to Identifier::new
+            let identifier = Identifier::new(prop_name)
+                .map_err(|e| GraphError::InvalidData(format!("Invalid property name: {}", e)))?;
+            let json_value = serde_json::to_value(prop_value)
+                .map_err(|e| GraphError::SerializationError(format!("Failed to convert PropertyValue to Json: {}", e)))?;
+            internal.vertex_properties.insert((vertex.id.0, identifier), Json::new(json_value));
+        }
+        Ok(())
+    }
+
+    async fn delete_vertex(&self, id: &Uuid) -> GraphResult<()> {
+        let mut internal = self.get_internal_mut()?;
+        if internal.vertices.remove(id).is_none() {
+            // Corrected: Pass owned String to Identifier::new
+            return Err(GraphError::NotFound(Identifier::new(id.to_string()).unwrap()));
+        }
+
+        // Remove associated properties
+        // Corrected: Pass a single tuple of Bounds to the range method, using Identifier::new("".to_string()).unwrap()
+        let mut props_to_remove = Vec::new();
+        let start_bound_key = (id.clone(), Identifier::new("".to_string()).unwrap());
+        let end_bound_key = (next_uuid(id.clone())?, Identifier::new("".to_string()).unwrap());
+
+        for ((prop_id, prop_name), _) in internal.vertex_properties.range((
+            Bound::Included(&start_bound_key), // Pass reference to the tuple
+            Bound::Excluded(&end_bound_key)   // Pass reference to the tuple
+        )) {
+            if prop_id == id {
+                props_to_remove.push((prop_id.clone(), prop_name.clone()));
+            } else {
+                break;
+            }
+        }
+        for (prop_id, prop_name) in props_to_remove {
+            internal.vertex_properties.remove(&(prop_id, prop_name));
+        }
+
+        // Remove associated edges
+        internal.edges.retain(|edge| edge.outbound_id.0 != *id && edge.inbound_id.0 != *id);
+        internal.reversed_edges.retain(|edge| edge.outbound_id.0 != *id && edge.inbound_id.0 != *id);
+
+        // Remove associated edge properties
+        // This line was causing E0425 in some user reports due to context mismatch.
+        // In delete_vertex, 'id' is in scope, so this line is logically correct for removing properties
+        // associated with edges connected to the deleted vertex.
+        internal.edge_properties.retain(|(edge, _), _| edge.outbound_id.0 != *id && edge.inbound_id.0 != *id);
+
+        Ok(())
+    }
+
+    async fn get_all_vertices(&self) -> GraphResult<Vec<Vertex>> {
+        let internal = self.get_internal_read()?;
+        let mut vertices = Vec::new();
+        for (id, label) in internal.vertices.iter() {
+            let mut vertex = Vertex::new_with_id(*id, label.clone());
+            // Retrieve properties
+            // Corrected: Pass a single tuple of Bounds to the range method, using Identifier::new("".to_string()).unwrap()
+            let start_bound_key = (id.clone(), Identifier::new("".to_string()).unwrap());
+            let end_bound_key = (next_uuid(id.clone())?, Identifier::new("".to_string()).unwrap());
+
+            for ((prop_id, prop_name), prop_json_value) in internal.vertex_properties.range((
+                Bound::Included(&start_bound_key), // Pass reference to the tuple
+                Bound::Excluded(&end_bound_key)   // Pass reference to the tuple
+            )) {
+                if prop_id == id {
+                    let prop_value: PropertyValue = serde_json::from_value(prop_json_value.0.as_ref().clone())
+                        .map_err(|e| GraphError::DeserializationError(format!("Failed to convert Json to PropertyValue: {}", e)))?;
+                    // Corrected: Convert Intern<String> to String for HashMap key
+                    vertex.properties.insert(prop_name.0.0.to_string(), prop_value);
+                } else {
+                    break;
+                }
+            }
+            vertices.push(vertex);
+        }
+        Ok(vertices)
+    }
+
+    async fn create_edge(&self, edge: Edge) -> GraphResult<()> {
+        let mut internal = self.get_internal_mut()?;
+        if !internal.vertices.contains_key(&edge.outbound_id.0) || !internal.vertices.contains_key(&edge.inbound_id.0) {
+            return Err(GraphError::InvalidData("One or both vertices for the edge do not exist.".to_string()));
+        }
+        if internal.edges.contains(&edge) {
+            return Err(GraphError::AlreadyExists(format!("Edge {:?} already exists.", edge)));
+        }
+        internal.edges.insert(edge.clone());
+        internal.reversed_edges.insert(edge.reversed());
+        Ok(())
+    }
+
+    async fn get_edge(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> GraphResult<Option<Edge>> {
+        let internal = self.get_internal_read()?;
+        let edge_to_find = Edge::new(*outbound_id, edge_type.clone(), *inbound_id);
+        if internal.edges.contains(&edge_to_find) {
+            Ok(Some(edge_to_find))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn update_edge(&self, edge: Edge) -> GraphResult<()> {
+        // For in-memory, update is effectively create if it doesn't exist, or replace if it does.
+        // We'll delete and then create to handle property updates cleanly.
+        self.delete_edge(&edge.outbound_id.0, &edge.t, &edge.inbound_id.0).await?;
+        self.create_edge(edge).await
+    }
+
+    async fn delete_edge(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> GraphResult<()> {
+        let mut internal = self.get_internal_mut()?;
+        let edge_to_delete = Edge::new(*outbound_id, edge_type.clone(), *inbound_id);
+        if !internal.edges.remove(&edge_to_delete) {
+            // Corrected: Pass owned String to Identifier::new
+            return Err(GraphError::NotFound(Identifier::new(format!("{:?}", edge_to_delete)).unwrap()));
+        }
+        internal.reversed_edges.remove(&edge_to_delete.reversed());
+
+        // Remove associated edge properties
+        internal.edge_properties.retain(|(edge, _), _| edge != &edge_to_delete);
+        
+        Ok(())
+    }
+
+    async fn get_all_edges(&self) -> GraphResult<Vec<Edge>> {
+        let internal = self.get_internal_read()?;
+        Ok(internal.edges.iter().cloned().collect())
     }
 }
 
-impl Datastore for MemoryDatastore {
-    type Transaction<'a> = MemoryTransaction<'a>;
-    fn transaction(&'_ self) -> Self::Transaction<'_> {
-        MemoryTransaction {
-            internal: self.internal.lock().unwrap(),
-            path: self.path.clone(),
-        }
-    }
-}
