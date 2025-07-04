@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use std::str::FromStr; // Required for FromStr trait implementation
 use serde_yaml2; // <--- Add this import
+use daemon_api::StorageEngineType as DaemonApiStorageEngineType; // Added: Import daemon_api's StorageEngineType
 
 
 // CLI's assumed default storage port. This is used for consistency in stop/status commands.
@@ -55,6 +56,22 @@ pub struct StorageConfig {
     pub storage_engine_type: String,
 }
 
+// Added: Default implementation for StorageConfig
+impl Default for StorageConfig {
+    fn default() -> Self {
+        StorageConfig {
+            data_directory: "/tmp/graphdb_data".to_string(),
+            log_directory: "/tmp/graphdb_logs".to_string(),
+            default_port: 8090, // A common default port for storage
+            cluster_range: "8090-8100".to_string(), // Example default cluster range
+            max_disk_space_gb: 100, // 100 GB default
+            min_disk_space_gb: 10,  // 10 GB default
+            use_raft_for_scale: false, // Default to not using Raft
+            storage_engine_type: "sled".to_string(), // Default to Sled
+        }
+    }
+}
+
 // Define a wrapper struct to match the 'storage:' key in the YAML config.
 #[derive(Debug, Deserialize)]
 struct StorageConfigWrapper {
@@ -91,6 +108,7 @@ pub fn get_default_rest_port_from_config() -> u16 {
 pub enum StorageEngineType {
     Sled,
     RocksDB,
+    InMemory, // Added InMemory option to align with lib and daemon_api
     // Add other storage engine types here
 }
 
@@ -101,6 +119,7 @@ impl FromStr for StorageEngineType {
         match s.to_lowercase().as_str() {
             "sled" => Ok(StorageEngineType::Sled),
             "rocksdb" => Ok(StorageEngineType::RocksDB),
+            "inmemory" => Ok(StorageEngineType::InMemory), // Added InMemory
             _ => Err(anyhow::anyhow!("Unknown storage engine type: {}", s)),
         }
     }
@@ -111,6 +130,20 @@ impl ToString for StorageEngineType {
         match self {
             StorageEngineType::Sled => "sled".to_string(),
             StorageEngineType::RocksDB => "rocksdb".to_string(),
+            StorageEngineType::InMemory => "inmemory".to_string(), // Added InMemory
         }
     }
 }
+
+// Added: From implementation to convert from cli::config::StorageEngineType
+// to daemon_api::StorageEngineType
+impl From<StorageEngineType> for DaemonApiStorageEngineType {
+    fn from(cli_type: StorageEngineType) -> Self {
+        match cli_type {
+            StorageEngineType::Sled => DaemonApiStorageEngineType::Sled,
+            StorageEngineType::RocksDB => DaemonApiStorageEngineType::RocksDB,
+            StorageEngineType::InMemory => DaemonApiStorageEngineType::InMemory,
+        }
+    }
+}
+
