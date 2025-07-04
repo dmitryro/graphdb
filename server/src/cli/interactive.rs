@@ -14,11 +14,12 @@ use std::path::PathBuf; // Added PathBuf import
 use clap::CommandFactory; // Added CommandFactory import
 use std::collections::HashSet; // Added for HashSet
 use strsim::jaro_winkler; // Added for jaro_winkler
-use tokio::task::JoinHandle; // Required for shared state
-use rustyline::DefaultEditor; // Added: Import DefaultEditor from rustyline
+use tokio::task::JoinHandle; // Re-added: Required for shared state (daemon_handles)
+use rustyline::DefaultEditor; // FIX: Added: Import DefaultEditor from rustyline
 
 // Import necessary items from sibling modules
-use crate::cli::commands::{CliArgs, DaemonCliCommand, RestCliCommand, StorageAction, StatusArgs, StopArgs, ReloadArgs, ReloadAction, StartAction}; // Added ReloadArgs, ReloadAction, StartAction
+use crate::cli::cli::CliArgs; // Corrected: Import CliArgs from cli.rs
+use crate::cli::commands::{DaemonCliCommand, RestCliCommand, StorageAction, RestartArgs, RestartAction}; // Corrected: Added RestartAction, Removed unused: StatusArgs, StopArgs, ReloadArgs, ReloadAction, StartAction
 use crate::cli::help_display::HelpArgs; // Corrected: Import HelpArgs from help_display
 // Removed unused imports: use crate::cli::config::CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS;
 use crate::cli::handlers;
@@ -38,7 +39,7 @@ pub enum CommandType {
     StartStorage { port: Option<u16>, config_file: Option<PathBuf> },
     StartDaemon { port: Option<u16>, cluster: Option<String> }, // Added for top-level 'start daemon'
     StartAll {
-        port: Option<u16>,
+        port: Option<u16>, // FIX: Changed u10 to u16
         cluster: Option<String>,
         listen_port: Option<u16>,
         storage_port: Option<u16>,
@@ -63,6 +64,13 @@ pub enum CommandType {
     ReloadStorage, // Added for 'reload storage'
     ReloadDaemon(Option<u16>), // Added for 'reload daemon [--port <port>]'
     ReloadCluster, // Added for 'reload cluster'
+    RestartAll { // Added for 'restart all'
+        port: Option<u16>,
+        cluster: Option<String>,
+        listen_port: Option<u16>,
+        storage_port: Option<u16>,
+        storage_config_file: Option<PathBuf>,
+    },
     Help(HelpArgs),
     Clear, // Added for 'clear' and 'clean' commands
     Exit,
@@ -527,6 +535,80 @@ pub fn parse_command(input: &str) -> (CommandType, Vec<String>) {
                 CommandType::Unknown
             }
         },
+        "restart" => { // Added restart command parsing
+            if parts.len() > 1 && parts[1].to_lowercase().as_str() == "all" {
+                let mut port_arg = None;
+                let mut cluster_arg = None;
+                let mut listen_port_arg = None;
+                let mut storage_port_arg = None;
+                let mut storage_config_file_arg = None;
+                let mut i = 2;
+
+                while i < parts.len() {
+                    match parts[i].to_lowercase().as_str() {
+                        "--port" | "-p" => {
+                            if i + 1 < parts.len() {
+                                port_arg = parts[i + 1].parse::<u16>().ok();
+                                i += 2;
+                            } else {
+                                eprintln!("Warning: Flag '{}' requires a value.", parts[i]);
+                                i += 1;
+                            }
+                        }
+                        "--cluster" => {
+                            if i + 1 < parts.len() {
+                                cluster_arg = Some(parts[i + 1].to_string());
+                                i += 2;
+                            } else {
+                                eprintln!("Warning: Flag '{}' requires a value.", parts[i]);
+                                i += 1;
+                            }
+                        }
+                        "--listen-port" => {
+                            if i + 1 < parts.len() {
+                                listen_port_arg = parts[i + 1].parse::<u16>().ok();
+                                i += 2;
+                            } else {
+                                eprintln!("Warning: Flag '{}' requires a value.", parts[i]);
+                                i += 1;
+                            }
+                        }
+                        "--storage-port" => {
+                            if i + 1 < parts.len() {
+                                storage_port_arg = parts[i + 1].parse::<u16>().ok();
+                                i += 2;
+                            } else {
+                                eprintln!("Warning: Flag '{}' requires a value.", parts[i]);
+                                i += 1;
+                            }
+                        }
+                        "--storage-config" => {
+                            if i + 1 < parts.len() {
+                                storage_config_file_arg = Some(PathBuf::from(parts[i + 1]));
+                                i += 2;
+                            } else {
+                                eprintln!("Warning: Flag '{}' requires a value.", parts[i]);
+                                i += 1;
+                            }
+                        }
+                        _ => {
+                            eprintln!("Warning: Unknown argument for 'restart all': {}", parts[i]);
+                            i += 1;
+                        }
+                    }
+                }
+                CommandType::RestartAll {
+                    port: port_arg,
+                    cluster: cluster_arg,
+                    listen_port: listen_port_arg,
+                    storage_port: storage_port_arg,
+                    storage_config_file: storage_config_file_arg,
+                }
+            } else {
+                eprintln!("Usage: restart all [--port <port>] [--cluster <range>] [--listen-port <port>] [--storage-port <port>] [--storage-config <path>]");
+                CommandType::Unknown
+            }
+        },
         "help" => {
             let mut help_command_string: Option<String> = None;
             let mut positional_args: Vec<String> = Vec::new();
@@ -573,32 +655,33 @@ pub fn print_interactive_help() {
     println!("  start [rest|storage|daemon|all] [--port <port>] [--cluster <range>] [--listen-port <port>] [--storage-port <port>] [--storage-config <path>] - Start GraphDB components");
     println!("  stop [rest|daemon|storage|all] [--port <port>] - Stop GraphDB components (all by default, or specific)");
     println!("  daemon start [--port <port>] [--cluster <range>] - Start a GraphDB daemon");
-    println!("  daemon stop [--port <port>]                        - Stop a GraphDB daemon");
-    println!("  daemon status [--port <port>]                      - Check status of a GraphDB daemon");
-    println!("  daemon list                                        - List daemons managed by this CLI");
-    println!("  daemon clear-all                                   - Stop all managed daemons and attempt to kill external ones");
+    println!("  daemon stop [--port <port>]                                 - Stop a GraphDB daemon");
+    println!("  daemon status [--port <port>]                               - Check status of a GraphDB daemon");
+    println!("  daemon list                                                 - List daemons managed by this CLI");
+    println!("  daemon clear-all                                            - Stop all managed daemons and attempt to kill external ones");
     println!("  rest start [--port <port>] [--listen-port <port>] - Start the REST API server");
-    println!("  rest stop                                          - Stop the REST API server");
-    println!("  rest status                                        - Check the status of the REST API server");
-    println!("  rest health                                        - Perform a health check on the REST API server");
-    println!("  rest version                                       - Get the version of the REST API server");
-    println!("  rest register-user <username> <password>           - Register a new user via REST API");
-    println!("  rest authenticate <username> <password>            - Authenticate a user and get a token via REST API");
-    println!("  rest graph-query \"<query_string>\" [persist]        - Execute a graph query via REST API");
-    println!("  rest storage-query                                 - Execute a storage query via REST API (placeholder)");
+    println!("  rest stop                                                   - Stop the REST API server");
+    println!("  rest status                                                 - Check the status of the REST API server");
+    println!("  rest health                                                 - Perform a health check on the REST API server");
+    println!("  rest version                                                - Get the version of the REST API server");
+    println!("  rest register-user <username> <password>                    - Register a new user via REST API");
+    println!("  rest authenticate <username> <password>                     - Authenticate a user and get a token via REST API");
+    println!("  rest graph-query \"<query_string>\" [persist]               - Execute a graph query via REST API");
+    println!("  rest storage-query                                          - Execute a storage query via REST API (placeholder)");
     println!("  storage start [--port <port>] [--config-file <path>] - Start the standalone Storage daemon");
-    println!("  storage stop [--port <port>]                       - Stop the standalone Storage daemon");
-    println!("  storage status [--port <port>]                     - Check the status of the standalone Storage daemon");
+    println!("  storage stop [--port <port>]                                - Stop the standalone Storage daemon");
+    println!("  storage status [--port <port>]                              - Check the status of the standalone Storage daemon");
     println!("  status [rest|daemon|storage|cluster|all] [--port <port>] - Get a comprehensive status summary or specific component status");
-    println!("  auth <username> <password>                         - Authenticate a user and get a token (top-level)");
-    println!("  authenticate <username> <password>                 - Authenticate a user and get a token (top-level)");
-    println!("  register <username> <password>                     - Register a new user (top-level)");
-    println!("  version                                            - Get the version of the REST API server (top-level)");
-    println!("  health                                             - Perform a health check on the REST API server (top-level)");
+    println!("  auth <username> <password>                                  - Authenticate a user and get a token (top-level)");
+    println!("  authenticate <username> <password>                          - Authenticate a user and get a token (top-level)");
+    println!("  register <username> <password>                              - Register a new user (top-level)");
+    println!("  version                                                     - Get the version of the REST API server (top-level)");
+    println!("  health                                                      - Perform a health check on the REST API server (top-level)");
     println!("  reload [all|rest|storage|daemon|cluster] [--port <port>] - Reload GraphDB components");
-    println!("  clear | clean                                      - Clear the terminal screen"); // Added
-    println!("  help [--command|-c <command_string>]               - Display this help message or help for a specific command");
-    println!("  exit | quit | q                                    - Exit the CLI");
+    println!("  restart all [--port <port>] [--cluster <range>] [--listen-port <port>] [--storage-port <port>] [--storage-config <path>] - Restart all core GraphDB components");
+    println!("  clear | clean                                               - Clear the terminal screen"); // Added
+    println!("  help [--command|-c <command_string>]                        - Display this help message or help for a specific command");
+    println!("  exit | quit | q                                             - Exit the CLI");
     println!("\nNote: Commands like 'view-graph', 'index-node', etc., are placeholders.");
 }
 
@@ -643,13 +726,10 @@ pub fn print_interactive_filtered_help(_cmd: &mut clap::Command, command_filter:
         ("register <username> <password>", "Register a new user"), // Added
         ("version", "Get the version of the REST API server"), // Added
         ("health", "Perform a health check on the REST API server"), // Added
-        ("reload all", "Reload all GraphDB components"), // Added
-        ("reload rest", "Reload the REST API server"), // Added
-        ("reload storage", "Reload the standalone Storage daemon"), // Added
-        ("reload daemon [--port <port>]", "Reload a specific GraphDB daemon"), // Added
-        ("reload cluster", "Reload the cluster configuration"), // Added
-        ("clear", "Clear the terminal screen"), // Added
-        ("clean", "Clear the terminal screen"), // Added
+        ("reload [all|rest|storage|daemon|cluster] [--port <port>]", "Reload GraphDB components"), // Fixed E0308
+        ("restart all [--port <port>] [--cluster <range>] [--listen-port <port>] [--storage-port <port>] [--storage-config <path>]", "Restart all core GraphDB components"),
+        ("clear", "Clear the terminal screen"),
+        ("clean", "Clear the terminal screen"),
         ("help [--command|-c <command_string>]", "Display this help message or help for a specific command"),
         ("exit | quit | q", "Exit the CLI"),
     ];
@@ -710,7 +790,11 @@ pub async fn run_cli_interactive(
     rest_api_shutdown_tx_opt: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     rest_api_port_arc: Arc<Mutex<Option<u16>>>,
     rest_api_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    // New shared state for Storage daemon - now passed as arguments
+    storage_daemon_shutdown_tx_opt: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    storage_daemon_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 ) -> Result<()> {
+    // FIX: DefaultEditor is now correctly imported and in scope.
     let mut rl = DefaultEditor::new()?;
     let history_path = "graphdb_cli_history.txt";
     let _ = rl.load_history(history_path);
@@ -720,6 +804,10 @@ pub async fn run_cli_interactive(
     let stdin = io::stdin();
     let mut reader = BufReader::new(stdin);
     let mut input = String::new();
+
+    // Removed: These lines are no longer needed as the state is passed as arguments
+    // let storage_daemon_shutdown_tx_opt: Arc<Mutex<Option<oneshot::Sender<()>>>> = Arc::new(Mutex::new(None));
+    // let storage_daemon_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
 
     loop {
         print!("graphdb-cli> ");
@@ -741,6 +829,8 @@ pub async fn run_cli_interactive(
                 rest_api_shutdown_tx_opt.clone(),
                 rest_api_port_arc.clone(),
                 rest_api_handle.clone(),
+                storage_daemon_shutdown_tx_opt.clone(), // Pass new storage state
+                storage_daemon_handle.clone(),            // Pass new storage state
             ).await?;
             break; // Exit the loop
         }
@@ -750,6 +840,8 @@ pub async fn run_cli_interactive(
         let rest_api_shutdown_tx_opt_clone = Arc::clone(&rest_api_shutdown_tx_opt);
         let rest_api_port_arc_clone = Arc::clone(&rest_api_port_arc);
         let rest_api_handle_clone = Arc::clone(&rest_api_handle);
+        let storage_daemon_shutdown_tx_opt_clone = Arc::clone(&storage_daemon_shutdown_tx_opt); // Clone new storage state
+        let storage_daemon_handle_clone = Arc::clone(&storage_daemon_handle);            // Clone new storage state
 
         // Dispatch the command to the interactive command handler
         handle_interactive_command(
@@ -758,6 +850,8 @@ pub async fn run_cli_interactive(
             rest_api_shutdown_tx_opt_clone,
             rest_api_port_arc_clone,
             rest_api_handle_clone,
+            storage_daemon_shutdown_tx_opt_clone, // Pass new storage state
+            storage_daemon_handle_clone,            // Pass new storage state
         ).await?;
     }
 
@@ -769,6 +863,13 @@ pub async fn run_cli_interactive(
         rest_api_shutdown_tx_opt.clone(),
         rest_api_port_arc.clone(),
         rest_api_handle.clone(),
+    ).await?;
+
+    // Stop Storage daemon if it was started by this CLI
+    handlers::stop_storage_interactive(
+        None, // No specific port, will check managed one
+        storage_daemon_shutdown_tx_opt.clone(), // Pass new storage state
+        storage_daemon_handle.clone(),            // Pass new storage state
     ).await?;
 
     // Stop all managed daemons
@@ -794,6 +895,9 @@ pub async fn handle_interactive_command(
     rest_api_shutdown_tx_opt: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     rest_api_port_arc: Arc<Mutex<Option<u16>>>,
     rest_api_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    // New parameters for Storage daemon management
+    storage_daemon_shutdown_tx_opt: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    storage_daemon_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 ) -> Result<()> {
     match command {
         CommandType::Daemon(daemon_cmd) => {
@@ -803,13 +907,13 @@ pub async fn handle_interactive_command(
             handlers::handle_rest_command_interactive(rest_cmd, rest_api_shutdown_tx_opt, rest_api_port_arc, rest_api_handle).await?;
         }
         CommandType::Storage(storage_action) => {
-            handlers::handle_storage_command_interactive(storage_action).await?;
+            handlers::handle_storage_command_interactive(storage_action, storage_daemon_shutdown_tx_opt.clone(), storage_daemon_handle.clone()).await?;
         }
         CommandType::StartRest { port, listen_port } => {
             handlers::start_rest_api_interactive(port, listen_port, rest_api_shutdown_tx_opt, rest_api_port_arc, rest_api_handle).await?;
         }
         CommandType::StartStorage { port, config_file } => {
-            handlers::start_storage_interactive(port, config_file).await?;
+            handlers::start_storage_interactive(port, config_file, storage_daemon_shutdown_tx_opt, storage_daemon_handle).await?;
         }
         CommandType::StartDaemon { port, cluster } => { // New handler for 'start daemon'
             handlers::start_daemon_instance_interactive(port, cluster, daemon_handles).await?;
@@ -817,7 +921,8 @@ pub async fn handle_interactive_command(
         CommandType::StartAll { port, cluster, listen_port, storage_port, storage_config_file } => { // New handler for 'start all'
             handlers::handle_start_all_interactive(
                 port, cluster, listen_port, storage_port, storage_config_file,
-                daemon_handles, rest_api_shutdown_tx_opt, rest_api_port_arc, rest_api_handle
+                daemon_handles, rest_api_shutdown_tx_opt, rest_api_port_arc, rest_api_handle,
+                storage_daemon_shutdown_tx_opt, storage_daemon_handle,
             ).await?;
         }
         CommandType::StopAll => {
@@ -826,6 +931,8 @@ pub async fn handle_interactive_command(
                 rest_api_shutdown_tx_opt,
                 rest_api_port_arc,
                 rest_api_handle,
+                storage_daemon_shutdown_tx_opt.clone(), // Pass new storage state
+                storage_daemon_handle.clone(),            // Pass new storage state
             ).await?;
         }
         CommandType::StopRest => {
@@ -835,13 +942,15 @@ pub async fn handle_interactive_command(
             handlers::stop_daemon_instance_interactive(port, daemon_handles).await?;
         }
         CommandType::StopStorage(port) => {
-            handlers::stop_storage_interactive(port).await?;
+            handlers::stop_storage_interactive(port, storage_daemon_shutdown_tx_opt.clone(), storage_daemon_handle.clone()).await?;
         }
         CommandType::StatusSummary => {
-            handlers::display_full_status_summary().await;
+            // FIX: Pass rest_api_port_arc.clone() to display_full_status_summary
+            handlers::display_full_status_summary(rest_api_port_arc.clone()).await;
         }
         CommandType::StatusRest => {
-            handlers::display_rest_api_status().await;
+            // FIX: Pass rest_api_port_arc.clone() to display_rest_api_status
+            handlers::display_rest_api_status(rest_api_port_arc.clone()).await;
         }
         CommandType::StatusDaemon(port) => {
             handlers::display_daemon_status(port).await;
@@ -873,6 +982,8 @@ pub async fn handle_interactive_command(
                 rest_api_shutdown_tx_opt,
                 rest_api_port_arc,
                 rest_api_handle,
+                storage_daemon_shutdown_tx_opt.clone(), // Pass new storage state
+                storage_daemon_handle.clone(),            // Pass new storage state
             ).await?;
         }
         CommandType::ReloadRest => { // Added
@@ -883,13 +994,30 @@ pub async fn handle_interactive_command(
             ).await?;
         }
         CommandType::ReloadStorage => { // Added
-            handlers::reload_storage_interactive().await?;
+            handlers::reload_storage_interactive(storage_daemon_shutdown_tx_opt.clone(), storage_daemon_handle.clone()).await?;
         }
         CommandType::ReloadDaemon(port) => { // Added
             handlers::reload_daemon_interactive(port).await?;
         }
         CommandType::ReloadCluster => { // Added
             handlers::reload_cluster_interactive().await?;
+        }
+        CommandType::RestartAll { port, cluster, listen_port, storage_port, storage_config_file } => { // Added
+            // FIX: Corrected argument passing to match RestartArgs struct structure
+            let restart_args = RestartArgs {
+                action: Some(RestartAction::All { // Wrap arguments in Option::Some
+                    port,
+                    cluster,
+                    listen_port,
+                    storage_port,
+                    storage_config_file,
+                }),
+            };
+            handlers::handle_restart_command_interactive(
+                restart_args, // Pass the struct
+                daemon_handles, rest_api_shutdown_tx_opt, rest_api_port_arc, rest_api_handle,
+                storage_daemon_shutdown_tx_opt, storage_daemon_handle,
+            ).await?;
         }
         CommandType::Clear => { // Handle clear/clean command
             handlers::clear_terminal_screen().await?;

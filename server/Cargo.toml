@@ -62,7 +62,7 @@ toml = "0.8.23"
 clap = { version = "4.5.29", features = ["derive"] }
 rustyline = "16.0.0"
 strsim = "0.11.1" # Added for string similarity calculations
-
+uuid = { version = "1.3.1", features = ["serde", "v4", "v1", "rng"] } # Consistent
 # Consolidated path dependencies with their features and versions
 storage_daemon_server = { path = "../storage_daemon_server", version = "0.1.0" }
 lib = { path = "../lib", version = "0.1.0", features = ["sled-datastore"] }

@@ -1,49 +1,68 @@
 // server/src/cli/mod.rs
 
-// This file declares the modules within the 'cli' directory and re-exports
-// common types and functions for easier access from other parts of the crate.
+// This module contains the command-line interface (CLI) logic for the GraphDB server.
+// It includes argument parsing, command handling, and interactive mode.
 
-pub mod cli; // Declare cli.rs as a submodule
+pub mod cli;
 pub mod commands;
-pub mod handlers;
-pub mod interactive;
 pub mod config;
 pub mod daemon_management;
-pub mod help_display; // Declare the new help_display module
+pub mod handlers;
+pub mod help_display;
+pub mod interactive;
 
-// Re-export necessary types and functions from sub-modules
-// These re-exports allow other modules (including cli.rs) to access items
-// without needing verbose paths (e.g., `use crate::cli::commands::CliArgs;`
-// can become `use crate::cli::CliArgs;` if re-exported here).
+// Re-export the main CLI entry point from cli.rs
+pub use cli::{start_cli, CliArgs, Commands}; // Corrected: Changed run_cli to start_cli
 
-pub use cli::{start_cli}; // Re-export the main CLI entry point from cli.rs
+// Re-export specific types/functions from other modules if they are part of the public CLI API
 pub use commands::{
-    CliArgs, GraphDbCommands, DaemonCliCommand, RestCliCommand, StorageAction,
-    StatusAction, StopAction, StatusArgs, StopArgs, // Removed HelpArgs from here
-    DaemonData, KVPair, PidStore,
+    DaemonCliCommand,
+    RestCliCommand,
+    StorageAction,
+    StatusArgs,
+    StopArgs,
+    ReloadArgs,
+    RestartArgs,
+    StartAction,
+    StopAction,
+    ReloadAction,
+    RestartAction,
+    StatusAction,
 };
 pub use handlers::{
-    display_rest_api_status, display_daemon_status, display_storage_daemon_status,
-    display_full_status_summary, stop_process_by_port, check_process_status_by_port,
-    print_welcome_screen,
+    handle_daemon_command,
+    handle_rest_command,
+    handle_storage_command,
+    handle_status_command,
+    handle_stop_command,
+    handle_start_command,
+    handle_reload_command,
+    handle_restart_command_interactive, // FIX: Changed to handle_restart_command_interactive
 };
 pub use interactive::{
-    parse_command, print_interactive_help, print_interactive_filtered_help, CommandType,
-    run_cli_interactive, handle_interactive_command,
+    run_cli_interactive,
+    print_interactive_help,
+    print_interactive_filtered_help,
+};
+pub use help_display::{
+    print_help_clap_generated,
+    print_filtered_help_clap_generated,
+    collect_all_cli_elements_for_suggestions,
 };
 pub use config::{
-    load_cli_config, load_storage_config, StorageConfig, StorageEngineType,
+    load_cli_config,
+    load_storage_config,
+    CliConfig,
+    ServerConfig,
+    StorageConfig,
+    StorageEngineType,
     CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS,
+    get_default_rest_port_from_config,
 };
 pub use daemon_management::{
-    find_running_storage_daemon_port, start_daemon_process, stop_daemon_api_call,
-    handle_internal_daemon_run,
+    start_daemon_process,
+    stop_daemon_api_call,
+    find_running_storage_daemon_port,
+    clear_all_daemon_processes,
 };
-pub use help_display::{print_help_clap_generated, print_filtered_help_clap_generated, HelpArgs}; // Corrected: Re-export HelpArgs from help_display
-
-// Lazy static for shared memory keys (if still needed globally across daemons)
-// Keeping it here for now as it's a global state that might be accessed by various parts.
-lazy_static::lazy_static! {
-    pub static ref SHARED_MEMORY_KEYS: tokio::sync::Mutex<std::collections::HashSet<i32>> = tokio::sync::Mutex::new(std::collections::HashSet::new());
-}
 
