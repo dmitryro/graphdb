@@ -12,4 +12,11 @@ daemonize = "0.5.0" # Consistent
 daemon = { path = "../daemon" }
 config = "0.15.8" # Consistent
 lazy_static = "1.5.0" # Aligned with lib
+clap = { version = "4.5.29", features = ["derive"] } # Added clap
+anyhow = "1.0.98" # Added anyhow for FromStr error type
+reqwest = { version = "0.12.22", features = ["json"] } # Added with json feature
+thiserror = "2.0.12" # Consistent
 tokio = { version = "1.44.2", features = ["net", "time"] } # Updated to latest stable, retaining specific features
+lib = { path = "../lib" }
+
+

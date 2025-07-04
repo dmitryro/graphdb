@@ -1,6 +1,7 @@
 // daemon_api/src/lib.rs
 use serde::{Serialize, Deserialize};
-use std::process::{Command, Stdio};
+// Changed to tokio::process::Command where .await is used
+use tokio::process::Command; 
 use std::sync::{Arc, Mutex};
 use std::fs::{self, File};
 use std::path::Path;
@@ -13,6 +14,20 @@ use regex::Regex;
 use std::net::ToSocketAddrs;
 use tokio::net::TcpStream; // Use tokio's TcpStream for async connect
 use tokio::time::{sleep, Duration}; // Use tokio's sleep for async delays
+use anyhow::Result; // Use anyhow::Result for consistent error handling
+use std::process::Stdio; // FIX: Added to bring Stdio into scope
+
+// Public modules for shared CLI schema and help generation
+pub mod cli_schema;
+pub mod help_generator;
+
+// Re-export common types and functions for easier access
+pub use cli_schema::{CliArgs, GraphDbCommands, DaemonCliCommand, RestCliCommand, StorageAction, StatusArgs, StopArgs, StopAction, StatusAction, HelpArgs};
+pub use lib::storage_engine::config::StorageEngineType;
+pub use help_generator::{generate_full_help, generate_help_for_path};
+
+// Shared constant for the assumed default storage daemon port used by CLI status and REST API
+pub const CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS: u16 = 8085;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct DaemonData {
@@ -32,39 +47,39 @@ fn remove_pid_file(pid_file_path: &str) {
 }
 
 fn cleanup_existing_daemons(base_process_name: &str) {
-    let _ = Command::new("pkill")
+    let _ = std::process::Command::new("pkill") // Use std::process::Command here as it's not awaited
         .arg("-f")
         .arg(base_process_name)
         .status();
     std::thread::sleep(std::time::Duration::from_millis(1000)); // This is blocking, but for cleanup it might be acceptable.
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)] // Use thiserror for better error handling integration
 pub enum DaemonError {
-    Daemonize(DaemonizeError),
+    #[error("Daemonize error: {0}")]
+    Daemonize(String), // FIX: Changed to String as DaemonizeError doesn't implement std::error::Error
+    #[error("Invalid port range: {0}")]
     InvalidPortRange(String),
+    #[error("Invalid cluster format: {0}")]
     InvalidClusterFormat(String),
+    #[error("No daemons started")]
     NoDaemonsStarted,
-    Io(std::io::Error),
-    Config(config::ConfigError),
-    // ADDED THESE VARIANTS
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("Config error: {0}")]
+    Config(#[from] config::ConfigError),
+    #[error("Process error: {0}")]
     ProcessError(String),
+    #[error("General error: {0}")]
     GeneralError(String),
+    #[error("Reqwest error: {0}")] // Added for potential HTTP client calls, although not used here yet
+    Reqwest(#[from] reqwest::Error), // Ensure reqwest is in Cargo.toml if this is enabled
 }
 
+// FIX: Manual From implementation for DaemonizeError
 impl From<DaemonizeError> for DaemonError {
     fn from(err: DaemonizeError) -> Self {
-        DaemonError::Daemonize(err)
-    }
-}
-impl From<std::io::Error> for DaemonError {
-    fn from(err: std::io::Error) -> Self {
-        DaemonError::Io(err)
-    }
-}
-impl From<config::ConfigError> for DaemonError {
-    fn from(err: config::ConfigError) -> Self {
-        DaemonError::Config(err)
+        DaemonError::Daemonize(format!("{}", err))
     }
 }
 
@@ -177,7 +192,7 @@ pub async fn start_daemon(port: Option<u16>, cluster_range: Option<String>, skip
                 }
             }
             Err(e) => {
-                return Err(DaemonError::Daemonize(e));
+                return Err(e.into()); // FIX: Use .into() to leverage the From implementation
             }
         }
     }
@@ -225,7 +240,7 @@ pub fn stop_port_daemon(port: u16) -> Result<(), DaemonError> {
     // Example: `graphdb --port 8080`
     let pgrep_arg = format!("graphdb --port {}", port); // Adjust this regex if your daemon uses a different argument structure
 
-    let pgrep_result = Command::new("pgrep")
+    let pgrep_result = std::process::Command::new("pgrep") // Use std::process::Command here
         .arg("-f")
         .arg(&pgrep_arg)
         .stdout(Stdio::piped())
@@ -285,7 +300,7 @@ pub fn stop_daemon() -> Result<(), DaemonError> {
 
     println!("Attempting to stop all 'graphdb' related daemon instances...");
 
-    let pgrep_result = Command::new("pgrep")
+    let pgrep_result = std::process::Command::new("pgrep") // Use std::process::Command here
         .arg("-f")
         .arg("graphdb")
         .stdout(Stdio::piped())
@@ -303,7 +318,7 @@ pub fn stop_daemon() -> Result<(), DaemonError> {
 
             if !pids.is_empty() {
                 for pid in pids {
-                    let comm_output = Command::new("ps")
+                    let comm_output = std::process::Command::new("ps") // Use std::process::Command here
                         .arg("-o")
                         .arg("comm=")
                         .arg(format!("{}", pid))
@@ -343,7 +358,7 @@ pub fn stop_daemon() -> Result<(), DaemonError> {
     let base_pid_file_path = "/tmp/graphdb-cli.pid";
     remove_pid_file(base_pid_file_path);
 
-    for port in 8000..=9010 {
+    for port in 8000..=9010 { // Iterate over a common range of daemon ports to cleanup PID files
         let port_pid_file = format!("/tmp/daemon-{}.pid", port);
         remove_pid_file(&port_pid_file);
     }
@@ -355,3 +370,78 @@ pub fn stop_daemon() -> Result<(), DaemonError> {
         Ok(()) // Not an error if nothing stopped
     }
 }
+
+/// Finds the running storage daemon port by checking common PID file locations
+/// or by listing processes.
+pub async fn find_running_storage_daemon_port() -> Option<u16> {
+    // 1. Check for the default storage daemon PID file
+    let default_pid_file = format!("/tmp/daemon-{}.pid", CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS);
+    if Path::new(&default_pid_file).exists() {
+        if let Ok(pid_str) = fs::read_to_string(&default_pid_file) {
+            if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                // Check if the process with this PID is actually running
+                // SIGCONT just checks if the process exists without killing it
+                if kill(Pid::from_raw(pid), Signal::SIGCONT).is_ok() {
+                    println!("[daemon_api] Found storage daemon PID {} in {}. Assumed running on port {}", pid, default_pid_file, CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS);
+                    return Some(CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS);
+                } else {
+                    println!("[daemon_api] PID {} in {} is stale. Removing file.", pid, default_pid_file);
+                    remove_pid_file(&default_pid_file);
+                }
+            }
+        }
+    }
+
+    // 2. Fallback: Search for "storage_daemon_server" process using lsof
+    // This is more precise than pgrep -f for finding processes by port.
+    let common_storage_ports = [CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS, 8086, 8087]; // Add other common storage daemon ports if any
+    for &port in &common_storage_ports {
+        let output = Command::new("lsof") // Use tokio::process::Command here
+            .arg("-i")
+            .arg(format!(":{}", port))
+            .arg("-t") // Only print PIDs
+            .output()
+            .await; // .await is now valid
+
+        if let Ok(output) = output {
+            let pids = String::from_utf8_lossy(&output.stdout);
+            if !pids.trim().is_empty() {
+                // Found a PID listening on this port. Assume it's the storage daemon.
+                // This is a heuristic; a more robust solution would involve PID files or health checks.
+                return Some(port);
+            }
+        }
+    }
+    
+    // As a last resort, check for the process name directly (less reliable for port determination)
+    let pgrep_result = std::process::Command::new("pgrep") // Use std::process::Command here
+        .arg("-f")
+        .arg("storage_daemon_server") // Assuming the storage daemon executable is named this
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|child| child.wait_with_output());
+
+    if let Ok(output) = pgrep_result {
+        let pids_str = String::from_utf8_lossy(&output.stdout);
+        let pids: Vec<u32> = pids_str.lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .collect();
+        if !pids.is_empty() {
+            println!("[daemon_api] Found storage daemon by process name. Cannot determine port reliably, returning default.");
+            // If we found it by name but not by port, we can't reliably say which port.
+            // For now, return the default.
+            return Some(CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS);
+        }
+    }
+
+    None
+}
+
+/// A wrapper function that simply calls the existing `stop_daemon` logic.
+/// This matches the previous mock's signature.
+pub fn stop_daemon_api_call() -> Result<(), anyhow::Error> {
+    // The existing stop_daemon returns Result<(), DaemonError>, convert to anyhow::Result
+    stop_daemon().map_err(|e| anyhow::anyhow!("Daemon stop failed: {}", e))
+}
+

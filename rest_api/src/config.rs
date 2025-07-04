@@ -1,49 +1,43 @@
-// server/src/cli/config.rs
-
-// This file handles loading CLI and Storage daemon configurations.
+// rest_api/src/config.rs
 
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use anyhow::{Context, Result};
-use std::str::FromStr; // Required for FromStr trait implementation
-use serde_yaml2; // <--- Add this import
-
+use std::str::FromStr; // Required for FromStr trait
+use serde_yaml2; // FIX: Use serde_yaml2
 
 // CLI's assumed default storage port. This is used for consistency in stop/status commands.
 // The actual daemon port is determined by the daemon itself based on CLI arguments or its own config file.
 pub const CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS: u16 = 8085;
 
-/// Represents the top-level structure of the CLI configuration file (e.g., config.toml).
+/// Represents the configuration for the REST API server itself.
 #[derive(Debug, Deserialize)]
-pub struct CliConfig {
-    pub server: ServerConfig,
+pub struct RestApiConfig {
+    pub port: u16,
+    pub host: String,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct ServerConfig {
-    pub port: Option<u16>,
-    pub host: Option<String>,
-}
+/// Loads the REST API configuration from `rest_api_config.toml` (or similar).
+/// For now, hardcode defaults as there's no explicit file.
+pub fn load_rest_api_config() -> Result<RestApiConfig> {
+    // In a real scenario, you'd load from a file like this:
+    // let config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rest_api_config.toml");
+    // let config_content = fs::read_to_string(&config_path)
+    //     .context(format!("Failed to read REST API config file: {}", config_path.display()))?;
+    // let config: RestApiConfig = toml::from_str(&config_content)
+    //     .context("Failed to parse REST API config file")?;
+    // Ok(config)
 
-/// Loads the CLI configuration from `server/src/cli/config.toml`.
-pub fn load_cli_config() -> Result<CliConfig> {
-    let config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("src")
-        .join("cli")
-        .join("config.toml");
-
-    let config_content = fs::read_to_string(&config_path)
-        .context(format!("Failed to read CLI config file: {}", config_path.display()))?;
-
-    let config: CliConfig = toml::from_str(&config_content)
-        .context("Failed to parse CLI config file")?;
-
-    Ok(config)
+    // For now, return a default configuration if no file is specified or found.
+    Ok(RestApiConfig {
+        port: 8082, // Default REST API port
+        host: "127.0.0.1".to_string(),
+    })
 }
 
 /// Define the StorageConfig struct to mirror the content under 'storage:' in storage_config.yaml.
-#[derive(Debug, Deserialize, Serialize, Clone)] // Added Clone for passing to daemonized process
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct StorageConfig {
     pub data_directory: String,
     pub log_directory: String,
@@ -74,16 +68,10 @@ pub fn load_storage_config(config_file_path: Option<PathBuf>) -> Result<StorageC
     let config_content = fs::read_to_string(&path_to_use)
         .map_err(|e| anyhow::anyhow!("Failed to read storage config file {}: {}", path_to_use.display(), e))?;
 
-    // Change from serde_yaml::from_str to serde_yaml2::from_str
-    let wrapper: StorageConfigWrapper = serde_yaml2::from_str(&config_content) // <--- Changed here
+    let wrapper: StorageConfigWrapper = serde_yaml2::from_str(&config_content) // FIX: Use serde_yaml2::from_str
         .map_err(|e| anyhow::anyhow!("Failed to parse storage config file {}: {}", path_to_use.display(), e))?;
 
     Ok(wrapper.storage)
-}
-
-/// Function to get default REST API port from config
-pub fn get_default_rest_port_from_config() -> u16 {
-    8082 // Default REST API port
 }
 
 /// Enum for different storage engine types.
@@ -114,3 +102,4 @@ impl ToString for StorageEngineType {
         }
     }
 }
+

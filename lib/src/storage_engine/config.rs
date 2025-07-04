@@ -1,9 +1,10 @@
 // lib/src/storage_engine/config.rs
 
 use serde::{Serialize, Deserialize};
+use clap::ValueEnum; // <--- Add this line
 
 /// Enum to specify the type of storage engine to use.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ValueEnum)] // <--- Add ValueEnum here
 pub enum StorageEngineType {
     Sled,
     RocksDB,
@@ -36,4 +37,3 @@ impl Default for StorageConfig {
         }
     }
 }
-

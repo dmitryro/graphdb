@@ -137,4 +137,3 @@ pub fn stop_daemon_api_call() -> Result<(), anyhow::Error> {
     // Changed formatting from {} to {:?} for DaemonError as it doesn't implement Display
     stop_daemon().map_err(|e| anyhow::anyhow!("Daemon API error: {:?}", e)) 
 }
-
