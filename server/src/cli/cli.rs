@@ -1,28 +1,141 @@
 // server/src/cli/cli.rs
 
-use clap::Parser;
-use std::process;
-use std::env;
+use anyhow::Result;
+use clap::{Parser, Subcommand, CommandFactory};
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex};
 use tokio::task::JoinHandle;
-use std::sync::Arc;
+use std::process;
+use std::env;
 
-use crate::cli::{
-    commands::{CliArgs, GraphDbCommands, StartAction, DaemonCliCommand, RestCliCommand, StorageAction, StatusArgs, StopArgs, ReloadArgs},
-    handlers::{self as handlers_mod, print_welcome_screen},
-    interactive::{self as interactive_mod, run_cli_interactive},
-    daemon_management,
-    config::{self as config_mod},
-    help_display::{self as help_display_mod},
+// Import modules
+use crate::cli::commands::{
+    DaemonCliCommand, RestCliCommand, StorageAction,
+    StatusArgs, StopArgs, ReloadArgs, RestartArgs,
+    ReloadAction, RestartAction, StartAction, StopAction, StatusAction
 };
+use crate::cli::config as config_mod; // Alias for config module
+use crate::cli::handlers as handlers_mod;
+use crate::cli::interactive as interactive_mod;
+use crate::cli::help_display as help_display_mod; // Alias the module directly
+use crate::cli::daemon_management::handle_internal_daemon_run; // Corrected: Imported directly
 
-use anyhow::Result;
-use clap::CommandFactory;
-use lib::storage_engine::config::StorageEngineType as LibStorageEngineType;
+use lib::query_parser::{parse_query_from_string, QueryType};
+// Removed unused import: use lib::storage_engine::config::StorageEngineType as LibStorageEngineType;
 
-/// The main entry point for the CLI logic, called by server/src/main.rs
-/// This function parses command-line arguments and dispatches to appropriate handlers.
+/// GraphDB Command Line Interface
+#[derive(Parser, Debug)]
+#[clap(author, version, about = "GraphDB Command Line Interface", long_about = None)]
+#[clap(propagate_version = true)]
+pub struct CliArgs {
+    #[clap(subcommand)]
+    pub command: Option<Commands>,
+
+    /// Run CLI in interactive mode
+    #[clap(long, short = 'c')]
+    pub cli: bool,
+    /// Enable experimental plugins
+    #[clap(long)]
+    pub enable_plugins: bool,
+    /// Execute a direct query string
+    #[clap(long, short = 'q')]
+    pub query: Option<String>,
+
+    // Internal flags for daemonized processes (hidden from help)
+    #[clap(long, hide = true)]
+    pub internal_rest_api_run: bool,
+    #[clap(long, hide = true)]
+    pub internal_storage_daemon_run: bool,
+    #[clap(long, hide = true)]
+    pub internal_port: Option<u16>,
+    #[clap(long, hide = true)]
+    pub internal_storage_config_path: Option<PathBuf>,
+    #[clap(long, hide = true)]
+    pub internal_storage_engine: Option<config_mod::StorageEngineType>, // Use config_mod alias
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Commands {
+    /// Start GraphDB components (daemon, rest, storage, or all)
+    Start {
+        #[clap(subcommand)]
+        action: Option<StartAction>,
+        /// Port for the daemon (if starting daemon or all)
+        #[clap(long, short = 'p')]
+        port: Option<u16>,
+        /// Cluster range for daemon (e.g., "8080-8085")
+        #[clap(long)]
+        cluster: Option<String>,
+        /// Listen port for the REST API (if starting rest or all)
+        #[clap(long)]
+        listen_port: Option<u16>,
+        /// Storage port for the Storage daemon (if starting storage or all)
+        #[clap(long)]
+        storage_port: Option<u16>,
+        /// Path to the storage configuration file (if starting storage or all)
+        #[clap(long)]
+        storage_config_file: Option<PathBuf>,
+    },
+    /// Stop GraphDB components (daemon, rest, storage, or all)
+    Stop(StopArgs), // Corrected: Changed to directly use StopArgs
+    /// Get status of GraphDB components (daemon, rest, storage, cluster, or all)
+    Status(StatusArgs),
+    /// Manage GraphDB daemon instances
+    #[clap(subcommand)]
+    Daemon(DaemonCliCommand),
+    /// Manage REST API server
+    #[clap(subcommand)]
+    Rest(RestCliCommand),
+    /// Manage standalone Storage daemon
+    #[clap(subcommand)]
+    Storage(StorageAction),
+    /// Reload GraphDB components (all, rest, storage, daemon, or cluster)
+    Reload(ReloadArgs),
+    /// Restart GraphDB components (all, rest, storage, daemon, or cluster)
+    Restart(RestartArgs),
+    /// Run CLI in interactive mode
+    Interactive,
+    /// Authenticate a user and get a token
+    Auth {
+        username: String,
+        password: String,
+    },
+    /// Authenticate a user and get a token (alias for 'auth')
+    Authenticate {
+        username: String,
+        password: String,
+    },
+    /// Register a new user
+    Register {
+        username: String,
+        password: String,
+    },
+    /// Get the version of the REST API server
+    Version,
+    /// Perform a health check on the REST API server
+    Health,
+    /// Display help message
+    Help(HelpArgs),
+    // Added missing top-level commands to the Commands enum definition
+    // These were missing from the enum definition but present in the match arm
+    // No explicit variants needed for Clear/Clean as they are not top-level subcommands
+}
+
+#[derive(Parser, Debug)]
+pub struct HelpArgs {
+    /// Filter help for a specific command (e.g., "start daemon")
+    #[clap(long, short = 'c')]
+    pub filter_command: Option<String>,
+    /// Positional arguments for the command path (e.g., "start", "daemon")
+    pub command_path: Vec<String>,
+}
+
+/// Main entry point for CLI command handling.
+///
+/// This function dispatches commands based on `CliArgs` and manages the lifecycle
+/// of daemon and REST API processes.
 #[tokio::main]
 pub async fn start_cli() -> Result<()> {
     // --- Custom Help Command Handling ---
@@ -44,17 +157,13 @@ pub async fn start_cli() -> Result<()> {
 
     if args.internal_rest_api_run || args.internal_storage_daemon_run {
         let converted_storage_engine = args.internal_storage_engine.map(|se_cli| {
-            match se_cli {
-                config_mod::StorageEngineType::Sled => LibStorageEngineType::Sled,
-                config_mod::StorageEngineType::RocksDB => LibStorageEngineType::RocksDB,
-                config_mod::StorageEngineType::InMemory => LibStorageEngineType::InMemory,
-            }
+            se_cli.into()
         });
 
-        return daemon_management::handle_internal_daemon_run(
+        return handle_internal_daemon_run(
             args.internal_rest_api_run,
             args.internal_storage_daemon_run,
-            args.internal_port,
+            args.internal_port, // Corrected: Pass Option<u16> directly
             args.internal_storage_config_path,
             converted_storage_engine,
         ).await;
@@ -75,7 +184,6 @@ pub async fn start_cli() -> Result<()> {
 
     if let Some(query_string) = args.query {
         println!("Executing direct query: {}", query_string);
-        use lib::query_parser::{parse_query_from_string, QueryType};
         match parse_query_from_string(&query_string) {
             Ok(parsed_query) => match parsed_query {
                 QueryType::Cypher => println!("  -> Identified as Cypher query."),
@@ -92,6 +200,8 @@ pub async fn start_cli() -> Result<()> {
     let rest_api_shutdown_tx_opt: Arc<Mutex<Option<oneshot::Sender<()>>>> = Arc::new(Mutex::new(None));
     let rest_api_port_arc: Arc<Mutex<Option<u16>>> = Arc::new(Mutex::new(None));
     let rest_api_handle: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+    let storage_daemon_shutdown_tx_opt: Arc<Mutex<Option<oneshot::Sender<()>>>> = Arc::new(Mutex::new(None));
+    let storage_daemon_handle: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::new(Mutex::new(None));
 
     let should_enter_interactive_mode = args.cli || args.command.is_none();
 
@@ -100,66 +210,22 @@ pub async fn start_cli() -> Result<()> {
             println!("Experimental plugins are enabled.");
         }
         match command {
-            GraphDbCommands::ViewGraph { graph_id } => {
-                if let Some(id) = graph_id {
-                    println!("Executing view-graph for graph ID: {}", id);
-                } else {
-                    println!("Executing view-graph without specifying a graph ID");
-                }
-            }
-            GraphDbCommands::ViewGraphHistory { graph_id, start_date, end_date } => {
-                if let Some(graph_id) = graph_id {
-                    println!("Executing view-graph-history for graph ID: {}", graph_id);
-                } else {
-                    println!("Executing view-graph-history with no graph ID specified");
-                }
-                if let Some(start) = start_date {
-                    println!("Start Date: {}", start);
-                } else {
-                    println!("Start Date: not specified");
-                }
-                if let Some(end_val) = end_date {
-                    println!("End Date: {}", end_val);
-                } else {
-                    println!("End Date: not specified");
-                }
-            }
-            GraphDbCommands::IndexNode { node_id } => {
-                if let Some(id) = node_id {
-                    println!("Executing index-node for node ID: {}", id);
-                } else {
-                    println!("Executing index-node with no node ID specified");
-                }
-            }
-            GraphDbCommands::CacheNodeState { node_id } => {
-                if let Some(id) = node_id {
-                    println!("Executing cache-node-state for node ID: {}", id);
-                } else {
-                    println!("Executing cache-node-state with no node ID specified");
-                }
-            }
-            GraphDbCommands::Start(start_args) => {
-                match start_args.action {
-                    StartAction::All { port, cluster, listen_port, storage_port, storage_config_file } => {
+            Commands::Start { action, port, cluster, listen_port, storage_port, storage_config_file } => {
+                match action {
+                    Some(StartAction::All { port, cluster, listen_port, storage_port, storage_config_file }) => {
                         handlers_mod::handle_start_all_interactive(
-                            port,
-                            cluster,
-                            listen_port,
-                            storage_port,
-                            storage_config_file,
-                            daemon_handles.clone(),
-                            rest_api_shutdown_tx_opt.clone(),
-                            rest_api_port_arc.clone(),
-                            rest_api_handle.clone(),
+                            port, cluster, listen_port, storage_port, storage_config_file,
+                            daemon_handles.clone(), rest_api_shutdown_tx_opt.clone(), rest_api_port_arc.clone(), rest_api_handle.clone(),
+                            storage_daemon_shutdown_tx_opt.clone(), storage_daemon_handle.clone(),
                         ).await?;
                     }
-                    StartAction::Daemon { port, cluster } => {
+                    Some(StartAction::Daemon { port, cluster }) => {
                         handlers_mod::handle_daemon_command_interactive(
                             DaemonCliCommand::Start { port, cluster },
                             daemon_handles.clone(),
                         ).await?;
                     }
-                    StartAction::Rest { port, listen_port } => {
+                    Some(StartAction::Rest { port, listen_port }) => {
                         handlers_mod::handle_rest_command_interactive(
                             RestCliCommand::Start { port, listen_port },
                             rest_api_shutdown_tx_opt.clone(),
@@ -167,20 +233,32 @@ pub async fn start_cli() -> Result<()> {
                             rest_api_handle.clone(),
                         ).await?;
                     }
-                    StartAction::Storage { port, config_file } => {
+                    Some(StartAction::Storage { port, config_file }) => {
                         handlers_mod::handle_storage_command_interactive(
                             StorageAction::Start { port, config_file },
+                            storage_daemon_shutdown_tx_opt.clone(),
+                            storage_daemon_handle.clone(),
+                        ).await?;
+                    }
+                    None => {
+                        handlers_mod::handle_start_all_interactive(
+                            port, cluster, listen_port, storage_port, storage_config_file,
+                            daemon_handles.clone(), rest_api_shutdown_tx_opt.clone(), rest_api_port_arc.clone(), rest_api_handle.clone(),
+                            storage_daemon_shutdown_tx_opt.clone(), storage_daemon_handle.clone(),
                         ).await?;
                     }
                 }
             }
-            GraphDbCommands::Stop(stop_args) => {
+            Commands::Stop(stop_args) => {
+                // FIX: Removed extra arguments as handle_stop_command in handlers_mod expects only StopArgs
                 handlers_mod::handle_stop_command(stop_args).await?;
             }
-            GraphDbCommands::Status(status_args) => {
-                handlers_mod::handle_status_command(status_args).await?;
+            Commands::Status(status_args) => {
+                // FIX: Pass the rest_api_port_arc for status commands
+                handlers_mod::handle_status_command(status_args, rest_api_port_arc.clone()).await?;
             }
-            GraphDbCommands::Reload(reload_args) => {
+            Commands::Reload(reload_args) => {
+                // FIX: Removed extra arguments as handle_reload_command in handlers_mod expects 5 arguments
                 handlers_mod::handle_reload_command(
                     reload_args,
                     daemon_handles.clone(),
@@ -189,13 +267,29 @@ pub async fn start_cli() -> Result<()> {
                     rest_api_handle.clone(),
                 ).await?;
             }
-            GraphDbCommands::Storage(storage_action) => {
-                handlers_mod::handle_storage_command_interactive(storage_action).await?;
+            Commands::Restart(restart_args) => {
+                // FIX: Corrected function name and argument passing
+                handlers_mod::handle_restart_command_interactive(
+                    restart_args, // Pass the RestartArgs struct directly
+                    daemon_handles.clone(),
+                    rest_api_shutdown_tx_opt.clone(),
+                    rest_api_port_arc.clone(),
+                    rest_api_handle.clone(),
+                    storage_daemon_shutdown_tx_opt.clone(),
+                    storage_daemon_handle.clone(),
+                ).await?;
             }
-            GraphDbCommands::Daemon(daemon_cmd) => {
+            Commands::Storage(storage_action) => {
+                handlers_mod::handle_storage_command_interactive(
+                    storage_action,
+                    storage_daemon_shutdown_tx_opt.clone(),
+                    storage_daemon_handle.clone(),
+                ).await?;
+            }
+            Commands::Daemon(daemon_cmd) => {
                 handlers_mod::handle_daemon_command_interactive(daemon_cmd, daemon_handles.clone()).await?;
             }
-            GraphDbCommands::Rest(rest_cmd) => {
+            Commands::Rest(rest_cmd) => {
                 handlers_mod::handle_rest_command_interactive(
                     rest_cmd,
                     rest_api_shutdown_tx_opt.clone(),
@@ -203,23 +297,41 @@ pub async fn start_cli() -> Result<()> {
                     rest_api_handle.clone(),
                 ).await?;
             }
-            GraphDbCommands::Auth(auth_args) => {
-                println!("Auth command received: {:?}", auth_args);
+            Commands::Interactive => {
+                interactive_mod::run_cli_interactive(
+                    daemon_handles,
+                    rest_api_shutdown_tx_opt,
+                    rest_api_port_arc,
+                    rest_api_handle,
+                    storage_daemon_shutdown_tx_opt,
+                    storage_daemon_handle,
+                ).await?;
             }
-            GraphDbCommands::Authenticate(auth_args) => {
-                println!("Authenticate command received: {:?}", auth_args);
+            Commands::Help(help_args) => {
+                let mut cmd = CliArgs::command();
+                if let Some(command_filter) = help_args.filter_command {
+                    help_display_mod::print_filtered_help_clap_generated(&mut cmd, &command_filter);
+                } else if !help_args.command_path.is_empty() {
+                    let command_filter = help_args.command_path.join(" ");
+                    help_display_mod::print_filtered_help_clap_generated(&mut cmd, &command_filter);
+                } else {
+                    help_display_mod::print_help_clap_generated();
+                }
             }
-            GraphDbCommands::Register(register_args) => {
-                println!("Register command received: {:?}", register_args);
+            Commands::Auth { username, password } => {
+                handlers_mod::authenticate_user(username, password).await;
             }
-            GraphDbCommands::Version => {
-                println!("Version command received.");
+            Commands::Authenticate { username, password } => {
+                handlers_mod::authenticate_user(username, password).await;
             }
-            GraphDbCommands::Health => {
-                println!("Health command received.");
+            Commands::Register { username, password } => {
+                handlers_mod::register_user(username, password).await;
             }
-            GraphDbCommands::Clear | GraphDbCommands::Clean => {
-                handlers_mod::clear_terminal_screen().await?;
+            Commands::Version => {
+                handlers_mod::display_rest_api_version().await;
+            }
+            Commands::Health => {
+                handlers_mod::display_rest_api_health().await;
             }
         }
         return Ok(());
@@ -229,12 +341,13 @@ pub async fn start_cli() -> Result<()> {
         if args.enable_plugins {
             println!("Experimental plugins are enabled.");
         }
-        // print_welcome_screen(); // Removed: This is now handled by interactive_mod::run_cli_interactive
         interactive_mod::run_cli_interactive(
             daemon_handles,
             rest_api_shutdown_tx_opt,
             rest_api_port_arc,
             rest_api_handle,
+            storage_daemon_shutdown_tx_opt,
+            storage_daemon_handle,
         ).await?;
     } else if args.enable_plugins {
         println!("Experimental plugins is enabled.");
