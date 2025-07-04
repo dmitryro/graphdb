@@ -12,6 +12,8 @@ use tokio::sync::{oneshot, Mutex};
 use std::process; // For process::exit
 use std::path::PathBuf; // Added PathBuf import
 use clap::CommandFactory; // Added CommandFactory import
+use std::collections::HashSet; // Added for HashSet
+use strsim::jaro_winkler; // Added for jaro_winkler
 
 // Import necessary items from sibling modules
 use crate::cli::commands::{CliArgs, DaemonCliCommand, RestCliCommand, StorageAction};
@@ -19,7 +21,7 @@ use crate::cli::help_display::HelpArgs; // Corrected: Import HelpArgs from help_
 // Removed unused imports: use crate::cli::config::CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS;
 use crate::cli::handlers;
 use crate::cli::daemon_management::stop_daemon_api_call;
-use crate::cli::help_display; // Import the help_display module directly
+use crate::cli::help_display::{collect_all_cli_elements_for_suggestions, print_help_clap_generated, print_filtered_help_clap_generated}; // Imported functions
 
 /// Enum representing the parsed command type in interactive mode.
 #[derive(Debug, PartialEq)]
@@ -27,6 +29,9 @@ pub enum CommandType {
     Daemon(DaemonCliCommand),
     Rest(RestCliCommand),
     Storage(StorageAction),
+    // Added top-level Start command variants
+    StartRest { port: Option<u16>, listen_port: Option<u16> },
+    StartStorage { port: Option<u16>, config_file: Option<PathBuf> },
     StopAll,
     StopRest,
     StopDaemon(Option<u16>),
@@ -48,9 +53,86 @@ pub fn parse_command(input: &str) -> (CommandType, Vec<String>) {
     }
 
     let command_str = parts[0].to_lowercase();
-    let args: Vec<String> = parts[1..].iter().map(|&s| s.to_string()).collect();
+    let args: Vec<String> = parts[1..].iter().map(|&s| s.to_string()).collect(); // Removed mut as 'args' is not mutated after initialization
 
     let cmd_type = match command_str.as_str() {
+        "start" => {
+            if parts.len() > 1 {
+                match parts[1].to_lowercase().as_str() {
+                    "rest" => {
+                        let mut port_arg = None;
+                        let mut listen_port_arg = None;
+                        let mut i = 2; // Start parsing from the third part
+
+                        while i < parts.len() {
+                            match parts[i].to_lowercase().as_str() {
+                                "--port" => {
+                                    if i + 1 < parts.len() {
+                                        port_arg = parts[i + 1].parse::<u16>().ok();
+                                        i += 2;
+                                    } else {
+                                        eprintln!("Warning: Flag '{}' requires a value.", parts[i]); // Fixed: Added parts[i]
+                                        i += 1;
+                                    }
+                                }
+                                "--listen-port" => {
+                                    if i + 1 < parts.len() {
+                                        listen_port_arg = parts[i + 1].parse::<u16>().ok();
+                                        i += 2;
+                                    } else {
+                                        eprintln!("Warning: Flag '{}' requires a value.", parts[i]); // Fixed: Added parts[i]
+                                        i += 1;
+                                    }
+                                }
+                                _ => {
+                                    eprintln!("Warning: Unknown argument for 'start rest': {}", parts[i]);
+                                    i += 1;
+                                }
+                            }
+                        }
+                        CommandType::StartRest { port: port_arg, listen_port: listen_port_arg }
+                    },
+                    "storage" => {
+                        let mut port_arg = None;
+                        let mut config_file_arg = None;
+                        let mut i = 2; // Start parsing from the third part
+
+                        while i < parts.len() {
+                            match parts[i].to_lowercase().as_str() {
+                                "--port" => {
+                                    if i + 1 < parts.len() {
+                                        port_arg = parts[i + 1].parse::<u16>().ok();
+                                        i += 2;
+                                    } else {
+                                        eprintln!("Warning: Flag '{}' requires a value.", parts[i]); // Fixed: Added parts[i]
+                                        i += 1;
+                                    }
+                                }
+                                "--config-file" => {
+                                    if i + 1 < parts.len() {
+                                        config_file_arg = Some(PathBuf::from(parts[i + 1]));
+                                        i += 2;
+                                    } else {
+                                        eprintln!("Warning: Flag '{}' requires a value.", parts[i]); // Fixed: Added parts[i]
+                                        i += 1;
+                                    }
+                                }
+                                _ => {
+                                    eprintln!("Warning: Unknown argument for 'start storage': {}", parts[i]);
+                                    i += 1;
+                                }
+                            }
+                        }
+                        CommandType::StartStorage { port: port_arg, config_file: config_file_arg }
+                    },
+                    _ => CommandType::Unknown, // Handle other "start" subcommands if any
+                }
+            } else {
+                // If only "start" is given, it's ambiguous or implies a default start
+                // For now, treat as unknown or provide a general start behavior if defined.
+                CommandType::Unknown
+            }
+        },
         "daemon" => {
             if parts.len() > 1 {
                 match parts[1].to_lowercase().as_str() {
@@ -79,8 +161,39 @@ pub fn parse_command(input: &str) -> (CommandType, Vec<String>) {
             if parts.len() > 1 {
                 match parts[1].to_lowercase().as_str() {
                     "start" => {
-                        let port_arg = args.get(1).and_then(|s| s.parse::<u16>().ok());
-                        CommandType::Rest(RestCliCommand::Start { port: port_arg })
+                        let mut port_arg = None;
+                        let mut listen_port_arg = None;
+                        let mut current_idx = 2; // Start parsing from the third part
+
+                        while current_idx < parts.len() {
+                            match parts[current_idx].to_lowercase().as_str() {
+                                "--port" => {
+                                    if current_idx + 1 < parts.len() {
+                                        port_arg = parts[current_idx + 1].parse::<u16>().ok();
+                                        current_idx += 2;
+                                    } else {
+                                        eprintln!("Warning: Flag '{}' requires a value.", parts[current_idx]); // Fixed: Added parts[current_idx]
+                                        current_idx += 1;
+                                    }
+                                }
+                                "--listen-port" => {
+                                    if current_idx + 1 < parts.len() {
+                                        listen_port_arg = parts[current_idx + 1].parse::<u16>().ok();
+                                        current_idx += 2;
+                                    } else {
+                                        eprintln!("Warning: Flag '{}' requires a value.", parts[current_idx]); // Fixed: Added parts[current_idx]
+                                        current_idx += 1;
+                                    }
+                                }
+                                _ => {
+                                    // If it's not a recognized flag, it might be a positional argument
+                                    // For "rest start", we only expect port arguments, so this is an unknown arg.
+                                    eprintln!("Warning: Unknown argument for 'rest start': {}", parts[current_idx]);
+                                    current_idx += 1;
+                                }
+                            }
+                        }
+                        CommandType::Rest(RestCliCommand::Start { port: port_arg, listen_port: listen_port_arg })
                     },
                     "stop" => CommandType::Rest(RestCliCommand::Stop),
                     "status" => CommandType::Rest(RestCliCommand::Status),
@@ -126,8 +239,36 @@ pub fn parse_command(input: &str) -> (CommandType, Vec<String>) {
             if parts.len() > 1 {
                 match parts[1].to_lowercase().as_str() {
                     "start" => {
-                        let port_arg = args.get(1).and_then(|s| s.parse::<u16>().ok());
-                        let config_file_arg = args.iter().position(|s| s == "--config-file").map(|i| i + 1).and_then(|idx| args.get(idx)).map(PathBuf::from);
+                        let mut port_arg = None;
+                        let mut config_file_arg = None;
+                        let mut i = 2; // Start parsing from the third part
+
+                        while i < parts.len() {
+                            match parts[i].to_lowercase().as_str() {
+                                "--port" => {
+                                    if i + 1 < parts.len() {
+                                        port_arg = parts[i + 1].parse::<u16>().ok();
+                                        i += 2;
+                                    } else {
+                                        eprintln!("Warning: Flag '{}' requires a value.", parts[i]); // Fixed: Added parts[i]
+                                        i += 1;
+                                    }
+                                }
+                                "--config-file" => {
+                                    if i + 1 < parts.len() {
+                                        config_file_arg = Some(PathBuf::from(parts[i + 1]));
+                                        i += 2;
+                                    } else {
+                                        eprintln!("Warning: Flag '{}' requires a value.", parts[i]); // Fixed: Added parts[i]
+                                        i += 1;
+                                    }
+                                }
+                                _ => {
+                                    eprintln!("Warning: Unknown argument for 'storage start': {}", parts[i]);
+                                    i += 1;
+                                }
+                            }
+                        }
                         CommandType::Storage(StorageAction::Start { port: port_arg, config_file: config_file_arg.unwrap_or_else(|| PathBuf::from("storage_config.yaml")) })
                     },
                     "stop" => {
@@ -192,7 +333,7 @@ pub fn parse_command(input: &str) -> (CommandType, Vec<String>) {
                             help_command_string = Some(parts[i + 1].to_string());
                             i += 2;
                         } else {
-                            eprintln!("Warning: Flag '{}' requires a value.", parts[i]);
+                            eprintln!("Warning: Flag '{}' requires a value.", parts[i]); // Fixed: Added parts[i]
                             i += 1;
                         }
                     },
@@ -222,14 +363,14 @@ pub fn parse_command(input: &str) -> (CommandType, Vec<String>) {
 /// Prints general help messages for the interactive CLI.
 pub fn print_interactive_help() {
     println!("\nGraphDB CLI Commands:");
-    println!("  start [--port <port>] [--cluster <range>] [--listen-port <port>] [--storage-port <port>] - Start GraphDB components");
+    println!("  start [rest|storage] [--port <port>] [--listen-port <port>] [--config-file <path>] - Start GraphDB components");
     println!("  stop [rest|daemon|storage] [--port <port>] - Stop GraphDB components (all by default, or specific)");
     println!("  daemon start [--port <port>] [--cluster <range>] - Start a GraphDB daemon");
     println!("  daemon stop [--port <port>]                       - Stop a GraphDB daemon");
     println!("  daemon status [--port <port>]                     - Check status of a GraphDB daemon");
     println!("  daemon list                                       - List daemons managed by this CLI");
     println!("  daemon clear-all                                  - Stop all managed daemons and attempt to kill external ones");
-    println!("  rest start [--port <port>]                        - Start the REST API server");
+    println!("  rest start [--port <port>] [--listen-port <port>] - Start the REST API server");
     println!("  rest stop                                         - Stop the REST API server");
     println!("  rest status                                       - Check the status of the REST API server");
     println!("  rest health                                       - Perform a health check on the REST API server");
@@ -251,16 +392,16 @@ pub fn print_interactive_help() {
 }
 
 /// Prints help messages filtered by a command string for interactive mode.
-pub fn print_interactive_filtered_help(cmd: &mut clap::Command, command_filter: &str) {
+pub fn print_interactive_filtered_help(_cmd: &mut clap::Command, command_filter: &str) { // Added _ to cmd
     let commands = [
-        ("start [--port <port>] [--cluster <range>] [--listen-port <port>] [--storage-port <port>]", "Start GraphDB components"),
+        ("start [rest|storage] [--port <port>] [--listen-port <port>] [--config-file <path>]", "Start GraphDB components"),
         ("stop [rest|daemon|storage] [--port <port>]", "Stop GraphDB components (all by default, or specific)"),
         ("daemon start [--port <port>] [--cluster <range>]", "Start a GraphDB daemon"),
         ("daemon stop [--port <port>]", "Stop a GraphDB daemon"),
         ("daemon status [--port <port>]", "Check status of a GraphDB daemon"),
         ("daemon list", "List daemons managed by this CLI"),
         ("daemon clear-all", "Stop all managed daemons and attempt to kill external ones"),
-        ("rest start [--port <port>]", "Start the REST API server"),
+        ("rest start [--port <port>] [--listen-port <port>]", "Start the REST API server"),
         ("rest stop", "Stop the REST API server"),
         ("rest status", "Check the status of the REST API server"),
         ("rest health", "Perform a health check on the REST API server"),
@@ -292,8 +433,39 @@ pub fn print_interactive_filtered_help(cmd: &mut clap::Command, command_filter: 
     }
 
     if !found_match {
-        println!("\nNo specific help found for '{}'. Displaying general help.", command_filter);
-        print_interactive_help();
+        // If no exact subcommand path, or if the last segment was an option/bad input
+        // Fallback to fuzzy matching and general help.
+
+        // Collect all possible command paths and individual option names
+        let mut all_known_elements = HashSet::<String>::new(); // Fixed: Added type annotation
+        collect_all_cli_elements_for_suggestions(&CliArgs::command(), &mut Vec::new(), &mut all_known_elements);
+
+        let mut suggestions = Vec::new();
+        const JARO_WINKLER_THRESHOLD: f64 = 0.75; // Adjust as needed for strictness (0.75-0.85 is common)
+
+        for known_element in &all_known_elements {
+            let similarity = jaro_winkler(&filter_lower, &known_element.to_lowercase());
+            if similarity > JARO_WINKLER_THRESHOLD {
+                suggestions.push((known_element.clone(), similarity));
+            }
+        }
+
+        // Sort suggestions by similarity (highest first)
+        suggestions.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        if !suggestions.is_empty() {
+            println!("\nNo exact help found for '{}'. Did you mean one of these?", command_filter);
+            for (suggestion, _) in suggestions.iter().take(5) { // Limit to top 5 suggestions
+                println!("  graphdb-cli {}", suggestion);
+            }
+            // Add a general hint for options if the filter looked like an option
+            if command_filter.starts_with("--") || command_filter.ends_with("-") { // Corrected starts_backwards to ends_with
+                println!("\nIf you were looking for an option for a command, try 'graphdb-cli <command> --help'.");
+            }
+        } else {
+            println!("\nNo specific help found for '{}'. Displaying general help.", command_filter);
+            print_help_clap_generated();
+        }
     }
     println!("------------------------------------");
 }
@@ -421,6 +593,14 @@ pub async fn handle_interactive_command(
         CommandType::Storage(storage_action) => {
             handlers::handle_storage_command_interactive(storage_action).await?;
         }
+        CommandType::StartRest { port, listen_port } => { // Added match arm for StartRest
+            let rest_cmd = RestCliCommand::Start { port, listen_port };
+            handlers::handle_rest_command_interactive(rest_cmd, rest_api_shutdown_tx_opt, rest_api_port_arc, rest_api_handle).await?;
+        }
+        CommandType::StartStorage { port, config_file } => { // Added match arm for StartStorage
+            let storage_action = StorageAction::Start { port, config_file: config_file.unwrap_or_else(|| PathBuf::from("storage_config.yaml")) };
+            handlers::handle_storage_command_interactive(storage_action).await?;
+        }
         CommandType::StopAll => {
             handlers::handle_stop_all_interactive().await?;
         }
@@ -450,12 +630,12 @@ pub async fn handle_interactive_command(
             // Corrected: Pass a reference to the String, or clone it if ownership is needed later.
             // Since print_filtered_help_clap_generated expects &str, we pass &String.
             if let Some(command_filter) = help_args.filter_command {
-                help_display::print_filtered_help_clap_generated(&mut cmd, &command_filter);
+                print_filtered_help_clap_generated(&mut cmd, &command_filter); // Fixed: Removed help_display:: prefix
             } else if !help_args.command_path.is_empty() {
                 let command_filter = help_args.command_path.join(" ");
-                help_display::print_filtered_help_clap_generated(&mut cmd, &command_filter);
+                print_filtered_help_clap_generated(&mut cmd, &command_filter); // Fixed: Removed help_display:: prefix
             } else {
-                help_display::print_help_clap_generated();
+                print_help_clap_generated(); // Fixed: Removed help_display:: prefix
             }
         }
         CommandType::Exit => {

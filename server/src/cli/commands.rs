@@ -183,6 +183,8 @@ pub enum RestCliCommand {
     Start {
         #[arg(long)]
         port: Option<u16>,
+        #[arg(long = "listen-port", value_name = "LISTEN_PORT", help = "Expose REST API on this port")]
+        listen_port: Option<u16>, // Added listen_port
     },
     /// Stop the REST API server
     Stop,
@@ -219,7 +221,7 @@ pub enum StorageAction {
     Start {
         /// The port for the standalone Storage daemon. If not provided, the storage daemon will use its own configured default.
         #[clap(long)]
-        port: Option<u16>, // Changed from Option<u10> to Option<u16>
+        port: Option<u16>,
         /// Path to the storage daemon's configuration file (default: storage_config.yaml in daemon's CWD).
         #[clap(long, default_value = "storage_config.yaml")]
         config_file: PathBuf,
