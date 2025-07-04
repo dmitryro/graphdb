@@ -1005,13 +1005,13 @@ pub async fn handle_interactive_command(
         CommandType::RestartAll { port, cluster, listen_port, storage_port, storage_config_file } => { // Added
             // FIX: Corrected argument passing to match RestartArgs struct structure
             let restart_args = RestartArgs {
-                action: Some(RestartAction::All { // Wrap arguments in Option::Some
+                action: RestartAction::All { // <--- Remove 'Some()'
                     port,
                     cluster,
                     listen_port,
                     storage_port,
                     storage_config_file,
-                }),
+                },
             };
             handlers::handle_restart_command_interactive(
                 restart_args, // Pass the struct

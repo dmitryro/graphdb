@@ -89,7 +89,7 @@ pub enum StorageAction {
     /// Start the standalone Storage daemon.
     Start {
         /// Port for the Storage daemon to listen on.
-        #[clap(long, short = 'p')]
+        #[clap(long, short = 'p', name = "storage-port")] // FIX: Added name to map --storage-port
         port: Option<u16>,
         /// Path to the storage configuration file.
         #[clap(long)]
@@ -174,16 +174,14 @@ pub enum StartAction {
     /// Start the REST API server.
     Rest {
         /// Port for the REST API.
-        #[clap(long, short = 'p')]
+        #[clap(long, short = 'p', name = "listen-port")] // FIX: Added name to map --listen-port
         port: Option<u16>,
-        /// Listen port for the REST API.
-        #[clap(long)]
-        listen_port: Option<u16>,
+        // Removed `listen_port` field as it's redundant with `port` and `name` attribute
     },
     /// Start the standalone Storage daemon.
     Storage {
         /// Port for the Storage daemon.
-        #[clap(long, short = 'p')]
+        #[clap(long, short = 'p', name = "storage-port")] // FIX: Added name to map --storage-port
         port: Option<u16>,
         /// Path to the storage configuration file.
         #[clap(long)]
@@ -248,7 +246,7 @@ pub enum ReloadAction {
 #[derive(Debug, Parser)]
 pub struct RestartArgs {
     #[clap(subcommand)]
-    pub action: Option<RestartAction>, // Changed to Option<RestartAction> to allow `restart` without subcommand
+    pub action: RestartAction, // FIX: Changed to mandatory RestartAction
 }
 
 /// Actions for the `restart` command.

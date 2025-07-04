@@ -225,17 +225,21 @@ pub async fn start_cli() -> Result<()> {
                             daemon_handles.clone(),
                         ).await?;
                     }
-                    Some(StartAction::Rest { port, listen_port }) => {
+                    // FIX: Updated StartAction::Rest destructuring and call to match commands.rs
+                    Some(StartAction::Rest { port: rest_start_port }) => {
                         handlers_mod::handle_rest_command_interactive(
-                            RestCliCommand::Start { port, listen_port },
+                            // Assuming RestCliCommand::Start still has both `port` and `listen_port`
+                            // and `rest_start_port` carries the value from `--listen-port`
+                            RestCliCommand::Start { port: rest_start_port, listen_port: rest_start_port }, // Corrected: Added listen_port
                             rest_api_shutdown_tx_opt.clone(),
                             rest_api_port_arc.clone(),
                             rest_api_handle.clone(),
                         ).await?;
                     }
-                    Some(StartAction::Storage { port, config_file }) => {
+                    // FIX: Updated StartAction::Storage destructuring and call to match commands.rs
+                    Some(StartAction::Storage { port: storage_start_port, config_file: storage_start_config_file }) => {
                         handlers_mod::handle_storage_command_interactive(
-                            StorageAction::Start { port, config_file },
+                            StorageAction::Start { port: storage_start_port, config_file: storage_start_config_file }, // FIX: Pass directly
                             storage_daemon_shutdown_tx_opt.clone(),
                             storage_daemon_handle.clone(),
                         ).await?;
@@ -250,21 +254,17 @@ pub async fn start_cli() -> Result<()> {
                 }
             }
             Commands::Stop(stop_args) => {
-                // FIX: Removed extra arguments as handle_stop_command in handlers_mod expects only StopArgs
                 handlers_mod::handle_stop_command(stop_args).await?;
             }
             Commands::Status(status_args) => {
-                // FIX: Pass the rest_api_port_arc for status commands
                 handlers_mod::handle_status_command(status_args, rest_api_port_arc.clone()).await?;
             }
             Commands::Reload(reload_args) => {
-                // FIX: Corrected function call to pass only reload_args
                 handlers_mod::handle_reload_command(reload_args).await?;
             }
             Commands::Restart(restart_args) => {
-                // FIX: Corrected function name and argument passing
                 handlers_mod::handle_restart_command_interactive(
-                    restart_args, // Pass the RestartArgs struct directly
+                    restart_args,
                     daemon_handles.clone(),
                     rest_api_shutdown_tx_opt.clone(),
                     rest_api_port_arc.clone(),
