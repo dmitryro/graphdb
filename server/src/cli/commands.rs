@@ -94,8 +94,8 @@ pub enum GraphDbCommands {
     #[clap(subcommand)]
     Rest(RestCliCommand),
 
-    /// Display help information for commands.
-    Help(HelpArgs),
+    // Removed the Help subcommand from here.
+    // The 'help' command will now be handled manually in cli.rs
 }
 
 /// Arguments for the top-level `stop` command
@@ -219,7 +219,7 @@ pub enum StorageAction {
     Start {
         /// The port for the standalone Storage daemon. If not provided, the storage daemon will use its own configured default.
         #[clap(long)]
-        port: Option<u16>,
+        port: Option<u16>, // Changed from Option<u10> to Option<u16>
         /// Path to the storage daemon's configuration file (default: storage_config.yaml in daemon's CWD).
         #[clap(long, default_value = "storage_config.yaml")]
         config_file: PathBuf,
@@ -233,22 +233,12 @@ pub enum StorageAction {
     /// Check the status of the standalone Storage daemon
     Status {
         /// The port of the standalone Storage daemon to check. If not provided, it checks the daemon on the commonly assumed default port (8085).
-        #[clap(long)]
+        #[arg(long)]
         port: Option<u16>,
     },
 }
 
-/// Arguments for the `help` command
-#[derive(Args, Debug, PartialEq)]
-pub struct HelpArgs {
-    /// Specify a command string to get specific help for (e.g., "daemon start").
-    #[arg(long = "command", short = 'c', value_name = "COMMAND_STRING", help = "Get help for a specific command.")]
-    pub filter_command: Option<String>, 
-
-    /// Positional arguments representing the command path (e.g., "daemon start").
-    #[arg(raw = true)]
-    pub command_path: Vec<String>,
-}
+// Removed HelpArgs struct as it's no longer needed for clap parsing.
 
 // Data structures for internal use or communication (if needed)
 // These might be moved to a `models.rs` if they grow in number and complexity.

@@ -1,20 +1,22 @@
 // lib/src/storage_engine/config.rs
+// Updated: 2025-07-04 - Added InMemory to StorageEngineType.
 
 use serde::{Serialize, Deserialize};
-use clap::ValueEnum; // <--- Add this line
+use clap::ValueEnum;
 
 /// Enum to specify the type of storage engine to use.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ValueEnum)] // <--- Add ValueEnum here
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 pub enum StorageEngineType {
     Sled,
     RocksDB,
+    InMemory, // Added InMemory option
     // Add other storage types like PostgreSQL, Redis, etc., as needed
 }
 
 /// Configuration for the storage engine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageConfig {
-    /// The type of storage engine to use (e.g., Sled, RocksDB).
+    /// The type of storage engine to use (e.g., Sled, RocksDB, InMemory).
     pub engine_type: StorageEngineType,
     /// The path to the directory where the database files will be stored.
     pub data_path: String,
@@ -37,3 +39,4 @@ impl Default for StorageConfig {
         }
     }
 }
+

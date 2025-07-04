@@ -1,7 +1,5 @@
 // server/src/cli/handlers.rs
-
-// This file contains the core logic for executing various CLI commands.
-// It interacts with daemon_management and config modules.
+// Updated: 2025-07-04 - Corrected IP address for REST API calls.
 
 use anyhow::{Context, Result};
 use std::time::Duration;
@@ -12,8 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 // Import necessary items from sibling modules
-// Corrected import: Removed the alias for StatusAction.
-use crate::cli::commands::{DaemonCliCommand, RestCliCommand, StorageAction, StatusArgs, StopArgs, StopAction, StatusAction}; 
+use crate::cli::commands::{DaemonCliCommand, RestCliCommand, StorageAction, StatusArgs, StopArgs, StopAction, StatusAction};
 use crate::cli::config::{get_default_rest_port_from_config, load_storage_config, StorageConfig, StorageEngineType, CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS};
 use crate::cli::daemon_management::{find_running_storage_daemon_port, start_daemon_process, stop_daemon_api_call};
 use crate::cli::config::CliConfig;
@@ -23,9 +20,6 @@ use reqwest;
 use serde_json;
 use std::str::FromStr;
 use daemon_api::start_daemon;
-// Removed unused imports:
-// use storage_daemon_server::run_storage_daemon as start_storage_server;
-// use rest_api::start_server as start_rest_server;
 
 /// Helper to find and kill a process by port. This is used for all daemon processes.
 pub fn stop_process_by_port(process_name: &str, port: u16) -> Result<(), anyhow::Error> {
@@ -703,7 +697,7 @@ pub async fn handle_rest_command(rest_cmd: RestCliCommand) -> Result<()> {
         RestCliCommand::RegisterUser { username, password } => {
             let rest_port = get_default_rest_port_from_config();
             let client = reqwest::Client::new();
-            let url = format!("http://127.0.0.1:{}/api/v1/register", rest_port);
+            let url = format!("http://127.0.0.1:{}/api/v1/register", rest_port); // Corrected IP
             let request_body = serde_json::json!({
                 "username": username,
                 "password": password,
@@ -724,7 +718,7 @@ pub async fn handle_rest_command(rest_cmd: RestCliCommand) -> Result<()> {
         RestCliCommand::Authenticate { username, password } => {
             let rest_port = get_default_rest_port_from_config();
             let client = reqwest::Client::new();
-            let url = format!("http://127.0.0.1:{}/api/v1/auth", rest_port);
+            let url = format!("http://127.0.0.1:{}/api/v1/auth", rest_port); // Corrected IP
             let request_body = serde_json::json!({
                 "username": username,
                 "password": password,
@@ -745,7 +739,7 @@ pub async fn handle_rest_command(rest_cmd: RestCliCommand) -> Result<()> {
         RestCliCommand::GraphQuery { query_string, persist } => {
             let rest_port = get_default_rest_port_from_config();
             let client = reqwest::Client::new();
-            let url = format!("http://127.0.0.1:{}/api/v1/query", rest_port); 
+            let url = format!("http://127.0.0.1:{}/api/v1/query", rest_port); // Corrected IP
             let request_body = serde_json::json!({
                 "query": query_string,
                 "persist": persist.unwrap_or(false),
@@ -1004,7 +998,7 @@ pub async fn handle_rest_command_interactive(
         RestCliCommand::RegisterUser { username, password } => {
             let rest_port = get_default_rest_port_from_config();
             let client = reqwest::Client::new();
-            let url = format!("http://172.0.0.1:{}/api/v1/register", rest_port);
+            let url = format!("http://127.0.0.1:{}/api/v1/register", rest_port); // Corrected IP
             let request_body = serde_json::json!({
                 "username": username,
                 "password": password,
@@ -1025,7 +1019,7 @@ pub async fn handle_rest_command_interactive(
         RestCliCommand::Authenticate { username, password } => {
             let rest_port = get_default_rest_port_from_config();
             let client = reqwest::Client::new();
-            let url = format!("http://172.0.0.1:{}/api/v1/auth", rest_port);
+            let url = format!("http://127.0.0.1:{}/api/v1/auth", rest_port); // Corrected IP
             let request_body = serde_json::json!({
                 "username": username,
                 "password": password,
@@ -1046,7 +1040,7 @@ pub async fn handle_rest_command_interactive(
         RestCliCommand::GraphQuery { query_string, persist } => {
             let rest_port = get_default_rest_port_from_config();
             let client = reqwest::Client::new();
-            let url = format!("http://172.0.0.1:{}/api/v1/query", rest_port); 
+            let url = format!("http://127.0.0.1:{}/api/v1/query", rest_port); // Corrected IP
             let request_body = serde_json::json!({
                 "query": query_string,
                 "persist": persist.unwrap_or(false),

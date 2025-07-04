@@ -14,7 +14,8 @@ use std::path::PathBuf; // Added PathBuf import
 use clap::CommandFactory; // Added CommandFactory import
 
 // Import necessary items from sibling modules
-use crate::cli::commands::{CliArgs, DaemonCliCommand, RestCliCommand, StorageAction, HelpArgs};
+use crate::cli::commands::{CliArgs, DaemonCliCommand, RestCliCommand, StorageAction};
+use crate::cli::help_display::HelpArgs; // Corrected: Import HelpArgs from help_display
 // Removed unused imports: use crate::cli::config::CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS;
 use crate::cli::handlers;
 use crate::cli::daemon_management::stop_daemon_api_call;
@@ -224,28 +225,28 @@ pub fn print_interactive_help() {
     println!("  start [--port <port>] [--cluster <range>] [--listen-port <port>] [--storage-port <port>] - Start GraphDB components");
     println!("  stop [rest|daemon|storage] [--port <port>] - Stop GraphDB components (all by default, or specific)");
     println!("  daemon start [--port <port>] [--cluster <range>] - Start a GraphDB daemon");
-    println!("  daemon stop [--port <port>]              - Stop a GraphDB daemon");
-    println!("  daemon status [--port <port>]            - Check status of a GraphDB daemon");
-    println!("  daemon list                              - List daemons managed by this CLI");
-    println!("  daemon clear-all                         - Stop all managed daemons and attempt to kill external ones");
-    println!("  rest start [--port <port>]               - Start the REST API server");
-    println!("  rest stop                                - Stop the REST API server");
-    println!("  rest status                              - Check the status of the REST API server");
-    println!("  rest health                              - Perform a health check on the REST API server");
-    println!("  rest version                             - Get the version of the REST API server");
-    println!("  rest register-user <username> <password> - Register a new user via REST API");
-    println!("  rest authenticate <username> <password>  - Authenticate a user and get a token via REST API");
-    println!("  rest graph-query \"<query_string>\" [persist] - Execute a graph query via REST API");
-    println!("  rest storage-query                       - Execute a storage query via REST API (placeholder)");
+    println!("  daemon stop [--port <port>]                       - Stop a GraphDB daemon");
+    println!("  daemon status [--port <port>]                     - Check status of a GraphDB daemon");
+    println!("  daemon list                                       - List daemons managed by this CLI");
+    println!("  daemon clear-all                                  - Stop all managed daemons and attempt to kill external ones");
+    println!("  rest start [--port <port>]                        - Start the REST API server");
+    println!("  rest stop                                         - Stop the REST API server");
+    println!("  rest status                                       - Check the status of the REST API server");
+    println!("  rest health                                       - Perform a health check on the REST API server");
+    println!("  rest version                                      - Get the version of the REST API server");
+    println!("  rest register-user <username> <password>          - Register a new user via REST API");
+    println!("  rest authenticate <username> <password>           - Authenticate a user and get a token via REST API");
+    println!("  rest graph-query \"<query_string>\" [persist]       - Execute a graph query via REST API");
+    println!("  rest storage-query                                - Execute a storage query via REST API (placeholder)");
     println!("  storage start [--port <port>] [--config-file <path>] - Start the standalone Storage daemon");
-    println!("  storage stop [--port <port>]             - Stop the standalone Storage daemon");
-    println!("  storage status [--port <port>]           - Check the status of the standalone Storage daemon");
-    println!("  status                                   - Get a comprehensive status summary of all GraphDB components");
-    println!("  status rest                              - Get detailed status of the REST API component");
-    println!("  status daemon [--port <port>]            - Get detailed status of a specific daemon or list common ones");
-    println!("  status storage [--port <port>]           - Get detailed status of the Storage component");
-    println!("  help [--command|-c <command_string>]     - Display this help message or help for a specific command");
-    println!("  exit | quit | q                          - Exit the CLI");
+    println!("  storage stop [--port <port>]                      - Stop the standalone Storage daemon");
+    println!("  storage status [--port <port>]                    - Check the status of the standalone Storage daemon");
+    println!("  status                                            - Get a comprehensive status summary of all GraphDB components");
+    println!("  status rest                                       - Get detailed status of the REST API component");
+    println!("  status daemon [--port <port>]                     - Get detailed status of a specific daemon or list common ones");
+    println!("  status storage [--port <port>]                    - Get detailed status of the Storage component");
+    println!("  help [--command|-c <command_string>]              - Display this help message or help for a specific command");
+    println!("  exit | quit | q                                   - Exit the CLI");
     println!("\nNote: Commands like 'view-graph', 'index-node', etc., are placeholders.");
 }
 
@@ -446,6 +447,8 @@ pub async fn handle_interactive_command(
         }
         CommandType::Help(help_args) => {
             let mut cmd = CliArgs::command(); // Get the top-level Command object for clap's help generation
+            // Corrected: Pass a reference to the String, or clone it if ownership is needed later.
+            // Since print_filtered_help_clap_generated expects &str, we pass &String.
             if let Some(command_filter) = help_args.filter_command {
                 help_display::print_filtered_help_clap_generated(&mut cmd, &command_filter);
             } else if !help_args.command_path.is_empty() {

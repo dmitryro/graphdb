@@ -19,7 +19,7 @@ pub mod help_display; // Declare the new help_display module
 pub use cli::{start_cli}; // Re-export the main CLI entry point from cli.rs
 pub use commands::{
     CliArgs, GraphDbCommands, DaemonCliCommand, RestCliCommand, StorageAction,
-    StatusAction, StopAction, HelpArgs, StatusArgs, StopArgs,
+    StatusAction, StopAction, StatusArgs, StopArgs, // Removed HelpArgs from here
     DaemonData, KVPair, PidStore,
 };
 pub use handlers::{
@@ -39,7 +39,7 @@ pub use daemon_management::{
     find_running_storage_daemon_port, start_daemon_process, stop_daemon_api_call,
     handle_internal_daemon_run,
 };
-pub use help_display::{print_help_clap_generated, print_filtered_help_clap_generated}; // Re-export help display functions
+pub use help_display::{print_help_clap_generated, print_filtered_help_clap_generated, HelpArgs}; // Corrected: Re-export HelpArgs from help_display
 
 // Lazy static for shared memory keys (if still needed globally across daemons)
 // Keeping it here for now as it's a global state that might be accessed by various parts.

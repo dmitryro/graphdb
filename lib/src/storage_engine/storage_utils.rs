@@ -1,11 +1,14 @@
 // lib/src/storage_engine/storage_utils.rs
-// Fixed: 2025-07-02 - Corrected bincode serialization/deserialization function calls.
+// Fixed: 2025-07-04 - Corrected create_edge_key to use util::build for Identifier.
 
 use models::{Edge, Identifier, Vertex};
 use models::errors::{GraphError, GraphResult};
 use uuid::Uuid;
 // Corrected bincode imports for version 2.x API
 use bincode::{encode_to_vec, decode_from_slice, config};
+
+// Import util for key building
+use crate::util::{build as util_build_key, Component as UtilComponent};
 
 
 /// Helper to serialize a Vertex to bytes using bincode.
@@ -36,15 +39,12 @@ pub fn deserialize_edge(bytes: &[u8]) -> GraphResult<Edge> {
 
 /// Helper to create a consistent byte key for an edge from its components.
 /// This key is used for storage in key-value stores.
+/// It uses the `util::build` function to ensure correct Identifier serialization.
 pub fn create_edge_key(outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> Vec<u8> {
-    // A simple concatenation for the key.
-    // In a real system, you might want a more robust keying scheme that
-    // ensures lexicographical ordering for range scans and avoids collisions.
-    // For example, using a fixed-size prefix for type, then UUIDs.
-    let mut key = Vec::new();
-    key.extend_from_slice(outbound_id.as_bytes());
-    key.extend_from_slice(edge_type.as_bytes()); // Identifier's as_bytes() might need careful handling if it's not fixed length or null-terminated
-    key.extend_from_slice(inbound_id.as_bytes());
-    key
+    util_build_key(&[
+        UtilComponent::Uuid(*outbound_id),
+        UtilComponent::Identifier(edge_type.clone()), // Identifier needs to be cloned for Component enum
+        UtilComponent::Uuid(*inbound_id),
+    ])
 }
 
