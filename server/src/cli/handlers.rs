@@ -42,8 +42,25 @@ pub struct RestArgs {
 pub mod rest {
     pub mod api {
         use anyhow::Result;
-        pub async fn check_rest_api_status() -> Result<String> { Ok("OK".to_string()) }
-        pub async fn perform_rest_api_health_check() -> Result<String> { Ok("Healthy".to_string()) }
+        use reqwest::Client;
+        use std::time::Duration;
+
+        // Function to check REST API status (actual health check)
+        pub async fn check_rest_api_status(port: u16) -> Result<String> {
+            let client = Client::builder().timeout(Duration::from_secs(2)).build()?;
+            let url = format!("http://127.0.0.1:{}/api/v1/health", port);
+            match client.get(&url).send().await {
+                Ok(resp) if resp.status().is_success() => Ok("OK".to_string()),
+                Ok(resp) => Err(anyhow::anyhow!("REST API health check failed with status: {}", resp.status())),
+                Err(e) => Err(anyhow::anyhow!("Failed to connect to REST API for health check: {}", e)),
+            }
+        }
+
+        pub async fn perform_rest_api_health_check() -> Result<String> {
+            // This function needs to know the port. It should probably be passed.
+            // For now, it's a placeholder.
+            Ok("Healthy".to_string())
+        }
         pub async fn get_rest_api_version() -> Result<String> { Ok("0.1.0".to_string()) }
         pub async fn register_user(_username: &str, _password: &str) -> Result<()> {
             println!("Registering user {}...", _username);
@@ -144,9 +161,35 @@ pub async fn check_process_status_by_port(_process_name: &str, port: u16) -> boo
     false
 }
 
+/// Helper to find a running REST API port by attempting health checks on common ports.
+pub async fn find_running_rest_api_port() -> Option<u16> {
+    // FIX: Added more common ports for discovery
+    let common_rest_ports = [DEFAULT_REST_API_PORT, 8081, 8082, 8083, 8084, 8085, 8086];
+    for &port in &common_rest_ports {
+        if rest::api::check_rest_api_status(port).await.is_ok() {
+            return Some(port);
+        }
+    }
+    None
+}
+
+
 /// Displays detailed status for the REST API server.
 pub async fn display_rest_api_status(rest_api_port_arc: Arc<Mutex<Option<u16>>>) {
-    let rest_port = rest_api_port_arc.lock().await.unwrap_or(DEFAULT_REST_API_PORT);
+    let mut rest_port_opt = *rest_api_port_arc.lock().await; // Get the port from the Arc if set by interactive mode
+
+    let actual_rest_port = if let Some(p) = rest_port_opt {
+        p
+    } else {
+        // If not set in Arc (e.g., direct CLI command), try to discover
+        if let Some(found_port) = find_running_rest_api_port().await {
+            // Update the Arc for potential future use within this CLI instance's lifetime
+            *rest_api_port_arc.lock().await = Some(found_port);
+            found_port
+        } else {
+            DEFAULT_REST_API_PORT // Fallback if nothing found
+        }
+    };
 
     println!("\n--- REST API Status ---");
     println!("{:<15} {:<10} {:<40}", "Status", "Port", "Details");
@@ -159,13 +202,13 @@ pub async fn display_rest_api_status(rest_api_port_arc: Arc<Mutex<Option<u16>>>)
     let mut rest_api_status = "Down".to_string();
     let mut rest_api_details = String::new();
 
-    let health_url = format!("http://127.0.0.1:{}/api/v1/health", rest_port);
+    let health_url = format!("http://127.0.0.1:{}/api/v1/health", actual_rest_port);
     match client.get(&health_url).send().await {
         Ok(resp) if resp.status().is_success() => {
             rest_api_status = "Running".to_string();
             rest_api_details = format!("Health: OK");
 
-            let version_url = format!("http://127.0.0.1:{}/api/v1/version", rest_port);
+            let version_url = format!("http://127.0.0.1:{}/api/v1/version", actual_rest_port);
             match client.get(&version_url).send().await {
                 Ok(v_resp) if v_resp.status().is_success() => {
                     let v_json: serde_json::Value = v_resp.json().await.unwrap_or_default();
@@ -177,7 +220,7 @@ pub async fn display_rest_api_status(rest_api_port_arc: Arc<Mutex<Option<u16>>>)
         },
         _ => { /* Status remains "Down" */ },
     }
-    println!("{:<15} {:<10} {:<40}", rest_api_status, rest_port, rest_api_details);
+    println!("{:<15} {:<10} {:<40}", rest_api_status, actual_rest_port, rest_api_details);
     println!("--------------------------------------------------");
 }
 
@@ -219,7 +262,7 @@ pub async fn display_storage_daemon_status(port_arg: Option<u16>) {
         find_running_storage_daemon_port().await.unwrap_or(DEFAULT_STORAGE_PORT)
     };
 
-    let storage_config = StorageConfig::default();
+    let storage_config = StorageConfig::default(); // This might not reflect actual running config
 
     println!("\n--- Storage Daemon Status ---");
     println!("{:<15} {:<10} {:<40}", "Status", "Port", "Details");
@@ -274,9 +317,21 @@ pub async fn display_full_status_summary(rest_api_port_arc: Arc<Mutex<Option<u16
     println!("{:<20} {:<15} {:<10} {:<40}", "GraphDB Daemon", daemon_status_msg, "N/A", "Core Graph Processing");
 
     // --- 2. REST API Status ---
-    let rest_port = rest_api_port_arc.lock().await.unwrap_or(DEFAULT_REST_API_PORT);
-    let rest_health_url = format!("http://127.0.0.1:{}/api/v1/health", rest_port);
-    let rest_version_url = format!("http://127.0.0.1:{}/api/v1/version", rest_port);
+    let mut rest_port_opt = *rest_api_port_arc.lock().await;
+
+    let actual_rest_port = if let Some(p) = rest_port_opt {
+        p
+    } else {
+        if let Some(found_port) = find_running_rest_api_port().await {
+            *rest_api_port_arc.lock().await = Some(found_port);
+            found_port
+        } else {
+            DEFAULT_REST_API_PORT // Fallback if nothing found
+        }
+    };
+
+    let rest_health_url = format!("http://127.0.0.1:{}/api/v1/health", actual_rest_port);
+    let rest_version_url = format!("http://127.0.0.1:{}/api/v1/version", actual_rest_port);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build().expect("Failed to build reqwest client");
@@ -287,6 +342,8 @@ pub async fn display_full_status_summary(rest_api_port_arc: Arc<Mutex<Option<u16
     match client.get(&rest_health_url).send().await {
         Ok(resp) if resp.status().is_success() => {
             rest_api_status = "Running".to_string();
+            rest_api_details = format!("Health: OK");
+
             let version_info = client.get(&rest_version_url).send().await;
             match version_info {
                 Ok(v_resp) if v_resp.status().is_success() => {
@@ -299,13 +356,13 @@ pub async fn display_full_status_summary(rest_api_port_arc: Arc<Mutex<Option<u16
         },
         _ => { /* Status remains "Down" */ },
     }
-    println!("{:<20} {:<15} {:<10} {:<40}", "REST API", rest_api_status, rest_port, rest_api_details);
+    println!("{:<20} {:<15} {:<10} {:<40}", "REST API", rest_api_status, actual_rest_port, rest_api_details);
 
     // --- 3. Storage Daemon Status ---
-    let storage_config = StorageConfig::default();
+    let storage_config = StorageConfig::default(); // This might not reflect actual running config
 
     let mut storage_daemon_status = "Down".to_string();
-    let mut actual_storage_port_reported = DEFAULT_STORAGE_PORT; 
+    let mut actual_storage_port_reported = DEFAULT_STORAGE_PORT;
 
     if let Some(found_port) = find_running_storage_daemon_port().await {
         storage_daemon_status = "Running".to_string();
@@ -524,7 +581,7 @@ pub async fn handle_start_command(
                 storage_status_msg = format!("Running on port: {}", storage_port_to_use);
             } else {
                 eprintln!("Warning: Storage daemon daemonized but did not become reachable on port {} within {:?}. This might indicate an internal startup failure.",
-                        storage_port_to_use, health_check_timeout);
+                    storage_port_to_use, health_check_timeout);
                 storage_status_msg = format!("Daemonized but failed to become reachable on port {}", storage_port_to_use);
             }
         }
@@ -544,7 +601,8 @@ pub async fn handle_start_command(
 pub async fn handle_stop_command(stop_args: StopArgs) -> Result<()> {
     match stop_args.action {
         Some(crate::cli::commands::StopAction::Rest) => {
-            let rest_port = DEFAULT_REST_API_PORT;
+            // FIX: Use discovery for REST API port
+            let rest_port = find_running_rest_api_port().await.unwrap_or(DEFAULT_REST_API_PORT);
             stop_process_by_port("REST API", rest_port).await?;
             println!("REST API stop command processed for port {}.", rest_port);
         }
@@ -560,7 +618,8 @@ pub async fn handle_stop_command(stop_args: StopArgs) -> Result<()> {
         }
         Some(crate::cli::commands::StopAction::All) | None => {
             println!("Attempting to stop all GraphDB components...");
-            let rest_port = DEFAULT_REST_API_PORT;
+            // FIX: Use discovery for REST API port when stopping all
+            let rest_port = find_running_rest_api_port().await.unwrap_or(DEFAULT_REST_API_PORT);
             stop_process_by_port("REST API", rest_port).await?;
             println!("REST API stop command processed for port {}.", rest_port);
 
@@ -597,23 +656,40 @@ pub async fn handle_rest_command(
             Ok(())
         }
         RestCliCommand::Health => {
-            self::rest::api::perform_rest_api_health_check().await?;
+            // FIX: Need to pass the actual port for health check
+            let current_rest_port = find_running_rest_api_port().await.unwrap_or(DEFAULT_REST_API_PORT);
+            match rest::api::check_rest_api_status(current_rest_port).await {
+                Ok(status) => println!("REST API Health on port {}: {}", current_rest_port, status),
+                Err(e) => eprintln!("Failed to check REST API health on port {}: {}", current_rest_port, e),
+            }
             Ok(())
         }
         RestCliCommand::Version => {
-            self::rest::api::get_rest_api_version().await?;
+            // FIX: Need to pass the actual port for version check if API supports it, or get it dynamically
+            let current_rest_port = find_running_rest_api_port().await.unwrap_or(DEFAULT_REST_API_PORT);
+            let client = reqwest::Client::builder().timeout(Duration::from_secs(2)).build().expect("Failed to build reqwest client");
+            let version_url = format!("http://127.0.0.1:{}/api/v1/version", current_rest_port);
+            match client.get(&version_url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    let v_json: serde_json::Value = resp.json().await.unwrap_or_default();
+                    let version = v_json["version"].as_str().unwrap_or("N/A");
+                    println!("REST API Version on port {}: {}", current_rest_port, version);
+                },
+                Err(e) => eprintln!("Failed to get REST API version on port {}: {}", current_rest_port, e),
+                _ => eprintln!("Failed to get REST API version on port {}.", current_rest_port),
+            }
             Ok(())
         }
         RestCliCommand::RegisterUser { username, password } => {
-            self::rest::api::register_user(&username, &password).await?;
+            rest::api::register_user(&username, &password).await?;
             Ok(())
         }
         RestCliCommand::Authenticate { username, password } => {
-            self::rest::api::authenticate_user(&username, &password).await?;
+            rest::api::authenticate_user(&username, &password).await?;
             Ok(())
         }
         RestCliCommand::GraphQuery { query_string, persist } => {
-            self::rest::api::execute_graph_query(&query_string, persist).await?;
+            rest::api::execute_graph_query(&query_string, persist).await?;
             Ok(())
         }
         RestCliCommand::StorageQuery => {
@@ -733,40 +809,78 @@ pub async fn handle_status_command(status_args: StatusArgs, rest_api_port_arc: A
 /// Handles the top-level `reload` command.
 pub async fn handle_reload_command(
     reload_args: ReloadArgs,
-    daemon_handles: Arc<Mutex<HashMap<u16, (JoinHandle<()>, oneshot::Sender<()>)>>>,
-    rest_api_shutdown_tx_opt: Arc<Mutex<Option<oneshot::Sender<()>>>>,
-    rest_api_port_arc: Arc<Mutex<Option<u16>>>,
-    rest_api_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    // FIX: Removed Arc arguments from reload command as it's non-interactive
+    // It should rely on discovery or explicit ports.
 ) -> Result<()> {
     match reload_args.action {
         ReloadAction::All => {
             println!("Reloading all GraphDB components...");
-            // Stop all components
+            // Stop all components using the non-interactive stop handler
             self::handle_stop_command(crate::cli::commands::StopArgs { action: Some(crate::cli::commands::StopAction::All) }).await?;
 
-            // Restart components (simplified: assumes default ports/configs for restart)
             println!("Restarting all GraphDB components after reload...");
-            self::handle_daemon_command(DaemonCliCommand::Start { port: None, cluster: None }, daemon_handles.clone()).await?; 
-            handle_rest_command_interactive(RestCliCommand::Start { port: None, listen_port: None }, rest_api_shutdown_tx_opt.clone(), rest_api_port_arc.clone(), rest_api_handle.clone()).await?;
-            self::handle_storage_command(StorageAction::Start { port: None, config_file: None }).await?;
+            // Restart daemons (direct call to daemon_api)
+            let daemon_result = start_daemon(None, None, vec![]).await;
+            match daemon_result {
+                Ok(()) => println!("GraphDB Daemon(s) restarted."),
+                Err(e) => eprintln!("Failed to restart daemon(s): {:?}", e),
+            }
+
+            // Restart REST API (direct call to start_daemon_process)
+            let rest_port_to_restart = find_running_rest_api_port().await.unwrap_or(DEFAULT_REST_API_PORT);
+            stop_process_by_port("REST API", rest_port_to_restart).await?;
+            start_daemon_process(
+                true, false, Some(rest_port_to_restart),
+                Some(PathBuf::from(StorageConfig::default().data_path)), // Use default storage path
+                Some(StorageConfig::default().engine_type.into()), // Use default storage engine type, converted
+            ).await?;
+            println!("REST API server restarted on port {}.", rest_port_to_restart);
+
+            // Restart Storage (direct call to start_daemon_process)
+            let storage_port_to_restart = find_running_storage_daemon_port().await.unwrap_or(DEFAULT_STORAGE_PORT);
+            stop_process_by_port("Storage Daemon", storage_port_to_restart).await?;
+            let actual_storage_config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .expect("Failed to get parent directory of server crate")
+                .join("storage_daemon_server")
+                .join("storage_config.yaml");
+            start_daemon_process(
+                false, true, Some(storage_port_to_restart),
+                Some(actual_storage_config_path),
+                None,
+            ).await?;
+            println!("Standalone Storage daemon restarted on port {}.", storage_port_to_restart);
 
             println!("All GraphDB components reloaded (stopped and restarted).");
         }
         ReloadAction::Rest => {
             println!("Reloading REST API server...");
-            let current_rest_port = *rest_api_port_arc.lock().await;
+            let current_rest_port = find_running_rest_api_port().await.unwrap_or(DEFAULT_REST_API_PORT);
 
-            stop_rest_api_interactive(rest_api_shutdown_tx_opt.clone(), rest_api_port_arc.clone(), rest_api_handle.clone()).await?;
-            
-            start_rest_api_interactive(current_rest_port, current_rest_port, rest_api_shutdown_tx_opt, rest_api_port_arc, rest_api_handle).await?;
+            stop_process_by_port("REST API", current_rest_port).await?;
+            start_daemon_process(
+                true, false, Some(current_rest_port),
+                Some(PathBuf::from(StorageConfig::default().data_path)),
+                Some(StorageConfig::default().engine_type.into()),
+            ).await?;
             
             println!("REST API server reloaded.");
         }
         ReloadAction::Storage => {
             println!("Reloading standalone Storage daemon...");
+            let current_storage_port = find_running_storage_daemon_port().await.unwrap_or(DEFAULT_STORAGE_PORT);
             
-            self::handle_storage_command(StorageAction::Stop { port: None }).await?;
-            self::handle_storage_command(StorageAction::Start { port: None, config_file: None }).await?;
+            stop_process_by_port("Storage Daemon", current_storage_port).await?;
+            let actual_storage_config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .expect("Failed to get parent directory of server crate")
+                .join("storage_daemon_server")
+                .join("storage_config.yaml");
+            start_daemon_process(
+                false, true, Some(current_storage_port),
+                Some(actual_storage_config_path),
+                None,
+            ).await?;
             
             println!("Standalone Storage daemon reloaded.");
         }
@@ -796,23 +910,32 @@ pub async fn handle_reload_command(
 
 pub async fn display_rest_api_health() {
     println!("Performing REST API health check...");
-    match self::rest::api::perform_rest_api_health_check().await {
-        Ok(health) => println!("REST API Health: {}", health),
-        Err(e) => eprintln!("Failed to get REST API health: {}", e),
+    let current_rest_port = find_running_rest_api_port().await.unwrap_or(DEFAULT_REST_API_PORT);
+    match rest::api::check_rest_api_status(current_rest_port).await {
+        Ok(health) => println!("REST API Health on port {}: {}", current_rest_port, health),
+        Err(e) => eprintln!("Failed to get REST API health on port {}: {}", current_rest_port, e),
     }
 }
 
 pub async fn display_rest_api_version() {
     println!("Getting REST API version...");
-    match self::rest::api::get_rest_api_version().await {
-        Ok(version) => println!("REST API Version: {}", version),
-        Err(e) => eprintln!("Failed to get REST API version: {}", e),
+    let current_rest_port = find_running_rest_api_port().await.unwrap_or(DEFAULT_REST_API_PORT);
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(2)).build().expect("Failed to build reqwest client");
+    let version_url = format!("http://127.0.0.1:{}/api/v1/version", current_rest_port);
+    match client.get(&version_url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let v_json: serde_json::Value = resp.json().await.unwrap_or_default();
+            let version = v_json["version"].as_str().unwrap_or("N/A");
+            println!("REST API Version on port {}: {}", current_rest_port, version);
+        },
+        Err(e) => eprintln!("Failed to get REST API version on port {}: {}", current_rest_port, e),
+        _ => eprintln!("Failed to get REST API version on port {}.", current_rest_port),
     }
 }
 
 pub async fn register_user(username: String, password: String) {
     println!("Registering user '{}'...", username);
-    match self::rest::api::register_user(&username, &password).await {
+    match rest::api::register_user(&username, &password).await {
         Ok(_) => println!("User '{}' registered successfully.", username),
         Err(e) => eprintln!("Failed to register user '{}': {}", username, e),
     }
@@ -820,7 +943,7 @@ pub async fn register_user(username: String, password: String) {
 
 pub async fn authenticate_user(username: String, password: String) {
     println!("Authenticating user '{}'...", username);
-    match self::rest::api::authenticate_user(&username, &password).await {
+    match rest::api::authenticate_user(&username, &password).await {
         Ok(token) => println!("User '{}' authenticated successfully. Token: {}", username, token),
         Err(e) => eprintln!("Failed to authenticate user '{}': {}", username, e),
     }
@@ -828,7 +951,7 @@ pub async fn authenticate_user(username: String, password: String) {
 
 pub async fn execute_graph_query(query_string: String, persist: Option<bool>) {
     println!("Executing graph query: '{}' (persist: {:?})", query_string, persist);
-    match self::rest::api::execute_graph_query(&query_string, persist).await {
+    match rest::api::execute_graph_query(&query_string, persist).await {
         Ok(result) => println!("Graph query result: {}", result),
         Err(e) => eprintln!("Failed to execute graph query: {}", e),
     }
@@ -943,7 +1066,7 @@ pub async fn start_rest_api_interactive(
         false, // is_storage_daemon
         Some(actual_port),
         Some(PathBuf::from(current_storage_config.data_path)),
-        Some(lib_storage_engine_type),
+        Some(lib_storage_engine_type.into()), // Convert to daemon_api::StorageEngineType
     ).await?;
 
     // Perform health check to confirm it's reachable
@@ -977,6 +1100,7 @@ pub async fn start_rest_api_interactive(
     }
     Ok(())
 }
+
 
 /// Stops the REST API server managed by the interactive CLI.
 pub async fn stop_rest_api_interactive(
@@ -1188,11 +1312,28 @@ pub async fn handle_rest_command_interactive(
             Ok(())
         }
         RestCliCommand::Health => {
-            rest::api::perform_rest_api_health_check().await?;
+            // FIX: Need to pass the actual port for health check
+            let current_rest_port = rest_api_port_arc.lock().await.unwrap_or(DEFAULT_REST_API_PORT);
+            match rest::api::check_rest_api_status(current_rest_port).await {
+                Ok(status) => println!("REST API Health on port {}: {}", current_rest_port, status),
+                Err(e) => eprintln!("Failed to check REST API health on port {}: {}", current_rest_port, e),
+            }
             Ok(())
         }
         RestCliCommand::Version => {
-            rest::api::get_rest_api_version().await?;
+            // FIX: Need to pass the actual port for version check if API supports it, or get it dynamically
+            let current_rest_port = rest_api_port_arc.lock().await.unwrap_or(DEFAULT_REST_API_PORT);
+            let client = reqwest::Client::builder().timeout(Duration::from_secs(2)).build().expect("Failed to build reqwest client");
+            let version_url = format!("http://127.0.0.1:{}/api/v1/version", current_rest_port);
+            match client.get(&version_url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    let v_json: serde_json::Value = resp.json().await.unwrap_or_default();
+                    let version = v_json["version"].as_str().unwrap_or("N/A");
+                    println!("REST API Version on port {}: {}", current_rest_port, version);
+                },
+                Err(e) => eprintln!("Failed to get REST API version on port {}: {}", current_rest_port, e),
+                _ => eprintln!("Failed to get REST API version on port {}.", current_rest_port),
+            }
             Ok(())
         }
         RestCliCommand::RegisterUser { username, password } => {
@@ -1245,9 +1386,18 @@ pub async fn reload_all_interactive(
 ) -> Result<()> {
     println!("Reloading all GraphDB components...");
     
-    self::handle_stop_command(crate::cli::commands::StopArgs { action: Some(crate::cli::commands::StopAction::All) }).await?;
+    // Use the interactive stop function, which correctly uses the shared state
+    stop_all_interactive(
+        daemon_handles.clone(),
+        rest_api_shutdown_tx_opt.clone(),
+        rest_api_port_arc.clone(),
+        rest_api_handle.clone(),
+        storage_daemon_shutdown_tx_opt.clone(),
+        storage_daemon_handle.clone(),
+    ).await?;
 
     println!("Restarting all GraphDB components after reload...");
+    // Use the interactive start functions, which correctly use the shared state
     start_daemon_instance_interactive(None, None, daemon_handles).await?; 
     start_rest_api_interactive(None, None, rest_api_shutdown_tx_opt, rest_api_port_arc, rest_api_handle).await?;
     start_storage_interactive(None, None, storage_daemon_shutdown_tx_opt, storage_daemon_handle).await?;
@@ -1263,7 +1413,7 @@ pub async fn reload_rest_interactive(
     rest_api_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 ) -> Result<()> {
     println!("Reloading REST API server...");
-    let current_rest_port = *rest_api_port_arc.lock().await;
+    let current_rest_port = *rest_api_port_arc.lock().await; // Get the currently tracked port
 
     stop_rest_api_interactive(rest_api_shutdown_tx_opt.clone(), rest_api_port_arc.clone(), rest_api_handle.clone()).await?;
     

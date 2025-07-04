@@ -258,14 +258,8 @@ pub async fn start_cli() -> Result<()> {
                 handlers_mod::handle_status_command(status_args, rest_api_port_arc.clone()).await?;
             }
             Commands::Reload(reload_args) => {
-                // FIX: Removed extra arguments as handle_reload_command in handlers_mod expects 5 arguments
-                handlers_mod::handle_reload_command(
-                    reload_args,
-                    daemon_handles.clone(),
-                    rest_api_shutdown_tx_opt.clone(),
-                    rest_api_port_arc.clone(),
-                    rest_api_handle.clone(),
-                ).await?;
+                // FIX: Corrected function call to pass only reload_args
+                handlers_mod::handle_reload_command(reload_args).await?;
             }
             Commands::Restart(restart_args) => {
                 // FIX: Corrected function name and argument passing
