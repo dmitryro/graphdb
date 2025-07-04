@@ -4,9 +4,9 @@
 // leveraging clap's generated help.
 
 use clap::{CommandFactory, Command, Arg, ValueHint, Args};
-use crate::cli::commands::CliArgs;
+use crate::cli::cli::CliArgs; // Corrected: Import CliArgs from cli.rs
 use std::collections::HashSet;
-use strsim::{jaro_winkler};
+use strsim::jaro_winkler;
 
 /// Arguments for the `help` command
 #[derive(Args, Debug, PartialEq)]
