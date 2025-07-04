@@ -6,6 +6,280 @@ use clap::{Parser, Subcommand, Args};
 use std::path::PathBuf;
 use crate::cli::config::StorageEngineType; // Import StorageEngineType from config module
 
+/// Arguments for the `start` command's sub-actions.
+#[derive(Subcommand, Debug, PartialEq, Clone)] // Added Clone for easier handling in interactive mode
+pub enum StartAction {
+    /// Start the REST API server.
+    Rest {
+        /// Port for the REST API server to listen on. Defaults to value in config.
+        #[arg(long, short)]
+        port: Option<u16>,
+        /// Alias for --port, for consistency with other commands.
+        #[arg(long)]
+        listen_port: Option<u16>,
+    },
+    /// Start the standalone Storage daemon.
+    Storage {
+        /// Port for the Storage daemon to listen on. Defaults to value in config.
+        #[arg(long, short)]
+        port: Option<u16>,
+        /// Path to the storage configuration file.
+        #[arg(long, short = 'f', value_name = "FILE")]
+        config_file: Option<PathBuf>,
+    },
+    /// Start a GraphDB daemon instance.
+    Daemon {
+        /// Port for the daemon to listen on.
+        #[arg(long, short)]
+        port: Option<u16>,
+        /// Range of ports for a cluster (e.g., "9000-9002").
+        #[arg(long, short)]
+        cluster: Option<String>,
+    },
+    /// Start all core GraphDB components (daemon, REST API, storage).
+    All {
+        /// Port for the main Graph Daemon to listen on. Ignored if --cluster is used.
+        #[arg(short = 'p', long = "port", value_name = "PORT")]
+        port: Option<u16>,
+        /// Range of ports for a cluster (e.g., "9001-9005"). Max 10 ports.
+        #[arg(long = "cluster", value_name = "START-END")]
+        cluster: Option<String>,
+        /// Expose REST API on this port.
+        #[arg(long = "listen-port", value_name = "LISTEN_PORT")]
+        listen_port: Option<u16>,
+        /// Port for the standalone Storage daemon.
+        #[arg(long = "storage-port", value_name = "STORAGE_PORT")]
+        storage_port: Option<u16>,
+        /// Path to the storage daemon's configuration file.
+        #[arg(long = "storage-config", value_name = "STORAGE_CONFIG_FILE")]
+        storage_config_file: Option<PathBuf>,
+    },
+}
+
+/// Arguments for the top-level `start` command.
+#[derive(Args, Debug, PartialEq, Clone)]
+pub struct StartArgs {
+    #[command(subcommand)]
+    pub action: StartAction,
+}
+
+/// Arguments for the `daemon` subcommand.
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum DaemonCliCommand {
+    /// Start a GraphDB daemon instance.
+    Start {
+        /// Port for the daemon to listen on.
+        #[arg(long, short)]
+        port: Option<u16>,
+        /// Range of ports for a cluster (e.g., "9000-9002").
+        #[arg(long, short)]
+        cluster: Option<String>,
+    },
+    /// Stop a running GraphDB daemon instance.
+    Stop {
+        /// Port of the daemon to stop.
+        #[arg(long, short)]
+        port: Option<u16>,
+    },
+    /// Get the status of a GraphDB daemon instance.
+    Status {
+        /// Port of the daemon to check status for.
+        #[arg(long, short)]
+        port: Option<u16>,
+    },
+    /// List all currently managed daemon instances.
+    List,
+    /// Stop all managed daemon instances and attempt to kill any external ones.
+    ClearAll,
+}
+
+/// Arguments for the `rest` subcommand.
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum RestCliCommand {
+    /// Start the REST API server.
+    Start {
+        /// Port for the REST API server to listen on. Defaults to value in config.
+        #[arg(long, short)]
+        port: Option<u16>,
+        /// Alias for --port, for consistency with other commands.
+        #[arg(long)]
+        listen_port: Option<u16>,
+    },
+    /// Stop the REST API server.
+    Stop,
+    /// Get the status of the REST API server.
+    Status,
+    /// Perform a health check on the REST API server.
+    Health,
+    /// Get the version of the REST API server.
+    Version,
+    /// Register a new user with the GraphDB REST API.
+    RegisterUser {
+        /// Username for the new user.
+        username: String,
+        /// Password for the new user.
+        password: String,
+    },
+    /// Authenticate a user and get an authentication token.
+    Authenticate {
+        /// Username to authenticate.
+        username: String,
+        /// Password for authentication.
+        password: String,
+    },
+    /// Execute a graph query via the REST API.
+    GraphQuery {
+        /// The graph query string.
+        query_string: String,
+        /// Whether to persist the results of the query.
+        #[arg(long)]
+        persist: Option<bool>,
+    },
+    /// Execute a storage-level query via the REST API (placeholder).
+    StorageQuery,
+}
+
+/// Arguments for the `storage` subcommand.
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum StorageAction {
+    /// Start the standalone Storage daemon.
+    Start {
+        /// Port for the Storage daemon to listen on. Defaults to value in config.
+        #[arg(long, short)]
+        port: Option<u16>,
+        /// Path to the storage configuration file.
+        #[arg(long, short = 'f', value_name = "FILE")]
+        config_file: Option<PathBuf>,
+    },
+    /// Stop the standalone Storage daemon.
+    Stop {
+        /// Port of the Storage daemon to stop.
+        #[arg(long, short)]
+        port: Option<u16>,
+    },
+    /// Get the status of the standalone Storage daemon.
+    Status {
+        /// Port of the Storage daemon to check status for.
+        #[arg(long, short)]
+        port: Option<u16>,
+    },
+}
+
+/// Arguments for the top-level `stop` command.
+#[derive(Args, Debug, PartialEq, Clone)]
+pub struct StopArgs {
+    /// Specify which component to stop (rest, daemon, storage). If omitted, all components will be stopped.
+    #[command(subcommand)]
+    pub action: Option<StopAction>,
+}
+
+/// Actions for the top-level `stop` command.
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum StopAction {
+    /// Stop the REST API server.
+    Rest,
+    /// Stop a GraphDB daemon instance.
+    Daemon {
+        /// Port of the daemon to stop.
+        #[arg(long, short)]
+        port: Option<u16>,
+    },
+    /// Stop the standalone Storage daemon.
+    Storage {
+        /// Port of the Storage daemon to stop.
+        #[arg(long, short)]
+        port: Option<u16>,
+    },
+    /// Stop all core GraphDB components.
+    All,
+}
+
+/// Arguments for the top-level `status` command.
+#[derive(Args, Debug, PartialEq, Clone)]
+pub struct StatusArgs {
+    /// Specify which component to get status for (rest, daemon, storage). If omitted, a summary will be displayed.
+    #[command(subcommand)]
+    pub action: Option<StatusAction>,
+}
+
+/// Actions for the top-level `status` command.
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum StatusAction {
+    /// Get the status of the REST API server.
+    Rest,
+    /// Get the status of a GraphDB daemon instance.
+    Daemon {
+        /// Port of the daemon to check status for.
+        #[arg(long, short)]
+        port: Option<u16>,
+    },
+    /// Get the status of the standalone Storage daemon.
+    Storage {
+        /// Port of the Storage daemon to check status for.
+        #[arg(long, short)]
+        port: Option<u16>,
+    },
+    /// Get the status of the entire cluster.
+    Cluster, // Added for 'status cluster'
+    /// Get a comprehensive status summary of all GraphDB components.
+    All,
+}
+
+/// Arguments for the top-level `auth` command.
+#[derive(Args, Debug, PartialEq, Clone)]
+pub struct AuthArgs {
+    /// Username for authentication.
+    pub username: String,
+    /// Password for authentication.
+    pub password: String,
+}
+
+/// Arguments for the top-level `authenticate` command.
+#[derive(Args, Debug, PartialEq, Clone)]
+pub struct AuthenticateArgs {
+    /// Username to authenticate.
+    pub username: String,
+    /// Password for authentication.
+    pub password: String,
+}
+
+/// Arguments for the top-level `register` command.
+#[derive(Args, Debug, PartialEq, Clone)]
+pub struct RegisterArgs {
+    /// Username for the new user.
+    pub username: String,
+    /// Password for the new user.
+    pub password: String,
+}
+
+/// Arguments for the top-level `reload` command.
+#[derive(Args, Debug, PartialEq, Clone)]
+pub struct ReloadArgs {
+    /// Specify which component to reload (all, rest, storage, daemon, cluster).
+    #[command(subcommand)]
+    pub action: ReloadAction,
+}
+
+/// Actions for the top-level `reload` command.
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum ReloadAction {
+    /// Reload all GraphDB components.
+    All,
+    /// Reload the REST API server.
+    Rest,
+    /// Reload the standalone Storage daemon.
+    Storage,
+    /// Reload a specific GraphDB daemon instance.
+    Daemon {
+        /// Port of the daemon to reload.
+        #[arg(long, short)]
+        port: Option<u16>,
+    },
+    /// Reload the cluster configuration.
+    Cluster,
+}
+
+
 /// Main CLI arguments structure
 #[derive(Parser, Debug)]
 #[command(name = "graphdb-cli")]
@@ -37,7 +311,7 @@ pub struct CliArgs {
     pub command: Option<GraphDbCommands>,
 }
 
-/// Top-level GraphDB CLI commands
+/// Enum representing the top-level commands.
 #[derive(Subcommand, Debug)]
 pub enum GraphDbCommands {
     /// View a graph by ID.
@@ -65,18 +339,7 @@ pub enum GraphDbCommands {
         node_id: Option<u32>,
     },
     /// Start various GraphDB components (REST API, Storage Daemon, optional Graph Daemon).
-    Start {
-        #[arg(short = 'p', long = "port", value_name = "PORT", help = "Port for the main Graph Daemon to listen on. Ignored if --cluster is used.")]
-        port: Option<u16>,
-        #[arg(long = "cluster", value_name = "START-END", help = "Start a cluster of daemons on a range of ports (e.g., '9001-9005'). Max 10 ports.")]
-        cluster: Option<String>,
-        #[arg(long = "listen-port", value_name = "LISTEN_PORT", help = "Expose REST API on this port")]
-        listen_port: Option<u16>,
-        #[arg(long = "storage-port", value_name = "STORAGE_PORT", help = "Port for the standalone Storage daemon.")]
-        storage_port: Option<u16>,
-        #[arg(long = "storage-config", value_name = "STORAGE_CONFIG_FILE", help = "Path to the storage daemon's configuration file.")]
-        storage_config_file: Option<PathBuf>,
-    },
+    Start(StartArgs), // Now uses StartArgs for subcommands like 'start rest' or 'start all'
     /// Stop various GraphDB components (all by default, or specific with subcommands).
     Stop(StopArgs),
     /// Get a comprehensive status summary of all GraphDB components or specific component status.
@@ -94,153 +357,26 @@ pub enum GraphDbCommands {
     #[clap(subcommand)]
     Rest(RestCliCommand),
 
-    // Removed the Help subcommand from here.
-    // The 'help' command will now be handled manually in cli.rs
-}
+    /// Authenticate a user and get an authentication token.
+    Auth(AuthArgs), // Added top-level Auth command
+    /// Authenticate a user and get an authentication token.
+    Authenticate(AuthenticateArgs), // Added top-level Authenticate command
+    /// Register a new user.
+    Register(RegisterArgs), // Added top-level Register command
+    /// Get the version of the REST API server.
+    Version, // Added top-level Version command
+    /// Perform a health check on the REST API server.
+    Health, // Added top-level Health command
+    /// Reload GraphDB components.
+    Reload(ReloadArgs), // Added top-level Reload command
 
-/// Arguments for the top-level `stop` command
-#[derive(Args, Debug)]
-pub struct StopArgs {
-    #[clap(subcommand)]
-    pub action: Option<StopAction>,
-}
+    /// Clear the terminal screen.
+    Clear,
+    /// Alias for 'clear' to clear the terminal screen.
+    Clean,
 
-/// Subcommands for the top-level `stop` command
-#[derive(Subcommand, Debug)]
-pub enum StopAction {
-    /// Stop the REST API server.
-    Rest,
-    /// Stop a specific GraphDB daemon.
-    Daemon {
-        /// The port of the daemon to stop.
-        #[arg(long)]
-        port: Option<u16>,
-    },
-    /// Stop the standalone Storage daemon.
-    Storage {
-        /// The port of the Storage daemon to stop. If not provided, it attempts to stop the commonly assumed default port (8085).
-        #[arg(long)]
-        port: Option<u16>,
-    },
+    // Help command is handled interactively, not via clap subcommand here.
 }
-
-/// Arguments for the top-level `status` command
-#[derive(Args, Debug)]
-pub struct StatusArgs {
-    #[clap(subcommand)]
-    pub action: Option<StatusAction>,
-}
-
-/// Subcommands for the top-level `status` command
-#[derive(Subcommand, Debug)]
-pub enum StatusAction {
-    /// Check the status of the REST API server.
-    Rest,
-    /// Check the status of a specific GraphDB daemon.
-    Daemon {
-        /// The port of the daemon to check.
-        #[arg(long)]
-        port: Option<u16>,
-    },
-    /// Check the status of the standalone Storage daemon.
-    Storage {
-        /// The port of the Storage daemon to check. If not provided, it checks the commonly assumed default port (8085).
-        #[arg(long)]
-        port: Option<u16>,
-    },
-}
-
-/// Commands for interacting with the GraphDB daemon
-#[derive(Subcommand, Debug, PartialEq)]
-pub enum DaemonCliCommand {
-    /// Start the GraphDB daemon
-    Start {
-        #[arg(short = 'p', long = "port", value_name = "PORT", help = "Port for the daemon to listen on.")]
-        port: Option<u16>,
-        #[arg(long = "cluster", value_name = "START-END", help = "Start a cluster of daemons on a range of ports (e.g., '9001-9005'). Max 10 ports.")]
-        cluster: Option<String>,
-    },
-    /// Stop the GraphDB daemon
-    Stop {
-        #[arg(short = 'p', long = "port", value_name = "PORT", help = "Port of the daemon to stop.")]
-        port: Option<u16>,
-    },
-    /// Get status of the GraphDB daemon
-    Status {
-        #[arg(short = 'p', long = "port", value_name = "PORT", help = "Port of the daemon to check status for.")]
-        port: Option<u16>,
-    },
-    /// List all daemons managed by this CLI instance.
-    List,
-    /// Stop all daemons managed by this CLI instance and attempt to kill external ones.
-    ClearAll,
-}
-
-/// Commands for interacting with the REST API server
-#[derive(Subcommand, Debug, PartialEq)]
-pub enum RestCliCommand {
-    /// Start the REST API server
-    Start {
-        #[arg(long)]
-        port: Option<u16>,
-        #[arg(long = "listen-port", value_name = "LISTEN_PORT", help = "Expose REST API on this port")]
-        listen_port: Option<u16>, // Added listen_port
-    },
-    /// Stop the REST API server
-    Stop,
-    /// Check the status of the REST API server
-    Status,
-    /// Perform a health check on the REST API server
-    Health,
-    /// Get the version of the REST API server
-    Version,
-    /// Register a new user via REST API
-    RegisterUser {
-        username: String,
-        password: String,
-    },
-    /// Authenticate a user and get a token via REST API
-    Authenticate {
-        username: String,
-        password: String,
-    },
-    /// Execute a graph query via REST API
-    GraphQuery {
-        query_string: String,
-        #[arg(long)]
-        persist: Option<bool>,
-    },
-    /// Execute a storage query via REST API (placeholder)
-    StorageQuery,
-}
-
-/// Commands for interacting with the standalone Storage daemon
-#[derive(Subcommand, Debug, PartialEq)]
-pub enum StorageAction {
-    /// Start the standalone Storage daemon
-    Start {
-        /// The port for the standalone Storage daemon. If not provided, the storage daemon will use its own configured default.
-        #[clap(long)]
-        port: Option<u16>,
-        /// Path to the storage daemon's configuration file (default: storage_config.yaml in daemon's CWD).
-        #[clap(long, default_value = "storage_config.yaml")]
-        config_file: PathBuf,
-    },
-    /// Stop the standalone Storage daemon
-    Stop {
-        /// The port of the standalone Storage daemon to stop. If not provided, it attempts to stop the daemon on its common default port (8085).
-        #[clap(long)]
-        port: Option<u16>,
-    },
-    /// Check the status of the standalone Storage daemon
-    Status {
-        /// The port of the standalone Storage daemon to check. If not provided, it checks the daemon on the commonly assumed default port (8085).
-        #[arg(long)]
-        port: Option<u16>,
-    },
-}
-
-// Removed HelpArgs struct as it's no longer needed for clap parsing.
 
 // Data structures for internal use or communication (if needed)
 // These might be moved to a `models.rs` if they grow in number and complexity.
