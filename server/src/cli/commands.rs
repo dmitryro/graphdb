@@ -43,11 +43,9 @@ pub enum RestCliCommand {
     /// Start the REST API server.
     Start {
         /// Port for the REST API to listen on.
-        #[clap(long, short = 'p')]
+        #[clap(long, short = 'p', name = "listen-port")] // Use name to map --listen-port to 'port'
         port: Option<u16>,
-        /// Listen port for the REST API.
-        #[clap(long)]
-        listen_port: Option<u16>,
+        // Removed listen_port field for consistency
     },
     /// Stop the REST API server.
     Stop,
@@ -89,7 +87,7 @@ pub enum StorageAction {
     /// Start the standalone Storage daemon.
     Start {
         /// Port for the Storage daemon to listen on.
-        #[clap(long, short = 'p', name = "storage-port")] // FIX: Added name to map --storage-port
+        #[clap(long, short = 'p', name = "storage-port")] // Consistent: Use name to map --storage-port to 'port'
         port: Option<u16>,
         /// Path to the storage configuration file.
         #[clap(long)]
@@ -98,13 +96,13 @@ pub enum StorageAction {
     /// Stop the standalone Storage daemon.
     Stop {
         /// Port of the storage daemon to stop. If not specified, attempts to stop the default or managed storage daemon.
-        #[clap(long, short = 'p')]
+        #[clap(long, short = 'p', name = "storage-port")] // Consistent: Use name to map --storage-port to 'port'
         port: Option<u16>,
     },
     /// Get the status of the standalone Storage daemon.
     Status {
         /// Port of the storage daemon to check status for.
-        #[clap(long, short = 'p')]
+        #[clap(long, short = 'p', name = "storage-port")] // Consistent: Use name to map --storage-port to 'port'
         port: Option<u16>,
     },
 }
@@ -130,7 +128,7 @@ pub enum StatusAction {
     /// Get detailed status of the Storage component.
     Storage {
         /// Port of the storage daemon to check status for.
-        #[clap(long, short = 'p')]
+        #[clap(long, short = 'p', name = "storage-port")] // Consistent: Use name to map --storage-port to 'port'
         port: Option<u16>,
     },
     /// Get status of the cluster (placeholder).
@@ -161,7 +159,7 @@ pub enum StopAction {
     /// Stop the standalone Storage daemon.
     Storage {
         /// Port of the storage daemon to stop.
-        #[clap(long, short = 'p')]
+        #[clap(long, short = 'p', name = "storage-port")] // Consistent: Use name to map --storage-port to 'port'
         port: Option<u16>,
     },
     /// Stop all GraphDB components.
@@ -174,14 +172,14 @@ pub enum StartAction {
     /// Start the REST API server.
     Rest {
         /// Port for the REST API.
-        #[clap(long, short = 'p', name = "listen-port")] // FIX: Added name to map --listen-port
+        #[clap(long, short = 'p', name = "listen-port")] // Consistent: Use name to map --listen-port to 'port'
         port: Option<u16>,
         // Removed `listen_port` field as it's redundant with `port` and `name` attribute
     },
     /// Start the standalone Storage daemon.
     Storage {
         /// Port for the Storage daemon.
-        #[clap(long, short = 'p', name = "storage-port")] // FIX: Added name to map --storage-port
+        #[clap(long, short = 'p', name = "storage-port")] // Consistent: Use name to map --storage-port to 'port'
         port: Option<u16>,
         /// Path to the storage configuration file.
         #[clap(long)]
@@ -273,16 +271,14 @@ pub enum RestartAction {
     /// Restart the REST API server.
     Rest {
         /// Port for the REST API.
-        #[clap(long, short = 'p')]
+        #[clap(long, short = 'p', name = "listen-port")] // Consistent: Use name to map --listen-port to 'port'
         port: Option<u16>,
-        /// Listen port for the REST API.
-        #[clap(long)]
-        listen_port: Option<u16>,
+        // Removed `listen_port` field for consistency
     },
     /// Restart the standalone Storage daemon.
     Storage {
         /// Port for the Storage daemon.
-        #[clap(long, short = 'p')]
+        #[clap(long, short = 'p', name = "storage-port")] // Consistent: Use name to map --storage-port to 'port'
         port: Option<u16>,
         /// Path to the storage configuration file.
         #[clap(long)]

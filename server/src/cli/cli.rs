@@ -62,21 +62,8 @@ pub enum Commands {
     Start {
         #[clap(subcommand)]
         action: Option<StartAction>,
-        /// Port for the daemon (if starting daemon or all)
-        #[clap(long, short = 'p')]
-        port: Option<u16>,
-        /// Cluster range for daemon (e.g., "8080-8085")
-        #[clap(long)]
-        cluster: Option<String>,
-        /// Listen port for the REST API (if starting rest or all)
-        #[clap(long)]
-        listen_port: Option<u16>,
-        /// Storage port for the Storage daemon (if starting storage or all)
-        #[clap(long)]
-        storage_port: Option<u16>,
-        /// Path to the storage configuration file (if starting storage or all)
-        #[clap(long)]
-        storage_config_file: Option<PathBuf>,
+        // Removed top-level port, cluster, listen_port, storage_port, storage_config_file
+        // These are now only available within StartAction::All
     },
     /// Stop GraphDB components (daemon, rest, storage, or all)
     Stop(StopArgs), // Corrected: Changed to directly use StopArgs
@@ -210,7 +197,8 @@ pub async fn start_cli() -> Result<()> {
             println!("Experimental plugins are enabled.");
         }
         match command {
-            Commands::Start { action, port, cluster, listen_port, storage_port, storage_config_file } => {
+            // Updated Commands::Start to only have 'action'
+            Commands::Start { action } => { // Removed port, cluster, listen_port, storage_port, storage_config_file
                 match action {
                     Some(StartAction::All { port, cluster, listen_port, storage_port, storage_config_file }) => {
                         handlers_mod::handle_start_all_interactive(
@@ -226,27 +214,27 @@ pub async fn start_cli() -> Result<()> {
                         ).await?;
                     }
                     // FIX: Updated StartAction::Rest destructuring and call to match commands.rs
-                    Some(StartAction::Rest { port: rest_start_port }) => {
+                    Some(StartAction::Rest { port: rest_start_port }) => { // 'port' is now the listen-port
                         handlers_mod::handle_rest_command_interactive(
-                            // Assuming RestCliCommand::Start still has both `port` and `listen_port`
-                            // and `rest_start_port` carries the value from `--listen-port`
-                            RestCliCommand::Start { port: rest_start_port, listen_port: rest_start_port }, // Corrected: Added listen_port
+                            // Pass the 'port' argument as the single port for RestCliCommand::Start
+                            RestCliCommand::Start { port: rest_start_port },
                             rest_api_shutdown_tx_opt.clone(),
                             rest_api_port_arc.clone(),
                             rest_api_handle.clone(),
                         ).await?;
                     }
-                    // FIX: Updated StartAction::Storage destructuring and call to match commands.rs
-                    Some(StartAction::Storage { port: storage_start_port, config_file: storage_start_config_file }) => {
+                    // FIX: Updated StartAction::Storage destructuring to use `port`
+                    Some(StartAction::Storage { port, config_file: storage_start_config_file }) => { // Corrected: Destructure `port`
                         handlers_mod::handle_storage_command_interactive(
-                            StorageAction::Start { port: storage_start_port, config_file: storage_start_config_file }, // FIX: Pass directly
+                            StorageAction::Start { port, config_file: storage_start_config_file }, // FIX: Pass `port`
                             storage_daemon_shutdown_tx_opt.clone(),
                             storage_daemon_handle.clone(),
                         ).await?;
                     }
                     None => {
+                        // Default `start` command now implies `start all` without specific args
                         handlers_mod::handle_start_all_interactive(
-                            port, cluster, listen_port, storage_port, storage_config_file,
+                            None, None, None, None, None, // Pass None for all options
                             daemon_handles.clone(), rest_api_shutdown_tx_opt.clone(), rest_api_port_arc.clone(), rest_api_handle.clone(),
                             storage_daemon_shutdown_tx_opt.clone(), storage_daemon_handle.clone(),
                         ).await?;

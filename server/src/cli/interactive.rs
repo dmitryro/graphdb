@@ -21,7 +21,7 @@ use rustyline::DefaultEditor; // FIX: Added: Import DefaultEditor from rustyline
 use crate::cli::cli::CliArgs; // Corrected: Import CliArgs from cli.rs
 use crate::cli::commands::{DaemonCliCommand, RestCliCommand, StorageAction, RestartArgs, RestartAction}; // Corrected: Added RestartAction, Removed unused: StatusArgs, StopArgs, ReloadArgs, ReloadAction, StartAction
 use crate::cli::help_display::HelpArgs; // Corrected: Import HelpArgs from help_display
-// Removed unused imports: use crate::cli::config::CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS;
+use crate::cli::config::CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS; // Re-added: Used in parse_command
 use crate::cli::handlers;
 // The following stop_daemon_api_call is now primarily for global cleanup on exit,
 // interactive command handling uses handlers.rs functions.
@@ -35,7 +35,7 @@ pub enum CommandType {
     Rest(RestCliCommand),
     Storage(StorageAction),
     // Top-level Start command variants
-    StartRest { port: Option<u16>, listen_port: Option<u16> },
+    StartRest { port: Option<u16> }, // FIX: Removed listen_port
     StartStorage { port: Option<u16>, config_file: Option<PathBuf> },
     StartDaemon { port: Option<u16>, cluster: Option<String> }, // Added for top-level 'start daemon'
     StartAll {
@@ -71,6 +71,10 @@ pub enum CommandType {
         storage_port: Option<u16>,
         storage_config_file: Option<PathBuf>,
     },
+    RestartRest { port: Option<u16> }, // ADDED
+    RestartStorage { port: Option<u16>, config_file: Option<PathBuf> }, // ADDED
+    RestartDaemon { port: Option<u16>, cluster: Option<String> }, // ADDED
+    RestartCluster, // ADDED
     Help(HelpArgs),
     Clear, // Added for 'clear' and 'clean' commands
     Exit,
@@ -93,12 +97,12 @@ pub fn parse_command(input: &str) -> (CommandType, Vec<String>) {
                 match parts[1].to_lowercase().as_str() {
                     "rest" => {
                         let mut port_arg = None;
-                        let mut listen_port_arg = None;
+                        // Removed listen_port_arg as it's no longer a separate field
                         let mut i = 2;
 
                         while i < parts.len() {
                             match parts[i].to_lowercase().as_str() {
-                                "--port" => {
+                                "--port" | "-p" | "--listen-port" => { // ADDED --listen-port
                                     if i + 1 < parts.len() {
                                         port_arg = parts[i + 1].parse::<u16>().ok();
                                         i += 2;
@@ -107,22 +111,14 @@ pub fn parse_command(input: &str) -> (CommandType, Vec<String>) {
                                         i += 1;
                                     }
                                 }
-                                "--listen-port" => {
-                                    if i + 1 < parts.len() {
-                                        listen_port_arg = parts[i + 1].parse::<u16>().ok();
-                                        i += 2;
-                                    } else {
-                                        eprintln!("Warning: Flag '{}' requires a value.", parts[i]);
-                                        i += 1;
-                                    }
-                                }
+                                // Removed "--listen-port" as it's now handled by "--port" with name="listen-port" in commands.rs
                                 _ => {
                                     eprintln!("Warning: Unknown argument for 'start rest': {}", parts[i]);
                                     i += 1;
                                 }
                             }
                         }
-                        CommandType::StartRest { port: port_arg, listen_port: listen_port_arg }
+                        CommandType::StartRest { port: port_arg } // FIX: Removed listen_port_arg
                     },
                     "storage" => {
                         let mut port_arg = None;
@@ -131,7 +127,7 @@ pub fn parse_command(input: &str) -> (CommandType, Vec<String>) {
 
                         while i < parts.len() {
                             match parts[i].to_lowercase().as_str() {
-                                "--port" => {
+                                "--port" | "-p" | "--storage-port" => { // ADDED --storage-port
                                     if i + 1 < parts.len() {
                                         port_arg = parts[i + 1].parse::<u16>().ok();
                                         i += 2;
@@ -330,12 +326,12 @@ pub fn parse_command(input: &str) -> (CommandType, Vec<String>) {
                 match parts[1].to_lowercase().as_str() {
                     "start" => {
                         let mut port_arg = None;
-                        let mut listen_port_arg = None;
+                        // Removed listen_port_arg as it's no longer a separate field
                         let mut current_idx = 2;
 
                         while current_idx < parts.len() {
                             match parts[current_idx].to_lowercase().as_str() {
-                                "--port" => {
+                                "--port" | "-p" | "--listen-port" => { // ADDED --listen-port
                                     if current_idx + 1 < parts.len() {
                                         port_arg = parts[current_idx + 1].parse::<u16>().ok();
                                         current_idx += 2;
@@ -344,22 +340,14 @@ pub fn parse_command(input: &str) -> (CommandType, Vec<String>) {
                                         current_idx += 1;
                                     }
                                 }
-                                "--listen-port" => {
-                                    if current_idx + 1 < parts.len() {
-                                        listen_port_arg = parts[current_idx + 1].parse::<u16>().ok();
-                                        current_idx += 2;
-                                    } else {
-                                        eprintln!("Warning: Flag '{}' requires a value.", parts[current_idx]);
-                                        current_idx += 1;
-                                    }
-                                }
+                                // Removed "--listen-port" as it's now handled by "--port" with name="listen-port" in commands.rs
                                 _ => {
                                     eprintln!("Warning: Unknown argument for 'rest start': {}", parts[current_idx]);
                                     current_idx += 1;
                                 }
                             }
                         }
-                        CommandType::Rest(RestCliCommand::Start { port: port_arg, listen_port: listen_port_arg })
+                        CommandType::Rest(RestCliCommand::Start { port: port_arg }) // FIX: Removed listen_port
                     },
                     "stop" => CommandType::Rest(RestCliCommand::Stop),
                     "status" => CommandType::Rest(RestCliCommand::Status),
@@ -411,7 +399,7 @@ pub fn parse_command(input: &str) -> (CommandType, Vec<String>) {
 
                         while i < parts.len() {
                             match parts[i].to_lowercase().as_str() {
-                                "--port" => {
+                                "--port" | "-p" | "--storage-port" => { // ADDED --storage-port
                                     if i + 1 < parts.len() {
                                         port_arg = parts[i + 1].parse::<u16>().ok();
                                         i += 2;
@@ -536,76 +524,168 @@ pub fn parse_command(input: &str) -> (CommandType, Vec<String>) {
             }
         },
         "restart" => { // Added restart command parsing
-            if parts.len() > 1 && parts[1].to_lowercase().as_str() == "all" {
-                let mut port_arg = None;
-                let mut cluster_arg = None;
-                let mut listen_port_arg = None;
-                let mut storage_port_arg = None;
-                let mut storage_config_file_arg = None;
-                let mut i = 2;
+            if parts.len() > 1 {
+                match parts[1].to_lowercase().as_str() {
+                    "all" => {
+                        let mut port_arg = None;
+                        let mut cluster_arg = None;
+                        let mut listen_port_arg = None;
+                        let mut storage_port_arg = None;
+                        let mut storage_config_file_arg = None;
+                        let mut i = 2;
 
-                while i < parts.len() {
-                    match parts[i].to_lowercase().as_str() {
-                        "--port" | "-p" => {
-                            if i + 1 < parts.len() {
-                                port_arg = parts[i + 1].parse::<u16>().ok();
-                                i += 2;
-                            } else {
-                                eprintln!("Warning: Flag '{}' requires a value.", parts[i]);
-                                i += 1;
+                        while i < parts.len() {
+                            match parts[i].to_lowercase().as_str() {
+                                "--port" | "-p" => {
+                                    if i + 1 < parts.len() {
+                                        port_arg = parts[i + 1].parse::<u16>().ok();
+                                        i += 2;
+                                    } else {
+                                        eprintln!("Warning: Flag '{}' requires a value.", parts[i]);
+                                        i += 1;
+                                    }
+                                }
+                                "--cluster" => {
+                                    if i + 1 < parts.len() {
+                                        cluster_arg = Some(parts[i + 1].to_string());
+                                        i += 2;
+                                    } else {
+                                        eprintln!("Warning: Flag '{}' requires a value.", parts[i]);
+                                        i += 1;
+                                    }
+                                }
+                                "--listen-port" => {
+                                    if i + 1 < parts.len() {
+                                        listen_port_arg = parts[i + 1].parse::<u16>().ok();
+                                        i += 2;
+                                    } else {
+                                        eprintln!("Warning: Flag '{}' requires a value.", parts[i]);
+                                        i += 1;
+                                    }
+                                }
+                                "--storage-port" => {
+                                    if i + 1 < parts.len() {
+                                        storage_port_arg = parts[i + 1].parse::<u16>().ok();
+                                        i += 2;
+                                    } else {
+                                        eprintln!("Warning: Flag '{}' requires a value.", parts[i]);
+                                        i += 1;
+                                    }
+                                }
+                                "--storage-config" => {
+                                    if i + 1 < parts.len() {
+                                        storage_config_file_arg = Some(PathBuf::from(parts[i + 1]));
+                                        i += 2;
+                                    } else {
+                                        eprintln!("Warning: Flag '{}' requires a value.", parts[i]);
+                                        i += 1;
+                                    }
+                                }
+                                _ => {
+                                    eprintln!("Warning: Unknown argument for 'restart all': {}", parts[i]);
+                                    i += 1;
+                                }
                             }
                         }
-                        "--cluster" => {
-                            if i + 1 < parts.len() {
-                                cluster_arg = Some(parts[i + 1].to_string());
-                                i += 2;
-                            } else {
-                                eprintln!("Warning: Flag '{}' requires a value.", parts[i]);
-                                i += 1;
+                        CommandType::RestartAll {
+                            port: port_arg,
+                            cluster: cluster_arg,
+                            listen_port: listen_port_arg,
+                            storage_port: storage_port_arg,
+                            storage_config_file: storage_config_file_arg,
+                        }
+                    },
+                    "rest" => { // ADDED for restart rest
+                        let mut port_arg = None;
+                        let mut i = 2;
+                        while i < parts.len() {
+                            match parts[i].to_lowercase().as_str() {
+                                "--port" | "-p" | "--listen-port" => {
+                                    if i + 1 < parts.len() {
+                                        port_arg = parts[i + 1].parse::<u16>().ok();
+                                        i += 2;
+                                    } else {
+                                        eprintln!("Warning: Flag '{}' requires a value.", parts[i]);
+                                        i += 1;
+                                    }
+                                }
+                                _ => {
+                                    eprintln!("Warning: Unknown argument for 'restart rest': {}", parts[i]);
+                                    i += 1;
+                                }
                             }
                         }
-                        "--listen-port" => {
-                            if i + 1 < parts.len() {
-                                listen_port_arg = parts[i + 1].parse::<u16>().ok();
-                                i += 2;
-                            } else {
-                                eprintln!("Warning: Flag '{}' requires a value.", parts[i]);
-                                i += 1;
+                        CommandType::RestartRest { port: port_arg }
+                    },
+                    "storage" => { // ADDED for restart storage
+                        let mut port_arg = None;
+                        let mut config_file_arg = None;
+                        let mut i = 2;
+                        while i < parts.len() {
+                            match parts[i].to_lowercase().as_str() {
+                                "--port" | "-p" | "--storage-port" => {
+                                    if i + 1 < parts.len() {
+                                        port_arg = parts[i + 1].parse::<u16>().ok();
+                                        i += 2;
+                                    } else {
+                                        eprintln!("Warning: Flag '{}' requires a value.", parts[i]);
+                                        i += 1;
+                                    }
+                                }
+                                "--config-file" => {
+                                    if i + 1 < parts.len() {
+                                        config_file_arg = Some(PathBuf::from(parts[i + 1]));
+                                        i += 2;
+                                    } else {
+                                        eprintln!("Warning: Flag '{}' requires a value.", parts[i]);
+                                        i += 1;
+                                    }
+                                }
+                                _ => {
+                                    eprintln!("Warning: Unknown argument for 'restart storage': {}", parts[i]);
+                                    i += 1;
+                                }
                             }
                         }
-                        "--storage-port" => {
-                            if i + 1 < parts.len() {
-                                storage_port_arg = parts[i + 1].parse::<u16>().ok();
-                                i += 2;
-                            } else {
-                                eprintln!("Warning: Flag '{}' requires a value.", parts[i]);
-                                i += 1;
+                        CommandType::RestartStorage { port: port_arg, config_file: config_file_arg }
+                    },
+                    "daemon" => { // ADDED for restart daemon
+                        let mut port_arg = None;
+                        let mut cluster_arg = None;
+                        let mut i = 2;
+                        while i < parts.len() {
+                            match parts[i].to_lowercase().as_str() {
+                                "--port" | "-p" => {
+                                    if i + 1 < parts.len() {
+                                        port_arg = parts[i + 1].parse::<u16>().ok();
+                                        i += 2;
+                                    } else {
+                                        eprintln!("Warning: Flag '{}' requires a value.", parts[i]);
+                                        i += 1;
+                                    }
+                                }
+                                "--cluster" => {
+                                    if i + 1 < parts.len() {
+                                        cluster_arg = Some(parts[i + 1].to_string());
+                                        i += 2;
+                                    } else {
+                                        eprintln!("Warning: Flag '{}' requires a value.", parts[i]);
+                                        i += 1;
+                                    }
+                                }
+                                _ => {
+                                    eprintln!("Warning: Unknown argument for 'restart daemon': {}", parts[i]);
+                                    i += 1;
+                                }
                             }
                         }
-                        "--storage-config" => {
-                            if i + 1 < parts.len() {
-                                storage_config_file_arg = Some(PathBuf::from(parts[i + 1]));
-                                i += 2;
-                            } else {
-                                eprintln!("Warning: Flag '{}' requires a value.", parts[i]);
-                                i += 1;
-                            }
-                        }
-                        _ => {
-                            eprintln!("Warning: Unknown argument for 'restart all': {}", parts[i]);
-                            i += 1;
-                        }
-                    }
-                }
-                CommandType::RestartAll {
-                    port: port_arg,
-                    cluster: cluster_arg,
-                    listen_port: listen_port_arg,
-                    storage_port: storage_port_arg,
-                    storage_config_file: storage_config_file_arg,
+                        CommandType::RestartDaemon { port: port_arg, cluster: cluster_arg }
+                    },
+                    "cluster" => CommandType::RestartCluster, // ADDED
+                    _ => CommandType::Unknown,
                 }
             } else {
-                eprintln!("Usage: restart all [--port <port>] [--cluster <range>] [--listen-port <port>] [--storage-port <port>] [--storage-config <path>]");
+                eprintln!("Usage: restart [all|rest|storage|daemon|cluster] ...");
                 CommandType::Unknown
             }
         },
@@ -659,7 +739,7 @@ pub fn print_interactive_help() {
     println!("  daemon status [--port <port>]                               - Check status of a GraphDB daemon");
     println!("  daemon list                                                 - List daemons managed by this CLI");
     println!("  daemon clear-all                                            - Stop all managed daemons and attempt to kill external ones");
-    println!("  rest start [--port <port>] [--listen-port <port>] - Start the REST API server");
+    println!("  rest start [--listen-port <port>] - Start the REST API server"); // FIX: Changed to --listen-port
     println!("  rest stop                                                   - Stop the REST API server");
     println!("  rest status                                                 - Check the status of the REST API server");
     println!("  rest health                                                 - Perform a health check on the REST API server");
@@ -668,7 +748,7 @@ pub fn print_interactive_help() {
     println!("  rest authenticate <username> <password>                     - Authenticate a user and get a token via REST API");
     println!("  rest graph-query \"<query_string>\" [persist]               - Execute a graph query via REST API");
     println!("  rest storage-query                                          - Execute a storage query via REST API (placeholder)");
-    println!("  storage start [--port <port>] [--config-file <path>] - Start the standalone Storage daemon");
+    println!("  storage start [--storage-port <port>] [--config-file <path>] - Start the standalone Storage daemon"); // FIX: Changed to --storage-port
     println!("  storage stop [--port <port>]                                - Stop the standalone Storage daemon");
     println!("  storage status [--port <port>]                              - Check the status of the standalone Storage daemon");
     println!("  status [rest|daemon|storage|cluster|all] [--port <port>] - Get a comprehensive status summary or specific component status");
@@ -677,8 +757,12 @@ pub fn print_interactive_help() {
     println!("  register <username> <password>                              - Register a new user (top-level)");
     println!("  version                                                     - Get the version of the REST API server (top-level)");
     println!("  health                                                      - Perform a health check on the REST API server (top-level)");
-    println!("  reload [all|rest|storage|daemon|cluster] [--port <port>] - Reload GraphDB components");
+    println!("  reload [all|rest|storage|daemon|cluster] [--port <port>] - Reload GraphDB components"); // Fixed E0308
     println!("  restart all [--port <port>] [--cluster <range>] [--listen-port <port>] [--storage-port <port>] [--storage-config <path>] - Restart all core GraphDB components");
+    println!("  restart rest [--listen-port <port>] - Restart the REST API server"); // ADDED
+    println!("  restart storage [--storage-port <port>] [--config-file <path>] - Restart the standalone Storage daemon"); // ADDED
+    println!("  restart daemon [--port <port>] [--cluster <range>] - Restart a GraphDB daemon"); // ADDED
+    println!("  restart cluster - Restart cluster configuration (placeholder)"); // ADDED
     println!("  clear | clean                                               - Clear the terminal screen"); // Added
     println!("  help [--command|-c <command_string>]                        - Display this help message or help for a specific command");
     println!("  exit | quit | q                                             - Exit the CLI");
@@ -688,22 +772,22 @@ pub fn print_interactive_help() {
 /// Prints help messages filtered by a command string for interactive mode.
 pub fn print_interactive_filtered_help(_cmd: &mut clap::Command, command_filter: &str) {
     let commands = [
-        ("start rest [--port <port>] [--listen-port <port>]", "Start the REST API server"),
-        ("start storage [--port <port>] [--config-file <path>]", "Start the standalone Storage daemon"),
+        ("start rest [--listen-port <port>]", "Start the REST API server"), // FIX: Changed to --listen-port
+        ("start storage [--storage-port <port>] [--config-file <path>]", "Start the standalone Storage daemon"), // FIX: Changed to --storage-port
         ("start daemon [--port <port>] [--cluster <range>]", "Start a GraphDB daemon instance"),
         ("start all [--port <port>] [--cluster <range>] [--listen-port <port>] [--storage-port <port>] [--storage-config <path>]", "Start all core GraphDB components"),
-        ("start", "Start all core GraphDB components (default)"), // Generic start
+        ("start", "Start all core GraphDB components (default)"),
         ("stop rest", "Stop the REST API server"),
         ("stop daemon [--port <port>]", "Stop a GraphDB daemon"),
         ("stop storage [--port <port>]", "Stop the standalone Storage daemon"),
         ("stop all", "Stop all core GraphDB components"),
-        ("stop", "Stop all GraphDB components (default)"), // Generic stop
+        ("stop", "Stop all GraphDB components (default)"),
         ("daemon start [--port <port>] [--cluster <range>]", "Start a GraphDB daemon"),
         ("daemon stop [--port <port>]", "Stop a GraphDB daemon"),
         ("daemon status [--port <port>]", "Check status of a GraphDB daemon"),
         ("daemon list", "List daemons managed by this CLI"),
         ("daemon clear-all", "Stop all managed daemons and attempt to kill external ones"),
-        ("rest start [--port <port>] [--listen-port <port>]", "Start the REST API server"),
+        ("rest start [--listen-port <port>]", "Start the REST API server"), // FIX: Changed to --listen-port
         ("rest stop", "Stop the REST API server"),
         ("rest status", "Check the status of the REST API server"),
         ("rest health", "Perform a health check on the REST API server"),
@@ -712,22 +796,26 @@ pub fn print_interactive_filtered_help(_cmd: &mut clap::Command, command_filter:
         ("rest authenticate <username> <password>", "Authenticate a user and get a token via REST API"),
         ("rest graph-query \"<query_string>\" [persist]", "Execute a graph query via REST API"),
         ("rest storage-query", "Execute a storage query via REST API (placeholder)"),
-        ("storage start [--port <port>] [--config-file <path>]", "Start the standalone Storage daemon"),
+        ("storage start [--storage-port <port>] [--config-file <path>]", "Start the standalone Storage daemon"), // FIX: Changed to --storage-port
         ("storage stop [--port <port>]", "Stop the standalone Storage daemon"),
         ("storage status [--port <port>]", "Check the status of the standalone Storage daemon"),
         ("status rest", "Get detailed status of the REST API component"),
         ("status daemon [--port <port>]", "Get detailed status of a specific daemon or list common ones"),
         ("status storage [--port <port>]", "Get detailed status of the Storage component"),
-        ("status cluster", "Get status of the cluster (placeholder)"), // Added
+        ("status cluster", "Get status of the cluster (placeholder)"),
         ("status all", "Get a comprehensive status summary of all GraphDB components"),
-        ("status", "Get a comprehensive status summary of all GraphDB components (default)"), // Generic status
-        ("auth <username> <password>", "Authenticate a user and get a token"), // Added
-        ("authenticate <username> <password>", "Authenticate a user and get a token"), // Added
-        ("register <username> <password>", "Register a new user"), // Added
-        ("version", "Get the version of the REST API server"), // Added
-        ("health", "Perform a health check on the REST API server"), // Added
-        ("reload [all|rest|storage|daemon|cluster] [--port <port>]", "Reload GraphDB components"), // Fixed E0308
+        ("status", "Get a comprehensive status summary of all GraphDB components (default)"),
+        ("auth <username> <password>", "Authenticate a user and get a token"),
+        ("authenticate <username> <password>", "Authenticate a user and get a token"),
+        ("register <username> <password>", "Register a new user"),
+        ("version", "Get the version of the REST API server"),
+        ("health", "Perform a health check on the REST API server"),
+        ("reload [all|rest|storage|daemon|cluster] [--port <port>]", "Reload GraphDB components"),
         ("restart all [--port <port>] [--cluster <range>] [--listen-port <port>] [--storage-port <port>] [--storage-config <path>]", "Restart all core GraphDB components"),
+        ("restart rest [--listen-port <port>]", "Restart the REST API server"), // ADDED
+        ("restart storage [--storage-port <port>] [--config-file <path>]", "Restart the standalone Storage daemon"), // ADDED
+        ("restart daemon [--port <port>] [--cluster <range>]", "Restart a GraphDB daemon"), // ADDED
+        ("restart cluster", "Restart cluster configuration (placeholder)"), // ADDED
         ("clear", "Clear the terminal screen"),
         ("clean", "Clear the terminal screen"),
         ("help [--command|-c <command_string>]", "Display this help message or help for a specific command"),
@@ -790,7 +878,7 @@ pub async fn run_cli_interactive(
     rest_api_shutdown_tx_opt: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     rest_api_port_arc: Arc<Mutex<Option<u16>>>,
     rest_api_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
-    // New shared state for Storage daemon - now passed as arguments
+    // New shared state for Storage daemon - these were added in previous attempt
     storage_daemon_shutdown_tx_opt: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     storage_daemon_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 ) -> Result<()> {
@@ -805,9 +893,10 @@ pub async fn run_cli_interactive(
     let mut reader = BufReader::new(stdin);
     let mut input = String::new();
 
-    // Removed: These lines are no longer needed as the state is passed as arguments
-    // let storage_daemon_shutdown_tx_opt: Arc<Mutex<Option<oneshot::Sender<()>>>> = Arc::new(Mutex::new(None));
-    // let storage_daemon_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+    // Initialize storage daemon state here, as it's not passed from main run_cli
+    let storage_daemon_shutdown_tx_opt_local: Arc<Mutex<Option<oneshot::Sender<()>>>> = Arc::new(Mutex::new(None));
+    let storage_daemon_handle_local: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+
 
     loop {
         print!("graphdb-cli> ");
@@ -829,8 +918,8 @@ pub async fn run_cli_interactive(
                 rest_api_shutdown_tx_opt.clone(),
                 rest_api_port_arc.clone(),
                 rest_api_handle.clone(),
-                storage_daemon_shutdown_tx_opt.clone(), // Pass new storage state
-                storage_daemon_handle.clone(),            // Pass new storage state
+                storage_daemon_shutdown_tx_opt_local.clone(), // Use local storage state
+                storage_daemon_handle_local.clone(),           // Use local storage state
             ).await?;
             break; // Exit the loop
         }
@@ -840,8 +929,8 @@ pub async fn run_cli_interactive(
         let rest_api_shutdown_tx_opt_clone = Arc::clone(&rest_api_shutdown_tx_opt);
         let rest_api_port_arc_clone = Arc::clone(&rest_api_port_arc);
         let rest_api_handle_clone = Arc::clone(&rest_api_handle);
-        let storage_daemon_shutdown_tx_opt_clone = Arc::clone(&storage_daemon_shutdown_tx_opt); // Clone new storage state
-        let storage_daemon_handle_clone = Arc::clone(&storage_daemon_handle);            // Clone new storage state
+        let storage_daemon_shutdown_tx_opt_clone = Arc::clone(&storage_daemon_shutdown_tx_opt_local); // Clone local storage state
+        let storage_daemon_handle_clone = Arc::clone(&storage_daemon_handle_local);           // Clone local storage state
 
         // Dispatch the command to the interactive command handler
         handle_interactive_command(
@@ -850,8 +939,8 @@ pub async fn run_cli_interactive(
             rest_api_shutdown_tx_opt_clone,
             rest_api_port_arc_clone,
             rest_api_handle_clone,
-            storage_daemon_shutdown_tx_opt_clone, // Pass new storage state
-            storage_daemon_handle_clone,            // Pass new storage state
+            storage_daemon_shutdown_tx_opt_clone, // Pass local storage state
+            storage_daemon_handle_clone,           // Pass local storage state
         ).await?;
     }
 
@@ -868,8 +957,8 @@ pub async fn run_cli_interactive(
     // Stop Storage daemon if it was started by this CLI
     handlers::stop_storage_interactive(
         None, // No specific port, will check managed one
-        storage_daemon_shutdown_tx_opt.clone(), // Pass new storage state
-        storage_daemon_handle.clone(),            // Pass new storage state
+        storage_daemon_shutdown_tx_opt_local.clone(), // Use local storage state
+        storage_daemon_handle_local.clone(),           // Use local storage state
     ).await?;
 
     // Stop all managed daemons
@@ -909,8 +998,8 @@ pub async fn handle_interactive_command(
         CommandType::Storage(storage_action) => {
             handlers::handle_storage_command_interactive(storage_action, storage_daemon_shutdown_tx_opt.clone(), storage_daemon_handle.clone()).await?;
         }
-        CommandType::StartRest { port, listen_port } => {
-            handlers::start_rest_api_interactive(port, listen_port, rest_api_shutdown_tx_opt, rest_api_port_arc, rest_api_handle).await?;
+        CommandType::StartRest { port } => { // FIX: Removed listen_port from destructuring
+            handlers::start_rest_api_interactive(port, rest_api_shutdown_tx_opt, rest_api_port_arc, rest_api_handle).await?; // FIX: Removed listen_port argument
         }
         CommandType::StartStorage { port, config_file } => {
             handlers::start_storage_interactive(port, config_file, storage_daemon_shutdown_tx_opt, storage_daemon_handle).await?;
@@ -932,7 +1021,7 @@ pub async fn handle_interactive_command(
                 rest_api_port_arc,
                 rest_api_handle,
                 storage_daemon_shutdown_tx_opt.clone(), // Pass new storage state
-                storage_daemon_handle.clone(),            // Pass new storage state
+                storage_daemon_handle.clone(),           // Pass new storage state
             ).await?;
         }
         CommandType::StopRest => {
@@ -983,7 +1072,7 @@ pub async fn handle_interactive_command(
                 rest_api_port_arc,
                 rest_api_handle,
                 storage_daemon_shutdown_tx_opt.clone(), // Pass new storage state
-                storage_daemon_handle.clone(),            // Pass new storage state
+                storage_daemon_handle.clone(),           // Pass new storage state
             ).await?;
         }
         CommandType::ReloadRest => { // Added
@@ -1015,6 +1104,46 @@ pub async fn handle_interactive_command(
             };
             handlers::handle_restart_command_interactive(
                 restart_args, // Pass the struct
+                daemon_handles, rest_api_shutdown_tx_opt, rest_api_port_arc, rest_api_handle,
+                storage_daemon_shutdown_tx_opt, storage_daemon_handle,
+            ).await?;
+        }
+        CommandType::RestartRest { port } => { // ADDED
+            let restart_args = RestartArgs {
+                action: RestartAction::Rest { port },
+            };
+            handlers::handle_restart_command_interactive(
+                restart_args,
+                daemon_handles, rest_api_shutdown_tx_opt, rest_api_port_arc, rest_api_handle,
+                storage_daemon_shutdown_tx_opt, storage_daemon_handle,
+            ).await?;
+        }
+        CommandType::RestartStorage { port, config_file } => { // ADDED
+            let restart_args = RestartArgs {
+                action: RestartAction::Storage { port, config_file },
+            };
+            handlers::handle_restart_command_interactive(
+                restart_args,
+                daemon_handles, rest_api_shutdown_tx_opt, rest_api_port_arc, rest_api_handle,
+                storage_daemon_shutdown_tx_opt, storage_daemon_handle,
+            ).await?;
+        }
+        CommandType::RestartDaemon { port, cluster } => { // ADDED
+            let restart_args = RestartArgs {
+                action: RestartAction::Daemon { port, cluster },
+            };
+            handlers::handle_restart_command_interactive(
+                restart_args,
+                daemon_handles, rest_api_shutdown_tx_opt, rest_api_port_arc, rest_api_handle,
+                storage_daemon_shutdown_tx_opt, storage_daemon_handle,
+            ).await?;
+        }
+        CommandType::RestartCluster => { // ADDED
+            let restart_args = RestartArgs {
+                action: RestartAction::Cluster,
+            };
+            handlers::handle_restart_command_interactive(
+                restart_args,
                 daemon_handles, rest_api_shutdown_tx_opt, rest_api_port_arc, rest_api_handle,
                 storage_daemon_shutdown_tx_opt, storage_daemon_handle,
             ).await?;

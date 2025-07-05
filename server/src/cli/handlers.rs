@@ -255,8 +255,8 @@ pub async fn display_daemon_status(port_arg: Option<u16>) {
 }
 
 /// Displays detailed status for the standalone Storage daemon.
-pub async fn display_storage_daemon_status(port_arg: Option<u16>) {
-    let port_to_check = if let Some(p) = port_arg {
+pub async fn display_storage_daemon_status(port_arg: Option<u16>) { // Changed back to port_arg
+    let port_to_check = if let Some(p) = port_arg { // Changed back to port_arg
         p
     } else {
         find_running_storage_daemon_port().await.unwrap_or(DEFAULT_STORAGE_PORT)
@@ -612,7 +612,7 @@ pub async fn handle_stop_command(stop_args: StopArgs) -> Result<()> {
             stop_process_by_port("GraphDB Daemon", p).await?;
             println!("GraphDB Daemon stop command processed for port {}.", p);
         }
-        Some(crate::cli::commands::StopAction::Storage { port }) => {
+        Some(crate::cli::commands::StopAction::Storage { port }) => { // Corrected to use 'port'
             let p = port.unwrap_or(DEFAULT_STORAGE_PORT); // Use port from action, or default
             stop_process_by_port("Storage Daemon", p).await?;
             println!("Standalone Storage daemon stop command processed for port {}.", p);
@@ -646,12 +646,10 @@ pub async fn handle_rest_command(
     rest_api_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 ) -> Result<()> {
     match rest_cmd {
-        // FIX: Updated pattern to include `listen_port` as per compiler error
-        RestCliCommand::Start { port, listen_port } => {
-            // FIX: Pass `listen_port` to `start_rest_api_interactive`
+        // FIX: Updated pattern to use 'port' (which is the listen-port)
+        RestCliCommand::Start { port } => {
             start_rest_api_interactive(
-                port, // Pass the 'port' argument
-                listen_port, // Pass the 'listen_port' argument
+                port, // Pass the 'port' argument (which is the listen-port)
                 rest_api_shutdown_tx_opt,
                 rest_api_port_arc,
                 rest_api_handle
@@ -748,7 +746,7 @@ pub async fn handle_daemon_command(
 /// Handles `storage` subcommand for direct CLI execution.
 pub async fn handle_storage_command(storage_action: StorageAction) -> Result<()> {
     match storage_action {
-        StorageAction::Start { port, config_file } => {
+        StorageAction::Start { port, config_file } => { // Corrected to use `port`
             let actual_port = port.unwrap_or(DEFAULT_STORAGE_PORT);
             let actual_config_file = config_file.unwrap_or_else(|| {
                 PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -780,13 +778,13 @@ pub async fn handle_storage_command(storage_action: StorageAction) -> Result<()>
             }
             Ok(())
         }
-        StorageAction::Stop { port } => {
+        StorageAction::Stop { port } => { // Corrected to use `port`
             let actual_port = port.unwrap_or(DEFAULT_STORAGE_PORT);
             stop_process_by_port("Storage Daemon", actual_port).await?;
             println!("Standalone Storage daemon stop command processed for port {}.", actual_port);
             Ok(())
         }
-        StorageAction::Status { port } => {
+        StorageAction::Status { port } => { // Corrected to use `port`
             display_storage_daemon_status(port).await;
             Ok(())
         }
@@ -802,7 +800,7 @@ pub async fn handle_status_command(status_args: StatusArgs, rest_api_port_arc: A
         Some(crate::cli::commands::StatusAction::Daemon { port }) => {
             display_daemon_status(port).await;
         }
-        Some(crate::cli::commands::StatusAction::Storage { port }) => {
+        Some(crate::cli::commands::StatusAction::Storage { port }) => { // Corrected to use `port`
             display_storage_daemon_status(port).await;
         }
         Some(crate::cli::commands::StatusAction::Cluster) => {
@@ -1040,14 +1038,12 @@ pub async fn stop_daemon_instance_interactive(
 
 /// Starts the REST API server and manages its lifecycle in the interactive CLI.
 pub async fn start_rest_api_interactive(
-    port: Option<u16>,
-    listen_port: Option<u16>, // FIX: Added listen_port to the signature
+    port: Option<u16>, // This now represents the --listen-port
     rest_api_shutdown_tx_opt: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     rest_api_port_arc: Arc<Mutex<Option<u16>>>,
     rest_api_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 ) -> Result<()> {
-    // FIX: Prioritize listen_port if provided, otherwise use port, then default
-    let actual_port = listen_port.or(port).unwrap_or(DEFAULT_REST_API_PORT);
+    let actual_port = port.unwrap_or(DEFAULT_REST_API_PORT);
 
     // Check if already running by port
     if check_process_status_by_port("REST API", actual_port).await {
@@ -1128,12 +1124,12 @@ pub async fn stop_rest_api_interactive(
 
 /// Starts a storage instance and manages its lifecycle in the interactive CLI.
 pub async fn start_storage_interactive(
-    port: Option<u16>,
+    port: Option<u16>, // Changed to 'port' to match commands.rs
     config_file: Option<PathBuf>,
     storage_daemon_shutdown_tx_opt: Arc<Mutex<Option<oneshot::Sender<()>>>>, // No longer used for direct management
     storage_daemon_handle: Arc<Mutex<Option<JoinHandle<()>>>>, // No longer used for direct management
 ) -> Result<()> {
-    let actual_port = port.unwrap_or(DEFAULT_STORAGE_PORT);
+    let actual_port = port.unwrap_or(DEFAULT_STORAGE_PORT); // Changed to 'port'
     let actual_config_file = config_file.unwrap_or_else(|| {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -1195,11 +1191,11 @@ pub async fn start_storage_interactive(
 
 /// Stops a storage instance.
 pub async fn stop_storage_interactive(
-    port: Option<u16>,
+    port: Option<u16>, // Changed to 'port' to match commands.rs
     storage_daemon_shutdown_tx_opt: Arc<Mutex<Option<oneshot::Sender<()>>>>, // No longer used for direct management
     storage_daemon_handle: Arc<Mutex<Option<JoinHandle<()>>>>, // No longer used for direct management
 ) -> Result<()> {
-    let actual_port = port.unwrap_or(DEFAULT_STORAGE_PORT);
+    let actual_port = port.unwrap_or(DEFAULT_STORAGE_PORT); // Changed to 'port'
     
     println!("Attempting to stop Storage daemon on port {}...", actual_port);
     stop_process_by_port("Storage Daemon", actual_port).await?;
@@ -1234,8 +1230,7 @@ pub async fn handle_start_all_interactive(
     // 2. Start components
     // Call start functions directly, they will handle background launching and health checks.
     start_daemon_instance_interactive(port, cluster, daemon_handles).await?;
-    // FIX: Pass `listen_port` to `start_rest_api_interactive`
-    start_rest_api_interactive(listen_port, listen_port, rest_api_shutdown_tx_opt, rest_api_port_arc, rest_api_handle).await?;
+    start_rest_api_interactive(listen_port, rest_api_shutdown_tx_opt, rest_api_port_arc, rest_api_handle).await?; // Pass listen_port
     start_storage_interactive(storage_port, storage_config_file, storage_daemon_shutdown_tx_opt, storage_daemon_handle).await?;
 
     println!("All GraphDB components start commands processed.");
@@ -1310,12 +1305,10 @@ pub async fn handle_rest_command_interactive(
     rest_api_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 ) -> Result<()> {
     match command {
-        // FIX: Updated pattern to include `listen_port` as per compiler error
-        RestCliCommand::Start { port, listen_port } => {
-            // FIX: Pass `listen_port` to `start_rest_api_interactive`
+        // FIX: Updated pattern to use 'port' (which is the listen-port)
+        RestCliCommand::Start { port } => {
             start_rest_api_interactive(
-                port, // Pass the 'port' argument
-                listen_port, // Pass the 'listen_port' argument
+                port, // Pass the 'port' argument (which is the listen-port)
                 rest_api_shutdown_tx_opt,
                 rest_api_port_arc,
                 rest_api_handle
@@ -1379,13 +1372,13 @@ pub async fn handle_storage_command_interactive(
     storage_daemon_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 ) -> Result<()> {
     match action {
-        StorageAction::Start { port, config_file } => {
+        StorageAction::Start { port, config_file } => { // Corrected to use `port`
             start_storage_interactive(port, config_file, storage_daemon_shutdown_tx_opt, storage_daemon_handle).await
         }
-        StorageAction::Stop { port } => {
+        StorageAction::Stop { port } => { // Corrected to use `port`
             stop_storage_interactive(port, storage_daemon_shutdown_tx_opt, storage_daemon_handle).await
         }
-        StorageAction::Status { port } => {
+        StorageAction::Status { port } => { // Corrected to use `port`
             display_storage_daemon_status(port).await;
             Ok(())
         }
@@ -1416,10 +1409,8 @@ pub async fn reload_all_interactive(
     println!("Restarting all GraphDB components after reload...");
     // Use the interactive start functions, which correctly use the shared state
     start_daemon_instance_interactive(None, None, daemon_handles).await?; 
-    // FIX: Pass `listen_port` (None in this case) to `start_rest_api_interactive`
-    start_rest_api_interactive(None, None, rest_api_shutdown_tx_opt, rest_api_port_arc, rest_api_handle).await?;
+    start_rest_api_interactive(None, rest_api_shutdown_tx_opt, rest_api_port_arc, rest_api_handle).await?; // Pass None for port
     start_storage_interactive(None, None, storage_daemon_shutdown_tx_opt, storage_daemon_handle).await?;
-
     println!("All GraphDB components reloaded (stopped and restarted).");
     Ok(())
 }
@@ -1435,8 +1426,7 @@ pub async fn reload_rest_interactive(
 
     stop_rest_api_interactive(rest_api_shutdown_tx_opt.clone(), rest_api_port_arc.clone(), rest_api_handle.clone()).await?;
     
-    // FIX: Pass `listen_port` (None in this case) to `start_rest_api_interactive`
-    start_rest_api_interactive(current_rest_port, None, rest_api_shutdown_tx_opt, rest_api_port_arc, rest_api_handle).await?;
+    start_rest_api_interactive(current_rest_port, rest_api_shutdown_tx_opt, rest_api_port_arc, rest_api_handle).await?; // Pass current_rest_port
     
     println!("REST API server reloaded.");
     Ok(())
@@ -1519,20 +1509,19 @@ pub async fn handle_restart_command_interactive(
             println!("All GraphDB components restarted.");
         },
         // FIX: Updated RestartAction::Rest destructuring and call to match commands.rs
-        RestartAction::Rest { port: rest_restart_port, listen_port: restart_listen_port } => {
+        RestartAction::Rest { port: rest_restart_port } => { // 'port' is now the listen-port
             println!("Restarting REST API server...");
             // Use the provided port or the currently tracked one, prioritizing the provided one
-            let actual_port = restart_listen_port.or(rest_restart_port).or_else(|| *rest_api_port_arc.blocking_lock()).unwrap_or(DEFAULT_REST_API_PORT);
+            let actual_port = rest_restart_port.or_else(|| *rest_api_port_arc.blocking_lock()).unwrap_or(DEFAULT_REST_API_PORT);
 
             stop_rest_api_interactive(rest_api_shutdown_tx_opt.clone(), rest_api_port_arc.clone(), rest_api_handle.clone()).await?;
-            // FIX: Pass `restart_listen_port` to `start_rest_api_interactive`
-            start_rest_api_interactive(rest_restart_port, restart_listen_port, rest_api_shutdown_tx_opt, rest_api_port_arc, rest_api_handle).await?;
+            start_rest_api_interactive(rest_restart_port, rest_api_shutdown_tx_opt, rest_api_port_arc, rest_api_handle).await?; // Pass rest_restart_port
             println!("REST API server restarted.");
         },
         // FIX: Updated RestartAction::Storage destructuring and call to match commands.rs
-        RestartAction::Storage { port: storage_restart_port, config_file: storage_restart_config_file } => {
+        RestartAction::Storage { port, config_file: storage_restart_config_file } => { // Corrected to use `port`
             println!("Restarting standalone Storage daemon...");
-            let actual_port = storage_restart_port.unwrap_or(DEFAULT_STORAGE_PORT); // Use default if no port provided
+            let actual_port = port.unwrap_or(DEFAULT_STORAGE_PORT); // Corrected to use `port`
 
             stop_storage_interactive(Some(actual_port), storage_daemon_shutdown_tx_opt.clone(), storage_daemon_handle.clone()).await?;
             start_storage_interactive(Some(actual_port), storage_restart_config_file, storage_daemon_shutdown_tx_opt, storage_daemon_handle).await?;
