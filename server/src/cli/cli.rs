@@ -62,21 +62,8 @@ pub enum Commands {
     Start {
         #[clap(subcommand)]
         action: Option<StartAction>,
-        /// Port for the daemon (if starting daemon or all)
-        #[clap(long, short = 'p')]
-        port: Option<u16>,
-        /// Cluster range for daemon (e.g., "8080-8085")
-        #[clap(long)]
-        cluster: Option<String>,
-        /// Listen port for the REST API (if starting rest or all)
-        #[clap(long)]
-        listen_port: Option<u16>,
-        /// Storage port for the Storage daemon (if starting storage or all)
-        #[clap(long)]
-        storage_port: Option<u16>,
-        /// Path to the storage configuration file (if starting storage or all)
-        #[clap(long)]
-        storage_config_file: Option<PathBuf>,
+        // Removed top-level port, cluster, listen_port, storage_port, storage_config_file
+        // These are now only available within StartAction::All
     },
     /// Stop GraphDB components (daemon, rest, storage, or all)
     Stop(StopArgs), // Corrected: Changed to directly use StopArgs
@@ -210,7 +197,8 @@ pub async fn start_cli() -> Result<()> {
             println!("Experimental plugins are enabled.");
         }
         match command {
-            Commands::Start { action, port, cluster, listen_port, storage_port, storage_config_file } => {
+            // Updated Commands::Start to only have 'action'
+            Commands::Start { action } => { // Removed port, cluster, listen_port, storage_port, storage_config_file
                 match action {
                     Some(StartAction::All { port, cluster, listen_port, storage_port, storage_config_file }) => {
                         handlers_mod::handle_start_all_interactive(
@@ -225,24 +213,28 @@ pub async fn start_cli() -> Result<()> {
                             daemon_handles.clone(),
                         ).await?;
                     }
-                    Some(StartAction::Rest { port, listen_port }) => {
+                    // FIX: Updated StartAction::Rest destructuring and call to match commands.rs
+                    Some(StartAction::Rest { port: rest_start_port }) => { // 'port' is now the listen-port
                         handlers_mod::handle_rest_command_interactive(
-                            RestCliCommand::Start { port, listen_port },
+                            // Pass the 'port' argument as the single port for RestCliCommand::Start
+                            RestCliCommand::Start { port: rest_start_port },
                             rest_api_shutdown_tx_opt.clone(),
                             rest_api_port_arc.clone(),
                             rest_api_handle.clone(),
                         ).await?;
                     }
-                    Some(StartAction::Storage { port, config_file }) => {
+                    // FIX: Updated StartAction::Storage destructuring to use `port`
+                    Some(StartAction::Storage { port, config_file: storage_start_config_file }) => { // Corrected: Destructure `port`
                         handlers_mod::handle_storage_command_interactive(
-                            StorageAction::Start { port, config_file },
+                            StorageAction::Start { port, config_file: storage_start_config_file }, // FIX: Pass `port`
                             storage_daemon_shutdown_tx_opt.clone(),
                             storage_daemon_handle.clone(),
                         ).await?;
                     }
                     None => {
+                        // Default `start` command now implies `start all` without specific args
                         handlers_mod::handle_start_all_interactive(
-                            port, cluster, listen_port, storage_port, storage_config_file,
+                            None, None, None, None, None, // Pass None for all options
                             daemon_handles.clone(), rest_api_shutdown_tx_opt.clone(), rest_api_port_arc.clone(), rest_api_handle.clone(),
                             storage_daemon_shutdown_tx_opt.clone(), storage_daemon_handle.clone(),
                         ).await?;
@@ -250,21 +242,17 @@ pub async fn start_cli() -> Result<()> {
                 }
             }
             Commands::Stop(stop_args) => {
-                // FIX: Removed extra arguments as handle_stop_command in handlers_mod expects only StopArgs
                 handlers_mod::handle_stop_command(stop_args).await?;
             }
             Commands::Status(status_args) => {
-                // FIX: Pass the rest_api_port_arc for status commands
                 handlers_mod::handle_status_command(status_args, rest_api_port_arc.clone()).await?;
             }
             Commands::Reload(reload_args) => {
-                // FIX: Corrected function call to pass only reload_args
                 handlers_mod::handle_reload_command(reload_args).await?;
             }
             Commands::Restart(restart_args) => {
-                // FIX: Corrected function name and argument passing
                 handlers_mod::handle_restart_command_interactive(
-                    restart_args, // Pass the RestartArgs struct directly
+                    restart_args,
                     daemon_handles.clone(),
                     rest_api_shutdown_tx_opt.clone(),
                     rest_api_port_arc.clone(),
