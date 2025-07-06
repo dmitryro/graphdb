@@ -10,6 +10,9 @@
 // UPDATED: 2025-07-04 - Added Clear, Exit, Quit commands. Corrected run_cli_interactive argument passing.
 // UPDATED: 2025-07-04 - Removed duplicate HelpArgs struct, now relying on import.
 // FIX: 2025-07-04 - Corrected import path for `handle_internal_daemon_run`.
+// FIX: 2025-07-06 - Updated Start command handling to support direct flags without subcommand.
+// FIX: 2025-07-06 - Ensured rest_api_port_arc is updated for non-interactive REST API start.
+// FIX: 2025-07-06 - Reintroduced rest_api_handle declaration to resolve E0425 errors.
 
 use clap::{Parser, Subcommand, CommandFactory};
 use anyhow::Result;
@@ -26,7 +29,7 @@ use std::collections::HashMap;
 use crate::cli::commands::{
     DaemonCliCommand, RestCliCommand, StorageAction,
     StatusArgs, StopArgs, ReloadArgs, RestartArgs,
-    ReloadAction, RestartAction, StartAction, StopAction, StatusAction
+    ReloadAction, RestartAction, Start, StartAction, StopAction, StatusAction
 };
 use crate::cli::config as config_mod;
 use crate::cli::handlers as handlers_mod;
@@ -64,16 +67,13 @@ pub struct CliArgs {
     #[clap(long, hide = true)]
     pub internal_storage_config_path: Option<PathBuf>,
     #[clap(long, hide = true)]
-    pub internal_storage_engine: Option<config_mod::StorageEngineType>, // Use config_mod alias
+    pub internal_storage_engine: Option<config_mod::StorageEngineType>,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     /// Start GraphDB components (daemon, rest, storage, or all)
-    Start {
-        #[clap(subcommand)]
-        action: Option<StartAction>,
-    },
+    Start(Start),
     /// Stop GraphDB components (daemon, rest, storage, or all)
     Stop(StopArgs),
     /// Get status of GraphDB components (daemon, rest, storage, cluster, or all)
@@ -201,23 +201,33 @@ pub async fn start_cli() -> Result<()> {
             println!("Experimental plugins are enabled.");
         }
         match command {
-            Commands::Start { action } => {
+            Commands::Start(Start { action, port, cluster, listen_port, storage_port, storage_config_file }) => {
                 match action {
-                    Some(StartAction::All { port, cluster, listen_port, storage_port, storage_config_file }) => {
+                    Some(StartAction::All { port: all_port, cluster: all_cluster, listen_port: all_listen_port, storage_port: all_storage_port, storage_config_file: all_storage_config_file }) => {
+                        // Update rest_api_port_arc before starting
+                        if let Some(listen_port) = all_listen_port {
+                            let mut port_guard = rest_api_port_arc.lock().await;
+                            *port_guard = Some(listen_port);
+                        }
                         handlers_mod::handle_start_all_interactive(
-                            port, cluster, listen_port, storage_port, storage_config_file,
+                            all_port, all_cluster, all_listen_port, all_storage_port, all_storage_config_file,
                             daemon_handles.clone(), rest_api_shutdown_tx_opt.clone(), rest_api_port_arc.clone(), rest_api_handle.clone(),
                             storage_daemon_shutdown_tx_opt.clone(), storage_daemon_handle.clone(),
                             storage_daemon_port_arc.clone(),
                         ).await?;
                     }
-                    Some(StartAction::Daemon { port, cluster }) => {
+                    Some(StartAction::Daemon { port: daemon_port, cluster: daemon_cluster }) => {
                         handlers_mod::handle_daemon_command_interactive(
-                            DaemonCliCommand::Start { port, cluster },
+                            DaemonCliCommand::Start { port: daemon_port, cluster: daemon_cluster },
                             daemon_handles.clone(),
                         ).await?;
                     }
                     Some(StartAction::Rest { port: rest_start_port }) => {
+                        // Update rest_api_port_arc before starting
+                        if let Some(port) = rest_start_port {
+                            let mut port_guard = rest_api_port_arc.lock().await;
+                            *port_guard = Some(port);
+                        }
                         handlers_mod::handle_rest_command_interactive(
                             RestCliCommand::Start { port: rest_start_port },
                             rest_api_shutdown_tx_opt.clone(),
@@ -226,6 +236,11 @@ pub async fn start_cli() -> Result<()> {
                         ).await?;
                     }
                     Some(StartAction::Storage { port, config_file: storage_start_config_file }) => {
+                        // Update storage_daemon_port_arc before starting
+                        if let Some(port) = port {
+                            let mut port_guard = storage_daemon_port_arc.lock().await;
+                            *port_guard = Some(port);
+                        }
                         handlers_mod::handle_storage_command_interactive(
                             StorageAction::Start { port, config_file: storage_start_config_file },
                             storage_daemon_shutdown_tx_opt.clone(),
@@ -234,8 +249,17 @@ pub async fn start_cli() -> Result<()> {
                         ).await?;
                     }
                     None => {
+                        // Update rest_api_port_arc and storage_daemon_port_arc before starting
+                        if let Some(listen_port) = listen_port {
+                            let mut port_guard = rest_api_port_arc.lock().await;
+                            *port_guard = Some(listen_port);
+                        }
+                        if let Some(storage_port) = storage_port {
+                            let mut port_guard = storage_daemon_port_arc.lock().await;
+                            *port_guard = Some(storage_port);
+                        }
                         handlers_mod::handle_start_all_interactive(
-                            None, None, None, None, None,
+                            port, cluster, listen_port, storage_port, storage_config_file,
                             daemon_handles.clone(), rest_api_shutdown_tx_opt.clone(), rest_api_port_arc.clone(), rest_api_handle.clone(),
                             storage_daemon_shutdown_tx_opt.clone(), storage_daemon_handle.clone(),
                             storage_daemon_port_arc.clone(),
@@ -355,4 +379,3 @@ pub async fn start_cli() -> Result<()> {
 
     Ok(())
 }
-

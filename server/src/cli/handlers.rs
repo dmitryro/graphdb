@@ -1633,4 +1633,3 @@ pub async fn handle_restart_command_interactive(
     }
     Ok(())
 }
-

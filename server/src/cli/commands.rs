@@ -5,10 +5,10 @@
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use uuid::Uuid; // Corrected: Ensure Uuid is imported
+use uuid::Uuid; // Ensure Uuid is imported
 
 /// Commands for managing GraphDB daemon instances.
-#[derive(Debug, Subcommand, PartialEq)] // Removed Args, Added PartialEq
+#[derive(Debug, Subcommand, PartialEq)]
 pub enum DaemonCliCommand {
     /// Start a GraphDB daemon instance.
     Start {
@@ -38,14 +38,13 @@ pub enum DaemonCliCommand {
 }
 
 /// Commands for managing the REST API server.
-#[derive(Debug, Subcommand, PartialEq)] // Removed Args, Added PartialEq
+#[derive(Debug, Subcommand, PartialEq)]
 pub enum RestCliCommand {
     /// Start the REST API server.
     Start {
         /// Port for the REST API to listen on.
-        #[clap(long, short = 'p', name = "listen-port")] // Use name to map --listen-port to 'port'
+        #[clap(long, short = 'p', name = "listen-port")]
         port: Option<u16>,
-        // Removed listen_port field for consistency
     },
     /// Stop the REST API server.
     Stop,
@@ -82,12 +81,12 @@ pub enum RestCliCommand {
 }
 
 /// Actions for managing the standalone Storage daemon.
-#[derive(Debug, Subcommand, PartialEq)] // Removed Args, Added PartialEq
+#[derive(Debug, Subcommand, PartialEq)]
 pub enum StorageAction {
     /// Start the standalone Storage daemon.
     Start {
         /// Port for the Storage daemon to listen on.
-        #[clap(long, short = 'p', name = "storage-port")] // Consistent: Use name to map --storage-port to 'port'
+        #[clap(long, short = 'p', name = "storage-port")]
         port: Option<u16>,
         /// Path to the storage configuration file.
         #[clap(long)]
@@ -96,13 +95,13 @@ pub enum StorageAction {
     /// Stop the standalone Storage daemon.
     Stop {
         /// Port of the storage daemon to stop. If not specified, attempts to stop the default or managed storage daemon.
-        #[clap(long, short = 'p', name = "storage-port")] // Consistent: Use name to map --storage-port to 'port'
+        #[clap(long, short = 'p', name = "storage-port")]
         port: Option<u16>,
     },
     /// Get the status of the standalone Storage daemon.
     Status {
         /// Port of the storage daemon to check status for.
-        #[clap(long, short = 'p', name = "storage-port")] // Consistent: Use name to map --storage-port to 'port'
+        #[clap(long, short = 'p', name = "storage-port")]
         port: Option<u16>,
     },
 }
@@ -115,7 +114,7 @@ pub struct StatusArgs {
 }
 
 /// Actions for the `status` command.
-#[derive(Debug, Subcommand, PartialEq)] // Added PartialEq
+#[derive(Debug, Subcommand, PartialEq)]
 pub enum StatusAction {
     /// Get detailed status of the REST API component.
     Rest,
@@ -128,7 +127,7 @@ pub enum StatusAction {
     /// Get detailed status of the Storage component.
     Storage {
         /// Port of the storage daemon to check status for.
-        #[clap(long, short = 'p', name = "storage-port")] // Consistent: Use name to map --storage-port to 'port'
+        #[clap(long, short = 'p', name = "storage-port")]
         port: Option<u16>,
     },
     /// Get status of the cluster (placeholder).
@@ -142,11 +141,10 @@ pub enum StatusAction {
 pub struct StopArgs {
     #[clap(subcommand)]
     pub action: Option<StopAction>,
-    // Removed: pub port: Option<u16>, // Removed this field to align with observed compiler error
 }
 
 /// Actions for the `stop` command.
-#[derive(Debug, Subcommand, PartialEq)] // Added PartialEq
+#[derive(Debug, Subcommand, PartialEq)]
 pub enum StopAction {
     /// Stop the REST API server.
     Rest,
@@ -159,27 +157,48 @@ pub enum StopAction {
     /// Stop the standalone Storage daemon.
     Storage {
         /// Port of the storage daemon to stop.
-        #[clap(long, short = 'p', name = "storage-port")] // Consistent: Use name to map --storage-port to 'port'
+        #[clap(long, short = 'p', name = "storage-port")]
         port: Option<u16>,
     },
     /// Stop all GraphDB components.
     All,
 }
 
-/// Arguments for the top-level `start` command actions.
-#[derive(Debug, Subcommand, PartialEq)] // Added PartialEq
+/// Arguments for the top-level `start` command.
+#[derive(Debug, Parser)]
+pub struct Start {
+    #[clap(subcommand)]
+    pub action: Option<StartAction>,
+    /// Port for the daemon (if starting daemon).
+    #[clap(long, short = 'p')]
+    pub port: Option<u16>,
+    /// Cluster range for daemon (e.g., "8080-8085").
+    #[clap(long)]
+    pub cluster: Option<String>,
+    /// Listen port for the REST API.
+    #[clap(long)]
+    pub listen_port: Option<u16>,
+    /// Storage port for the Storage daemon.
+    #[clap(long)]
+    pub storage_port: Option<u16>,
+    /// Path to the storage configuration file.
+    #[clap(long)]
+    pub storage_config_file: Option<PathBuf>,
+}
+
+/// Actions for the top-level `start` command actions.
+#[derive(Debug, Subcommand, PartialEq)]
 pub enum StartAction {
     /// Start the REST API server.
     Rest {
         /// Port for the REST API.
-        #[clap(long, short = 'p', name = "listen-port")] // Consistent: Use name to map --listen-port to 'port'
+        #[clap(long, short = 'p', name = "listen-port")]
         port: Option<u16>,
-        // Removed `listen_port` field as it's redundant with `port` and `name` attribute
     },
     /// Start the standalone Storage daemon.
     Storage {
         /// Port for the Storage daemon.
-        #[clap(long, short = 'p', name = "storage-port")] // Consistent: Use name to map --storage-port to 'port'
+        #[clap(long, short = 'p', name = "storage-port")]
         port: Option<u16>,
         /// Path to the storage configuration file.
         #[clap(long)]
@@ -222,7 +241,7 @@ pub struct ReloadArgs {
 }
 
 /// Actions for the `reload` command.
-#[derive(Debug, Subcommand, PartialEq)] // Added PartialEq
+#[derive(Debug, Subcommand, PartialEq)]
 pub enum ReloadAction {
     /// Reload all GraphDB components (stop and restart).
     All,
@@ -244,11 +263,11 @@ pub enum ReloadAction {
 #[derive(Debug, Parser)]
 pub struct RestartArgs {
     #[clap(subcommand)]
-    pub action: RestartAction, // FIX: Changed to mandatory RestartAction
+    pub action: RestartAction,
 }
 
 /// Actions for the `restart` command.
-#[derive(Debug, Subcommand, PartialEq)] // Added PartialEq
+#[derive(Debug, Subcommand, PartialEq)]
 pub enum RestartAction {
     /// Restart all core GraphDB components.
     All {
@@ -271,14 +290,13 @@ pub enum RestartAction {
     /// Restart the REST API server.
     Rest {
         /// Port for the REST API.
-        #[clap(long, short = 'p', name = "listen-port")] // Consistent: Use name to map --listen-port to 'port'
+        #[clap(long, short = 'p', name = "listen-port")]
         port: Option<u16>,
-        // Removed `listen_port` field for consistency
     },
     /// Restart the standalone Storage daemon.
     Storage {
         /// Port for the Storage daemon.
-        #[clap(long, short = 'p', name = "storage-port")] // Consistent: Use name to map --storage-port to 'port'
+        #[clap(long, short = 'p', name = "storage-port")]
         port: Option<u16>,
         /// Path to the storage configuration file.
         #[clap(long)]
@@ -296,4 +314,3 @@ pub enum RestartAction {
     /// Restart cluster configuration (placeholder).
     Cluster,
 }
-
