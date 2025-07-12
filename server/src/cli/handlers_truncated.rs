@@ -1,0 +1,1327 @@
+// server/src/cli/handlers.rs
+
+// This file contains handler functions for CLI commands.
+// FIX: 2025-07-12 - Added cluster field to StartAction::Rest pattern to resolve E0027.
+// FIX: 2025-07-12 - Added cluster field to StartAction::Storage pattern to resolve E0027.
+// FIX: 2025-07-12 - Ensured cluster field is included in patterns to match updated StartAction definitions in commands.rs.
+
+use anyhow::{Result, Context};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use tokio::sync::{oneshot, Mutex};
+use tokio::task::JoinHandle;
+use std::sync::Arc;
+use tokio::process::Command as TokioCommand;
+use std::process::Stdio;
+use std::time::{Duration, Instant};
+use crossterm::style::{self, Stylize};
+use crossterm::terminal::{Clear, ClearType, size as terminal_size};
+use crossterm::execute;
+use crossterm::cursor::MoveTo;
+use std::io::{self, Write};
+use futures::future;
+
+use crate::cli::commands::{DaemonCliCommand, RestCliCommand, StorageAction, StatusArgs, StopArgs, ReloadArgs, RestartArgs, StatusAction, StopAction, ReloadAction, RestartAction, StartArgs, StartAction};
+use crate::cli::config::{load_storage_config, StorageConfig};
+use lib::storage_engine::config::{StorageConfig as LibStorageConfig, StorageEngineType};
+use crate::cli::daemon_management::{find_running_storage_daemon_port, start_daemon_process, stop_daemon_api_call};
+use daemon_api::{stop_daemon, start_daemon};
+
+const DEFAULT_DAEMON_PORT: u16 = 8000;
+const DEFAULT_REST_API_PORT: u16 = 8080;
+
+#[derive(Debug, Clone)]
+pub struct DaemonArgs {
+    pub port: Option<u16>,
+    pub cluster: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RestArgs {
+    pub port: Option<u16>,
+    pub cluster: Option<String>,
+}
+
+pub mod rest {
+    pub mod api {
+        use anyhow::Result;
+        use reqwest::Client;
+        use std::time::Duration;
+
+        pub async fn check_rest_api_status(port: u16) -> Result<String> {
+            let client = Client::builder().timeout(Duration::from_secs(2)).build()?;
+            let url = format!("http://127.0.0.1:{}/api/v1/health", port);
+            match client.get(&url).send().await {
+                Ok(resp) if resp.status().is_success() => Ok("OK".to_string()),
+                Ok(resp) => Err(anyhow::anyhow!("REST API health check failed with status: {}", resp.status())),
+                Err(e) => Err(anyhow::anyhow!("Failed to connect to REST API for health check: {}", e)),
+            }
+        }
+
+        pub async fn perform_rest_api_health_check() -> Result<String> {
+            Ok("Healthy".to_string())
+        }
+        pub async fn get_rest_api_version() -> Result<String> { Ok("0.1.0".to_string()) }
+        pub async fn register_user(_username: &str, _password: &str) -> Result<()> {
+            println!("Registering user {}...", _username);
+            Ok(())
+        }
+        pub async fn authenticate_user(_username: &str, _password: &str) -> Result<String> {
+            println!("Authenticating user {}...", _username);
+            Ok("dummy_token".to_string())
+        }
+        pub async fn execute_graph_query(_query: &str, _persist: Option<bool>) -> Result<String> {
+            Ok(format!("Query result for: {}", _query))
+        }
+    }
+}
+
+pub mod storage {
+    pub mod api {
+        use anyhow::Result;
+        pub async fn check_storage_daemon_status(_port: u16) -> Result<String> { Ok("Running".to_string()) }
+    }
+}
+
+pub fn get_current_exe_path() -> Result<PathBuf> {
+    std::env::current_exe().context("Failed to get current executable path")
+}
+
+pub async fn is_port_free(port: u16) -> bool {
+    tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await.is_ok()
+}
+
+async fn run_command_with_timeout(
+    command_name: &str,
+    args: &[&str],
+    timeout_duration: Duration,
+) -> Result<std::process::Output, anyhow::Error> {
+    let mut command = TokioCommand::new(command_name);
+    command.args(args);
+    tokio::time::timeout(timeout_duration, command.output())
+        .await
+        .map_err(|_| anyhow::anyhow!("Command '{} {}' timed out after {:?}", command_name, args.join(" "), timeout_duration))?
+        .context(format!("Failed to run command '{} {}'", command_name, args.join(" ")))
+}
+
+pub async fn stop_process_by_port(process_name: &str, port: u16) -> Result<(), anyhow::Error> {
+    println!("Attempting to find and kill process for {} on port {}...", process_name, port);
+    let output = run_command_with_timeout(
+        "lsof",
+        &["-i", &format!(":{}", port), "-t"],
+        Duration::from_secs(3),
+    ).await?;
+
+    let pids = String::from_utf8_lossy(&output.stdout);
+    let pids: Vec<i32> = pids.trim().lines().filter_map(|s| s.parse::<i32>().ok()).collect();
+
+    if pids.is_empty() {
+        println!("No {} process found running on port {}.", process_name, port);
+        return Ok(());
+    }
+
+    for pid in pids {
+        println!("Killing process {} (for {} on port {})...", pid, process_name, port);
+        match TokioCommand::new("kill").arg("-9").arg(pid.to_string()).status().await {
+            Ok(status) if status.success() => println!("Process {} killed successfully.", pid),
+            Ok(_) => eprintln!("Failed to kill process {}.", pid),
+            Err(e) => eprintln!("Error killing process {}: {}", pid, e),
+        }
+    }
+
+    let start_time = Instant::now();
+    let wait_timeout = Duration::from_secs(5);
+    let poll_interval = Duration::from_millis(200);
+
+    while start_time.elapsed() < wait_timeout {
+        if is_port_free(port).await {
+            println!("Port {} is now free.", port);
+            return Ok(());
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+
+    Err(anyhow::anyhow!("Port {} remained in use after killing processes within {:?}.", port, wait_timeout))
+}
+
+pub async fn check_process_status_by_port(_process_name: &str, port: u16) -> bool {
+    let output_result = run_command_with_timeout(
+        "lsof",
+        &["-i", &format!("TCP:{}", port), "-s", "TCP:LISTEN", "-t"],
+        Duration::from_secs(3),
+    ).await;
+
+    if let Ok(output) = output_result {
+        let pids = String::from_utf8_lossy(&output.stdout);
+        if !pids.trim().is_empty() {
+            return true;
+        }
+    }
+    false
+}
+
+pub async fn find_all_running_rest_api_ports() -> Vec<u16> {
+    let common_rest_ports = [DEFAULT_REST_API_PORT, 8081, 8082, 8083, 8084, 8085, 8086];
+    let mut running_ports = Vec::new();
+    for &port in &common_rest_ports {
+        if rest::api::check_rest_api_status(port).await.is_ok() {
+            running_ports.push(port);
+        }
+    }
+    running_ports
+}
+
+pub async fn find_all_running_storage_daemon_ports() -> Vec<u16> {
+    let config = load_storage_config(None).expect("Failed to load storage config");
+    let mut ports_to_check = vec![config.default_port];
+    if let Ok(cluster_ports) = parse_cluster_range(&config.cluster_range) {
+        ports_to_check.extend(cluster_ports);
+    }
+    let mut running_ports = Vec::new();
+    for &port in &ports_to_check {
+        if check_process_status_by_port("Storage Daemon", port).await {
+            running_ports.push(port);
+        }
+    }
+    running_ports
+}
+
+pub async fn display_rest_api_status(_rest_api_port_arc: Arc<Mutex<Option<u16>>>) {
+    println!("\n--- REST API Status ---");
+    println!("{:<15} {:<10} {:<40}", "Status", "Port", "Details");
+    println!("{:-<15} {:-<10} {:-<40}", "", "", "");
+
+    let running_ports = find_all_running_rest_api_ports().await;
+
+    if running_ports.is_empty() {
+        println!("{:<15} {:<10} {:<40}", "Down", "N/A", "No REST API servers found on common ports.");
+    } else {
+        for &port in &running_ports {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(2))
+                .build().expect("Failed to build reqwest client");
+
+            let mut rest_api_details = String::new();
+
+            let health_url = format!("http://127.0.0.1:{}/api/v1/health", port);
+            match client.get(&health_url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    rest_api_details = format!("Health: OK");
+
+                    let version_url = format!("http://127.0.0.1:{}/api/v1/version", port);
+                    match client.get(&version_url).send().await {
+                        Ok(v_resp) if v_resp.status().is_success() => {
+                            let v_json: serde_json::Value = v_resp.json().await.unwrap_or_default();
+                            let version = v_json["version"].as_str().unwrap_or("N/A");
+                            rest_api_details = format!("{}; Version: {}", rest_api_details, version);
+                        },
+                        _ => rest_api_details = format!("{}; Version: N/A", rest_api_details),
+                    }
+                },
+                _ => rest_api_details = "Health: Down".to_string(),
+            }
+            println!("{:<15} {:<10} {:<40}", "Running", port, rest_api_details);
+        }
+    }
+
+    println!("--------------------------------------------------");
+}
+
+pub async fn display_daemon_status(port_arg: Option<u16>) {
+    println!("\n--- GraphDB Daemon Status ---");
+    println!("{:<15} {:<10} {:<40}", "Status", "Port", "Details");
+    println!("{:-<15} {:-<10} {:-<40}", "", "", "");
+
+    let ports_to_check = if let Some(p) = port_arg {
+        vec![p]
+    } else {
+        vec![DEFAULT_DAEMON_PORT, 8081, 9001, 9002, 9003, 9004, 9005]
+    };
+
+    let mut found_any = false;
+    for &port in &ports_to_check {
+        let status_message = if check_process_status_by_port("GraphDB Daemon", port).await {
+            found_any = true;
+            "Running".to_string()
+        } else {
+            "Down".to_string()
+        };
+        println!("{:<15} {:<10} {:<40}", status_message, port, "Core Graph Processing");
+    }
+
+    if !found_any && port_arg.is_none() {
+        println!("{:<15} {:<10} {:<40}", "Down", "N/A", "No daemons found on common ports.");
+    }
+    if port_arg.is_none() {
+        println!("\nTo check a specific daemon, use 'status daemon --port <port>'.");
+    }
+    println!("--------------------------------------------------");
+}
+
+pub async fn display_storage_daemon_status(port_arg: Option<u16>, _storage_daemon_port_arc: Arc<Mutex<Option<u16>>>) {
+    let config = load_storage_config(None).expect("Failed to load storage config");
+    let port_to_check = port_arg.unwrap_or(config.default_port);
+
+    let storage_config = LibStorageConfig::default();
+    let cluster_ports = parse_cluster_range(&config.cluster_range).unwrap_or_default();
+
+    println!("\n--- Storage Daemon Status ---");
+    println!("{:<15} {:<10} {:<40}", "Status", "Port", "Details");
+    println!("{:-<15} {:-<10} {:-<40}", "", "", "");
+
+    let status_message = if check_process_status_by_port("Storage Daemon", port_to_check).await {
+        "Running".to_string()
+    } else {
+        "Down".to_string()
+    };
+    println!("{:<15} {:<10} {:<40}", status_message, port_to_check, format!("Type: {:?}", storage_config.engine_type));
+    println!("{:<15} {:<10} {:<40}", "", "", format!("Data Dir: {}", storage_config.data_path));
+    println!("{:<15} {:<10} {:<40}", "", "", format!("Engine Config: {:?}", storage_config.engine_specific_config));
+    println!("{:<15} {:<10} {:<40}", "", "", format!("Max Open Files: {:?}", storage_config.max_open_files));
+    if !cluster_ports.is_empty() {
+        println!("{:<15} {:<10} {:<40}", "", "", format!("Cluster Ports: {}", cluster_ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")));
+    }
+    println!("--------------------------------------------------");
+}
+
+pub async fn display_cluster_status() {
+    println!("\n--- Cluster Status ---");
+    println!("Cluster status is a placeholder. In a real implementation, this would query all daemons in the cluster.");
+    println!("--------------------------------------------------");
+}
+
+pub async fn display_full_status_summary(_rest_api_port_arc: Arc<Mutex<Option<u16>>>, _storage_daemon_port_arc: Arc<Mutex<Option<u16>>>) {
+    let config = load_storage_config(None).expect("Failed to load storage config");
+    println!("\n--- GraphDB System Status Summary ---");
+    println!("{:<20} {:<15} {:<10} {:<40}", "Component", "Status", "Port", "");
+    println!("{:-<20} {:-<15} {:-<10} {:-<40}", "", "", "", "");
+
+    let common_daemon_ports = [DEFAULT_DAEMON_PORT, 8081, 9001, 9002, 9003, 9004, 9005];
+    let daemon_checks: Vec<_> = common_daemon_ports.iter().map(|&port| {
+        tokio::spawn(async move {
+            (port, check_process_status_by_port("GraphDB Daemon", port).await)
+        })
+    }).collect();
+
+    let results = future::join_all(daemon_checks).await;
+    let mut running_daemon_ports = Vec::new();
+    for result in results {
+        if let Ok((port, is_running)) = result {
+            if is_running {
+                running_daemon_ports.push(port);
+            }
+        } else {
+            eprintln!("Error checking daemon status: {:?}", result.unwrap_err());
+        }
+    }
+
+    let daemon_status_msg = if !running_daemon_ports.is_empty() {
+        format!("Running on: {}", running_daemon_ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", "))
+    } else {
+        "Down".to_string()
+    };
+    println!("{:<20} {:<15} {:<10} {:<40}", "GraphDB Daemon", daemon_status_msg, "N/A", "Core Graph Processing");
+
+    let running_rest_ports = find_all_running_rest_api_ports().await;
+    let rest_api_status = if running_rest_ports.is_empty() {
+        "Down".to_string()
+    } else {
+        "Running".to_string()
+    };
+    let rest_ports_display = if running_rest_ports.is_empty() {
+        DEFAULT_REST_API_PORT.to_string()
+    } else {
+        running_rest_ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
+    };
+    let mut rest_api_details = String::new();
+
+    if !running_rest_ports.is_empty() {
+        if let Some(&port) = running_rest_ports.first() {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(2))
+                .build().expect("Failed to build reqwest client");
+            let health_url = format!("http://127.0.0.1:{}/api/v1/health", port);
+            let version_url = format!("http://127.0.0.1:{}/api/v1/version", port);
+
+            match client.get(&health_url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    rest_api_details = format!("Health: OK");
+                    let version_info = client.get(&version_url).send().await;
+                    match version_info {
+                        Ok(v_resp) if v_resp.status().is_success() => {
+                            let v_json: serde_json::Value = v_resp.json().await.unwrap_or_default();
+                            let version = v_json["version"].as_str().unwrap_or("N/A");
+                            rest_api_details = format!("{}; Version: {}", rest_api_details, version);
+                        },
+                        _ => rest_api_details = "Version: N/A".to_string(),
+                    }
+                },
+                _ => rest_api_details = "Health: Down".to_string(),
+            }
+        }
+    }
+    println!("{:<20} {:<15} {:<10} {:<40}", "REST API", rest_api_status, rest_ports_display, rest_api_details);
+
+    let storage_config = LibStorageConfig::default();
+    let cluster_ports = parse_cluster_range(&config.cluster_range).unwrap_or_default();
+    let running_storage_ports = find_all_running_storage_daemon_ports().await;
+    let storage_daemon_status = if running_storage_ports.is_empty() {
+        "Down".to_string()
+    } else {
+        "Running".to_string()
+    };
+    let storage_ports_display = if running_storage_ports.is_empty() {
+        config.default_port.to_string()
+    } else {
+        running_storage_ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
+    };
+
+    println!("{:<20} {:<15} {:<10} {:<40}", "Storage Daemon", storage_daemon_status, storage_ports_display, format!("Type: {:?}", storage_config.engine_type));
+    println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Data Dir: {}", storage_config.data_path));
+    println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Engine Config: {:?}", storage_config.engine_specific_config));
+    println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Max Open Files: {:?}", storage_config.max_open_files));
+    if !cluster_ports.is_empty() {
+        println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Cluster Ports: {}", cluster_ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")));
+    }
+    println!("--------------------------------------------------");
+}
+
+fn parse_cluster_range(range: &str) -> Result<Vec<u16>> {
+    let parts: Vec<&str> = range.split('-').collect();
+    if parts.len() != 2 {
+        return Err(anyhow::anyhow!("Invalid cluster range format: {}", range));
+    }
+    let start: u16 = parts[0].parse().context("Invalid start port")?;
+    let end: u16 = parts[1].parse().context("Invalid end port")?;
+    if start > end || start < 1024 || end > 65535 {
+        return Err(anyhow::anyhow!("Invalid port range: {}-{}", start, end));
+    }
+    Ok((start..=end).collect())
+}
+
+pub fn print_welcome_screen() {
+    let (cols, rows) = terminal_size().unwrap_or((120, 40));
+    let total_width = cols as usize;
+    let border_char = '#';
+
+    let line_str = border_char.to_string().repeat(total_width);
+
+    let title = "GraphDB Command Line Interface";
+    let version = "Version 0.1.0 (Experimental)";
+    let welcome_msg = "Welcome! Type 'help' for a list of commands.";
+    let start_tip = "Tip: Use 'start all' to launch all components.";
+    let status_tip = "Tip: Use 'status all' to check component health.";
+    let clear_tip = "Use 'clear' or 'clean' to clear the terminal.";
+    let exit_tip = "Type 'exit' or 'quit' to leave the CLI.";
+
+    let print_centered_colored = |text: &str, text_color: style::Color, is_bold: bool| {
+        let internal_padding_chars = 6;
+        let content_width = total_width.saturating_sub(2 + internal_padding_chars);
+        let padding_len = content_width.saturating_sub(text.len());
+        let left_padding = padding_len / 2;
+        let right_padding = padding_len - left_padding;
+
+        print!("{}", style::SetForegroundColor(style::Color::Cyan));
+        print!("{}", border_char);
+        print!("{}", " ".repeat(internal_padding_chars / 2));
+
+        print!("{}", style::ResetColor);
+        let styled_text = if is_bold {
+            text.with(text_color).bold()
+        } else {
+            text.with(text_color)
+        };
+
+        print!("{}", " ".repeat(left_padding));
+        print!("{}", styled_text);
+        print!("{}", " ".repeat(right_padding));
+
+        print!("{}", style::SetForegroundColor(style::Color::Cyan));
+        println!("{}{}", border_char, style::ResetColor);
+    };
+
+    let content_lines = 13;
+    let available_rows = rows as usize;
+    let top_bottom_padding = available_rows.saturating_sub(content_lines) / 2;
+
+    for _ in 0..top_bottom_padding {
+        println!();
+    }
+
+    println!("{}", line_str.clone().with(style::Color::Cyan));
+    print_centered_colored("", style::Color::Blue, false);
+    print_centered_colored(title, style::Color::DarkCyan, true);
+    print_centered_colored(version, style::Color::White, true);
+    print_centered_colored("", style::Color::Blue, false);
+    print_centered_colored(welcome_msg, style::Color::Green, true);
+    print_centered_colored(start_tip, style::Color::Yellow, false);
+    print_centered_colored(status_tip, style::Color::Yellow, false);
+    print_centered_colored(clear_tip, style::Color::Yellow, false);
+    print_centered_colored(exit_tip, style::Color::Red, false);
+    print_centered_colored("", style::Color::Blue, false);
+    println!("{}", line_str.with(style::Color::Cyan));
+
+    for _ in 0..top_bottom_padding {
+        println!();
+    }
+}
+
+pub async fn clear_terminal_screen() -> Result<()> {
+    execute!(io::stdout(), Clear(ClearType::All), MoveTo(0, 0))
+        .context("Failed to clear terminal screen or move cursor")?;
+    io::stdout().flush()?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_start_command(
+    start_args: StartArgs,
+    _config: &crate::cli::config::CliConfig,
+    daemon_handles: Arc<Mutex<HashMap<u16, (JoinHandle<()>, oneshot::Sender<()>)>>>,
+    rest_api_shutdown_tx_opt: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    rest_api_port_arc: Arc<Mutex<Option<u16>>>,
+    rest_api_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    storage_daemon_shutdown_tx_opt: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    storage_daemon_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    storage_daemon_port_arc: Arc<Mutex<Option<u16>>>,
+) -> Result<()> {
+    let config = load_storage_config(None).expect("Failed to load storage config");
+    let mut daemon_status_msg = "Not requested".to_string();
+    let mut rest_api_status_msg = "Not requested".to_string();
+    let mut storage_status_msg = "Not requested".to_string();
+
+    match start_args.action {
+        StartAction::All {
+            port,
+            cluster,
+            config_file: _,
+            listen_port,
+            storage_port,
+            storage_config_file,
+            data_directory,
+            log_directory,
+            max_disk_space_gb,
+            min_disk_space_gb,
+            use_raft_for_scale,
+            storage_engine_type,
+        } => {
+            let start_daemon_requested = port.is_some() || cluster.is_some();
+            let start_rest_requested = listen_port.is_some();
+            let start_storage_requested = storage_port.is_some() || storage_config_file.is_some();
+
+            let mut skip_ports = Vec::new();
+            if let Some(rest_p) = listen_port {
+                skip_ports.push(rest_p);
+            }
+            if let Some(storage_p) = storage_port {
+                skip_ports.push(storage_p);
+            }
+
+            if start_daemon_requested {
+                let daemon_result = start_daemon(port, cluster.clone(), skip_ports.clone()).await;
+                match daemon_result {
+                    Ok(()) => {
+                        if let Some(ref cluster_range) = cluster {
+                            daemon_status_msg = format!("Running on cluster ports: {}", cluster_range);
+                        } else if let Some(p) = port {
+                            daemon_status_msg = format!("Running on port: {}", p);
+                        } else {
+                            daemon_status_msg = format!("Running on default port: {}", DEFAULT_DAEMON_PORT);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to start daemon(s): {:?}", e);
+                        daemon_status_msg = format!("Failed to start ({:?})", e);
+                    }
+                }
+            }
+
+            if start_rest_requested {
+                let rest_port_to_use = listen_port.unwrap_or(DEFAULT_REST_API_PORT);
+                if rest_port_to_use < 1024 || rest_port_to_use > 65535 {
+                    eprintln!("Invalid port: {}. Must be between 1024 and 65535.", rest_port_to_use);
+                    rest_api_status_msg = format!("Invalid port: {}", rest_port_to_use);
+                } else {
+                    stop_process_by_port("REST API", rest_port_to_use).await?;
+                    println!("Starting REST API server on port {}...", rest_port_to_use);
+                    let current_storage_config = LibStorageConfig::default();
+                    let lib_storage_engine_type = current_storage_config.engine_type;
+                    start_daemon_process(
+                        true,
+                        false,
+                        Some(rest_port_to_use),
+                        Some(PathBuf::from(current_storage_config.data_path)),
+                        Some(lib_storage_engine_type.into()),
+                    ).await?;
+                    rest_api_status_msg = format!("Running on port: {}", rest_port_to_use);
+                }
+            }
+
+            if start_storage_requested {
+                let storage_port_to_use = storage_port.unwrap_or(config.default_port);
+                let cluster_ports = if let Some(ref cluster_range) = cluster {
+                    parse_cluster_range(cluster_range).unwrap_or_default()
+                } else {
+                    parse_cluster_range(&config.cluster_range).unwrap_or_default()
+                };
+                let all_ports = if cluster_ports.is_empty() {
+                    vec![storage_port_to_use]
+                } else {
+                    let mut ports = vec![storage_port_to_use];
+                    ports.extend(cluster_ports);
+                    ports
+                };
+                for &port in &all_ports {
+                    if port < 1024 || port > 65535 {
+                        eprintln!("Invalid storage port: {}. Must be between 1024 and 65535.", port);
+                        storage_status_msg = format!("Invalid port: {}", port);
+                        continue;
+                    }
+                    stop_process_by_port("Storage Daemon", port).await?;
+                    println!("Starting Storage daemon on port {}...", port);
+                    let actual_storage_config_path = storage_config_file.clone().unwrap_or_else(|| {
+                        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                            .parent()
+                            .expect("Failed to get parent directory of server crate")
+                            .join("storage_daemon_server")
+                            .join("storage_config.yaml")
+                    });
+                    start_daemon_process(
+                        false,
+                        true,
+                        Some(port),
+                        Some(actual_storage_config_path.clone()),
+                        None,
+                    ).await?;
+                    let addr_check = format!("127.0.0.1:{}", port);
+                    let health_check_timeout = Duration::from_secs(10);
+                    let poll_interval = Duration::from_millis(500);
+                    let mut started_ok = false;
+                    let start_time = Instant::now();
+                    while start_time.elapsed() < health_check_timeout {
+                        match tokio::net::TcpStream::connect(&addr_check).await {
+                            Ok(_) => {
+                                println!("Storage daemon on port {} responded to health check.", port);
+                                started_ok = true;
+                                break;
+                            }
+                            Err(_) => {
+                                tokio::time::sleep(poll_interval).await;
+                            }
+                        }
+                    }
+                    if started_ok {
+                        storage_status_msg = format!("Running on port(s): {}", all_ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", "));
+                    } else {
+                        eprintln!("Warning: Storage daemon daemonized but did not become reachable on port {} within {:?}", port, health_check_timeout);
+                        storage_status_msg = format!("Daemonized but failed to become reachable on port {}", port);
+                    }
+                }
+            }
+        }
+        StartAction::Daemon { port, cluster } => {
+            let daemon_result = start_daemon(port, cluster.clone(), vec![]).await;
+            match daemon_result {
+                Ok(()) => {
+                    if let Some(ref cluster_range) = cluster {
+                        daemon_status_msg = format!("Running on cluster ports: {}", cluster_range);
+                    } else if let Some(p) = port {
+                        daemon_status_msg = format!("Running on port: {}", p);
+                    } else {
+                        daemon_status_msg = format!("Running on default port: {}", DEFAULT_DAEMON_PORT);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to start daemon(s): {:?}", e);
+                    daemon_status_msg = format!("Failed to start ({:?})", e);
+                }
+            }
+        }
+        StartAction::Rest { port, cluster, .. } => {
+            let rest_port_to_use = port.unwrap_or(DEFAULT_REST_API_PORT);
+            if rest_port_to_use < 1024 || rest_port_to_use > 65535 {
+                eprintln!("Invalid port: {}. Must be between 1024 and 65535.", rest_port_to_use);
+                rest_api_status_msg = format!("Invalid port: {}", rest_port_to_use);
+            } else {
+                stop_process_by_port("REST API", rest_port_to_use).await?;
+                println!("Starting REST API server on port {}...", rest_port_to_use);
+                let current_storage_config = LibStorageConfig::default();
+                let lib_storage_engine_type = current_storage_config.engine_type;
+                start_daemon_process(
+                    true,
+                    false,
+                    Some(rest_port_to_use),
+                    Some(PathBuf::from(current_storage_config.data_path)),
+                    Some(lib_storage_engine_type.into()),
+                ).await?;
+                rest_api_status_msg = format!("Running on port: {}", rest_port_to_use);
+            }
+        }
+        StartAction::Storage {
+            port,
+            config_file,
+            cluster,
+            data_directory,
+            log_directory,
+            max_disk_space_gb,
+            min_disk_space_gb,
+            use_raft_for_scale,
+            storage_engine_type,
+        } => {
+            let storage_port_to_use = port.unwrap_or(config.default_port);
+            let cluster_ports = if let Some(ref cluster_range) = cluster {
+                parse_cluster_range(cluster_range).unwrap_or_default()
+            } else {
+                parse_cluster_range(&config.cluster_range).unwrap_or_default()
+            };
+            let all_ports = if cluster_ports.is_empty() {
+                vec![storage_port_to_use]
+            } else {
+                let mut ports = vec![storage_port_to_use];
+                ports.extend(cluster_ports);
+                ports
+            };
+            for &p in &all_ports {
+                if p < 1024 || p > 65535 {
+                    eprintln!("Invalid storage port: {}. Must be between 1024 and 65535.", p);
+                    storage_status_msg = format!("Invalid port: {}", p);
+                    continue;
+                }
+                stop_process_by_port("Storage Daemon", p).await?;
+                println!("Starting Storage daemon on port {}...", p);
+                let actual_storage_config_path = config_file.clone().unwrap_or_else(|| {
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .parent()
+                        .expect("Failed to get parent directory of server crate")
+                        .join("storage_daemon_server")
+                        .join("storage_config.yaml")
+                });
+                start_daemon_process(
+                    false,
+                    true,
+                    Some(p),
+                    Some(actual_storage_config_path.clone()),
+                    None,
+                ).await?;
+                let addr_check = format!("127.0.0.1:{}", p);
+                let health_check_timeout = Duration::from_secs(10);
+                let poll_interval = Duration::from_millis(500);
+                let mut started_ok = false;
+                let start_time = Instant::now();
+                while start_time.elapsed() < health_check_timeout {
+                    match tokio::net::TcpStream::connect(&addr_check).await {
+                        Ok(_) => {
+                            println!("Storage daemon on port {} responded to health check.", p);
+                            started_ok = true;
+                            break;
+                        }
+                        Err(_) => {
+                            tokio::time::sleep(poll_interval).await;
+                        }
+                    }
+                }
+                if started_ok {
+                    storage_status_msg = format!("Running on port(s): {}", all_ports.iter().map(|port| port.to_string()).collect::<Vec<_>>().join(", "));
+                } else {
+                    eprintln!("Warning: Storage daemon daemonized but did not become reachable on port {} within {:?}", p, health_check_timeout);
+                    storage_status_msg = format!("Daemonized but failed to become reachable on port {}", p);
+                }
+            }
+        }
+    }
+
+    println!("\n--- Start Command Summary ---");
+    println!("{:<20} {:<30}", "Component", "Status");
+    println!("{:-<20} {:-<30}", "", "");
+    println!("{:<20} {:<30}", "GraphDB Daemon", daemon_status_msg);
+    println!("{:<20} {:<30}", "REST API", rest_api_status_msg);
+    println!("{:<20} {:<30}", "Storage Daemon", storage_status_msg);
+    println!("-----------------------------");
+
+    Ok(())
+}
+
+
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_start_all_interactive(
+    daemon_port_opt: Option<u16>,
+    daemon_cluster_opt: Option<String>,
+    rest_api_port_opt: Option<u16>,
+    storage_port_opt: Option<u16>,
+    storage_config_file_opt: Option<PathBuf>,
+    data_directory_opt: Option<String>,
+    log_directory_opt: Option<String>,
+    max_disk_space_gb_opt: Option<u64>,
+    min_disk_space_gb_opt: Option<u64>,
+    use_raft_for_scale_opt: Option<bool>,
+    storage_engine_type_opt: Option<StorageEngineType>,
+    daemon_handles: Arc<Mutex<HashMap<u16, (JoinHandle<()>, oneshot::Sender<()>)>>>,
+    rest_api_shutdown_tx_opt: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    rest_api_port_arc: Arc<Mutex<Option<u16>>>,
+    rest_api_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    storage_daemon_shutdown_tx_opt: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    storage_daemon_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    storage_daemon_port_arc: Arc<Mutex<Option<u16>>>,
+) -> Result<()> {
+    println!("Attempting to start all components...");
+
+    let mut skip_ports = Vec::new();
+    if let Some(rest_p) = rest_api_port_opt {
+        skip_ports.push(rest_p);
+    }
+    if let Some(storage_p) = storage_port_opt {
+        skip_ports.push(storage_p);
+    }
+
+    // Start Daemon
+    println!("Starting GraphDB Daemon...");
+    let daemon_start_result = start_daemon(daemon_port_opt, daemon_cluster_opt.clone(), skip_ports.clone()).await;
+    match daemon_start_result {
+        Ok(()) => {
+            println!("GraphDB Daemon started successfully.");
+        }
+        Err(e) => {
+            eprintln!("Failed to start GraphDB Daemon: {:?}", e);
+        }
+    }
+
+    // Start REST API
+    println!("Starting REST API server...");
+    let rest_port_to_use = rest_api_port_opt.unwrap_or(DEFAULT_REST_API_PORT);
+    if rest_port_to_use < 1024 || rest_port_to_use > 65535 {
+        eprintln!("Invalid port for REST API: {}. Must be between 1024 and 65535.", rest_port_to_use);
+    } else {
+        stop_daemon_instance_interactive(Some(rest_port_to_use), daemon_handles.clone()).await?; // Use daemon_handles for consistency
+        let (tx, rx) = oneshot::channel();
+        *rest_api_shutdown_tx_opt.lock().await = Some(tx);
+        *rest_api_port_arc.lock().await = Some(rest_port_to_use);
+
+        let current_storage_config = LibStorageConfig::default();
+        let lib_storage_engine_type = current_storage_config.engine_type;
+
+        let handle = tokio::spawn(async move {
+            let result = start_daemon_process(
+                true,
+                false,
+                Some(rest_port_to_use),
+                Some(PathBuf::from(current_storage_config.data_path)),
+                Some(lib_storage_engine_type.into()),
+            ).await;
+            if let Err(e) = result {
+                eprintln!("REST API server process failed: {:?}", e);
+            }
+            drop(rx);
+        });
+        *rest_api_handle.lock().await = Some(handle);
+        println!("REST API server daemonized on port {}.", rest_port_to_use);
+    }
+
+    // Start Storage Daemon
+    println!("Starting Storage daemon...");
+    start_storage_interactive(
+        storage_port_opt,
+        storage_config_file_opt.clone(),
+        daemon_cluster_opt.clone(), // Pass daemon cluster opt to storage as well
+        data_directory_opt,
+        log_directory_opt,
+        max_disk_space_gb_opt,
+        min_disk_space_gb_opt,
+        use_raft_for_scale_opt,
+        storage_engine_type_opt,
+        storage_daemon_shutdown_tx_opt.clone(),
+        storage_daemon_handle.clone(),
+        storage_daemon_port_arc.clone(),
+    ).await?;
+
+    println!("All components initiated. Check 'status all' for full details.");
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn start_storage_interactive(
+    port_opt: Option<u16>,
+    config_file: Option<PathBuf>,
+    cluster: Option<String>,
+    data_directory: Option<String>,
+    log_directory: Option<String>,
+    max_disk_space_gb: Option<u64>,
+    min_disk_space_gb: Option<u64>,
+    use_raft_for_scale: Option<bool>,
+    storage_engine_type: Option<StorageEngineType>,
+    _storage_daemon_shutdown_tx_opt: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    _storage_daemon_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    _storage_daemon_port_arc: Arc<Mutex<Option<u16>>>,
+) -> Result<()> {
+    let config = load_storage_config(None).expect("Failed to load storage config");
+    let storage_port_to_use = port_opt.unwrap_or(config.default_port);
+
+    let cluster_ports = if let Some(ref cluster_range) = cluster {
+        parse_cluster_range(cluster_range).unwrap_or_default()
+    } else {
+        parse_cluster_range(&config.cluster_range).unwrap_or_default()
+    };
+    let all_ports = if cluster_ports.is_empty() {
+        vec![storage_port_to_use]
+    } else {
+        let mut ports = vec![storage_port_to_use];
+        ports.extend(cluster_ports);
+        ports
+    };
+
+    for &p in &all_ports {
+        if p < 1024 || p > 65535 {
+            eprintln!("Invalid storage port: {}. Must be between 1024 and 65535.", p);
+            continue;
+        }
+        stop_process_by_port("Storage Daemon", p).await?;
+        println!("Starting Storage daemon on port {}...", p);
+        let actual_storage_config_path = config_file.clone().unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .expect("Failed to get parent directory of server crate")
+                .join("storage_daemon_server")
+                .join("storage_config.yaml")
+        });
+
+        start_daemon_process(
+            false,
+            true,
+            Some(p),
+            Some(actual_storage_config_path.clone()),
+            None,
+        ).await?;
+        let addr_check = format!("127.0.0.1:{}", p);
+        let health_check_timeout = Duration::from_secs(10);
+        let poll_interval = Duration::from_millis(500);
+        let mut started_ok = false;
+        let start_time = Instant::now();
+        while start_time.elapsed() < health_check_timeout {
+            match tokio::net::TcpStream::connect(&addr_check).await {
+                Ok(_) => {
+                    println!("Storage daemon on port {} responded to health check.", p);
+                    started_ok = true;
+                    break;
+                }
+                Err(_) => {
+                    tokio::time::sleep(poll_interval).await;
+                }
+            }
+        }
+        if started_ok {
+            println!("Storage daemon daemonized successfully on port {}.", p);
+        } else {
+            eprintln!("Warning: Storage daemon daemonized but did not become reachable on port {} within {:?}", p, health_check_timeout);
+        }
+    }
+    Ok(())
+}
+
+pub async fn handle_stop_command(
+    stop_args: StopArgs,
+    daemon_handles: Arc<Mutex<HashMap<u16, (JoinHandle<()>, oneshot::Sender<()>)>>>,
+    rest_api_shutdown_tx_opt: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    rest_api_port_arc: Arc<Mutex<Option<u16>>>,
+    rest_api_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    storage_daemon_shutdown_tx_opt: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    storage_daemon_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    storage_daemon_port_arc: Arc<Mutex<Option<u16>>>,
+) -> Result<()> {
+    match stop_args.action {
+        StopAction::All => {
+            println!("Stopping all components...");
+            stop_all_interactive(
+                daemon_handles,
+                rest_api_shutdown_tx_opt,
+                rest_api_port_arc,
+                rest_api_handle,
+                storage_daemon_shutdown_tx_opt,
+                storage_daemon_handle,
+                storage_daemon_port_arc,
+            ).await?;
+            println!("All components stopped.");
+        }
+        StopAction::Daemon { port } => {
+            println!("Stopping GraphDB daemon...");
+            stop_daemon_instance_interactive(port, daemon_handles).await?;
+            println!("GraphDB daemon stopped.");
+        }
+        StopAction::Rest { port } => {
+            println!("Stopping REST API server...");
+            let rest_port_to_stop = port.unwrap_or(DEFAULT_REST_API_PORT);
+            stop_daemon_api_call(Some(rest_port_to_stop), true, false).await?;
+            println!("REST API server stopped.");
+        }
+        StopAction::Storage { port } => {
+            println!("Stopping Storage daemon...");
+            let storage_port_to_stop = port.unwrap_or_else(|| {
+                load_storage_config(None).expect("Failed to load storage config").default_port
+            });
+            stop_daemon_api_call(Some(storage_port_to_stop), false, true).await?;
+            println!("Storage daemon stopped.");
+        }
+        StopAction::Cluster => {
+            println!("Stopping cluster is a placeholder. This would involve coordinating stops across multiple daemon instances.");
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn stop_all_interactive(
+    daemon_handles: Arc<Mutex<HashMap<u16, (JoinHandle<()>, oneshot::Sender<()>)>>>,
+    rest_api_shutdown_tx_opt: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    rest_api_port_arc: Arc<Mutex<Option<u16>>>,
+    rest_api_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    storage_daemon_shutdown_tx_opt: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    storage_daemon_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    storage_daemon_port_arc: Arc<Mutex<Option<u16>>>,
+) -> Result<()> {
+    println!("Stopping all running daemons and services...");
+
+    // Stop REST API
+    if let Some(tx) = rest_api_shutdown_tx_opt.lock().await.take() {
+        if tx.send(()).is_ok() {
+            println!("Sent shutdown signal to REST API server.");
+        }
+    }
+    if let Some(handle) = rest_api_handle.lock().await.take() {
+        if let Err(e) = handle.await {
+            eprintln!("Error awaiting REST API handle: {:?}", e);
+        }
+        println!("REST API server task finished.");
+    }
+    if let Some(port) = *rest_api_port_arc.lock().await {
+        if check_process_status_by_port("REST API", port).await {
+            stop_process_by_port("REST API", port).await?;
+        }
+    }
+
+    // Stop Storage Daemon
+    if let Some(tx) = storage_daemon_shutdown_tx_opt.lock().await.take() {
+        if tx.send(()).is_ok() {
+            println!("Sent shutdown signal to Storage daemon.");
+        }
+    }
+    if let Some(handle) = storage_daemon_handle.lock().await.take() {
+        if let Err(e) = handle.await {
+            eprintln!("Error awaiting Storage daemon handle: {:?}", e);
+        }
+        println!("Storage daemon task finished.");
+    }
+    if let Some(port) = *storage_daemon_port_arc.lock().await {
+        if check_process_status_by_port("Storage Daemon", port).await {
+            stop_process_by_port("Storage Daemon", port).await?;
+        }
+    }
+
+    // Stop GraphDB Daemons
+    let mut handles_guard = daemon_handles.lock().await;
+    for (port, (handle, tx)) in handles_guard.drain() {
+        if tx.send(()).is_ok() {
+            println!("Sent shutdown signal to GraphDB Daemon on port {}.", port);
+        }
+        if let Err(e) = handle.await {
+            eprintln!("Error awaiting GraphDB Daemon handle on port {}: {:?}", port, e);
+        }
+        println!("GraphDB Daemon task on port {} finished.", port);
+        if check_process_status_by_port("GraphDB Daemon", port).await {
+            stop_process_by_port("GraphDB Daemon", port).await?;
+        }
+    }
+    drop(handles_guard); // Explicitly drop the lock guard
+
+    println!("All components stopped.");
+    Ok(())
+}
+
+pub async fn stop_daemon_instance_interactive(
+    port: Option<u16>,
+    daemon_handles: Arc<Mutex<HashMap<u16, (JoinHandle<()>, oneshot::Sender<()>)>>>,
+) -> Result<()> {
+    let target_port = port.unwrap_or(DEFAULT_DAEMON_PORT);
+    let mut handles_guard = daemon_handles.lock().await;
+
+    if let Some((handle, tx)) = handles_guard.remove(&target_port) {
+        if tx.send(()).is_ok() {
+            println!("Sent shutdown signal to GraphDB Daemon on port {}.", target_port);
+        }
+        if let Err(e) = handle.await {
+            eprintln!("Error awaiting GraphDB Daemon handle on port {}: {:?}", target_port, e);
+        }
+        println!("GraphDB Daemon task on port {} finished.", target_port);
+    } else {
+        println!("No internally managed GraphDB Daemon found on port {}. Attempting external stop...", target_port);
+    }
+
+    if check_process_status_by_port("GraphDB Daemon", target_port).await {
+        stop_process_by_port("GraphDB Daemon", target_port).await?;
+    } else {
+        println!("No GraphDB Daemon process found running on port {}.", target_port);
+    }
+    Ok(())
+}
+
+pub async fn handle_status_command(
+    status_args: StatusArgs,
+    rest_api_port_arc: Arc<Mutex<Option<u16>>>,
+    storage_daemon_port_arc: Arc<Mutex<Option<u16>>>,
+) -> Result<()> {
+    match status_args.action {
+        StatusAction::All => {
+            display_full_status_summary(rest_api_port_arc, storage_daemon_port_arc).await;
+        }
+        StatusAction::Daemon { port } => {
+            display_daemon_status(port).await;
+        }
+        StatusAction::Rest { port: _ } => { // Port is ignored for rest status as it checks all
+            display_rest_api_status(rest_api_port_arc).await;
+        }
+        StatusAction::Storage { port } => {
+            display_storage_daemon_status(port, storage_daemon_port_arc).await;
+        }
+        StatusAction::Cluster => {
+            display_cluster_status().await;
+        }
+    }
+    Ok(())
+}
+
+pub async fn handle_reload_command(
+    reload_args: ReloadArgs,
+    _daemon_handles: Arc<Mutex<HashMap<u16, (JoinHandle<()>, oneshot::Sender<()>)>>>,
+    _rest_api_shutdown_tx_opt: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    _rest_api_port_arc: Arc<Mutex<Option<u16>>>,
+    _rest_api_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    _storage_daemon_shutdown_tx_opt: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    _storage_daemon_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    _storage_daemon_port_arc: Arc<Mutex<Option<u16>>>,
+) -> Result<()> {
+    match reload_args.action {
+        ReloadAction::All => {
+            println!("Reloading all components...");
+            println!("A full system reload typically involves stopping and restarting components, or sending specific reload signals.");
+            println!("This is a placeholder for complex reload logic.");
+        }
+        ReloadAction::Daemon { port: _ } => {
+            println!("Reloading GraphDB daemon...");
+            println!("Daemon reload logic needs to be implemented. This might involve sending a reload signal or restarting the daemon.");
+        }
+        ReloadAction::Rest { port: _ } => {
+            println!("Reloading REST API server...");
+            println!("REST API server reload logic needs to be implemented. This might involve sending a reload signal or restarting the server.");
+        }
+        ReloadAction::Storage { port: _ } => {
+            println!("Reloading Storage daemon...");
+            println!("Storage daemon reload logic needs to be implemented. This might involve sending a reload signal or restarting the daemon.");
+        }
+        ReloadAction::Cluster => {
+            println!("Reloading cluster configuration...");
+            println!("A full cluster reload involves coordinating reloads across multiple daemon instances.");
+            println!("This is a placeholder for complex cluster management reload logic.");
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_restart_command(
+    restart_args: RestartArgs,
+    daemon_handles: Arc<Mutex<HashMap<u16, (JoinHandle<()>, oneshot::Sender<()>)>>>,
+    rest_api_shutdown_tx_opt: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    rest_api_port_arc: Arc<Mutex<Option<u16>>>,
+    rest_api_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    storage_daemon_shutdown_tx_opt: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    storage_daemon_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    storage_daemon_port_arc: Arc<Mutex<Option<u16>>>,
+) -> Result<()> {
+    match restart_args.action {
+        RestartAction::All {
+            port,
+            cluster,
+            listen_port,
+            storage_port,
+            storage_config_file,
+            data_directory,
+            log_directory,
+            max_disk_space_gb,
+            min_disk_space_gb,
+            use_raft_for_scale,
+            storage_engine_type,
+        } => {
+            println!("Restarting all components...");
+            stop_all_interactive(
+                daemon_handles.clone(),
+                rest_api_shutdown_tx_opt.clone(),
+                rest_api_port_arc.clone(),
+                rest_api_handle.clone(),
+                storage_daemon_shutdown_tx_opt.clone(),
+                storage_daemon_handle.clone(),
+                storage_daemon_port_arc.clone(),
+            ).await?;
+            handle_start_all_interactive(
+                port,
+                cluster,
+                listen_port,
+                storage_port,
+                storage_config_file,
+                data_directory,
+                log_directory,
+                max_disk_space_gb,
+                min_disk_space_gb,
+                use_raft_for_scale,
+                storage_engine_type,
+                daemon_handles,
+                rest_api_shutdown_tx_opt,
+                rest_api_port_arc,
+                rest_api_handle,
+                storage_daemon_shutdown_tx_tx_opt,
+                storage_daemon_handle,
+                storage_daemon_port_arc,
+            ).await?;
+            println!("All components restarted.");
+        }
+        RestartAction::Rest { port, cluster: _ } => {
+            println!("Restarting REST API server...");
+            let actual_port = port.unwrap_or(DEFAULT_REST_API_PORT);
+            stop_daemon_api_call(Some(actual_port), true, false).await?;
+            println!("REST API server stopped. Starting again...");
+            let current_storage_config = LibStorageConfig::default();
+            let lib_storage_engine_type = current_storage_config.engine_type;
+            start_daemon_process(
+                true,
+                false,
+                Some(actual_port),
+                Some(PathBuf::from(current_storage_config.data_path)),
+                Some(lib_storage_engine_type.into()),
+            ).await?;
+            println!("REST API server restarted on port {}.", actual_port);
+        }
+        RestartAction::Storage {
+            port,
+            config_file,
+            cluster,
+            data_directory,
+            log_directory,
+            max_disk_space_gb,
+            min_disk_space_gb,
+            use_raft_for_scale,
+            storage_engine_type,
+        } => {
+            println!("Restarting Storage daemon...");
+            let config = load_storage_config(None).expect("Failed to load storage config");
+            let storage_port_to_restart = port.unwrap_or(config.default_port);
+            let cluster_ports = if let Some(ref cluster_range) = cluster {
+                parse_cluster_range(cluster_range).unwrap_or_default()
+            } else {
+                parse_cluster_range(&config.cluster_range).unwrap_or_default()
+            };
+            let all_ports = if cluster_ports.is_empty() {
+                vec![storage_port_to_restart]
+            } else {
+                let mut ports = vec![storage_port_to_restart];
+                ports.extend(cluster_ports);
+                ports
+            };
+
+            for &port in &all_ports {
+                stop_daemon_api_call(Some(port), false, true).await?;
+                println!("Storage daemon stopped on port {}. Starting again...", port);
+                let actual_storage_config_path = config_file.clone().unwrap_or_else(|| {
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .parent()
+                        .expect("Failed to get parent directory of server crate")
+                        .join("storage_daemon_server")
+                        .join("storage_config.yaml")
+                });
+                start_storage_interactive(
+                    Some(port),
+                    config_file.clone(),
+                    cluster.clone(),
+                    data_directory.clone(),
+                    log_directory.clone(),
+                    max_disk_space_gb,
+                    min_disk_space_gb,
+                    use_raft_for_scale,
+                    storage_engine_type.clone(),
+                    _storage_daemon_shutdown_tx_opt.clone(),
+                    _storage_daemon_handle.clone(),
+                    _storage_daemon_port_arc.clone(),
+                ).await?;
+                println!("Storage daemon restarted on port {}.", port);
+            }
+        }
+        RestartAction::Daemon { port, .. } => {
+            println!("Restarting GraphDB Daemon...");
+            let actual_port = port.unwrap_or(DEFAULT_DAEMON_PORT);
+            stop_daemon_instance_interactive(Some(actual_port), daemon_handles.clone()).await?;
+            start_daemon_instance_interactive(Some(actual_port), None, daemon_handles.clone()).await?;
+            println!("GraphDB Daemon restarted on port {}.", actual_port);
+        }
+        RestartAction::Cluster => {
+            println!("Restarting cluster configuration...");
+            println!("A full cluster restart involves coordinating restarts across multiple daemon instances.");
+            println!("This is a placeholder for complex cluster management logic.");
+        }
+    }
+    Ok(())
+}
+
+pub async fn start_daemon_instance_interactive(
+    port_opt: Option<u16>,
+    cluster_opt: Option<String>,
+    daemon_handles: Arc<Mutex<HashMap<u16, (JoinHandle<()>, oneshot::Sender<()>)>>>,
+) -> Result<()> {
+    let port_to_use = port_opt.unwrap_or(DEFAULT_DAEMON_PORT);
+    let config = load_storage_config(None).expect("Failed to load storage config");
+
+    let cluster_ports_to_use = if let Some(ref cluster_range) = cluster_opt {
+        parse_cluster_range(cluster_range).unwrap_or_default()
+    } else {
+        parse_cluster_range(&config.cluster_range).unwrap_or_default()
+    };
+
+    let all_ports = if cluster_ports_to_use.is_empty() {
+        vec![port_to_use]
+    } else {
+        let mut ports = vec![port_to_use];
+        ports.extend(cluster_ports_to_use);
+        ports
+    };
+
+    let mut handles_guard = daemon_handles.lock().await;
+
+    for &p in &all_ports {
+        if p < 1024 || p > 65535 {
+            eprintln!("Invalid daemon port: {}. Must be between 1024 and 65535.", p);
+            continue;
+        }
+
+        if handles_guard.contains_key(&p) {
+            println!("GraphDB Daemon already managed on port {}. Skipping.", p);
+            continue;
+        }
+
+        stop_process_by_port("GraphDB Daemon", p).await?;
+
+        println!("Starting GraphDB Daemon process on port {}...", p);
+
+        let (tx_shutdown, rx_shutdown) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let result = start_daemon_process(
+                false, // not rest api
+                false, // not storage daemon
+                Some(p),
+                None, // No data directory for main daemon
+                None, // No storage engine type for main daemon
+            ).await;
+            if let Err(e) = result {
+                eprintln!("GraphDB Daemon process failed on port {}: {:?}", p, e);
+            }
+            drop(rx_shutdown);
+        });
+
+        handles_guard.insert(p, (handle, tx_shutdown));
+        println!("GraphDB Daemon daemonized on port {}.", p);
+    }
+    Ok(())
+}
