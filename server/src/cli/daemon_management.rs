@@ -204,3 +204,21 @@ pub async fn clear_all_daemon_processes() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// Helper function to find a running daemon's PID on a specific port.
+/// Returns the PID as u32 if found, otherwise None.
+pub async fn find_daemon_process_on_port(port: u16) -> Option<u32> {
+    let output = tokio::process::Command::new("lsof")
+        .arg("-i")
+        .arg(format!(":{}", port))
+        .arg("-t") // Only print PIDs
+        .output()
+        .await;
+
+    if let Ok(output) = output {
+        let pids = String::from_utf8_lossy(&output.stdout);
+        // Take the first PID found, assuming only one process should listen on a given port
+        pids.trim().lines().filter_map(|s| s.parse::<u32>().ok()).next()
+    } else {
+        None
+    }
+}

@@ -1,5 +1,4 @@
 // server/src/cli/mod.rs
-
 // This module contains the command-line interface (CLI) logic for the GraphDB server.
 // It includes argument parsing, command handling, and interactive mode.
 
@@ -12,7 +11,7 @@ pub mod help_display;
 pub mod interactive;
 
 // Re-export the main CLI entry point from cli.rs
-pub use cli::{start_cli, CliArgs, Commands}; // Corrected: Changed run_cli to start_cli
+pub use cli::{start_cli, CliArgs, Commands};
 
 // Re-export specific types/functions from other modules if they are part of the public CLI API
 pub use commands::{
@@ -23,7 +22,6 @@ pub use commands::{
     StopArgs,
     ReloadArgs,
     RestartArgs,
-    StartAction,
     StopAction,
     ReloadAction,
     RestartAction,
@@ -37,7 +35,7 @@ pub use handlers::{
     handle_stop_command,
     handle_start_command,
     handle_reload_command,
-    handle_restart_command_interactive, // FIX: Changed to handle_restart_command_interactive
+    handle_restart_command_interactive,
 };
 pub use interactive::{
     run_cli_interactive,
@@ -65,4 +63,3 @@ pub use daemon_management::{
     find_running_storage_daemon_port,
     clear_all_daemon_processes,
 };
-
