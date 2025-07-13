@@ -20,6 +20,7 @@ pub struct StorageConfig {
     pub min_disk_space_gb: u64,
     pub use_raft_for_scale: bool,
     pub storage_engine_type: String,
+    pub max_open_files: u64, // Added max_open_files field
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,6 +71,7 @@ impl Default for StorageConfig {
             min_disk_space_gb: 10,
             use_raft_for_scale: false,
             storage_engine_type: "sled".to_string(),
+            max_open_files: 1024, // Added default value for max_open_files
         }
     }
 }
@@ -137,4 +139,4 @@ impl From<StorageEngineType> for DaemonApiStorageEngineType {
             StorageEngineType::InMemory => DaemonApiStorageEngineType::InMemory,
         }
     }
-} 
+}

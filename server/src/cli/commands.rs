@@ -1,5 +1,3 @@
-// server/src/cli/commands.rs
-
 // This file defines the command-line arguments and subcommands
 // for the GraphDB CLI using the `clap` crate.
 // FIX: 2025-07-12 - Added cluster field to StartAction::Rest to support --cluster and --join-cluster flags, aligning with RestartAction::Rest and interactive.rs parsing.
@@ -8,6 +6,7 @@
 // FIX: 2025-07-12 - Ensured daemon, rest, and storage fields in RestartAction variants are Option<bool> to align with interactive.rs fixes for E0063 and E0308.
 // FIX: 2025-07-12 - Made StartArgs.action optional and added top-level flags to StartArgs to support direct flag usage without subcommand.
 // NEW: 2025-07-12 - Added daemon and storage fields to StartAction::Rest and RestartAction::Rest to resolve E0063 errors in interactive.rs.
+// NEW: 2025-07-12 - Added daemon and rest fields to StorageAction::Start to align with StartAction::Storage and RestartAction::Storage for consistency and reuse.
 
 use clap::{Args, Subcommand};
 use std::path::PathBuf;
@@ -114,6 +113,10 @@ pub enum StorageAction {
         use_raft_for_scale: Option<bool>,
         #[clap(long)]
         storage_engine_type: Option<String>,
+        #[clap(long)]
+        daemon: Option<bool>,
+        #[clap(long)]
+        rest: Option<bool>,
     },
     Stop {
         #[clap(long, short = 'p')]
@@ -231,37 +234,35 @@ pub enum ReloadAction {
 pub struct RestartArgs {
     #[clap(subcommand)]
     pub action: Option<RestartAction>,
-
-    // Add all top-level flags here to match StartArgs and allow direct usage
-    #[clap(long, short = 'p', help = "Port for the daemon, REST API, or storage (requires subcommand or flags if ambiguous)")]
+    #[clap(long, short = 'p')]
     pub port: Option<u16>,
-    #[clap(long, short = 'c', alias = "join-cluster", help = "Cluster range for the daemon, REST, or storage (e.g., '9001-9004')")]
+    #[clap(long, short = 'c', alias = "join-cluster")]
     pub cluster: Option<String>,
-    #[clap(long, help = "Path to configuration file for general settings or specific components")]
-    pub config_file: Option<PathBuf>, // Added config_file
-    #[clap(long, help = "Listen port for the REST API")]
+    #[clap(long)]
+    pub config_file: Option<PathBuf>,
+    #[clap(long)]
     pub listen_port: Option<u16>,
-    #[clap(long, help = "Storage port for the storage daemon")]
+    #[clap(long)]
     pub storage_port: Option<u16>,
-    #[clap(long, value_hint = clap::ValueHint::FilePath, help = "Path to storage configuration file")]
+    #[clap(long, value_hint = clap::ValueHint::FilePath)]
     pub storage_config_file: Option<PathBuf>,
-    #[clap(long, value_hint = clap::ValueHint::DirPath, help = "Data directory for storage daemon")]
+    #[clap(long, value_hint = clap::ValueHint::DirPath)]
     pub data_directory: Option<String>,
-    #[clap(long, value_hint = clap::ValueHint::DirPath, help = "Log directory for storage daemon")]
+    #[clap(long, value_hint = clap::ValueHint::DirPath)]
     pub log_directory: Option<String>,
-    #[clap(long, help = "Maximum disk space in GB for storage daemon")]
+    #[clap(long)]
     pub max_disk_space_gb: Option<u64>,
-    #[clap(long, help = "Minimum disk space in GB for storage daemon")]
+    #[clap(long)]
     pub min_disk_space_gb: Option<u64>,
-    #[clap(long, help = "Use Raft for scale in storage daemon")]
+    #[clap(long)]
     pub use_raft_for_scale: Option<bool>,
-    #[clap(long, help = "Storage engine type (e.g., 'sled', 'rocksdb')")]
+    #[clap(long)]
     pub storage_engine_type: Option<String>,
-    #[clap(long, help = "Restart the daemon component")]
+    #[clap(long)]
     pub daemon: Option<bool>,
-    #[clap(long, help = "Restart the REST API component")]
+    #[clap(long)]
     pub rest: Option<bool>,
-    #[clap(long, help = "Restart the storage component")]
+    #[clap(long)]
     pub storage: Option<bool>,
 }
 
@@ -352,33 +353,33 @@ pub enum RestartAction {
 pub struct StartArgs {
     #[clap(subcommand)]
     pub action: Option<StartAction>,
-    #[clap(long, short = 'p', help = "Port for the daemon, REST API, or storage (requires subcommand or flags if ambiguous)")]
+    #[clap(long, short = 'p')]
     pub port: Option<u16>,
-    #[clap(long, short = 'c', alias = "join-cluster", help = "Cluster range for the daemon, REST, or storage (e.g., '9001-9004')")]
+    #[clap(long, short = 'c', alias = "join-cluster")]
     pub cluster: Option<String>,
-    #[clap(long, help = "Listen port for the REST API")]
+    #[clap(long)]
     pub listen_port: Option<u16>,
-    #[clap(long, help = "Storage port for the storage daemon")]
+    #[clap(long)]
     pub storage_port: Option<u16>,
-    #[clap(long, help = "Path to storage configuration file")]
+    #[clap(long, value_hint = clap::ValueHint::FilePath)]
     pub storage_config_file: Option<PathBuf>,
-    #[clap(long, help = "Data directory for storage daemon")]
+    #[clap(long, value_hint = clap::ValueHint::DirPath)]
     pub data_directory: Option<String>,
-    #[clap(long, help = "Log directory for storage daemon")]
+    #[clap(long, value_hint = clap::ValueHint::DirPath)]
     pub log_directory: Option<String>,
-    #[clap(long, help = "Maximum disk space in GB for storage daemon")]
+    #[clap(long)]
     pub max_disk_space_gb: Option<u64>,
-    #[clap(long, help = "Minimum disk space in GB for storage daemon")]
+    #[clap(long)]
     pub min_disk_space_gb: Option<u64>,
-    #[clap(long, help = "Use Raft for scale in storage daemon")]
+    #[clap(long)]
     pub use_raft_for_scale: Option<bool>,
-    #[clap(long, help = "Storage engine type (e.g., 'sled', 'rocksdb')")]
+    #[clap(long)]
     pub storage_engine_type: Option<String>,
-    #[clap(long, help = "Start the daemon component")]
+    #[clap(long)]
     pub daemon: Option<bool>,
-    #[clap(long, help = "Start the REST API component")]
+    #[clap(long)]
     pub rest: Option<bool>,
-    #[clap(long, help = "Start the storage component")]
+    #[clap(long)]
     pub storage: Option<bool>,
 }
 

@@ -20,6 +20,12 @@
 // FIX: 2025-07-12 - Added top-level flags to CliArgs for start command and logic to infer StartAction based on flags.
 // FIX: 2025-07-12 - Fixed E0533 by using matches! for StartAction::All comparison in ambiguous port check.
 // FIX: 2025-07-12 - Updated StartArgs handling to use top-level flags when action is None, ensuring --cluster and --daemon are recognized.
+// FIX: 2025-07-12 - Added validation for critical fields in Restart commands and default port handling.
+// FIX: 2025-07-12 - Corrected config field access to use server.port, StorageConfig::default().default_port, and get_default_rest_port_from_config() to resolve E0609 errors.
+// FIX: 2025-07-12 - Corrected args.config_file to args.storage_config_file in RestartArgs construction.
+// FIX: 2025-07-12 - Added .clone() to storage_config_file in RestartArgs to resolve E0382 errors.
+// FIX: 2025-07-12 - Prioritized --cluster and --daemon for StartAction::Daemon and loaded storage_config.yaml by default.
+// FIX: 2025-07-12 - Fixed E0599 by removing unwrap_or on StatusAction and using direct action; fixed E0425 by correcting reload_args to restart_args in Restart branch.
 
 use clap::{Parser, Subcommand, CommandFactory, Args};
 use anyhow::Result;
@@ -211,6 +217,15 @@ pub async fn start_cli() -> Result<()> {
         }
     };
 
+    // Load default storage config
+    let storage_config = match config_mod::load_storage_config(None) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("Warning: Could not load storage config: {}. Using defaults.", e);
+            config_mod::StorageConfig::default()
+        }
+    };
+
     if let Some(query_string) = args.query {
         println!("Executing direct query: {}", query_string);
         match parse_query_from_string(&query_string) {
@@ -241,10 +256,13 @@ pub async fn start_cli() -> Result<()> {
         }
         match command {
             Commands::Start(start_args) => {
-                // Check top-level flags to infer StartAction if no subcommand is provided
+                // Load default ports
+                let default_rest_port = config_mod::get_default_rest_port_from_config();
+                let default_storage_port = storage_config.default_port;
+                let default_daemon_port = config.server.port.unwrap_or(8000);
+
                 match start_args.action {
                     Some(action) => {
-                        // Handle explicit subcommand
                         match action {
                             StartAction::All {
                                 port,
@@ -259,7 +277,7 @@ pub async fn start_cli() -> Result<()> {
                                 min_disk_space_gb,
                                 use_raft_for_scale,
                                 storage_engine_type,
-                                .. // Added to ignore daemon, rest, storage fields
+                                ..
                             } => {
                                 // Update rest_api_port_arc and storage_daemon_port_arc before starting
                                 if let Some(listen_port) = listen_port.or(start_args.listen_port).or(args.listen_port) {
@@ -271,17 +289,17 @@ pub async fn start_cli() -> Result<()> {
                                     *port_guard = Some(storage_port);
                                 }
                                 handlers_mod::handle_start_all_interactive(
-                                    port.or(start_args.port).or(args.port),
-                                    cluster.or(start_args.cluster).or(args.cluster),
-                                    listen_port.or(start_args.listen_port).or(args.listen_port),
-                                    storage_port.or(start_args.storage_port).or(args.storage_port),
+                                    port.or(start_args.port).or(args.port).or(Some(default_daemon_port)),
+                                    cluster.or(start_args.cluster).or(args.cluster).or(Some(storage_config.cluster_range.clone())),
+                                    listen_port.or(start_args.listen_port).or(args.listen_port).or(Some(default_rest_port)),
+                                    storage_port.or(start_args.storage_port).or(args.storage_port).or(Some(default_storage_port)),
                                     storage_config_file.or(start_args.storage_config_file).or(args.storage_config_file),
-                                    data_directory.or(start_args.data_directory).or(args.data_directory),
-                                    log_directory.or(start_args.log_directory).or(args.log_directory),
-                                    max_disk_space_gb.or(start_args.max_disk_space_gb).or(args.max_disk_space_gb),
-                                    min_disk_space_gb.or(start_args.min_disk_space_gb).or(args.min_disk_space_gb),
-                                    use_raft_for_scale.or(start_args.use_raft_for_scale).or(args.use_raft_for_scale),
-                                    storage_engine_type.or(start_args.storage_engine_type).or(args.storage_engine_type),
+                                    data_directory.or(start_args.data_directory).or(args.data_directory).or(Some(storage_config.data_directory.clone())),
+                                    log_directory.or(start_args.log_directory).or(args.log_directory).or(Some(storage_config.log_directory.clone())),
+                                    max_disk_space_gb.or(start_args.max_disk_space_gb).or(args.max_disk_space_gb).or(Some(storage_config.max_disk_space_gb)),
+                                    min_disk_space_gb.or(start_args.min_disk_space_gb).or(args.min_disk_space_gb).or(Some(storage_config.min_disk_space_gb)),
+                                    use_raft_for_scale.or(start_args.use_raft_for_scale).or(args.use_raft_for_scale).or(Some(storage_config.use_raft_for_scale)),
+                                    storage_engine_type.or(start_args.storage_engine_type).or(args.storage_engine_type).or(Some(storage_config.storage_engine_type.clone())),
                                     daemon_handles.clone(),
                                     rest_api_shutdown_tx_opt.clone(),
                                     rest_api_port_arc.clone(),
@@ -291,20 +309,19 @@ pub async fn start_cli() -> Result<()> {
                                     storage_daemon_port_arc.clone(),
                                 ).await?;
                             }
-                            StartAction::Daemon { port, cluster, .. } => { // Added ..
+                            StartAction::Daemon { port, cluster, .. } => {
                                 handlers_mod::handle_daemon_command_interactive(
                                     DaemonCliCommand::Start {
-                                        port: port.or(start_args.port).or(args.port),
-                                        cluster: cluster.or(start_args.cluster).or(args.cluster),
+                                        port: port.or(start_args.port).or(args.port).or(Some(default_daemon_port)),
+                                        cluster: cluster.or(start_args.cluster).or(args.cluster).or(Some(storage_config.cluster_range.clone())),
                                     },
                                     daemon_handles.clone(),
                                 ).await?;
                             }
-                            StartAction::Rest { port, .. } => { // Simplified and added ..
+                            StartAction::Rest { port, .. } => {
+                                let port = port.or(start_args.listen_port).or(args.listen_port).or(start_args.port).or(args.port).or(Some(default_rest_port));
                                 handlers_mod::handle_rest_command_interactive(
-                                    RestCliCommand::Start {
-                                        port: port.or(start_args.listen_port).or(args.listen_port).or(start_args.port).or(args.port),
-                                    },
+                                    RestCliCommand::Start { port },
                                     rest_api_shutdown_tx_opt.clone(),
                                     rest_api_port_arc.clone(),
                                     rest_api_handle.clone(),
@@ -320,20 +337,23 @@ pub async fn start_cli() -> Result<()> {
                                 min_disk_space_gb,
                                 use_raft_for_scale,
                                 storage_engine_type,
-                                .. // Added to ignore daemon, rest fields
+                                ..
                             } => {
                                 handlers_mod::handle_storage_command_interactive(
                                     StorageAction::Start {
-                                        port: port.or(start_args.storage_port).or(args.storage_port).or(start_args.port).or(args.port),
+                                        port: port.or(start_args.storage_port).or(args.storage_port).or(start_args.port).or(args.port).or(Some(default_storage_port)),
                                         config_file: config_file.or(start_args.storage_config_file).or(args.storage_config_file),
-                                        cluster: cluster.or(start_args.cluster).or(args.cluster),
-                                        data_directory: data_directory.or(start_args.data_directory).or(args.data_directory),
-                                        log_directory: log_directory.or(start_args.log_directory).or(args.log_directory),
-                                        max_disk_space_gb: max_disk_space_gb.or(start_args.max_disk_space_gb).or(args.max_disk_space_gb),
-                                        min_disk_space_gb: min_disk_space_gb.or(start_args.min_disk_space_gb).or(args.min_disk_space_gb),
-                                        use_raft_for_scale: use_raft_for_scale.or(start_args.use_raft_for_scale).or(args.use_raft_for_scale),
-                                        storage_engine_type: storage_engine_type.or(start_args.storage_engine_type).or(args.storage_engine_type),
+                                        cluster: cluster.or(start_args.cluster).or(args.cluster).or(Some(storage_config.cluster_range.clone())),
+                                        data_directory: data_directory.or(start_args.data_directory).or(args.data_directory).or(Some(storage_config.data_directory.clone())),
+                                        log_directory: log_directory.or(start_args.log_directory).or(args.log_directory).or(Some(storage_config.log_directory.clone())),
+                                        max_disk_space_gb: max_disk_space_gb.or(start_args.max_disk_space_gb).or(args.max_disk_space_gb).or(Some(storage_config.max_disk_space_gb)),
+                                        min_disk_space_gb: min_disk_space_gb.or(start_args.min_disk_space_gb).or(args.min_disk_space_gb).or(Some(storage_config.min_disk_space_gb)),
+                                        use_raft_for_scale: use_raft_for_scale.or(start_args.use_raft_for_scale).or(args.use_raft_for_scale).or(Some(storage_config.use_raft_for_scale)),
+                                        storage_engine_type: storage_engine_type.or(start_args.storage_engine_type).or(args.storage_engine_type).or(Some(storage_config.storage_engine_type.clone())),
+                                        daemon: None,
+                                        rest: None,
                                     },
+                                    daemon_handles.clone(), 
                                     storage_daemon_shutdown_tx_opt.clone(),
                                     storage_daemon_handle.clone(),
                                     storage_daemon_port_arc.clone(),
@@ -342,10 +362,19 @@ pub async fn start_cli() -> Result<()> {
                         }
                     }
                     None => {
-                        // Infer StartAction from top-level flags
-                        if start_args.listen_port.is_some() || start_args.rest.unwrap_or(false) || args.listen_port.is_some() || args.rest.unwrap_or(false) {
+                        // Infer StartAction from top-level flags, prioritizing --cluster and --daemon
+                        if start_args.cluster.is_some() || args.cluster.is_some() || start_args.daemon.unwrap_or(false) || args.daemon.unwrap_or(false) {
+                            // Imply StartAction::Daemon
+                            handlers_mod::handle_daemon_command_interactive(
+                                DaemonCliCommand::Start {
+                                    port: start_args.port.or(args.port).or(Some(default_daemon_port)),
+                                    cluster: start_args.cluster.or(args.cluster).or(Some(storage_config.cluster_range.clone())),
+                                },
+                                daemon_handles.clone(),
+                            ).await?;
+                        } else if start_args.listen_port.is_some() || start_args.rest.unwrap_or(false) || args.listen_port.is_some() || args.rest.unwrap_or(false) {
                             // Imply StartAction::Rest
-                            let port = start_args.listen_port.or(args.listen_port).or(start_args.port).or(args.port);
+                            let port = start_args.listen_port.or(args.listen_port).or(start_args.port).or(args.port).or(Some(default_rest_port));
                             handlers_mod::handle_rest_command_interactive(
                                 RestCliCommand::Start { port },
                                 rest_api_shutdown_tx_opt.clone(),
@@ -361,31 +390,25 @@ pub async fn start_cli() -> Result<()> {
                                   start_args.use_raft_for_scale.is_some() || args.use_raft_for_scale.is_some() ||
                                   start_args.storage_engine_type.is_some() || args.storage_engine_type.is_some() {
                             // Imply StartAction::Storage
-                            let port = start_args.storage_port.or(args.storage_port).or(start_args.port).or(args.port);
+                            let port = start_args.storage_port.or(args.storage_port).or(start_args.port).or(args.port).or(Some(default_storage_port));
                             handlers_mod::handle_storage_command_interactive(
                                 StorageAction::Start {
                                     port,
                                     config_file: start_args.storage_config_file.or(args.storage_config_file),
-                                    cluster: start_args.cluster.or(args.cluster),
-                                    data_directory: start_args.data_directory.or(args.data_directory),
-                                    log_directory: start_args.log_directory.or(args.log_directory),
-                                    max_disk_space_gb: start_args.max_disk_space_gb.or(args.max_disk_space_gb),
-                                    min_disk_space_gb: start_args.min_disk_space_gb.or(args.min_disk_space_gb),
-                                    use_raft_for_scale: start_args.use_raft_for_scale.or(args.use_raft_for_scale),
-                                    storage_engine_type: start_args.storage_engine_type.or(args.storage_engine_type),
+                                    cluster: start_args.cluster.or(args.cluster).or(Some(storage_config.cluster_range.clone())),
+                                    data_directory: start_args.data_directory.or(args.data_directory).or(Some(storage_config.data_directory.clone())),
+                                    log_directory: start_args.log_directory.or(args.log_directory).or(Some(storage_config.log_directory.clone())),
+                                    max_disk_space_gb: start_args.max_disk_space_gb.or(args.max_disk_space_gb).or(Some(storage_config.max_disk_space_gb)),
+                                    min_disk_space_gb: start_args.min_disk_space_gb.or(args.min_disk_space_gb).or(Some(storage_config.min_disk_space_gb)),
+                                    use_raft_for_scale: start_args.use_raft_for_scale.or(args.use_raft_for_scale).or(Some(storage_config.use_raft_for_scale)),
+                                    storage_engine_type: start_args.storage_engine_type.or(args.storage_engine_type).or(Some(storage_config.storage_engine_type.clone())),
+                                    daemon: None,
+                                    rest: None,
                                 },
+                                daemon_handles.clone(), 
                                 storage_daemon_shutdown_tx_opt.clone(),
                                 storage_daemon_handle.clone(),
                                 storage_daemon_port_arc.clone(),
-                            ).await?;
-                        } else if start_args.daemon.unwrap_or(false) || args.daemon.unwrap_or(false) {
-                            // Imply StartAction::Daemon
-                            handlers_mod::handle_daemon_command_interactive(
-                                DaemonCliCommand::Start {
-                                    port: start_args.port.or(args.port),
-                                    cluster: start_args.cluster.or(args.cluster),
-                                },
-                                daemon_handles.clone(),
                             ).await?;
                         } else if start_args.port.is_some() || args.port.is_some() {
                             // Ambiguous --port without specific flags or subcommand
@@ -394,17 +417,17 @@ pub async fn start_cli() -> Result<()> {
                         } else {
                             // Default to StartAction::All if no specific flags or subcommand
                             handlers_mod::handle_start_all_interactive(
-                                start_args.port.or(args.port),
-                                start_args.cluster.or(args.cluster),
-                                start_args.listen_port.or(args.listen_port),
-                                start_args.storage_port.or(args.storage_port),
+                                start_args.port.or(args.port).or(Some(default_daemon_port)),
+                                start_args.cluster.or(args.cluster).or(Some(storage_config.cluster_range.clone())),
+                                start_args.listen_port.or(args.listen_port).or(Some(default_rest_port)),
+                                start_args.storage_port.or(args.storage_port).or(Some(default_storage_port)),
                                 start_args.storage_config_file.or(args.storage_config_file),
-                                start_args.data_directory.or(args.data_directory),
-                                start_args.log_directory.or(args.log_directory),
-                                start_args.max_disk_space_gb.or(args.max_disk_space_gb),
-                                start_args.min_disk_space_gb.or(args.min_disk_space_gb),
-                                start_args.use_raft_for_scale.or(args.use_raft_for_scale),
-                                start_args.storage_engine_type.or(args.storage_engine_type),
+                                start_args.data_directory.or(args.data_directory).or(Some(storage_config.data_directory.clone())),
+                                start_args.log_directory.or(args.log_directory).or(Some(storage_config.log_directory.clone())),
+                                start_args.max_disk_space_gb.or(args.max_disk_space_gb).or(Some(storage_config.max_disk_space_gb)),
+                                start_args.min_disk_space_gb.or(args.min_disk_space_gb).or(Some(storage_config.min_disk_space_gb)),
+                                start_args.use_raft_for_scale.or(args.use_raft_for_scale).or(Some(storage_config.use_raft_for_scale)),
+                                start_args.storage_engine_type.or(args.storage_engine_type).or(Some(storage_config.storage_engine_type.clone())),
                                 daemon_handles.clone(),
                                 rest_api_shutdown_tx_opt.clone(),
                                 rest_api_port_arc.clone(),
@@ -431,6 +454,84 @@ pub async fn start_cli() -> Result<()> {
                 handlers_mod::handle_reload_command(reload_args).await?;
             }
             Commands::Restart(restart_args) => {
+                // Load default ports
+                let default_rest_port = config_mod::get_default_rest_port_from_config();
+                let default_storage_port = storage_config.default_port;
+                let default_daemon_port = config.server.port.unwrap_or(8000);
+
+                // Validate critical fields
+                if let Some(action) = &restart_args.action {
+                    match action {
+                        RestartAction::Rest { port, .. } => {
+                            if port.is_none() && restart_args.port.is_none() {
+                                eprintln!("Error: --port is required for 'restart rest'.");
+                                process::exit(1);
+                            }
+                        }
+                        RestartAction::Storage { port, .. } => {
+                            if port.is_none() && restart_args.port.is_none() {
+                                eprintln!("Error: --port is required for 'restart storage'.");
+                                process::exit(1);
+                            }
+                        }
+                        RestartAction::Daemon { port, .. } => {
+                            if port.is_none() && restart_args.port.is_none() {
+                                eprintln!("Error: --port is required for 'restart daemon'.");
+                                process::exit(1);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Update ports in shared state
+                if let Some(action) = &restart_args.action {
+                    match action {
+                        RestartAction::All { listen_port, storage_port, .. } => {
+                            if let Some(listen_port) = listen_port.or(restart_args.listen_port).or(args.listen_port) {
+                                let mut port_guard = rest_api_port_arc.lock().await;
+                                *port_guard = Some(listen_port);
+                            }
+                            if let Some(storage_port) = storage_port.or(restart_args.storage_port).or(args.storage_port) {
+                                let mut port_guard = storage_daemon_port_arc.lock().await;
+                                *port_guard = Some(storage_port);
+                            }
+                        }
+                        RestartAction::Rest { port, .. } => {
+                            if let Some(port) = port.or(restart_args.listen_port).or(args.listen_port).or(restart_args.port).or(args.port) {
+                                let mut port_guard = rest_api_port_arc.lock().await;
+                                *port_guard = Some(port);
+                            }
+                        }
+                        RestartAction::Storage { port, .. } => {
+                            if let Some(port) = port.or(restart_args.storage_port).or(args.storage_port).or(restart_args.port).or(args.port) {
+                                let mut port_guard = storage_daemon_port_arc.lock().await;
+                                *port_guard = Some(port);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                let restart_args = RestartArgs {
+                    action: restart_args.action,
+                    port: restart_args.port.or(args.port).or(Some(default_daemon_port)),
+                    cluster: restart_args.cluster.or(args.cluster).or(Some(storage_config.cluster_range.clone())),
+                    config_file: restart_args.storage_config_file.clone().or(args.storage_config_file.clone()),
+                    listen_port: restart_args.listen_port.or(args.listen_port).or(Some(default_rest_port)),
+                    storage_port: restart_args.storage_port.or(args.storage_port).or(Some(default_storage_port)),
+                    storage_config_file: restart_args.storage_config_file.clone().or(args.storage_config_file.clone()),
+                    data_directory: restart_args.data_directory.or(args.data_directory).or(Some(storage_config.data_directory.clone())),
+                    log_directory: restart_args.log_directory.or(args.log_directory).or(Some(storage_config.log_directory.clone())),
+                    max_disk_space_gb: restart_args.max_disk_space_gb.or(args.max_disk_space_gb).or(Some(storage_config.max_disk_space_gb)),
+                    min_disk_space_gb: restart_args.min_disk_space_gb.or(args.min_disk_space_gb).or(Some(storage_config.min_disk_space_gb)),
+                    use_raft_for_scale: restart_args.use_raft_for_scale.or(args.use_raft_for_scale).or(Some(storage_config.use_raft_for_scale)),
+                    storage_engine_type: restart_args.storage_engine_type.or(args.storage_engine_type).or(Some(storage_config.storage_engine_type.clone())),
+                    daemon: restart_args.daemon.or(args.daemon),
+                    rest: restart_args.rest.or(args.rest),
+                    storage: restart_args.storage.or(args.storage),
+                };
+
                 handlers_mod::handle_restart_command_interactive(
                     restart_args,
                     daemon_handles.clone(),
@@ -445,6 +546,7 @@ pub async fn start_cli() -> Result<()> {
             Commands::Storage(storage_action) => {
                 handlers_mod::handle_storage_command_interactive(
                     storage_action,
+                    daemon_handles.clone(),
                     storage_daemon_shutdown_tx_opt.clone(),
                     storage_daemon_handle.clone(),
                     storage_daemon_port_arc.clone(),

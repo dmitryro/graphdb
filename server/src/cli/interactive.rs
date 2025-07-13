@@ -791,6 +791,8 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                             min_disk_space_gb,
                             use_raft_for_scale,
                             storage_engine_type,
+                            daemon: None,
+                            rest: None,
                         })
                     },
                     "stop" => {
@@ -1617,7 +1619,7 @@ pub async fn handle_interactive_command(
             handlers::handle_rest_command_interactive(rest_cmd, rest_api_shutdown_tx_opt, rest_api_port_arc, rest_api_handle).await?;
         }
         CommandType::Storage(storage_action) => {
-            handlers::handle_storage_command_interactive(storage_action, storage_daemon_shutdown_tx_opt.clone(), storage_daemon_handle.clone(), storage_daemon_port_arc.clone()).await?;
+            handlers::handle_storage_command_interactive(storage_action, daemon_handles.clone(), storage_daemon_shutdown_tx_opt.clone(), storage_daemon_handle.clone(), storage_daemon_port_arc.clone()).await?;
         }
         CommandType::StartRest { port } => {
             handlers::start_rest_api_interactive(port, rest_api_shutdown_tx_opt, rest_api_port_arc, rest_api_handle).await?;
@@ -1634,7 +1636,10 @@ pub async fn handle_interactive_command(
                     min_disk_space_gb,
                     use_raft_for_scale,
                     storage_engine_type,
+                    daemon: None,
+                    rest: None,
                 },
+                daemon_handles.clone(),
                 storage_daemon_shutdown_tx_opt,
                 storage_daemon_handle,
                 storage_daemon_port_arc,
