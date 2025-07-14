@@ -1,4 +1,7 @@
-# storage_config.yaml
+# storage_daemon_server/storage_config.yaml (updated)
+
+config_root_directory: "/opt/graphdb" # NEW: Absolute path to the deployed app root for the daemon itself
+
 storage:
   data_directory: "/opt/graphdb/storage_data" # Path where storage daemon stores data
   log_directory: "/var/log/graphdb"           # Default log directory
