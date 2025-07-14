@@ -45,6 +45,21 @@ pub enum DaemonCliCommand {
         #[clap(long, short = 'p')]
         port: Option<u16>,
     },
+    // These variants for Restart/Reload directly under DaemonCliCommand
+    // are only for `graphdb-cli daemon restart` and `graphdb-cli daemon reload`.
+    // The main `graphdb-cli restart` command uses RestartArgs/RestartAction.
+    Restart {
+        #[clap(long, short = 'p')]
+        port: Option<u16>,
+        #[clap(long, short = 'c', alias = "join-cluster")]
+        cluster: Option<String>,
+    },
+    Reload {
+        #[clap(long, short = 'p')]
+        port: Option<u16>,
+        #[clap(long, short = 'c', alias = "join-cluster")]
+        cluster: Option<String>,
+    },
     List,
     ClearAll,
 }
@@ -203,19 +218,19 @@ pub enum ReloadAction {
         #[clap(long, short = 'c', alias = "join-cluster")]
         cluster: Option<String>,
         #[clap(long)]
-        rest: Option<bool>,
+        rest: Option<bool>, // Should these apply to daemon? Usually not
         #[clap(long)]
-        storage: Option<bool>,
+        storage: Option<bool>, // Should these apply to daemon? Usually not
     },
     Rest {
         #[clap(long, short = 'p')]
         port: Option<u16>,
         #[clap(long, short = 'c', alias = "join-cluster")]
-        cluster: Option<String>,
+        cluster: Option<String>, // Cluster generally applies to storage/daemon, less to rest directly
         #[clap(long)]
-        daemon: Option<bool>,
+        daemon: Option<bool>, // Should these apply to rest? Usually not
         #[clap(long)]
-        storage: Option<bool>,
+        storage: Option<bool>, // Should these apply to rest? Usually not
     },
     Storage {
         #[clap(long, short = 'p')]
@@ -223,9 +238,9 @@ pub enum ReloadAction {
         #[clap(long, value_hint = clap::ValueHint::FilePath)]
         config_file: Option<PathBuf>,
         #[clap(long)]
-        daemon: Option<bool>,
+        daemon: Option<bool>, // Should these apply to storage? Usually not
         #[clap(long)]
-        rest: Option<bool>,
+        rest: Option<bool>, // Should these apply to storage? Usually not
     },
     Cluster,
 }
@@ -233,37 +248,38 @@ pub enum ReloadAction {
 #[derive(Debug, Args, PartialEq)]
 pub struct RestartArgs {
     #[clap(subcommand)]
-    pub action: Option<RestartAction>,
+    pub action: Option<RestartAction>, // Make action optional to allow top-level flags
+    // Top-level flags that apply if no subcommand is given (implies RestartAction::All)
     #[clap(long, short = 'p')]
     pub port: Option<u16>,
     #[clap(long, short = 'c', alias = "join-cluster")]
     pub cluster: Option<String>,
     #[clap(long)]
-    pub config_file: Option<PathBuf>,
+    pub config_file: Option<PathBuf>, // General config for all or specific?
     #[clap(long)]
-    pub listen_port: Option<u16>,
+    pub listen_port: Option<u16>, // For daemon/rest
     #[clap(long)]
-    pub storage_port: Option<u16>,
+    pub storage_port: Option<u16>, // For storage
     #[clap(long, value_hint = clap::ValueHint::FilePath)]
-    pub storage_config_file: Option<PathBuf>,
+    pub storage_config_file: Option<PathBuf>, // Specific for storage
     #[clap(long, value_hint = clap::ValueHint::DirPath)]
-    pub data_directory: Option<String>,
+    pub data_directory: Option<String>, // Specific for storage
     #[clap(long, value_hint = clap::ValueHint::DirPath)]
-    pub log_directory: Option<String>,
+    pub log_directory: Option<String>, // Specific for storage/daemon/rest
     #[clap(long)]
-    pub max_disk_space_gb: Option<u64>,
+    pub max_disk_space_gb: Option<u64>, // Specific for storage
     #[clap(long)]
-    pub min_disk_space_gb: Option<u64>,
+    pub min_disk_space_gb: Option<u64>, // Specific for storage
     #[clap(long)]
-    pub use_raft_for_scale: Option<bool>,
+    pub use_raft_for_scale: Option<bool>, // Specific for storage
     #[clap(long)]
-    pub storage_engine_type: Option<String>,
+    pub storage_engine_type: Option<String>, // Specific for storage
     #[clap(long)]
-    pub daemon: Option<bool>,
+    pub daemon: Option<bool>, // Used with `restart all` or top-level to explicitly target daemon
     #[clap(long)]
-    pub rest: Option<bool>,
+    pub rest: Option<bool>,   // Used with `restart all` or top-level to explicitly target rest
     #[clap(long)]
-    pub storage: Option<bool>,
+    pub storage: Option<bool>, // Used with `restart all` or top-level to explicitly target storage
 }
 
 #[derive(Debug, Subcommand, PartialEq)]
@@ -305,8 +321,12 @@ pub enum RestartAction {
         port: Option<u16>,
         #[clap(long, short = 'c', alias = "join-cluster")]
         cluster: Option<String>,
+        // These fields (rest, storage) might be redundant/confusing under Daemon
+        // as they imply restarting other services *from* the daemon command.
+        // If the intent is `restart daemon --rest --storage`, it's better handled by `restart all --daemon --rest --storage`.
+        // I'll leave them for now as they were in your previous version, but note the ambiguity.
         #[clap(long)]
-        daemon: Option<bool>,
+        daemon: Option<bool>, // Redundant, implied by Daemon subcommand
         #[clap(long)]
         rest: Option<bool>,
         #[clap(long)]
@@ -316,11 +336,11 @@ pub enum RestartAction {
         #[clap(long, short = 'p')]
         port: Option<u16>,
         #[clap(long, short = 'c', alias = "join-cluster")]
-        cluster: Option<String>,
+        cluster: Option<String>, // Cluster usually not directly relevant for REST but kept for consistency
         #[clap(long)]
-        daemon: Option<bool>,
+        daemon: Option<bool>, // Redundant here
         #[clap(long)]
-        storage: Option<bool>,
+        storage: Option<bool>, // Redundant here
     },
     Storage {
         #[clap(long, short = 'p')]
@@ -342,11 +362,11 @@ pub enum RestartAction {
         #[clap(long)]
         storage_engine_type: Option<String>,
         #[clap(long)]
-        daemon: Option<bool>,
+        daemon: Option<bool>, // Redundant here
         #[clap(long)]
-        rest: Option<bool>,
+        rest: Option<bool>,   // Redundant here
     },
-    Cluster,
+    Cluster, // A restart for the entire cluster (could imply specific actions on all nodes)
 }
 
 #[derive(Debug, Args, PartialEq)]
