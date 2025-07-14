@@ -1,8 +1,30 @@
+# server/src/cli/config.toml (updated)
+
+[app]
+version = "0.1.0"
+
 [server]
 port = 9002
+host = "127.0.0.1"
+
+[rest]
+port = 8081
 host = "127.0.0.1"
 
 [daemon]
 process_name = "graphdb-cli"
 user = "graphdbuser"
-group = "GraphDBGroup" 
+group = "GraphDBGroup"
+
+[storage]
+port = 9000
+engine_type = "Sled"
+
+[deployment] # NEW SECTION
+# This is the absolute path to the root of the deployed GraphDB application.
+# Configuration files (e.g., storage_config.yaml) and executables (e.g., storage_daemon_server)
+# are expected to be found relative to this directory.
+# Example: "/usr/local/graphdb" or "/opt/graphdb"
+# You MUST set this to the actual deployment root on your system for the CLI to find components.
+config_root_directory = "/opt/graphdb" # <--- IMPORTANT: Adjust this path as needed for your deployment
+
