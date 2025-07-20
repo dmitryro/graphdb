@@ -9,6 +9,7 @@ pub mod daemon_management;
 pub mod handlers;
 pub mod help_display;
 pub mod interactive;
+pub mod network_utilities;
 
 // Re-export the main CLI entry point from cli.rs
 pub use cli::{start_cli, CliArgs, Commands};
@@ -34,15 +35,16 @@ pub use handlers::{
     handle_status_command,
     handle_stop_command,
     handle_start_command,
+    handle_restart_command,
     handle_reload_command,
     handle_restart_command_interactive,
 };
 pub use interactive::{
     run_cli_interactive,
-    print_interactive_help,
-    print_interactive_filtered_help,
 };
 pub use help_display::{
+    print_interactive_help,
+    print_interactive_filtered_help,
     print_help_clap_generated,
     print_filtered_help_clap_generated,
     collect_all_cli_elements_for_suggestions,
