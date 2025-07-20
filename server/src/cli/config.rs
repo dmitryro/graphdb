@@ -12,7 +12,9 @@ use std::str::FromStr;
 use serde_yaml2;
 use daemon_api::StorageEngineType as DaemonApiStorageEngineType;
 use toml;
-
+pub const DEFAULT_DAEMON_PORT: u16 = 8000;
+pub const DEFAULT_REST_API_PORT: u16 = 8080;
+pub const DEFAULT_STORAGE_PORT: u16 = 8085;
 // --- Configuration Structs for loading CLI defaults from config.toml ---
 
 // Corrected: Define the constant using `if cfg!(...)` for conditional compilation

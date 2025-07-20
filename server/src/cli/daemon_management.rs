@@ -343,7 +343,6 @@ pub async fn start_daemon_process(
     // Set stdio to null to detach from parent's stdout/stderr
     #[cfg(not(target_family = "windows"))] // On Unix, detach
     {
-        use std::os::unix::process::CommandExt;
         command.stdout(Stdio::null()).stderr(Stdio::null());
         unsafe {
             command.pre_exec(|| {
@@ -414,7 +413,7 @@ pub async fn send_stop_signal_to_daemon(daemon_name: &str, port: u16) -> Result<
     // Try to stop via general daemon API call first (if applicable to all daemons)
     let api_stop_result = stop_daemon();
     match api_stop_result {
-        Ok(_) => info!("Successfully sent general API stop signal."),
+        Ok(()) => info!("Successfully sent general API stop signal."),
         Err(e) => warn!("Warning: Failed to send general API stop signal: {:?}", e),
     }
 
@@ -609,6 +608,35 @@ pub async fn find_running_storage_daemon_port() -> Option<u16> {
     None
 }
 
+/// Helper function to find a running REST API daemon's port.
+/// Scans a range of common ports using PID files and then TCP connect.
+pub async fn find_running_rest_api_port() -> Option<u16> {
+    let common_rest_ports_to_check = vec![
+        crate::cli::config::get_default_rest_port_from_config(), // Default from config
+        8080, 8081, 9092, 9093 // Other common/tested ports
+    ];
+    for port in common_rest_ports_to_check {
+        // 1. Check PID file first
+        if let Ok(pid) = read_pid_file(port, "rest").await {
+            if is_process_running(pid).await {
+                info!("REST API daemon found via PID file on port {} (PID: {}).", port, pid);
+                return Some(port);
+            } else {
+                let _ = delete_pid_file(port, "rest").await; // Clean up stale PID file
+            }
+        }
+
+        // 2. Fallback to TCP connect and process name check
+        if TcpStream::connect(format!("127.0.0.1:{}", port)).await.is_ok() {
+            if let Some(pid) = find_daemon_process_on_port(port, Some("rest_api_server")).await {
+                info!("REST API daemon found via TCP connect and sysinfo on port {} (PID: {})", port, pid);
+                return Some(port);
+            }
+        }
+    }
+    None
+}
+
 /// Calls the `daemon_api::stop_daemon` function.
 /// This is a general API call, might not stop specific daemons.
 pub fn stop_daemon_api_call() -> Result<(), anyhow::Error> {
@@ -756,7 +784,7 @@ pub async fn clear_all_daemon_processes() -> Result<(), anyhow::Error> {
                         if let Err(e) = terminate_windows_process(pid.as_u32(), false).await {
                             warn!("Non-forceful termination failed for {} (PID {}): {}. Trying forceful.", name, pid.as_u32(), e);
                             if let Err(e) = terminate_windows_process(pid.as_u32(), true).await {
-                                warn!("Forceful termination failed for {} (PID {}): {}", name, pid.as_u32(), e);
+                                warn!("Forceful termination failed for {} (PID {}): {}\n", name, pid.as_u32(), e);
                             }
                         }
                         stopped_pids.insert(pid.as_u32());

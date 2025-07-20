@@ -13,7 +13,7 @@ use strsim::jaro_winkler;
 pub struct HelpArgs {
     /// Specify a command string to get specific help for (e.g., "daemon start").
     #[arg(long = "command", short = 'c', value_name = "COMMAND_STRING", help = "Get help for a specific command.")]
-    pub filter_command: Option<String>, 
+    pub filter_command: Option<String>,
 
     /// Positional arguments representing the command path (e.g., "daemon start").
     #[arg(raw = true)]
@@ -22,6 +22,8 @@ pub struct HelpArgs {
 
 
 /// Prints the full, auto-generated help message for the CLI.
+/// This function is not typically called directly for interactive help,
+/// but can be useful for debugging or full overview.
 pub fn print_help_clap_generated() {
     let mut cmd = CliArgs::command();
     cmd.print_help().expect("Failed to print help");
@@ -73,15 +75,111 @@ pub fn find_nested_subcommand_mut<'a>( // Made public
     Some(current_cmd) // Return the final found subcommand
 }
 
+/// Prints the full help message for interactive mode.
+pub fn print_interactive_help() {
+    println!("\nGraphDB CLI Commands:");
+    println!("  start [rest|storage|daemon|all] [--port <port>] [--cluster <range>] [--join-cluster <range>] [--listen-port <port>] [--rest-port <port>] [--storage-port <port>] [--daemon-port <port>] [--storage-config <path>] [--config-file <path>] [--data-directory <path>] [--log-directory <path>] [--max-disk-space-gb <gb>] [--min-disk-space-gb <gb>] [--use-raft-for-scale <true/false>] [--storage-engine <type>] [--daemon <true/false>] [--rest <true/false>] [--storage <true/false>] [--join-rest-cluster <true/false>] [--join-storage-cluster <true/false>] [--rest-cluster <range>] [--storage-cluster <range>] - Start GraphDB components");
+    println!("  stop [rest|daemon|storage|all] [--port <port>] [--rest-port <port>] [--listen-port <port>] [--storage-port <port>] [--daemon-port <port>] - Stop GraphDB components (all by default, or specific)");
+    println!("  daemon start [--port <port>] [--daemon-port <port>] [--cluster <range>] [--daemon-cluster <range>] [--join-cluster <range>] [--config-file <path>] - Start a GraphDB daemon");
+    println!("  daemon stop [--port <port>] [--daemon-port <port>] - Stop a GraphDB daemon");
+    println!("  daemon status [--port <port>] [--daemon-port <port>] - Check status of a GraphDB daemon");
+    println!("  daemon list - List daemons managed by this CLI");
+    println!("  daemon clear-all - Stop all managed daemons and attempt to kill external ones");
+    println!("  rest start [--listen-port <port>] [--rest-port <port>] [--port <port>] [--cluster <range>] [--rest-cluster <range>] [--join-cluster <range>] [--join-rest-cluster <true/false>] - Start the REST API server");
+    println!("  rest stop [--port <port>] [--rest-port <port>] [--listen-port <port>] - Stop the REST API server");
+    println!("  rest status [--port <port>] [--rest-port <port>] [--listen-port <port>] - Check the status of the REST API server");
+    println!("  rest health - Perform a health check on the REST API server");
+    println!("  rest version - Get the version of the REST API server");
+    println!("  rest register-user <username> <password> - Register a new user via REST API");
+    println!("  rest authenticate <username> <password> - Authenticate a user and get a token via REST API");
+    println!("  rest graph-query \"<query_string>\" [persist] - Execute a graph query via REST API");
+    println!("  rest storage-query - Execute a storage query via REST API (placeholder)");
+    println!("  storage start [--storage-port <port>] [--port <port>] [--config-file <path>] [--cluster <range>] [--storage-cluster <range>] [--join-cluster <range>] [--data-directory <path>] [--log-directory <path>] [--max-disk-space-gb <gb>] [--min-disk-space-gb <gb>] [--use-raft-for-scale <true/false>] [--storage-engine <type>] [--join-storage-cluster <true/false>] - Start the standalone Storage daemon");
+    println!("  storage stop [--port <port>] [--storage-port <port>] - Stop the standalone Storage daemon");
+    println!("  storage status [--port <port>] [--storage-port <port>] - Check the status of the standalone Storage daemon");
+    println!("  status [rest|daemon|storage|cluster|all] [--port <port>] [--rest-port <port>] [--rest-cluster <range>] [--storage-port <port>] [--storage-cluster <range>] [--daemon-port <port>] - Check the status of components or cluster");
+    println!("  auth <username> <password> - Authenticate a user and get a token (top-level)");
+    println!("  authenticate <username> <password> - Authenticate a user and get a token (top-level)");
+    println!("  register <username> <password> - Register a new user (top-level)");
+    println!("  version - Get the version of the REST API server (top-level)");
+    println!("  health - Perform a health check on the REST API server (top-level)");
+    println!("  restart [all|rest|storage|daemon|cluster] [--port <port>] [--daemon-port <port>] [--cluster <range>] [--daemon-cluster <range>] [--join-cluster <range>] [--listen-port <port>] [--rest-port <port>] [--storage-port <port>] [--storage-config <path>] [--config-file <path>] [--data-directory <path>] [--log-directory <path>] [--max-disk-space-gb <gb>] [--min-disk-space-gb <gb>] [--use-raft-for-scale <true/false>] [--storage-engine <type>] [--daemon <true/false>] [--rest <true/false>] [--storage <true/false>] [--join-rest-cluster <true/false>] [--join-storage-cluster <true/false>] [--rest-cluster <range>] [--storage-cluster <range>] - Restart GraphDB components");
+    println!("  clear | clean - Clear the terminal screen");
+    println!("  help [--command|-c <command_string>] - Display this help message or help for a specific command");
+    println!("  exit | quit | q - Exit the CLI");
+}
+
+/// Prints filtered help messages based on a command filter.
+pub fn print_interactive_filtered_help(_cmd_root: &mut clap::Command, command_filter: &str) {
+    let commands = [
+        ("start rest [--listen-port <port>] [--rest-port <port>] [--port <port>] [--cluster <range>] [--rest-cluster <range>] [--join-cluster <range>] [--join-rest-cluster <true/false>]", "Start the REST API server"),
+        ("start storage [--storage-port <port>] [--port <port>] [--config-file <path>] [--cluster <range>] [--storage-cluster <range>] [--join-cluster <range>] [--data-directory <path>] [--log-directory <path>] [--max-disk-space-gb <gb>] [--min-disk-space-gb <gb>] [--use-raft-for-scale <true/false>] [--storage-engine <type>] [--join-storage-cluster <true/false>]", "Start the standalone Storage daemon"),
+        ("start daemon [--port <port>] [--daemon-port <port>] [--cluster <range>] [--daemon-cluster <range>] [--join-cluster <range>] [--config-file <path>]", "Start a GraphDB daemon"),
+        ("start all [--port <port>] [--daemon-port <port>] [--cluster <range>] [--join-cluster <range>] [--listen-port <port>] [--rest-port <port>] [--storage-port <port>] [--storage-config <path>] [--config-file <path>] [--data-directory <path>] [--log-directory <path>] [--max-disk-space-gb <gb>] [--min-disk-space-gb <gb>] [--use-raft-for-scale <true/false>] [--storage-engine <type>] [--daemon <true/false>] [--rest <true/false>] [--storage <true/false>] [--join-rest-cluster <true/false>] [--join-storage-cluster <true/false>] [--rest-cluster <range>] [--storage-cluster <range>]", "Start all GraphDB components"),
+        ("stop rest [--port <port>] [--rest-port <port>] [--listen-port <port>]", "Stop the REST API server"),
+        ("stop daemon [--port <port>] [--daemon-port <port>]", "Stop a GraphDB daemon"),
+        ("stop storage [--port <port>] [--storage-port <port>]", "Stop the standalone Storage daemon"),
+        ("stop all", "Stop all GraphDB components"),
+        ("daemon start [--port <port>] [--daemon-port <port>] [--cluster <range>] [--daemon-cluster <range>] [--join-cluster <range>] [--config-file <path>]", "Start a GraphDB daemon"),
+        ("daemon stop [--port <port>] [--daemon-port <port>]", "Stop a GraphDB daemon"),
+        ("daemon status [--port <port>] [--daemon-port <port>]", "Check status of a GraphDB daemon"),
+        ("daemon list", "List daemons managed by this CLI"),
+        ("daemon clear-all", "Stop all managed daemons and attempt to kill external ones"),
+        ("rest start [--listen-port <port>] [--rest-port <port>] [--port <port>] [--cluster <range>] [--rest-cluster <range>] [--join-cluster <range>] [--join-rest-cluster <true/false>]", "Start the REST API server"),
+        ("rest stop [--port <port>] [--rest-port <port>] [--listen-port <port>]", "Stop the REST API server"),
+        ("rest status [--port <port>] [--rest-port <port>] [--listen-port <port>]", "Check the status of the REST API server"),
+        ("rest health", "Perform a health check on the REST API server"),
+        ("rest version", "Get the version of the REST API server"),
+        ("rest register-user <username> <password>", "Register a new user via REST API"),
+        ("rest authenticate <username> <password>", "Authenticate a user and get a token via REST API"),
+        ("rest graph-query \"<query_string>\" [persist]", "Execute a graph query via REST API"),
+        ("rest storage-query", "Execute a storage query via REST API (placeholder)"),
+        ("storage start [--storage-port <port>] [--port <port>] [--config-file <path>] [--cluster <range>] [--storage-cluster <range>] [--join-cluster <range>] [--data-directory <path>] [--log-directory <path>] [--max-disk-space-gb <gb>] [--min-disk-space-gb <gb>] [--use-raft-for-scale <true/false>] [--storage-engine <type>] [--join-storage-cluster <true/false>]", "Start the standalone Storage daemon"),
+        ("storage stop [--port <port>] [--storage-port <port>]", "Stop the standalone Storage daemon"),
+        ("storage status [--port <port>] [--storage-port <port>]", "Check the status of the standalone Storage daemon"),
+        ("status rest [--port <port>] [--rest-port <port>] [--rest-cluster <range>]", "Check the status of the REST API server"),
+        ("status daemon [--port <port>] [--daemon-port <port>]", "Check status of a GraphDB daemon"),
+        ("status storage [--port <port>] [--storage-port <port>] [--storage-cluster <range>]", "Check the status of the standalone Storage daemon"),
+        ("status cluster [--cluster <range>] [--rest-cluster <range>] [--storage-cluster <range>]", "Check the status of the cluster"),
+        ("status all", "Get a comprehensive status summary"),
+        ("auth <username> <password>", "Authenticate a user and get a token (top-level)"),
+        ("authenticate <username> <password>", "Authenticate a user and get a token (top-level)"),
+        ("register <username> <password>", "Register a new user (top-level)"),
+        ("version", "Get the version of the REST API server (top-level)"),
+        ("health", "Perform a health check on the REST API server (top-level)"),
+        ("restart all [--port <port>] [--daemon-port <port>] [--cluster <range>] [--daemon-cluster <range>] [--join-cluster <range>] [--listen-port <port>] [--rest-port <port>] [--storage-port <port>] [--storage-config <path>] [--config-file <path>] [--data-directory <path>] [--log-directory <path>] [--max-disk-space-gb <gb>] [--min-disk-space-gb <gb>] [--use-raft-for-scale <true/false>] [--storage-engine <type>] [--daemon <true/false>] [--rest <true/false>] [--storage <true/false>] [--join-rest-cluster <true/false>] [--join-storage-cluster <true/false>] [--rest-cluster <range>] [--storage-cluster <range>]", "Restart all core GraphDB components"),
+        ("restart rest [--listen-port <port>] [--rest-port <port>] [--port <port>] [--cluster <range>] [--rest-cluster <range>] [--join-cluster <range>] [--join-rest-cluster <true/false>]", "Restart the REST API server"),
+        ("restart storage [--storage-port <port>] [--port <port>] [--config-file <path>] [--cluster <range>] [--storage-cluster <range>] [--join-cluster <range>] [--data-directory <path>] [--log-directory <path>] [--max-disk-space-gb <gb>] [--min-disk-space-gb <gb>] [--use-raft-for-scale <true/false>] [--storage-engine <type>] [--join-storage-cluster <true/false>]", "Restart the standalone Storage daemon"),
+        ("restart daemon [--port <port>] [--daemon-port <port>] [--cluster <range>] [--daemon-cluster <range>] [--join-cluster <range>] [--config-file <path>]", "Restart a GraphDB daemon"),
+        ("restart cluster", "Restart cluster configuration (placeholder)"),
+        ("clear | clean", "Clear the terminal screen"),
+        ("help [--command|-c <command_string>]", "Display this help message or help for a specific command"),
+        ("exit | quit | q", "Exit the CLI"),
+    ];
+
+    let filtered_commands: Vec<_> = commands
+        .iter()
+        .filter(|(cmd, _)| cmd.contains(command_filter))
+        .collect();
+
+    if filtered_commands.is_empty() {
+        println!("No commands found matching '{}'. Available commands:", command_filter);
+        for (cmd, desc) in commands.iter() {
+            println!("  {} - {}", cmd, desc);
+        }
+    } else {
+        println!("Commands matching '{}':", command_filter);
+        for (cmd, desc) in filtered_commands {
+            println!("  {} - {}", cmd, desc);
+        }
+    }
+}
+
 /// Prints a filtered help message based on a command string, with suggestions.
+/// This function uses Clap's internal command structure for more precise help.
 pub fn print_filtered_help_clap_generated(_cmd_root: &mut clap::Command, command_filter: &str) {
     let filter_lower = command_filter.to_lowercase();
     let mut found_exact_subcommand_help = false;
-
-    // Commands array should match the interactive.rs print_interactive_help
-    // This array is now defined in interactive.rs and should be used there for filtering.
-    // This function is specifically for clap-generated help, which means it relies on CliArgs::command()
-    // and its subcommands.
 
     // Attempt to find exact match for a subcommand path (e.g., "stop rest")
     let filter_segments: Vec<&str> = command_filter.split_whitespace().collect();
@@ -121,7 +219,7 @@ pub fn print_filtered_help_clap_generated(_cmd_root: &mut clap::Command, command
             }
         } else {
             println!("\nNo specific help found for '{}'. Displaying general help.", command_filter);
-            print_help_clap_generated();
+            print_help_clap_generated(); // Call the full clap-generated help
         }
     }
     println!("------------------------------------");
