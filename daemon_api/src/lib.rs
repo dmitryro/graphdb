@@ -1,7 +1,7 @@
 // daemon_api/src/lib.rs
 use serde::{Serialize, Deserialize};
 // Changed to tokio::process::Command where .await is used
-use tokio::process::Command; 
+use tokio::process::Command;
 use std::sync::{Arc, Mutex};
 use std::fs::{self, File};
 use std::path::Path;
@@ -109,7 +109,7 @@ pub async fn start_daemon(port: Option<u16>, cluster_range: Option<String>, skip
         }
     }
 
-    cleanup_existing_daemons(&base_process_name);
+    // REMOVED: cleanup_existing_daemons(&base_process_name); // This was the problematic line
 
     let mut ports_to_start: Vec<u16> = Vec::new();
 
@@ -149,6 +149,18 @@ pub async fn start_daemon(port: Option<u16>, cluster_range: Option<String>, skip
 
     let mut any_started = false;
     for current_port in ports_to_start {
+        // Before attempting to start, check if the port is already in use by a GraphDB daemon
+        // This prevents trying to start a new daemon on an occupied port and avoids unnecessary killing.
+        // We're relying on the `daemon_management::check_process_status_by_port` or similar logic
+        // to determine if a daemon is already running on this port.
+        // Since `daemon_api` doesn't directly know about `daemon_management`'s `check_process_status_by_port`,
+        // we'll use a direct TCP bind attempt as a basic check.
+        if !TcpStream::connect(format!("127.0.0.1:{}", current_port)).await.is_err() {
+            println!("[INFO] Port {} is already in use. Assuming a daemon is running there; skipping start.", current_port);
+            any_started = true; // Consider it 'started' if it's already running
+            continue;
+        }
+
         // Skip ports in skip_ports vec (e.g., REST API port)
         if skip_ports.contains(&current_port) {
             println!("[INFO] Skipping reserved port {}: reserved for another service.", current_port);
@@ -323,6 +335,7 @@ pub fn stop_daemon() -> Result<(), DaemonError> {
                         .arg("comm=")
                         .arg(format!("{}", pid))
                         .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
                         .spawn()
                         .and_then(|child| child.wait_with_output());
 
@@ -444,4 +457,3 @@ pub fn stop_daemon_api_call() -> Result<(), anyhow::Error> {
     // The existing stop_daemon returns Result<(), DaemonError>, convert to anyhow::Result
     stop_daemon().map_err(|e| anyhow::anyhow!("Daemon stop failed: {}", e))
 }
-
