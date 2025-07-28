@@ -1,0 +1,10 @@
+# storage_config.yaml
+storage:
+  data_directory: "/opt/graphdb/storage_data" # Path where storage daemon stores data
+  log_directory: "/var/log/graphdb"           # Default log directory
+  default_port: 8085                          # Default port for a single storage daemon if no CLI port is given
+  cluster_range: "9000-9002"                  # Default cluster range if no CLI cluster is given
+  max_disk_space_gb: 1000                     # Max disk space in GB (e.g., 1 TB)
+  min_disk_space_gb: 10                       # Min free disk space threshold in GB
+  use_raft_for_scale: true                    # Enable Raft for scaling and consistency
+  storage_engine_type: "sled"                 # Or "rocksdb" to switch

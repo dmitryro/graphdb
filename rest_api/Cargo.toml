@@ -1,0 +1,60 @@
+# rest_api/Cargo.toml
+[package]
+name = "rest_api"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.44.2", features = ["full"] }
+sled = "0.34.7"
+hyper = { version = "0.14.28", features = ["full"] }
+serde = { version = "1.0.219", features = ["derive"] }
+chrono = { version = "0.4.39", features = ["serde"] }
+async-trait = "0.1.86"
+serde_json = "1.0.140"
+lazy_static = "1.5.0"
+regex = "1.11.1"
+daemon = { path = "../daemon" }
+daemon_api = { path = "../daemon_api" }
+
+# Crucial direct dependencies for `rest_api/src/lib.rs`
+jsonwebtoken = "9.3.0"
+argon2 = "0.5.3"
+password-hash = "0.5"
+anyhow = "1.0.98" # Added
+tracing = "0.1.37"
+tracing-subscriber = "0.3.18"
+dotenv = "0.15.0"
+env_logger = "0.11.8"
+thiserror = "2.0.12" # Consistent
+reqwest = { version = "0.12.22", features = ["json"] } # Added with json feature
+config = "0.15.8" # Added
+
+# Axum specific dependencies
+axum = "0.7.5"
+tower-http = { version = "0.5.2", features = ["cors"] } # Added with cors feature
+
+# Yaml rust2 replacing serde_yaml
+yaml-rust2 = "0.10.3"
+serde_yaml2= "0.1.3"
+
+# Workspace dependencies (correctly referencing your crate names)
+lib = { path = "../lib" }
+security = { path = "../security" }
+storage_daemon_server = { path = "../storage_daemon_server" }
+models = { path = "../models" }
+
+[lib]
+name = "rest_api"
+path = "src/lib.rs"
+
+[features]
+default = []
+server = []
+client = []
+test-suite = []
+
+[dependencies.plugin-host]
+path = "../plugins/host"
+version = "0.1.0"
+optional = true

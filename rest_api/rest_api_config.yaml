@@ -1,0 +1,6 @@
+config_root_directory: "/opt/graphdb"
+rest_api:
+  data_directory: "/opt/graphdb/storage_data"
+  log_directory: "/var/log/graphdb"
+  default_port: 8081
+  cluster_range: "8082-8086"
