@@ -21,6 +21,7 @@ use regex::Regex;
 use std::collections::{HashSet, HashMap};
 use std::ffi::OsStr; // Add this for OsStr
 use std::borrow::Cow; // Add this for Cow
+use std::fmt; // Import for Display/Debug traits
 
 use crate::cli::config::{
     get_default_rest_port_from_config,
@@ -398,71 +399,48 @@ pub async fn find_daemon_process_on_port_with_args(
     None
 }
 
-/// Helper to get all running daemon processes (main, REST, storage) and their associated ports.
-/// This is more efficient for `status` command as it avoids N scans.
-pub async fn get_all_daemon_processes_with_ports() -> HashMap<u16, (u32, String)> {
-    let mut found_daemons: HashMap<u16, (u32, String)> = HashMap::new();
+/// Helper to get the listening TCP port for a given PID using lsof.
+pub async fn get_listening_port_for_pid(pid: u32) -> Option<u16> {
+    let output_result = run_command_with_timeout(
+        "lsof",
+        &["-i", "-P", "-n", &format!("-a -p {}", pid), "-sTCP:LISTEN"],
+        Duration::from_secs(1), // Short timeout
+    ).await;
 
-    let default_ports = vec![
-        (DEFAULT_DAEMON_PORT, "main"),
-        (DEFAULT_REST_API_PORT, "rest"),
-        (DEFAULT_STORAGE_PORT, "storage"),
-    ];
-
-    for (port, service_type_str) in default_ports {
-        let service_type = match service_type_str {
-            "main" => ServiceType::Daemon,
-            "rest" => ServiceType::RestAPI,
-            "storage" => ServiceType::StorageDaemon,
-            _ => continue, 
-        };
-        
-        let pid_file_path = get_pid_file_path_for_service(port, &service_type).await;
-
-        if let Ok(pid) = read_pid_from_file(&pid_file_path).await {
-            let mut sys = System::new();
-            sys.refresh_all(); 
-
-            if let Some(process) = sys.process(Pid::from_u32(pid)) {
-                let process_name_lower = process.name().to_string_lossy().to_lowercase();
-                let cli_exe_name_full = std::env::current_exe()
-                    .ok()
-                    .and_then(|p| p.file_name().and_then(|s| s.to_str()).map(|s| s.to_owned()))
-                    .unwrap_or_else(|| "graphdb-cli".to_string());
-                let cli_name_pattern = Regex::new(&format!(r"(?i){}|graphdb-c", regex::escape(&cli_exe_name_full)))
-                    .expect("Failed to create cli_name_pattern regex");
-
-                let first_cmd_arg_lower = process.cmd().first().map_or("".to_string(), |s| s.to_string_lossy().to_lowercase()); 
-                let is_our_cli_process = cli_name_pattern.is_match(&process_name_lower) ||
-                                             cli_name_pattern.is_match(&first_cmd_arg_lower);
-
-                if is_our_cli_process {
-                    if tokio::time::timeout(Duration::from_secs(1), TcpStream::connect(format!("127.0.0.1:{}", port))).await.is_ok_and(|res| res.is_ok()) {
-                        found_daemons.insert(port, (pid, service_type_str.to_string()));
-                        debug!("Found {} daemon (PID {}) on port {} via PID file and TCP check.", service_type_str, pid, port);
-                    } else {
-                        warn!("PID file for {} on port {} exists (PID {}), but TCP check failed. Stale PID file?", service_type_str, port, pid);
-                        let _ = delete_pid_file(port, service_type_str).await;
+    if let Ok(output) = output_result {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Example lsof output line: COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
+        // graphdb-c 51905 user 9u IPv4 0x... 0t0 TCP 127.0.0.1:8082 (LISTEN)
+        // New parsing logic to robustly extract the port number
+        for line in stdout.lines() {
+            if line.contains("(LISTEN)") {
+                // Find the network address part, e.g., "127.0.0.1:8082" or "*:8080"
+                if let Some(tcp_pos) = line.rfind("TCP ") {
+                    let network_info_slice = &line[tcp_pos + 4..]; // +4 for "TCP "
+                    if let Some(space_after_network_info) = network_info_slice.find(' ') {
+                        let network_address_port = &network_info_slice[..space_after_network_info];
+                        
+                        // Now, find the last colon and parse the part after it
+                        if let Some(colon_pos) = network_address_port.rfind(':') {
+                            let port_str = &network_address_port[colon_pos + 1..];
+                            if let Ok(port) = port_str.parse::<u16>() {
+                                return Some(port);
+                            }
+                        }
                     }
-                } else {
-                    warn!("PID file for {} on port {} exists (PID {}), but process name '{}' does not match expected GraphDB pattern. Stale PID file?", service_type_str, port, pid, process_name_lower);
-                    let _ = delete_pid_file(port, service_type_str).await;
                 }
-            } else {
-                warn!("PID file for {} on port {} exists (PID {}), but process is not running. Deleting stale PID file.", service_type_str, port, pid);
-                let _ = delete_pid_file(port, service_type_str).await;
-            }
-        } else if let Err(e) = read_pid_from_file(&pid_file_path).await {
-            if e.downcast_ref::<std::io::Error>().map_or(false, |io_err| io_err.kind() == ErrorKind::NotFound) {
-                debug!("PID file for {} on port {} not found.", service_type_str, port);
-            } else {
-                error!("Error reading PID file for {} on port {}: {:?}", service_type_str, port, e);
             }
         }
     }
+    None
+}
 
+/// Helper to get all running daemon processes (main, REST, storage) and their associated ports.
+/// This version relies primarily on sysinfo and lsof for discovery.
+pub async fn get_all_daemon_processes_with_ports() -> HashMap<u16, (u32, String)> {
+    let mut found_daemons: HashMap<u16, (u32, String)> = HashMap::new();
     let mut sys = System::new();
-    sys.refresh_all(); 
+    sys.refresh_all();
 
     let cli_exe_name_full = std::env::current_exe()
         .ok()
@@ -472,21 +450,18 @@ pub async fn get_all_daemon_processes_with_ports() -> HashMap<u16, (u32, String)
         .expect("Failed to create cli_name_pattern regex");
 
     for (pid, process) in sys.processes() {
-        if found_daemons.values().any(|(p, _)| *p == pid.as_u32()) {
-            continue;
-        }
-
         let process_name_lower = process.name().to_string_lossy().to_lowercase();
         let cmd_args: Vec<String> = process.cmd().iter().map(|s| s.to_string_lossy().into_owned()).collect();
-        let first_cmd_arg_lower = cmd_args.first().map_or("".to_string(), |s| s.to_lowercase()); 
+        let first_cmd_arg_lower = cmd_args.first().map_or("".to_string(), |s| s.to_lowercase());
 
         let is_our_cli_process = cli_name_pattern.is_match(&process_name_lower) ||
                                      cli_name_pattern.is_match(&first_cmd_arg_lower);
 
         if is_our_cli_process {
             let mut service_type_found: Option<&str> = None;
-            let mut port_found: Option<u16> = None;
+            let mut port_from_args: Option<u16> = None;
 
+            // Try to determine service type from internal arguments
             if cmd_args.contains(&"--internal-daemon-run".to_string()) {
                 service_type_found = Some("main");
             } else if cmd_args.contains(&"--internal-rest-api-run".to_string()) {
@@ -495,21 +470,36 @@ pub async fn get_all_daemon_processes_with_ports() -> HashMap<u16, (u32, String)
                 service_type_found = Some("storage");
             }
 
+            // Extract port from command arguments if --internal-port is present
             if let Some(pos) = cmd_args.iter().position(|arg| arg == "--internal-port") {
                 if let Some(port_str) = cmd_args.get(pos + 1) {
                     if let Ok(p) = port_str.parse::<u16>() {
-                        port_found = Some(p);
+                        port_from_args = Some(p);
                     }
                 }
             }
 
-            if let (Some(port), Some(service_type)) = (port_found, service_type_found) {
-                if tokio::time::timeout(Duration::from_secs(1), TcpStream::connect(format!("127.0.0.1:{}", port))).await.is_ok_and(|res| res.is_ok()) {
-                    found_daemons.insert(port, (pid.as_u32(), service_type.to_string()));
-                    debug!("Found {} daemon (PID {}) on port {} via sysinfo scan and TCP check.", service_type, pid, port);
+            // Now, try to get the actual listening port using lsof if service type is determined
+            if let Some(s_type) = service_type_found {
+                let actual_listening_port = get_listening_port_for_pid(pid.as_u32()).await;
+
+                if let Some(l_port) = actual_listening_port {
+                    // Prioritize the port found by lsof, but ensure it matches the one from args if present
+                    if port_from_args.is_none() || port_from_args == Some(l_port) {
+                        if found_daemons.insert(l_port, (pid.as_u32(), s_type.to_string())).is_none() {
+                            debug!("Found {} daemon (PID {}) on port {} via sysinfo/lsof scan.", s_type, pid, l_port);
+                        }
+                    } else {
+                        warn!("Process PID {} has internal-port {} but is listening on {}. Using listening port.", pid, port_from_args.unwrap(), l_port);
+                        if found_daemons.insert(l_port, (pid.as_u32(), s_type.to_string())).is_none() {
+                             debug!("Found {} daemon (PID {}) on port {} via sysinfo/lsof scan (port mismatch corrected).", s_type, pid, l_port);
+                        }
+                    }
                 } else {
-                    debug!("TCP check failed for PID {} (port {}) and service_type {} during sysinfo scan. Likely not fully listening yet or timed out.", pid, port, service_type);
+                    debug!("Process PID {} identified as {} daemon but no listening port found via lsof.", pid, s_type);
                 }
+            } else {
+                debug!("Process PID {} is graphdb-cli but not identified as internal daemon type.", pid);
             }
         }
     }
@@ -812,17 +802,16 @@ async fn read_pid_from_file(path: &PathBuf) -> Result<u32, anyhow::Error> {
     Ok(pid)
 }
 
-async fn delete_pid_file(service_port: u16, service_type: &str) -> Result<()> {
+async fn delete_pid_file(service_port: u16, service_type: &ServiceType) -> Result<()> {
     let _pid_file = match service_type {
-        "main" => get_pid_file_path(service_port),
-        "rest" => get_rest_pid_file_path(service_port),
-        "storage" => get_storage_pid_file_path(service_port), 
-        _ => return Err(anyhow!("Invalid service type: {}", service_type)),
+        ServiceType::Daemon => get_pid_file_path(service_port),
+        ServiceType::RestAPI => get_rest_pid_file_path(service_port),
+        ServiceType::StorageDaemon => get_storage_pid_file_path(service_port), 
     };
     if _pid_file.exists() {
         tokio::fs::remove_file(&_pid_file).await
-            .with_context(|| format!("Failed to delete {} PID file: {:?}", service_type, _pid_file))?;
-        info!("Deleted {} PID file: {:?}", service_type, _pid_file);
+            .with_context(|| format!("Failed to delete {:?} PID file: {:?}", service_type, _pid_file))?;
+        info!("Deleted {:?} PID file: {:?}", service_type, _pid_file);
     }
     Ok(())
 }
@@ -845,11 +834,18 @@ async fn is_process_running(pid: u32) -> bool {
     sys.process(Pid::from_u32(pid)).is_some()
 }
 
-#[derive(Clone, Copy)] 
+#[derive(Clone, Copy, Debug)] // Added Debug trait
 enum ServiceType {
     Daemon,
     RestAPI,
     StorageDaemon,
+}
+
+// Implement Display for ServiceType to allow formatting with {}
+impl fmt::Display for ServiceType {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}", self) // Use Debug implementation for Display
+    }
 }
 
 // Helper to get PID file path based on ServiceType
@@ -872,8 +868,8 @@ async fn remove_pid_file(port: u16, service_type: &ServiceType) -> Result<()> {
     let path = get_pid_file_path_for_service(port, service_type).await;
     if path.exists() {
         tokio::fs::remove_file(&path).await
-            .with_context(|| format!("Failed to delete PID file: {:?}", path))?;
-        info!("Deleted PID file: {:?}", path);
+            .with_context(|| format!("Failed to delete {:?} PID file: {:?}", service_type, path))?;
+        info!("Deleted {:?} PID file: {:?}", service_type, path);
     }
     Ok(())
 }
@@ -1060,14 +1056,14 @@ pub async fn stop_process_by_port(process_name: &str, port: u16) -> Result<(), a
         tokio::time::sleep(poll_interval).await;
     }
 
-    Err(anyhow::anyhow!("Port {} remained in use after killing processes within {:?}.", port, wait_timeout))
+    Err(anyhow::anyhow!("Port {} remained in use after killing processes within {:?}..", port, wait_timeout))
 }
 
 /// Checks if a given port on localhost is actively listening.
 /// This is done by attempting to establish a TCP connection.
 pub async fn is_port_listening(port: u16) -> bool {
     tokio::time::timeout(Duration::from_secs(1), async {
-        TcpStream::connect(format!("127.0.0.1:{}", port)).await.is_ok()
+        TcpStream::connect(format!("127.0.0.1:{}/", port)).await.is_ok()
     }).await.unwrap_or(false)
 }
 

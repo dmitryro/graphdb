@@ -191,7 +191,7 @@ pub async fn find_all_running_rest_api_ports() -> Vec<u16> {
 
 
 /// Displays detailed status for the REST API server.
-pub async fn display_rest_api_status(rest_api_port_arc: Arc<TokioMutex<Option<u16>>>) {
+pub async fn display_rest_api_status(port_arg: Option<u16>, rest_api_port_arc: Arc<TokioMutex<Option<u16>>>) {
     println!("\n--- REST API Status ---");
     println!("{:<15} {:<10} {:<40}", "Status", "Port", "Details");
     println!("{:-<15} {:-<10} {:-<40}", "", "", "");
@@ -733,7 +733,7 @@ pub async fn handle_daemon_command(
     }
 }
 
-/// Handles `storage` subcommand for direct CLI execution.
+// Handles `storage` subcommand for direct CLI execution.
 pub async fn handle_storage_command(storage_action: StorageAction) -> Result<()> {
     match storage_action {
         StorageAction::Start { port, config_file, cluster } => { // Added `cluster` here
@@ -781,14 +781,29 @@ pub async fn handle_storage_command(storage_action: StorageAction) -> Result<()>
             display_storage_daemon_status(port, Arc::new(TokioMutex::new(None))).await;
             Ok(())
         }
+        StorageAction::StorageQuery => {
+            println!("Performing Storage Query (simulated, non-interactive mode)...");
+            // Add actual storage query logic here for direct CLI execution
+            Ok(())
+        }
+        StorageAction::Health => {
+            println!("Performing Storage Health Check (simulated, non-interactive mode)...");
+            // Add actual storage health check logic here for direct CLI execution
+            Ok(())
+        }
+        StorageAction::Version => {
+            println!("Retrieving Storage Version (simulated, non-interactive mode)...");
+            // Add actual storage version retrieval logic here for direct CLI execution
+            Ok(())
+        }
     }
 }
 
 /// Handles the top-level `status` command.
 pub async fn handle_status_command(status_args: StatusArgs, rest_api_port_arc: Arc<TokioMutex<Option<u16>>>, storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>) -> Result<()> {
     match status_args.action {
-        Some(crate::cli::commands::StatusAction::Rest) => {
-            display_rest_api_status(rest_api_port_arc).await;
+        Some(crate::cli::commands::StatusAction::Rest {port}) => {
+            display_rest_api_status(port, rest_api_port_arc).await;
         }
         Some(crate::cli::commands::StatusAction::Daemon { port }) => {
             display_daemon_status(port).await;
@@ -1246,8 +1261,8 @@ pub async fn handle_rest_command(
         RestCliCommand::Stop => {
             stop_rest_api_interactive(rest_api_shutdown_tx_opt, rest_api_port_arc, rest_api_handle).await
         }
-        RestCliCommand::Status => {
-            display_rest_api_status(rest_api_port_arc).await;
+        RestCliCommand::Status { port } => {
+            display_rest_api_status(port, rest_api_port_arc).await;
             Ok(())
         }    
         RestCliCommand::Health => {
@@ -1331,8 +1346,8 @@ pub async fn handle_rest_command_interactive(
         RestCliCommand::Stop => {
             stop_rest_api_interactive(rest_api_shutdown_tx_opt, rest_api_port_arc, rest_api_handle).await
         }
-        RestCliCommand::Status => {
-            display_rest_api_status(rest_api_port_arc).await;
+        RestCliCommand::Status { port } => {
+            display_rest_api_status(port, rest_api_port_arc).await; // Pass None for port_arg
             Ok(())
         }
         RestCliCommand::Health => {
@@ -1378,7 +1393,7 @@ pub async fn handle_storage_command_interactive(
 ) -> Result<()> {
     match action {
         // Corrected pattern to include `cluster`
-        StorageAction::Start { port, config_file, cluster } => { 
+        StorageAction::Start { port, config_file, cluster } => {
             start_storage_interactive(
                 port,
                 config_file,
@@ -1395,8 +1410,24 @@ pub async fn handle_storage_command_interactive(
             display_storage_daemon_status(port, storage_daemon_port_arc).await;
             Ok(())
         }
+        StorageAction::StorageQuery => {
+            println!("Performing Storage Query (simulated, interactive mode)...");
+            // Add actual storage query logic here
+            Ok(())
+        }
+        StorageAction::Health => {
+            println!("Performing Storage Health Check (simulated, interactive mode)...");
+            // Add actual storage health check logic here
+            Ok(())
+        }
+        StorageAction::Version => {
+            println!("Retrieving Storage Version (simulated, interactive mode)...");
+            // Add actual storage version retrieval logic here
+            Ok(())
+        }
     }
 }
+
 
 
 /// Handles the interactive 'reload all' command.
@@ -1786,5 +1817,3 @@ pub async fn stop_daemon_instance_interactive(
     }       
     Ok(())      
 }               
-
-

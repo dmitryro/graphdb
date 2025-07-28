@@ -100,7 +100,10 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
             } else {
                 match remaining_args[0].to_lowercase().as_str() {
                     "summary" | "all" => cmd_type = CommandType::StatusSummary,
-                    "rest" => cmd_type = CommandType::StatusRest,
+                    "rest" => {
+                        let port = remaining_args.get(1).and_then(|s| s.parse().ok());
+                        cmd_type = CommandType::StatusRest(port);
+                    },
                     "daemon" => {
                         let port = remaining_args.get(1).and_then(|s| s.parse().ok());
                         cmd_type = CommandType::StatusDaemon(port);
@@ -709,43 +712,50 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
             else { /* remains Unknown */ }
         },
         "rest" => {
-            if remaining_args.first().map_or(false, |s| s.to_lowercase() == "start") {
-                let mut port = None;
-                let mut cluster = None;
-                let mut i = 1; // Start after "start"
-                while i < remaining_args.len() {
-                    match remaining_args[i].to_lowercase().as_str() {
-                        "--port" | "-p" | "--listen-port" => {
-                            if i + 1 < remaining_args.len() {
-                                port = remaining_args[i + 1].parse::<u16>().ok();
-                                i += 2;
-                            } else {
-                                eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
-                                i += 1;
-                            }
+            // Declare port and cluster here, so they are in scope for all RestCliCommand variants
+            let mut port: Option<u16> = None;
+            let mut cluster: Option<String> = None;
+
+            // Parse arguments for common flags first, regardless of subcommand
+            let mut i = 0;
+            while i < remaining_args.len() {
+                match remaining_args[i].to_lowercase().as_str() {
+                    "--port" | "-p" | "--listen-port" => {
+                        if i + 1 < remaining_args.len() {
+                            port = remaining_args[i + 1].parse::<u16>().ok();
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
                         }
-                        "--cluster" => {
-                            if i + 1 < remaining_args.len() {
-                                cluster = Some(remaining_args[i + 1].clone());
-                                i += 2;
-                            } else {
-                                eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
-                                i += 1;
-                            }
-                        }
-                        _ => { i += 1; }
                     }
+                    "--cluster" => {
+                        if i + 1 < remaining_args.len() {
+                            cluster = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    _ => { i += 1; } // Move to the next argument if not a common flag
                 }
+            }
+
+            // Now, parse the specific subcommand
+            if remaining_args.first().map_or(false, |s| s.to_lowercase() == "start") {
                 cmd_type = CommandType::Rest(RestCliCommand::Start { port, cluster });
             } else if remaining_args.first().map_or(false, |s| s.to_lowercase() == "stop") {
                 cmd_type = CommandType::Rest(RestCliCommand::Stop);
             } else if remaining_args.first().map_or(false, |s| s.to_lowercase() == "status") {
-                cmd_type = CommandType::Rest(RestCliCommand::Status);
+                // 'port' is now in scope from the declaration above
+                cmd_type = CommandType::Rest(RestCliCommand::Status { port });
             } else if remaining_args.first().map_or(false, |s| s.to_lowercase() == "health") {
                 cmd_type = CommandType::Rest(RestCliCommand::Health);
             } else if remaining_args.first().map_or(false, |s| s.to_lowercase() == "version") {
                 cmd_type = CommandType::Rest(RestCliCommand::Version);
             } else if remaining_args.first().map_or(false, |s| s.to_lowercase() == "register-user") {
+                // ... (rest of your existing logic for register-user)
                 if remaining_args.len() >= 3 { // "register-user username password"
                     cmd_type = CommandType::Rest(RestCliCommand::RegisterUser {
                         username: remaining_args[1].clone(),
@@ -756,6 +766,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                     // cmd_type remains Unknown
                 }
             } else if remaining_args.first().map_or(false, |s| s.to_lowercase() == "authenticate") {
+                // ... (rest of your existing logic for authenticate)
                 if remaining_args.len() >= 3 { // "authenticate username password"
                     cmd_type = CommandType::Rest(RestCliCommand::Authenticate {
                         username: remaining_args[1].clone(),
@@ -766,6 +777,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                     // cmd_type remains Unknown
                 }
             } else if remaining_args.first().map_or(false, |s| s.to_lowercase() == "graph-query") {
+                // ... (rest of your existing logic for graph-query)
                 if remaining_args.len() >= 2 { // "graph-query <query_string> [persist]"
                     let query_string = remaining_args[1].clone();
                     let persist = remaining_args.get(2).and_then(|s| s.parse::<bool>().ok());
@@ -988,8 +1000,8 @@ pub async fn handle_interactive_command(
             .await;
             Ok(()) // Ensure a Result is returned
         }
-        CommandType::StatusRest => {
-            handlers::display_rest_api_status(rest_api_port_arc.clone()).await;
+        CommandType::StatusRest(port) => {
+            handlers::display_rest_api_status(port, rest_api_port_arc.clone()).await;
             Ok(()) // Ensure a Result is returned
         }
         CommandType::StatusDaemon(port) => {
