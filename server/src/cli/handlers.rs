@@ -22,7 +22,8 @@ use futures::future; // Added for parallel execution
 // Import command structs from commands.rs
 use crate::cli::commands::{DaemonCliCommand, RestCliCommand, StorageAction, StatusArgs, StopArgs, ReloadArgs, ReloadAction, RestartArgs, RestartAction};
 use lib::storage_engine::config::StorageConfig as LibStorageConfig; // Alias to avoid conflict
-use crate::cli::daemon_management::{find_running_storage_daemon_port, start_daemon_process, stop_daemon_api_call, handle_internal_daemon_run}; // Added handle_internal_daemon_run
+use crate::cli::daemon_management::{find_running_storage_daemon_port, clear_all_daemon_processes, start_daemon_process, 
+                                    stop_daemon_api_call, handle_internal_daemon_run}; // Added handle_internal_daemon_run
 use daemon_api::{stop_daemon, start_daemon};
 
 // Placeholder imports for daemon and rest args, assuming they exist in your project structure
@@ -724,7 +725,7 @@ pub async fn handle_daemon_command(
         DaemonCliCommand::Stop { port } => {
             stop_daemon_instance_interactive(port, daemon_handles).await
         }
-        DaemonCliCommand::Status { port } => {
+        DaemonCliCommand::Status { port, cluster } => {
             display_daemon_status(port).await;
             Ok(())
         }
@@ -743,7 +744,7 @@ pub async fn handle_daemon_command(
         DaemonCliCommand::ClearAll => {
             stop_daemon_instance_interactive(None, daemon_handles).await?;
             println!("Attempting to clear all external daemon processes...");
-            crate::cli::daemon_management::clear_all_daemon_processes().await?;
+            clear_all_daemon_processes().await?;
             Ok(())
         }
     }
@@ -793,7 +794,7 @@ pub async fn handle_storage_command(storage_action: StorageAction) -> Result<()>
             println!("Standalone Storage daemon stop command processed for port {}.", actual_port);
             Ok(())
         }
-        StorageAction::Status { port } => {
+        StorageAction::Status { port, cluster } => {
             display_storage_daemon_status(port, Arc::new(TokioMutex::new(None))).await;
             Ok(())
         }
@@ -1232,7 +1233,7 @@ pub async fn handle_daemon_command_interactive(
         DaemonCliCommand::Stop { port } => {
             stop_daemon_instance_interactive(port, daemon_handles).await
         }
-        DaemonCliCommand::Status { port } => {
+        DaemonCliCommand::Status { port, cluster } => {
             display_daemon_status(port).await;
             Ok(())
         }
@@ -1277,7 +1278,7 @@ pub async fn handle_rest_command(
         RestCliCommand::Stop => {
             stop_rest_api_interactive(rest_api_shutdown_tx_opt, rest_api_port_arc, rest_api_handle).await
         }
-        RestCliCommand::Status { port } => {
+        RestCliCommand::Status { port, cluster } => {
             display_rest_api_status(port, rest_api_port_arc).await;
             Ok(())
         }    
@@ -1362,7 +1363,7 @@ pub async fn handle_rest_command_interactive(
         RestCliCommand::Stop => {
             stop_rest_api_interactive(rest_api_shutdown_tx_opt, rest_api_port_arc, rest_api_handle).await
         }
-        RestCliCommand::Status { port } => {
+        RestCliCommand::Status { port, cluster } => {
             display_rest_api_status(port, rest_api_port_arc).await; // Pass None for port_arg
             Ok(())
         }
@@ -1422,7 +1423,7 @@ pub async fn handle_storage_command_interactive(
         StorageAction::Stop { port } => {
             stop_storage_interactive(port, storage_daemon_shutdown_tx_opt, storage_daemon_handle, storage_daemon_port_arc).await
         }
-        StorageAction::Status { port } => {
+        StorageAction::Status { port, cluster } => {
             display_storage_daemon_status(port, storage_daemon_port_arc).await;
             Ok(())
         }

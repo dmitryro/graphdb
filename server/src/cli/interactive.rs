@@ -86,317 +86,344 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
     const FUZZY_MATCH_THRESHOLD: usize = 2; // e.g., 'sta' vs 'start' (2 diff)
 
     let mut cmd_type = CommandType::Unknown; // Initialize with Unknown
-    let mut parsed_remaining_args = remaining_args.clone(); // Clone to modify if arguments are consumed
+    let parsed_remaining_args = remaining_args.clone(); // Clone to modify if arguments are consumed
 
     // Try exact match first
-    match command_str.as_str() {
-        "exit" | "quit" | "q" => cmd_type = CommandType::Exit,
-        "clear" | "clean" => cmd_type = CommandType::Clear,
-        "version" => cmd_type = CommandType::Version,
-        "health" => cmd_type = CommandType::Health,
+    cmd_type = match command_str.as_str() { // Assign the result of the outer match to cmd_type
+        "exit" | "quit" | "q" => CommandType::Exit,
+        "clear" | "clean" => CommandType::Clear,
+        "version" => CommandType::Version,
+        "health" => CommandType::Health,
         "status" => {
             if remaining_args.is_empty() {
-                cmd_type = CommandType::StatusSummary;
+                CommandType::StatusSummary
             } else {
                 match remaining_args[0].to_lowercase().as_str() {
-                    "summary" | "all" => cmd_type = CommandType::StatusSummary,
+                    "summary" | "all" => CommandType::StatusSummary,
                     "rest" => {
-                        let port = remaining_args.get(1).and_then(|s| s.parse().ok());
-                        cmd_type = CommandType::StatusRest(port);
+                        let mut port = None;
+                        let mut cluster = None;
+                        let mut i = 1; // Start after "rest"
+                        while i < remaining_args.len() {
+                            match remaining_args[i].to_lowercase().as_str() {
+                                "--port" | "-p" => {
+                                    if i + 1 < remaining_args.len() {
+                                        port = remaining_args[i + 1].parse::<u16>().ok();
+                                        i += 2;
+                                    } else {
+                                        eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                                        i += 1;
+                                    }
+                                }
+                                "--cluster" => {
+                                    if i + 1 < remaining_args.len() {
+                                        cluster = Some(remaining_args[i + 1].clone());
+                                        i += 2;
+                                    } else {
+                                        eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                                        i += 1;
+                                    }
+                                }
+                                _ => { i += 1; }
+                            }
+                        }
+                        CommandType::Rest(RestCliCommand::Status { port, cluster })
                     },
                     "daemon" => {
-                        let port = remaining_args.get(1).and_then(|s| s.parse().ok());
-                        cmd_type = CommandType::StatusDaemon(port);
+                        let mut port = None;
+                        let mut cluster = None; // Add missing cluster field
+                        let mut i = 1; // Start after "daemon"
+                        while i < remaining_args.len() {
+                            match remaining_args[i].to_lowercase().as_str() {
+                                "--port" | "-p" => {
+                                    if i + 1 < remaining_args.len() {
+                                        port = remaining_args[i + 1].parse::<u16>().ok();
+                                        i += 2;
+                                    } else {
+                                        eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                                        i += 1;
+                                    }
+                                }
+                                "--cluster" => { // Parse cluster for daemon status if provided
+                                    if i + 1 < remaining_args.len() {
+                                        cluster = Some(remaining_args[i + 1].clone());
+                                        i += 2;
+                                    } else {
+                                        eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                                        i += 1;
+                                    }
+                                }
+                                _ => { i += 1; }
+                            }
+                        }
+                        CommandType::Daemon(DaemonCliCommand::Status { port, cluster })
                     },
                     "storage" => {
-                        let port = remaining_args.get(1).and_then(|s| s.parse().ok());
-                        cmd_type = CommandType::StatusStorage(port);
+                        let mut port = None;
+                        let mut cluster = None; // Add missing cluster field
+                        let mut i = 1; // Start after "storage"
+                        while i < remaining_args.len() {
+                            match remaining_args[i].to_lowercase().as_str() {
+                                "--port" | "-p" => {
+                                    if i + 1 < remaining_args.len() {
+                                        port = remaining_args[i + 1].parse::<u16>().ok();
+                                        i += 2;
+                                    } else {
+                                        eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                                        i += 1;
+                                    }
+                                }
+                                "--cluster" => { // Parse cluster for storage status if provided
+                                    if i + 1 < remaining_args.len() {
+                                        cluster = Some(remaining_args[i + 1].clone());
+                                        i += 2;
+                                    } else {
+                                        eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                                        i += 1;
+                                    }
+                                }
+                                _ => { i += 1; }
+                            }
+                        }
+                        CommandType::Storage(StorageAction::Status { port, cluster })
                     },
-                    "cluster" => cmd_type = CommandType::StatusCluster,
-                    _ => { /* remains Unknown */ }
+                    "cluster" => CommandType::StatusCluster,
+                    _ => CommandType::Unknown,
                 }
             }
         },
         "start" => {
-            if remaining_args.is_empty() {
-                // If "start" is typed alone, assume "start all" with no specific args
-                cmd_type = CommandType::StartAll {
-                    port: None, cluster: None, listen_port: None, storage_port: None,
-                    storage_config_file: None, daemon_cluster: None, daemon_port: None,
-                    rest_cluster: None, rest_port: None, storage_cluster: None,
-                };
-            } else {
+            let mut port: Option<u16> = None;
+            let mut cluster: Option<String> = None;
+            let mut daemon_port: Option<u16> = None;
+            let mut daemon_cluster: Option<String> = None;
+            let mut listen_port: Option<u16> = None;
+            let mut rest_port: Option<u16> = None;
+            let mut rest_cluster: Option<String> = None;
+            let mut storage_port: Option<u16> = None;
+            let mut storage_cluster: Option<String> = None;
+            let mut storage_config_file: Option<PathBuf> = None;
+
+            let mut current_subcommand_index = 0;
+            let mut explicit_subcommand: Option<String> = None;
+
+            // First, identify if there's an explicit subcommand (e.g., "start rest")
+            if !remaining_args.is_empty() {
                 match remaining_args[0].to_lowercase().as_str() {
-                    "rest" => {
-                        let mut port = None;
-                        let mut cluster = None;
-                        let mut i = 1; // Start parsing from the argument after "rest"
-
-                        while i < remaining_args.len() {
-                            match remaining_args[i].to_lowercase().as_str() {
-                                "--port" | "-p" | "--listen-port" => {
-                                    if i + 1 < remaining_args.len() {
-                                        port = remaining_args[i + 1].parse::<u16>().ok();
-                                        i += 2;
-                                    } else {
-                                        eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
-                                        i += 1;
-                                    }
-                                }
-                                "--cluster" => {
-                                    if i + 1 < remaining_args.len() {
-                                        cluster = Some(remaining_args[i + 1].clone());
-                                        i += 2;
-                                    } else {
-                                        eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
-                                        i += 1;
-                                    }
-                                }
-                                _ => {
-                                    eprintln!("Warning: Unknown argument for 'start rest': {}", remaining_args[i]);
-                                    i += 1;
-                                }
-                            }
-                        }
-                        cmd_type = CommandType::StartRest { port, cluster };
-                    },
-                    "storage" => {
-                        let mut port = None;
-                        let mut config_file = None;
-                        let mut cluster = None;
-                        let mut i = 1; // Start parsing from the argument after "storage"
-
-                        while i < remaining_args.len() {
-                            match remaining_args[i].to_lowercase().as_str() {
-                                "--port" | "-p" | "--storage-port" => {
-                                    if i + 1 < remaining_args.len() {
-                                        port = remaining_args[i + 1].parse::<u16>().ok();
-                                        i += 2;
-                                    } else {
-                                        eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
-                                        i += 1;
-                                    }
-                                }
-                                "--config-file" => {
-                                    if i + 1 < remaining_args.len() {
-                                        config_file = Some(PathBuf::from(&remaining_args[i + 1]));
-                                        i += 2;
-                                    } else {
-                                        eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
-                                        i += 1;
-                                    }
-                                }
-                                "--cluster" => {
-                                    if i + 1 < remaining_args.len() {
-                                        cluster = Some(remaining_args[i + 1].clone());
-                                        i += 2;
-                                    } else {
-                                        eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
-                                        i += 1;
-                                    }
-                                }
-                                _ => {
-                                    eprintln!("Warning: Unknown argument for 'start storage': {}", remaining_args[i]);
-                                    i += 1;
-                                }
-                            }
-                        }
-                        cmd_type = CommandType::StartStorage { port, config_file, cluster };
-                    },
-                    "daemon" => {
-                        let mut port = None;
-                        let mut cluster = None;
-                        let mut i = 1; // Start parsing from the argument after "daemon"
-
-                        while i < remaining_args.len() {
-                            match remaining_args[i].to_lowercase().as_str() {
-                                "--port" | "-p" => {
-                                    if i + 1 < remaining_args.len() {
-                                        port = remaining_args[i + 1].parse::<u16>().ok();
-                                        i += 2;
-                                    } else {
-                                        eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
-                                        i += 1;
-                                    }
-                                }
-                                "--cluster" => {
-                                    if i + 1 < remaining_args.len() {
-                                        cluster = Some(remaining_args[i + 1].clone());
-                                        i += 2;
-                                    } else {
-                                        eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
-                                        i += 1;
-                                    }
-                                }
-                                _ => {
-                                    eprintln!("Warning: Unknown argument for 'start daemon': {}", remaining_args[i]);
-                                    i += 1;
-                                }
-                            }
-                        }
-                        cmd_type = CommandType::StartDaemon { port, cluster };
-                    },
-                    "all" => {
-                        let mut port = None;
-                        let mut cluster = None;
-                        let mut listen_port = None;
-                        let mut storage_port = None;
-                        let mut storage_config_file = None;
-                        let mut daemon_cluster = None;
-                        let mut daemon_port = None;
-                        let mut rest_cluster = None;
-                        let mut rest_port = None;
-                        let mut storage_cluster = None;
-                        let mut i = 1; // Start parsing from the argument after "all"
-
-                        while i < remaining_args.len() {
-                            match remaining_args[i].to_lowercase().as_str() {
-                                "--port" | "-p" => {
-                                    if i + 1 < remaining_args.len() {
-                                        port = remaining_args[i + 1].parse::<u16>().ok();
-                                        i += 2;
-                                    } else {
-                                        eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
-                                        i += 1;
-                                    }
-                                }
-                                "--cluster" => {
-                                    if i + 1 < remaining_args.len() {
-                                        cluster = Some(remaining_args[i + 1].clone());
-                                        i += 2;
-                                    } else {
-                                        eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
-                                        i += 1;
-                                    }
-                                }
-                                "--listen-port" => {
-                                    if i + 1 < remaining_args.len() {
-                                        listen_port = remaining_args[i + 1].parse::<u16>().ok();
-                                        i += 2;
-                                    } else {
-                                        eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
-                                        i += 1;
-                                    }
-                                }
-                                "--storage-port" => {
-                                    if i + 1 < remaining_args.len() {
-                                        storage_port = remaining_args[i + 1].parse::<u16>().ok();
-                                        i += 2;
-                                    } else {
-                                        eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
-                                        i += 1;
-                                    }
-                                }
-                                "--storage-config" => {
-                                    if i + 1 < remaining_args.len() {
-                                        storage_config_file = Some(PathBuf::from(&remaining_args[i + 1]));
-                                        i += 2;
-                                    } else {
-                                        eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
-                                        i += 1;
-                                    }
-                                }
-                                "--daemon-port" => {
-                                    if i + 1 < remaining_args.len() {
-                                        daemon_port = remaining_args[i + 1].parse::<u16>().ok();
-                                        i += 2;
-                                    } else {
-                                        eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
-                                        i += 1;
-                                    }
-                                }
-                                "--daemon-cluster" => {
-                                    if i + 1 < remaining_args.len() {
-                                        daemon_cluster = Some(remaining_args[i + 1].clone());
-                                        i += 2;
-                                    } else {
-                                        eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
-                                        i += 1;
-                                    }
-                                }
-                                "--rest-port" => {
-                                    if i + 1 < remaining_args.len() {
-                                        rest_port = remaining_args[i + 1].parse::<u16>().ok();
-                                        i += 2;
-                                    } else {
-                                        eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
-                                        i += 1;
-                                    }
-                                }
-                                "--rest-cluster" => {
-                                    if i + 1 < remaining_args.len() {
-                                        rest_cluster = Some(remaining_args[i + 1].clone());
-                                        i += 2;
-                                    } else {
-                                        eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
-                                        i += 1;
-                                    }
-                                }
-                                "--storage-cluster" => {
-                                    if i + 1 < remaining_args.len() {
-                                        storage_cluster = Some(remaining_args[i + 1].clone());
-                                        i += 2;
-                                    } else {
-                                        eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
-                                        i += 1;
-                                    }
-                                }
-                                _ => {
-                                    eprintln!("Warning: Unknown argument for 'start all': {}", remaining_args[i]);
-                                    i += 1;
-                                }
-                            }
-                        }
-                        cmd_type = CommandType::StartAll {
-                            port, cluster, listen_port, storage_port, storage_config_file,
-                            daemon_cluster, daemon_port, rest_cluster, rest_port, storage_cluster,
-                        };
-                    },
-                    _ => { /* remains Unknown */ }
+                    "all" | "daemon" | "rest" | "storage" => {
+                        explicit_subcommand = Some(remaining_args[0].to_lowercase());
+                        current_subcommand_index = 1; // Start parsing args after the subcommand
+                    }
+                    _ => {
+                        // No explicit subcommand, assume top-level 'start' with potential flags
+                        current_subcommand_index = 0;
+                    }
                 }
+            }
+
+            let mut i = current_subcommand_index;
+            while i < remaining_args.len() {
+                match remaining_args[i].to_lowercase().as_str() {
+                    "--port" | "-p" => {
+                        if i + 1 < remaining_args.len() {
+                            port = remaining_args[i + 1].parse::<u16>().ok();
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--cluster" => {
+                        if i + 1 < remaining_args.len() {
+                            cluster = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--daemon-port" => {
+                        if i + 1 < remaining_args.len() {
+                            daemon_port = remaining_args[i + 1].parse::<u16>().ok();
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--daemon-cluster" => {
+                        if i + 1 < remaining_args.len() {
+                            daemon_cluster = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--listen-port" => {
+                        if i + 1 < remaining_args.len() {
+                            listen_port = remaining_args[i + 1].parse::<u16>().ok();
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--rest-port" => {
+                        if i + 1 < remaining_args.len() {
+                            rest_port = remaining_args[i + 1].parse::<u16>().ok();
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--rest-cluster" => {
+                        if i + 1 < remaining_args.len() {
+                            rest_cluster = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--storage-port" => {
+                        if i + 1 < remaining_args.len() {
+                            storage_port = remaining_args[i + 1].parse::<u16>().ok();
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--storage-cluster" => {
+                        if i + 1 < remaining_args.len() {
+                            storage_cluster = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    "--storage-config" | "--config-file" => {
+                        if i + 1 < remaining_args.len() {
+                            storage_config_file = Some(PathBuf::from(remaining_args[i + 1].clone()));
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                    _ => {
+                        eprintln!("Warning: Unknown argument for 'start': {}", remaining_args[i]);
+                        i += 1;
+                    }
+                }
+            }
+
+            match explicit_subcommand.as_deref() {
+                Some("all") => CommandType::StartAll {
+                    port, cluster, daemon_port, daemon_cluster,
+                    listen_port, rest_port, rest_cluster,
+                    storage_port, storage_cluster, storage_config_file,
+                },
+                Some("daemon") => CommandType::StartDaemon { port: port.or(daemon_port), cluster: cluster.or(daemon_cluster) },
+                Some("rest") => CommandType::StartRest { port: port.or(listen_port).or(rest_port), cluster: cluster.or(rest_cluster) },
+                Some("storage") => CommandType::StartStorage { port: port.or(storage_port), config_file: storage_config_file, cluster: cluster.or(storage_cluster) },
+                None => CommandType::StartAll { // Default to StartAll if no subcommand and top-level args are present
+                    port, cluster, daemon_port, daemon_cluster,
+                    listen_port, rest_port, rest_cluster,
+                    storage_port, storage_cluster, storage_config_file,
+                },
+                _ => CommandType::Unknown, // Should not be reached
             }
         },
         "stop" => {
-            if remaining_args.is_empty() {
-                cmd_type = CommandType::StopAll;
+            if remaining_args.is_empty() || remaining_args[0].to_lowercase() == "all" {
+                CommandType::StopAll
             } else {
                 match remaining_args[0].to_lowercase().as_str() {
-                    "rest" => cmd_type = CommandType::StopRest,
+                    "rest" => CommandType::StopRest,
                     "daemon" => {
-                        let port = remaining_args.get(1).and_then(|s| s.parse().ok());
-                        cmd_type = CommandType::StopDaemon(port);
+                        let mut port = None;
+                        let mut i = 1; // Start after "daemon"
+                        while i < remaining_args.len() {
+                            match remaining_args[i].to_lowercase().as_str() {
+                                "--port" | "-p" => {
+                                    if i + 1 < remaining_args.len() {
+                                        port = remaining_args[i + 1].parse::<u16>().ok();
+                                        i += 2;
+                                    } else {
+                                        eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                                        i += 1;
+                                    }
+                                }
+                                _ => { i += 1; }
+                            }
+                        }
+                        CommandType::StopDaemon(port)
                     },
                     "storage" => {
-                        let port = remaining_args.get(1).and_then(|s| s.parse().ok());
-                        cmd_type = CommandType::StopStorage(port);
+                        let mut port = None;
+                        let mut i = 1; // Start after "storage"
+                        while i < remaining_args.len() {
+                            match remaining_args[i].to_lowercase().as_str() {
+                                "--port" | "-p" => {
+                                    if i + 1 < remaining_args.len() {
+                                        port = remaining_args[i + 1].parse::<u16>().ok();
+                                        i += 2;
+                                    } else {
+                                        eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                                        i += 1;
+                                    }
+                                }
+                                _ => { i += 1; }
+                            }
+                        }
+                        CommandType::StopStorage(port)
                     },
-                    "all" => cmd_type = CommandType::StopAll,
-                    _ => { /* remains Unknown */ }
+                    "all" => CommandType::StopAll,
+                    _ => CommandType::Unknown,
                 }
             }
         },
         "reload" => {
             if remaining_args.is_empty() {
                 eprintln!("Usage: reload [all|rest|storage|daemon|cluster] [--port <port>]");
-                // cmd_type remains Unknown
+                CommandType::Unknown // Return Unknown if no arguments provided
             } else {
                 match remaining_args[0].to_lowercase().as_str() {
-                    "all" => cmd_type = CommandType::ReloadAll,
-                    "rest" => cmd_type = CommandType::ReloadRest,
-                    "storage" => cmd_type = CommandType::ReloadStorage,
+                    "all" => CommandType::ReloadAll,
+                    "rest" => CommandType::ReloadRest,
+                    "storage" => CommandType::ReloadStorage,
                     "daemon" => {
-                        let port = remaining_args.get(1).and_then(|s| s.parse().ok());
-                        cmd_type = CommandType::ReloadDaemon(port);
+                        let mut port = None;
+                        let mut i = 1; // Start after "daemon"
+                        while i < remaining_args.len() {
+                            match remaining_args[i].to_lowercase().as_str() {
+                                "--port" | "-p" => {
+                                    if i + 1 < remaining_args.len() {
+                                        port = remaining_args[i + 1].parse::<u16>().ok();
+                                        i += 2;
+                                    } else {
+                                        eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                                        i += 1;
+                                    }
+                                }
+                                _ => { i += 1; }
+                            }
+                        }
+                        CommandType::ReloadDaemon(port)
                     },
-                    "cluster" => cmd_type = CommandType::ReloadCluster,
-                    _ => { /* remains Unknown */ }
+                    "cluster" => CommandType::ReloadCluster,
+                    _ => CommandType::Unknown,
                 }
             }
         },
         "restart" => {
             if remaining_args.is_empty() {
                 eprintln!("Usage: restart [all|rest|storage|daemon|cluster] ...");
-                // cmd_type remains Unknown
+                CommandType::Unknown // Return Unknown if no arguments provided
             } else {
                 match remaining_args[0].to_lowercase().as_str() {
                     "all" => {
@@ -510,10 +537,10 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                 }
                             }
                         }
-                        cmd_type = CommandType::RestartAll {
+                        CommandType::RestartAll {
                             port, cluster, listen_port, storage_port, storage_config_file,
                             daemon_cluster, daemon_port, rest_cluster, rest_port, storage_cluster,
-                        };
+                        }
                     },
                     "rest" => {
                         let mut port = None;
@@ -545,7 +572,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                 }
                             }
                         }
-                        cmd_type = CommandType::RestartRest { port, cluster };
+                        CommandType::RestartRest { port, cluster }
                     },
                     "storage" => {
                         let mut port = None;
@@ -587,7 +614,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                 }
                             }
                         }
-                        cmd_type = CommandType::RestartStorage { port, config_file, cluster };
+                        CommandType::RestartStorage { port, config_file, cluster }
                     },
                     "daemon" => {
                         let mut port = None;
@@ -619,27 +646,27 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                 }
                             }
                         }
-                        cmd_type = CommandType::RestartDaemon { port, cluster };
+                        CommandType::RestartDaemon { port, cluster }
                     },
-                    "cluster" => cmd_type = CommandType::RestartCluster,
-                    _ => { /* remains Unknown */ }
+                    "cluster" => CommandType::RestartCluster,
+                    _ => CommandType::Unknown,
                 }
             }
         },
         "auth" | "authenticate" => {
             if remaining_args.len() >= 2 {
-                cmd_type = CommandType::Auth { username: remaining_args[0].clone(), password: remaining_args[1].clone() };
+                CommandType::Authenticate { username: remaining_args[0].clone(), password: remaining_args[1].clone() }
             } else {
                 eprintln!("Usage: auth/authenticate <username> <password>");
-                // cmd_type remains Unknown
+                CommandType::Unknown
             }
         },
         "register" => {
             if remaining_args.len() >= 2 {
-                cmd_type = CommandType::RegisterUser { username: remaining_args[0].clone(), password: remaining_args[1].clone() };
+                CommandType::RegisterUser { username: remaining_args[0].clone(), password: remaining_args[1].clone() }
             } else {
                 eprintln!("Usage: register <username> <password>");
-                // cmd_type remains Unknown
+                CommandType::Unknown
             }
         },
         "help" => {
@@ -666,14 +693,14 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
             }
 
             let help_args = HelpArgs { filter_command, command_path };
-            cmd_type = CommandType::Help(help_args);
+            CommandType::Help(help_args)
         },
         // Direct subcommand calls (e.g., "daemon list" where "daemon" is the first arg)
         "daemon" => {
             if remaining_args.first().map_or(false, |s| s.to_lowercase() == "list") {
-                cmd_type = CommandType::Daemon(DaemonCliCommand::List);
+                CommandType::Daemon(DaemonCliCommand::List)
             } else if remaining_args.first().map_or(false, |s| s.to_lowercase() == "clear-all") {
-                cmd_type = CommandType::Daemon(DaemonCliCommand::ClearAll);
+                CommandType::Daemon(DaemonCliCommand::ClearAll)
             } else if remaining_args.first().map_or(false, |s| s.to_lowercase() == "start") {
                 let mut port = None;
                 let mut cluster = None;
@@ -701,105 +728,161 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                         _ => { i += 1; }
                     }
                 }
-                cmd_type = CommandType::Daemon(DaemonCliCommand::Start { port, cluster });
+                CommandType::Daemon(DaemonCliCommand::Start { port, cluster })
             } else if remaining_args.first().map_or(false, |s| s.to_lowercase() == "stop") {
-                let port = remaining_args.get(1).and_then(|s| s.parse::<u16>().ok());
-                cmd_type = CommandType::Daemon(DaemonCliCommand::Stop { port });
+                let mut port = None;
+                let mut i = 1; // Start after "stop"
+                while i < remaining_args.len() {
+                    match remaining_args[i].to_lowercase().as_str() {
+                        "--port" | "-p" => {
+                            if i + 1 < remaining_args.len() {
+                                port = remaining_args[i + 1].parse::<u16>().ok();
+                                i += 2;
+                            } else {
+                                eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                                i += 1;
+                            }
+                        }
+                        _ => { i += 1; }
+                    }
+                }
+                CommandType::Daemon(DaemonCliCommand::Stop { port })
             } else if remaining_args.first().map_or(false, |s| s.to_lowercase() == "status") {
-                let port = remaining_args.get(1).and_then(|s| s.parse::<u16>().ok());
-                cmd_type = CommandType::Daemon(DaemonCliCommand::Status { port });
+                let mut port = None;
+                let mut cluster = None; // Add missing cluster field
+                let mut i = 1; // Start after "status"
+                while i < remaining_args.len() {
+                    match remaining_args[i].to_lowercase().as_str() {
+                        "--port" | "-p" => {
+                            if i + 1 < remaining_args.len() {
+                                port = remaining_args[i + 1].parse::<u16>().ok();
+                                i += 2;
+                            } else {
+                                eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                                i += 1;
+                            }
+                        }
+                        "--cluster" => { // Parse cluster for daemon status if provided
+                            if i + 1 < remaining_args.len() {
+                                cluster = Some(remaining_args[i + 1].clone());
+                                i += 2;
+                            } else {
+                                eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                                i += 1;
+                            }
+                        }
+                        _ => { i += 1; }
+                    }
+                }
+                CommandType::Daemon(DaemonCliCommand::Status { port, cluster })
             }
-            else { /* remains Unknown */ }
+            else { CommandType::Unknown }
         },
         "rest" => {
-            // Declare port and cluster here, so they are in scope for all RestCliCommand variants
-            let mut port: Option<u16> = None;
-            let mut cluster: Option<String> = None;
+            if remaining_args.is_empty() {
+                eprintln!("Usage: rest <start|stop|status|health|version|register-user|authenticate|graph-query|storage-query>");
+                CommandType::Unknown
+            } else {
+                let rest_subcommand = remaining_args[0].to_lowercase();
+                let mut port: Option<u16> = None;
+                let mut cluster: Option<String> = None;
+                let mut query_string: Option<String> = None;
+                let mut persist: Option<bool> = None;
+                let mut username: Option<String> = None;
+                let mut password: Option<String> = None;
 
-            // Parse arguments for common flags first, regardless of subcommand
-            let mut i = 0;
-            while i < remaining_args.len() {
-                match remaining_args[i].to_lowercase().as_str() {
-                    "--port" | "-p" | "--listen-port" => {
-                        if i + 1 < remaining_args.len() {
-                            port = remaining_args[i + 1].parse::<u16>().ok();
-                            i += 2;
-                        } else {
-                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                let mut i = 1; // Start parsing args after the subcommand (e.g., "start", "status")
+                while i < remaining_args.len() {
+                    match remaining_args[i].to_lowercase().as_str() {
+                        "--port" | "-p" | "--listen-port" => {
+                            if i + 1 < remaining_args.len() {
+                                port = remaining_args[i + 1].parse::<u16>().ok();
+                                i += 2;
+                            } else {
+                                eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                                i += 1;
+                            }
+                        }
+                        "--cluster" => {
+                            if i + 1 < remaining_args.len() {
+                                cluster = Some(remaining_args[i + 1].clone());
+                                i += 2;
+                            } else {
+                                eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                                i += 1;
+                            }
+                        }
+                        "--persist" => {
+                            persist = Some(true); // Flag presence means true
+                            i += 1;
+                        }
+                        _ => {
+                            // Handle positional arguments for register-user, authenticate, graph-query
+                            if rest_subcommand == "register-user" || rest_subcommand == "authenticate" {
+                                if username.is_none() {
+                                    username = Some(remaining_args[i].clone());
+                                } else if password.is_none() {
+                                    password = Some(remaining_args[i].clone());
+                                }
+                            } else if rest_subcommand == "graph-query" {
+                                if query_string.is_none() {
+                                    query_string = Some(remaining_args[i].clone());
+                                }
+                            }
                             i += 1;
                         }
                     }
-                    "--cluster" => {
-                        if i + 1 < remaining_args.len() {
-                            cluster = Some(remaining_args[i + 1].clone());
-                            i += 2;
+                }
+
+                match rest_subcommand.as_str() {
+                    "start" => CommandType::Rest(RestCliCommand::Start { port, cluster }),
+                    "stop" => CommandType::Rest(RestCliCommand::Stop),
+                    "status" => CommandType::Rest(RestCliCommand::Status { port, cluster }), // Pass the parsed port and cluster
+                    "health" => CommandType::Rest(RestCliCommand::Health),
+                    "version" => CommandType::Rest(RestCliCommand::Version),
+                    "register-user" => {
+                        if let (Some(u), Some(p)) = (username, password) {
+                            CommandType::Rest(RestCliCommand::RegisterUser { username: u, password: p })
                         } else {
-                            eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
-                            i += 1;
+                            eprintln!("Usage: rest register-user <username> <password>");
+                            CommandType::Unknown
                         }
                     }
-                    _ => { i += 1; } // Move to the next argument if not a common flag
+                    "authenticate" => {
+                        if let (Some(u), Some(p)) = (username, password) {
+                            CommandType::Rest(RestCliCommand::Authenticate { username: u, password: p })
+                        } else {
+                            eprintln!("Usage: rest authenticate <username> <password>");
+                            CommandType::Unknown
+                        }
+                    }
+                    "graph-query" => {
+                        if let Some(q) = query_string {
+                            CommandType::Rest(RestCliCommand::GraphQuery { query_string: q, persist })
+                        } else {
+                            eprintln!("Usage: rest graph-query <query_string> [--persist]");
+                            CommandType::Unknown
+                        }
+                    }
+                    "storage-query" => CommandType::Rest(RestCliCommand::StorageQuery),
+                    _ => CommandType::Unknown,
                 }
             }
-
-            // Now, parse the specific subcommand
-            if remaining_args.first().map_or(false, |s| s.to_lowercase() == "start") {
-                cmd_type = CommandType::Rest(RestCliCommand::Start { port, cluster });
-            } else if remaining_args.first().map_or(false, |s| s.to_lowercase() == "stop") {
-                cmd_type = CommandType::Rest(RestCliCommand::Stop);
-            } else if remaining_args.first().map_or(false, |s| s.to_lowercase() == "status") {
-                // 'port' is now in scope from the declaration above
-                cmd_type = CommandType::Rest(RestCliCommand::Status { port });
-            } else if remaining_args.first().map_or(false, |s| s.to_lowercase() == "health") {
-                cmd_type = CommandType::Rest(RestCliCommand::Health);
-            } else if remaining_args.first().map_or(false, |s| s.to_lowercase() == "version") {
-                cmd_type = CommandType::Rest(RestCliCommand::Version);
-            } else if remaining_args.first().map_or(false, |s| s.to_lowercase() == "register-user") {
-                // ... (rest of your existing logic for register-user)
-                if remaining_args.len() >= 3 { // "register-user username password"
-                    cmd_type = CommandType::Rest(RestCliCommand::RegisterUser {
-                        username: remaining_args[1].clone(),
-                        password: remaining_args[2].clone(),
-                    });
-                } else {
-                    eprintln!("Usage: rest register-user <username> <password>");
-                    // cmd_type remains Unknown
-                }
-            } else if remaining_args.first().map_or(false, |s| s.to_lowercase() == "authenticate") {
-                // ... (rest of your existing logic for authenticate)
-                if remaining_args.len() >= 3 { // "authenticate username password"
-                    cmd_type = CommandType::Rest(RestCliCommand::Authenticate {
-                        username: remaining_args[1].clone(),
-                        password: remaining_args[2].clone(),
-                    });
-                } else {
-                    eprintln!("Usage: rest authenticate <username> <password>");
-                    // cmd_type remains Unknown
-                }
-            } else if remaining_args.first().map_or(false, |s| s.to_lowercase() == "graph-query") {
-                // ... (rest of your existing logic for graph-query)
-                if remaining_args.len() >= 2 { // "graph-query <query_string> [persist]"
-                    let query_string = remaining_args[1].clone();
-                    let persist = remaining_args.get(2).and_then(|s| s.parse::<bool>().ok());
-                    cmd_type = CommandType::Rest(RestCliCommand::GraphQuery { query_string, persist });
-                } else {
-                    eprintln!("Usage: rest graph-query <query_string> [persist]");
-                    // cmd_type remains Unknown
-                }
-            } else if remaining_args.first().map_or(false, |s| s.to_lowercase() == "storage-query") {
-                cmd_type = CommandType::Rest(RestCliCommand::StorageQuery);
-            }
-            else { /* remains Unknown */ }
         },
         "storage" => {
-            if remaining_args.first().map_or(false, |s| s.to_lowercase() == "start") {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: storage <start|stop|status|health|version|storage-query>");
+                CommandType::Unknown
+            } else {
+                let storage_subcommand = remaining_args[0].to_lowercase();
                 let mut port = None;
                 let mut config_file = None;
                 let mut cluster = None;
-                let mut i = 1; // Start after "start"
+
+                let mut i = 1; // Start parsing args after the subcommand
                 while i < remaining_args.len() {
                     match remaining_args[i].to_lowercase().as_str() {
-                        "--port" | "-p" | "--storage-port" => {
+                        "--port" | "-p" => {
                             if i + 1 < remaining_args.len() {
                                 port = remaining_args[i + 1].parse::<u16>().ok();
                                 i += 2;
@@ -810,7 +893,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                         }
                         "--config-file" => {
                             if i + 1 < remaining_args.len() {
-                                config_file = Some(PathBuf::from(&remaining_args[i + 1]));
+                                config_file = Some(PathBuf::from(remaining_args[i + 1].clone()));
                                 i += 2;
                             } else {
                                 eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
@@ -829,18 +912,20 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                         _ => { i += 1; }
                     }
                 }
-                cmd_type = CommandType::Storage(StorageAction::Start { port, config_file, cluster });
-            } else if remaining_args.first().map_or(false, |s| s.to_lowercase() == "stop") {
-                let port = remaining_args.get(1).and_then(|s| s.parse::<u16>().ok());
-                cmd_type = CommandType::Storage(StorageAction::Stop { port });
-            } else if remaining_args.first().map_or(false, |s| s.to_lowercase() == "status") {
-                let port = remaining_args.get(1).and_then(|s| s.parse::<u16>().ok());
-                cmd_type = CommandType::Storage(StorageAction::Status { port });
+
+                match storage_subcommand.as_str() {
+                    "start" => CommandType::Storage(StorageAction::Start { port, config_file, cluster }),
+                    "stop" => CommandType::Storage(StorageAction::Stop { port }),
+                    "status" => CommandType::Storage(StorageAction::Status { port, cluster }), // Pass the parsed port and cluster
+                    "health" => CommandType::Storage(StorageAction::Health),
+                    "version" => CommandType::Storage(StorageAction::Version),
+                    "storage-query" => CommandType::Storage(StorageAction::StorageQuery),
+                    _ => CommandType::Unknown,
+                }
             }
-            else { /* remains Unknown */ }
         },
-        _ => { /* remains Unknown */ }
-    }
+        _ => CommandType::Unknown,
+    }; // End of the outer match assignment to cmd_type
 
     // Fuzzy matching for top-level commands if the initial match was Unknown
     if cmd_type == CommandType::Unknown {
@@ -885,22 +970,36 @@ pub async fn handle_interactive_command(
             handlers::handle_daemon_command_interactive(daemon_cmd, daemon_handles).await
         }
         CommandType::Rest(rest_cmd) => {
-            handlers::handle_rest_command_interactive(
-                rest_cmd,
-                rest_api_shutdown_tx_opt,
-                rest_api_handle,
-                rest_api_port_arc,
-            )
-            .await
+            // Handle RestCliCommand variants
+            match rest_cmd {
+                RestCliCommand::Status { port, cluster: _ } => { // Destructure port and ignore cluster
+                    handlers::display_rest_api_status(port, rest_api_port_arc.clone()).await;
+                    Ok(())
+                },
+                // Delegate other RestCliCommand variants to the generic handler
+                _ => handlers::handle_rest_command_interactive(
+                    rest_cmd,
+                    rest_api_shutdown_tx_opt,
+                    rest_api_handle,
+                    rest_api_port_arc,
+                ).await,
+            }
         }
         CommandType::Storage(storage_action) => {
-            handlers::handle_storage_command_interactive(
-                storage_action,
-                storage_daemon_shutdown_tx_opt.clone(),
-                storage_daemon_handle.clone(),
-                storage_daemon_port_arc.clone(),
-            )
-            .await
+            // Handle StorageAction variants
+            match storage_action {
+                StorageAction::Status { port, cluster: _ } => { // Destructure port and ignore cluster
+                    handlers::display_storage_daemon_status(port, storage_daemon_port_arc.clone()).await;
+                    Ok(())
+                },
+                // Delegate other StorageAction variants to the generic handler
+                _ => handlers::handle_storage_command_interactive(
+                    storage_action,
+                    storage_daemon_shutdown_tx_opt.clone(),
+                    storage_daemon_handle.clone(),
+                    storage_daemon_port_arc.clone(),
+                ).await,
+            }
         }
         CommandType::StartRest { port, cluster } => {
             handlers::start_rest_api_interactive(
@@ -1000,10 +1099,7 @@ pub async fn handle_interactive_command(
             .await;
             Ok(()) // Ensure a Result is returned
         }
-        CommandType::StatusRest(port) => {
-            handlers::display_rest_api_status(port, rest_api_port_arc.clone()).await;
-            Ok(()) // Ensure a Result is returned
-        }
+        // CommandType::StatusRest is removed as it's now handled under CommandType::Rest
         CommandType::StatusDaemon(port) => {
             handlers::display_daemon_status(port).await;
             Ok(()) // Ensure a Result is returned

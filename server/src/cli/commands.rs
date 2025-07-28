@@ -53,7 +53,7 @@ pub enum CommandType {
 
     // Top-level Status commands (can also be subcommands of 'status')
     StatusSummary, // 'status' or 'status all' or 'status summary'
-    StatusRest(Option<u16>),
+    //StatusRest(Option<u16>),
     StatusDaemon(Option<u16>),
     StatusStorage(Option<u16>),
     StatusCluster,
@@ -349,6 +349,8 @@ pub enum DaemonCliCommand {
         /// Port of the daemon to check.
         #[clap(long, short = 'p')]
         port: Option<u16>,
+        #[clap(long)]
+        cluster: Option<String>,
     },
     /// List all running GraphDB daemon instances.
     List,
@@ -371,7 +373,9 @@ pub enum RestCliCommand {
     Stop,
     /// Get the status of the REST API server.
     Status {
-        /// Port for the Storage daemon.
+       /// Port for the Storage daemon.
+        #[clap(long)] 
+        cluster: Option<String>,  
         #[clap(long, short = 'p')]
         port: Option<u16>,
     },
@@ -422,6 +426,8 @@ pub enum StorageAction {
     /// Get the status of the standalone Storage daemon.
     Status {
         /// Port for the Storage daemon.
+        #[clap(long)]
+        cluster: Option<String>,
         #[clap(long, short = 'p')]
         port: Option<u16>,
     },
