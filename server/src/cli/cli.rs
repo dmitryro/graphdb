@@ -12,8 +12,10 @@
 // FIXED: 2025-07-27 - Corrected argument passing for handle_start_all_interactive and handle_rest_command_interactive.
 // FIXED: 2025-07-27 - Corrected handle_reload_command_interactive argument count and types.
 // FIXED: 2025-07-27 - Corrected handle_internal_daemon_run import and call path.
+// UPDATED: 2025-07-28 - Synchronized with latest commands.rs and interactive.rs changes.
+// FIXED: 2025-07-28 - Removed unused FromArgMatches import from clap.
 
-use clap::{Parser, Subcommand, CommandFactory, FromArgMatches};
+use clap::{Parser, Subcommand, CommandFactory}; // Removed FromArgMatches
 use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,12 +30,13 @@ use std::collections::HashMap;
 use crate::cli::commands::{
     DaemonCliCommand, RestCliCommand, StorageAction,
     StatusArgs, StopArgs, ReloadArgs, RestartArgs,
-    ReloadAction, RestartAction, StartAction, StopAction, StatusAction
+    ReloadAction, RestartAction, StartAction, StopAction, StatusAction,
+    HelpArgs // Import HelpArgs from commands.rs for consistency
 };
 use crate::cli::config as config_mod;
 use crate::cli::handlers as handlers_mod;
 use crate::cli::interactive as interactive_mod;
-use crate::cli::help_display as help_display_mod;
+use crate::cli::help_display as help_display_mod; // Still needed for print functions
 use crate::cli::daemon_management; // Import daemon_management directly
 
 
@@ -74,7 +77,7 @@ pub struct CliArgs {
 pub enum Commands {
     /// Start GraphDB components (daemon, rest, storage, or all)
     Start {
-        // FIX: These arguments capture top-level args for 'start' that implicitly mean 'start all'.
+        // These arguments capture top-level args for 'start' that implicitly mean 'start all'.
         #[arg(long, value_parser = clap::value_parser!(u16), help = "Port for the daemon. Conflicts with --daemon-port if both specified.")]
         port: Option<u16>,
         #[arg(long, value_parser = clap::value_parser!(String), help = "Cluster range for the daemon. Conflicts with --daemon-cluster if both specified.")]
@@ -138,7 +141,7 @@ pub enum Commands {
     /// Perform a health check on the REST API server
     Health,
     /// Display help message
-    Help(help_display_mod::HelpArgs),
+    Help(HelpArgs), // Use the HelpArgs struct from commands.rs
     /// Clear the terminal screen
     Clear,
     /// Exit the CLI
@@ -199,7 +202,7 @@ pub async fn start_cli() -> Result<()> {
 
     if let Some(query_string) = args.query {
         println!("Executing direct query: {}", query_string);
-        match parse_query_from_string(&query_string) {
+        match lib::query_parser::parse_query_from_string(&query_string) { // Fully qualified path
             Ok(parsed_query) => match parsed_query {
                 QueryType::Cypher => println!("  -> Identified as Cypher query."),
                 QueryType::SQL => println!("  -> Identified as SQL query."),
@@ -250,7 +253,7 @@ pub async fn start_cli() -> Result<()> {
                             port, cluster, daemon_port, daemon_cluster,
                             listen_port, rest_port, rest_cluster,
                             storage_port, storage_cluster,
-                            storage_config: storage_config.map(PathBuf::from), // Convert String to PathBuf
+                            storage_config, // This is already PathBuf from commands.rs
                         }
                     },
                     Some(other_action) => other_action, // Other explicit subcommands
@@ -276,7 +279,7 @@ pub async fn start_cli() -> Result<()> {
                             StartAction::All {
                                 port: None, cluster: None, daemon_port: None, daemon_cluster: None,
                                 listen_port: None, rest_port: None, rest_cluster: None,
-                                storage_port: None, storage_cluster: None, storage_config: None, // Keep as None
+                                storage_port: None, storage_cluster: None, storage_config: None,
                             }
                         }
                     }

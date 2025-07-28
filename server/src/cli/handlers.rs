@@ -643,14 +643,22 @@ pub async fn handle_start_command(
 /// Handles the top-level `stop` command.
 pub async fn handle_stop_command(stop_args: StopArgs) -> Result<()> {
     match stop_args.action {
-        Some(crate::cli::commands::StopAction::Rest) => {
-            let running_rest_ports = find_all_running_rest_api_ports().await;
-            if running_rest_ports.is_empty() {
-                println!("No REST API servers found running.");
+        Some(crate::cli::commands::StopAction::Rest { port }) => {
+            if let Some(p) = port {
+                // If a specific port is provided, stop only that one
+                println!("Attempting to stop REST API server on port {}...", p);
+                stop_process_by_port("REST API", p).await?;
+                println!("REST API server on port {} stopped.", p);
             } else {
-                for port in running_rest_ports {
-                    stop_process_by_port("REST API", port).await?;
-                    println!("REST API stop command processed for port {}.", port);
+                // If no port is specified, stop all running REST API instances (current behavior)
+                let running_rest_ports = find_all_running_rest_api_ports().await;
+                if running_rest_ports.is_empty() {
+                    println!("No REST API servers found running.");
+                } else {
+                    for p_found in running_rest_ports {
+                        stop_process_by_port("REST API", p_found).await?;
+                        println!("REST API server on port {} stopped.", p_found);
+                    }
                 }
             }
         }
@@ -791,7 +799,9 @@ pub async fn handle_status_command(status_args: StatusArgs, rest_api_port_arc: A
         Some(crate::cli::commands::StatusAction::Cluster) => {
             display_cluster_status().await;
         }
-        Some(crate::cli::commands::StatusAction::All) | None => {
+        Some(crate::cli::commands::StatusAction::All) | Some(crate::cli::commands::StatusAction::All) | None => {
+            // Both 'All' and 'Summary' actions, or no action specified,
+            // will display the full status summary.
             display_full_status_summary(rest_api_port_arc, storage_daemon_port_arc).await;
         }
     }
@@ -1216,7 +1226,6 @@ pub async fn handle_daemon_command_interactive(
     }
 }
 
-
 /// Handles `rest` subcommand for direct CLI execution.
 pub async fn handle_rest_command(
     rest_cmd: RestCliCommand,
@@ -1388,6 +1397,7 @@ pub async fn handle_storage_command_interactive(
         }
     }
 }
+
 
 /// Handles the interactive 'reload all' command.
 pub async fn reload_all_interactive(
@@ -1618,12 +1628,15 @@ pub async fn handle_restart_command_interactive(
     Ok(())
 }
 
-
 /// Handles the top-level `reload` command.
 pub async fn handle_reload_command(
     reload_args: ReloadArgs,
 ) -> Result<()> {
-    match reload_args.action {
+    // Extract the action, defaulting to ReloadAction::All if None is provided.
+    // This avoids the recursive call that caused the "recursion in an async fn requires boxing" error.
+    let action_to_perform = reload_args.action.unwrap_or(ReloadAction::All);
+
+    match action_to_perform {
         ReloadAction::All => {
             println!("Reloading all GraphDB components...");
             self::handle_stop_command(crate::cli::commands::StopArgs { action: Some(crate::cli::commands::StopAction::All) }).await?;
@@ -1641,7 +1654,7 @@ pub async fn handle_reload_command(
                 start_daemon_process(
                     true, false, Some(port),
                     Some(PathBuf::from(LibStorageConfig::default().data_path)),
-                    Some(LibStorageConfig::default().engine_type), // Corrected: Pass StorageEngineType directly
+                    Some(LibStorageConfig::default().engine_type.into()), // Corrected: Pass StorageEngineType directly
                 ).await?;
                 println!("REST API server restarted on port {}.", port);
             }
@@ -1652,7 +1665,7 @@ pub async fn handle_reload_command(
                 start_daemon_process(
                     true, false, Some(default_rest_port),
                     Some(PathBuf::from(LibStorageConfig::default().data_path)),
-                    Some(LibStorageConfig::default().engine_type), // Corrected: Pass StorageEngineType directly
+                    Some(LibStorageConfig::default().engine_type.into()), // Corrected: Pass StorageEngineType directly
                 ).await?;
                 println!("REST API server restarted on default port {}.", default_rest_port);
             }
@@ -1682,7 +1695,7 @@ pub async fn handle_reload_command(
                 start_daemon_process(
                     true, false, Some(DEFAULT_REST_API_PORT),
                     Some(PathBuf::from(LibStorageConfig::default().data_path)),
-                    Some(LibStorageConfig::default().engine_type), // Corrected: Pass StorageEngineType directly
+                    Some(LibStorageConfig::default().engine_type.into()), // Corrected: Pass StorageEngineType directly
                 ).await?;
             } else {
                 for &port in &running_ports { // Changed to iterate over reference
@@ -1690,7 +1703,7 @@ pub async fn handle_reload_command(
                     start_daemon_process(
                         true, false, Some(port),
                         Some(PathBuf::from(LibStorageConfig::default().data_path)),
-                        Some(LibStorageConfig::default().engine_type), // Corrected: Pass StorageEngineType directly
+                        Some(LibStorageConfig::default().engine_type.into()), // Corrected: Pass StorageEngineType directly
                     ).await?;
                     println!("REST API server reloaded on port {}.", port);
                 }
