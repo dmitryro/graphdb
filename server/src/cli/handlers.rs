@@ -196,14 +196,22 @@ pub async fn display_rest_api_status(port_arg: Option<u16>, rest_api_port_arc: A
     println!("{:<15} {:<10} {:<40}", "Status", "Port", "Details");
     println!("{:-<15} {:-<10} {:-<40}", "", "", "");
 
-    let running_ports = find_all_running_rest_api_ports().await;
+    let mut ports_to_check = Vec::new();
+
+    if let Some(p) = port_arg {
+        // If a specific port is provided, only check that port
+        ports_to_check.push(p);
+    } else {
+        // If no port is specified, find all running REST API instances
+        ports_to_check = find_all_running_rest_api_ports().await;
+    }
+
     let mut found_any = false;
 
-    if running_ports.is_empty() {
-        println!("{:<15} {:<10} {:<40}", "Down", "N/A", "No REST API servers found on common ports.");
+    if ports_to_check.is_empty() {
+        println!("{:<15} {:<10} {:<40}", "Down", "N/A", "No REST API servers found on common ports or specified port.");
     } else {
-        for &port in &running_ports {
-            found_any = true;
+        for &port in &ports_to_check {
             let client = reqwest::Client::builder()
                 .timeout(Duration::from_secs(2))
                 .build().expect("Failed to build reqwest client");
@@ -226,8 +234,12 @@ pub async fn display_rest_api_status(port_arg: Option<u16>, rest_api_port_arc: A
                         },
                         _ => rest_api_details = format!("{}; Version: N/A", rest_api_details),
                     }
+                    found_any = true; // Mark as found if health check is OK
                 },
-                _ => { /* Status remains "Down" */ },
+                _ => { 
+                    // Status remains "Down", and details can indicate connection failure
+                    rest_api_details = format!("Health: Down (Failed to connect or unhealthy)");
+                },
             }
             println!("{:<15} {:<10} {:<40}", rest_api_status, port, rest_api_details);
         }
@@ -235,8 +247,12 @@ pub async fn display_rest_api_status(port_arg: Option<u16>, rest_api_port_arc: A
     
     // Update the Arc with the first found port if any, for consistency with other parts
     // that might expect a single tracked port. This is a compromise for the current design.
-    if let Some(first_port) = running_ports.first() {
-        *rest_api_port_arc.lock().await = Some(*first_port);
+    if let Some(first_port) = ports_to_check.first() {
+        if found_any { // Only update if at least one was found to be running
+            *rest_api_port_arc.lock().await = Some(*first_port);
+        } else {
+            *rest_api_port_arc.lock().await = None;
+        }
     } else {
         *rest_api_port_arc.lock().await = None;
     }
