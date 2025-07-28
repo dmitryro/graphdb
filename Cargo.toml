@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+
+members = [
+    "caching",
+    "lib",
+    "proto",
+    "security",
+    "server",
+    "client", 
+    "rest_api", 
+    "daemon", 
+    "daemon_api", "security", "caching", "models", "storage_daemon_server", "storage_caching", 
+]

@@ -1,0 +1,21 @@
+roles:
+  admin:
+    id: 1
+    permissions:
+      - create
+      - read
+      - update
+      - delete
+      - superuser
+  guest:
+    id: 2
+    permissions:
+      - read
+  medical_staff:
+    id: 3
+    permissions:
+      - create
+      - read
+      - update
+      - write_notes
+      - read_drug
