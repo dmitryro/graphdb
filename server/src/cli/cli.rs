@@ -186,18 +186,9 @@ pub async fn start_cli() -> Result<()> {
             converted_storage_engine,
         ).await;
     }
-
     let config = match config_mod::load_cli_config() {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            eprintln!("Error loading configuration: {}", e); // Changed to eprintln for consistency
-            eprintln!("Attempted to load from: {}", std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("src")
-                .join("cli")
-                .join("config.toml")
-                .display());
-            process::exit(1);
-        }
+        Ok(config) => config,
+        Err(e) => return Err(e),
     };
 
     if let Some(query_string) = args.query {

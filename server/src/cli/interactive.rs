@@ -85,6 +85,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
     // Define a threshold for Levenshtein distance for a "suggestion"
     const FUZZY_MATCH_THRESHOLD: usize = 2; // e.g., 'sta' vs 'start' (2 diff)
 
+    #[allow(unused_variables)]
     let mut cmd_type = CommandType::Unknown; // Initialize with Unknown
     let parsed_remaining_args = remaining_args.clone(); // Clone to modify if arguments are consumed
 

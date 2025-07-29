@@ -15,6 +15,26 @@ pub mod daemon_registry;
 // Re-export the main CLI entry point from cli.rs
 pub use cli::{start_cli, CliArgs, Commands}; // Corrected: Changed run_cli to start_cli
 
+pub use config::{
+    load_cli_config,
+    load_storage_config,
+    get_default_rest_port_from_config,
+    get_default_storage_port_from_config_or_cli_default,
+    get_storage_cluster_range,
+    get_default_daemon_port,
+    get_daemon_cluster_range,
+    get_default_rest_port,
+    get_rest_cluster_range,
+    CliConfig,
+    CliConfigToml,
+    StorageConfig,
+    ServerConfig,
+    RestApiConfig,
+    MainDaemonConfig,
+    DaemonYamlConfig,
+    StorageEngineType,
+    CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS,
+};
 // Re-export specific types/functions from other modules if they are part of the public CLI API
 pub use commands::{
     DaemonCliCommand,
@@ -49,16 +69,6 @@ pub use help_display::{
     collect_all_cli_elements_for_suggestions,
     print_interactive_help,
     print_interactive_filtered_help,
-};
-pub use config::{
-    load_cli_config,
-    load_storage_config,
-    CliConfig,
-    ServerConfig,
-    StorageConfig,
-    StorageEngineType,
-    CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS,
-    get_default_rest_port_from_config,
 };
 pub use daemon_management::{
     start_daemon_process,
