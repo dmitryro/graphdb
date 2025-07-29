@@ -22,10 +22,11 @@ use futures::future; // Added for parallel execution
 // Import command structs from commands.rs
 use crate::cli::commands::{DaemonCliCommand, RestCliCommand, StorageAction, StatusArgs, StopArgs, 
                            ReloadArgs, ReloadAction, RestartArgs, RestartAction, StatusAction};
-use lib::storage_engine::config::StorageConfig as LibStorageConfig; // Alias to avoid conflict
+use lib::storage_engine::config::{StorageConfig as LibStorageConfig}; // Alias to avoid conflict
 use crate::cli::daemon_management::{find_running_storage_daemon_port, clear_all_daemon_processes, start_daemon_process, 
                                     stop_daemon_api_call, handle_internal_daemon_run}; // Added handle_internal_daemon_run
 use crate::cli::daemon_registry::{DaemonMetadata, GLOBAL_DAEMON_REGISTRY};                    
+use crate::cli::config::{DEFAULT_DAEMON_PORT, DEFAULT_REST_API_PORT, DEFAULT_STORAGE_PORT};
 use daemon_api::{stop_daemon, start_daemon};
 
 // Placeholder imports for daemon and rest args, assuming they exist in your project structure
@@ -85,12 +86,6 @@ pub mod storage {
         pub async fn check_storage_daemon_status(_port: u16) -> Result<String> { Ok("Running".to_string()) }
     }
 }
-
-
-// Constants for default ports
-const DEFAULT_DAEMON_PORT: u16 = 8000;
-const DEFAULT_REST_API_PORT: u16 = 8080;
-const DEFAULT_STORAGE_PORT: u16 = 8090;
 
 /// Helper to get the path to the current executable.
 pub fn get_current_exe_path() -> Result<PathBuf> {
