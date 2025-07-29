@@ -305,6 +305,7 @@ pub struct StatusArgs {
 pub enum StatusAction {
     /// Get a summary status of all running components.
     All,
+    Summary,
     /// Get the status of the REST API server.
     Rest {
         /// Port of the daemon to check.

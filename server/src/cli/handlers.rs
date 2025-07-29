@@ -20,10 +20,12 @@ use std::io::{self, Write};
 use futures::future; // Added for parallel execution
 
 // Import command structs from commands.rs
-use crate::cli::commands::{DaemonCliCommand, RestCliCommand, StorageAction, StatusArgs, StopArgs, ReloadArgs, ReloadAction, RestartArgs, RestartAction};
+use crate::cli::commands::{DaemonCliCommand, RestCliCommand, StorageAction, StatusArgs, StopArgs, 
+                           ReloadArgs, ReloadAction, RestartArgs, RestartAction, StatusAction};
 use lib::storage_engine::config::StorageConfig as LibStorageConfig; // Alias to avoid conflict
 use crate::cli::daemon_management::{find_running_storage_daemon_port, clear_all_daemon_processes, start_daemon_process, 
                                     stop_daemon_api_call, handle_internal_daemon_run}; // Added handle_internal_daemon_run
+use crate::cli::daemon_registry::{DaemonMetadata, GLOBAL_DAEMON_REGISTRY};                    
 use daemon_api::{stop_daemon, start_daemon};
 
 // Placeholder imports for daemon and rest args, assuming they exist in your project structure
@@ -819,23 +821,27 @@ pub async fn handle_storage_command(storage_action: StorageAction) -> Result<()>
 /// Handles the top-level `status` command.
 pub async fn handle_status_command(status_args: StatusArgs, rest_api_port_arc: Arc<TokioMutex<Option<u16>>>, storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>) -> Result<()> {
     match status_args.action {
-        Some(crate::cli::commands::StatusAction::Rest {port}) => {
+        Some(StatusAction::Rest {port}) => {
             display_rest_api_status(port, rest_api_port_arc).await;
         }
-        Some(crate::cli::commands::StatusAction::Daemon { port }) => {
+        Some(StatusAction::Daemon { port }) => {
             display_daemon_status(port).await;
         }
-        Some(crate::cli::commands::StatusAction::Storage { port }) => {
+        Some(StatusAction::Storage { port }) => {
             display_storage_daemon_status(port, storage_daemon_port_arc).await;
         }
-        Some(crate::cli::commands::StatusAction::Cluster) => {
+        Some(StatusAction::Cluster) => {
             display_cluster_status().await;
         }
-        Some(crate::cli::commands::StatusAction::All) | Some(crate::cli::commands::StatusAction::All) | None => {
+        Some(StatusAction::All) | Some(crate::cli::commands::StatusAction::All) | None => {
             // Both 'All' and 'Summary' actions, or no action specified,
             // will display the full status summary.
             display_full_status_summary(rest_api_port_arc, storage_daemon_port_arc).await;
         }
+        Some(StatusAction::Summary) => {
+            display_full_status_summary(rest_api_port_arc, storage_daemon_port_arc).await;
+        }
+
     }
     Ok(())
 }

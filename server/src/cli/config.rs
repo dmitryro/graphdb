@@ -17,6 +17,8 @@ use toml;
 // Added necessary import for StorageEngineType conversion
 use daemon_api::StorageEngineType as DaemonApiStorageEngineType;
 
+// Constants for sled database path
+pub const DAEMON_REGISTRY_DB_PATH: &str = "./daemon_registry_db";
 // Constants for default values and paths
 pub const DEFAULT_DAEMON_PORT: u16 = 9001;
 pub const DEFAULT_REST_API_PORT: u16 = 8081;

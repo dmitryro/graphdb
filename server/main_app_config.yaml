@@ -1,0 +1,6 @@
+config_root_directory: "/opt/graphdb"
+main_daemon:
+  data_directory: "/opt/graphdb/storage_data"
+  log_directory: "/var/log/graphdb"
+  default_port: 9001
+  cluster_range: "9001-9005"

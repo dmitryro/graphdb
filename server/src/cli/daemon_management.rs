@@ -15,7 +15,7 @@ use tokio::process::Command as TokioCommand;
 use tokio::time::{self, Duration};
 use tokio::io::{AsyncWriteExt, ErrorKind};
 use log::{info, error, warn, debug};
-use sysinfo::{System, Pid}; 
+use sysinfo::{System, Pid, ProcessStatus}; 
 use std::sync::Arc;
 use regex::Regex; 
 use std::collections::{HashSet, HashMap};
@@ -34,11 +34,8 @@ use crate::cli::config::{
     MAX_CLUSTER_SIZE,
     DEFAULT_STORAGE_CONFIG_PATH_RELATIVE,
     DEFAULT_CONFIG_ROOT_DIRECTORY_STR,
-    PID_FILE_DIR,
-    DAEMON_PID_FILE_NAME_PREFIX,
-    REST_PID_FILE_NAME_PREFIX,
-    STORAGE_PID_FILE_NAME_PREFIX,
     EXECUTABLE_NAME,
+    DAEMON_REGISTRY_DB_PATH,
     load_main_daemon_config, 
 };
 
@@ -47,6 +44,10 @@ use lib::storage_engine::config::{StorageEngineType, StorageConfig as LibStorage
 use daemon_api::{stop_daemon, DaemonError};
 use rest_api::start_server as start_rest_server;
 use storage_daemon_server::run_storage_daemon as start_storage_server;
+
+// Import the new DaemonRegistry
+use crate::cli::daemon_registry::{DaemonRegistry, DaemonMetadata, GLOBAL_DAEMON_REGISTRY};
+
 
 /// Helper to run an external command with a timeout.
 pub async fn run_command_with_timeout(
@@ -78,6 +79,7 @@ async fn start_graphdb_daemon_core(port: u16) -> Result<()> {
             loop {
                 match listener.accept().await {
                     Ok((_socket, _addr)) => {
+                        // In a real daemon, you'd handle the connection here
                     },
                     Err(e) => {
                         error!("[DAEMON PROCESS] GraphDB Daemon listener error: {:?}", e);
@@ -153,6 +155,8 @@ pub async fn handle_internal_daemon_run(
         Ok(()) 
     }
 }
+
+/// Spawns a daemon process (REST, Storage, or Main) and writes its PID to the DaemonRegistry.
 pub async fn start_daemon_process(
     is_rest: bool,
     is_storage: bool,
@@ -174,11 +178,14 @@ pub async fn start_daemon_process(
     if let Some(p) = port {
         command.arg("--internal-port").arg(p.to_string());
     }
-    if let Some(path) = config_path {
+
+    if let Some(path) = config_path.clone() {
         command.arg("--internal-storage-config-path").arg(path);
     }
-    if let Some(engine) = engine_type {
-        command.arg("--internal-storage-engine").arg(engine.to_possible_value().unwrap().get_name());
+
+    if let Some(ref engine) = engine_type {
+        command.arg("--internal-storage-engine")
+               .arg(engine.to_possible_value().unwrap().get_name());
     }
 
     command.stdin(std::process::Stdio::null())
@@ -186,31 +193,56 @@ pub async fn start_daemon_process(
            .stderr(std::process::Stdio::null());
 
     let child = command.spawn().context("Failed to spawn daemon process")?;
-    info!("Daemonized process spawned with PID {}", child.id().unwrap_or(0));
+    let spawned_pid = child.id().unwrap_or(0);
+    info!("Daemonized process spawned with PID {}", spawned_pid);
 
+    let service_type_str = if is_rest {
+        "rest"
+    } else if is_storage {
+        "storage"
+    } else {
+        "main"
+    };
+
+    let actual_port = port.unwrap_or_else(|| {
+        if is_rest {
+            get_default_rest_port_from_config()
+        } else if is_storage {
+            load_storage_config(None)
+                .map(|c| c.default_port)
+                .unwrap_or(CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS)
+        } else {
+            load_main_daemon_config(None)
+                .map(|c| c.default_port)
+                .unwrap_or(DEFAULT_DAEMON_PORT)
+        }
+    });
+
+    let metadata = DaemonMetadata {
+        service_type: service_type_str.to_string(),
+        port: actual_port,
+        pid: spawned_pid,
+        ip_address: "127.0.0.1".to_string(),
+        data_dir: None,
+        config_path,
+        engine_type: engine_type
+            .as_ref()
+            .map(|e| e.to_possible_value().unwrap().get_name().to_string()),
+    };
+
+    GLOBAL_DAEMON_REGISTRY.register_daemon(metadata).await?;
     Ok(())
 }
 
 /// Helper function to find a running storage daemon's port.
 /// Scans a range of common ports using `lsof`.
 pub async fn find_running_storage_daemon_port() -> Option<u16> {
-    let common_storage_ports_to_check = (CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS..=CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS + 10).collect::<Vec<u16>>();
-    for port in common_storage_ports_to_check {
-        let output = tokio::process::Command::new("lsof")
-            .arg("-i")
-            .arg(format!(":{}", port))
-            .arg("-t")
-            .output()
-            .await;
-
-        if let Ok(output) = output {
-            let pids = String::from_utf8_lossy(&output.stdout);
-            if !pids.trim().is_empty() {
-                return Some(port);
-            }
-        }
-    }
-    None
+    // This function can now leverage the DaemonRegistry
+    let all_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
+    all_daemons.iter()
+        .filter(|metadata| metadata.service_type == "storage")
+        .map(|metadata| metadata.port)
+        .next() // Just return the first one found
 }
 
 /// Calls the `daemon_api::stop_daemon` function.
@@ -220,123 +252,8 @@ pub fn stop_daemon_api_call() -> Result<(), anyhow::Error> {
     stop_daemon().map_err(|e| anyhow::anyhow!("Daemon API error: {:?}", e))
 }
 
-/*
-/// Attempts to clear all daemon processes by sending a global stop signal
-/// and then trying to kill processes on common daemon ports.
-pub async fn clear_all_daemon_processes() -> Result<(), anyhow::Error> {
-    println!("Attempting to clear all GraphDB daemon processes...");
-
-    // First, send the global stop signal via daemon_api
-    let stop_result = stop_daemon_api_call();
-    match stop_result {
-        Ok(()) => println!("Global daemon stop signal sent successfully."),
-        Err(ref e) => eprintln!("Failed to send global stop signal: {:?}", e),
-    }
-
-    // Then, iterate through common daemon ports and try to kill processes
-    let common_daemon_ports = [8000, 8080, 8081, 9001, 9002, 9003, 9004, 9005, CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS];
-    for &port in &common_daemon_ports {
-        let output = std::process::Command::new("lsof")
-            .arg("-i")
-            .arg(format!(":{}", port))
-            .arg("-t") // Only print PIDs
-            .output()
-            .context(format!("Failed to run lsof to find process on port {}", port))?;
-
-        let pids = String::from_utf8_lossy(&output.stdout);
-        let pids: Vec<i32> = pids.trim().lines().filter_map(|s| s.parse::<i32>().ok()).collect();
-
-        if !pids.is_empty() {
-            for pid in pids {
-                println!("Killing process {} on port {}...", pid, port);
-                match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGTERM) {
-                    Ok(_) => println!("Successfully sent SIGTERM to PID {}.", pid),
-                    Err(e) => eprintln!("Failed to send SIGTERM to PID {}: {}", pid, e),
-                }
-            }
-        }
-    }
-
-    // Also try to kill processes by generic names if they are still running
-    let generic_process_names = ["graphdb-cli", "rest_api_server", "storage_daemon_server"];
-    for name in &generic_process_names {
-        let pgrep_result = std::process::Command::new("pgrep")
-            .arg("-f")
-            .arg(name)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .and_then(|child| child.wait_with_output());
-
-        if let Ok(output) = pgrep_result {
-            let pids_str = String::from_utf8_lossy(&output.stdout);
-            let pids: Vec<u32> = pids_str.lines().filter_map(|line| line.trim().parse::<u32>().ok()).collect();
-            if !pids.is_empty() {
-                for pid in pids {
-                    println!("Killing process {} ({})...", pid, name);
-                    match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), nix::sys::signal::Signal::SIGTERM) {
-                        Ok(_) => println!("Successfully sent SIGTERM to PID {}.", pid),
-                        Err(e) => eprintln!("Failed to send SIGTERM to PID {}: {}", pid, e),
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-*/
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 /// Attempts to find a daemon process by checking its internal arguments and performing a TCP health check.
+/// This function is primarily used by `stop_daemon_by_pid_or_scan` as a fallback.
 pub async fn find_daemon_process_on_port_with_args(
     port: u16,
     expected_name_for_logging: &str,  
@@ -386,11 +303,11 @@ pub async fn find_daemon_process_on_port_with_args(
 
             if has_expected_internal_arg && matched_port {
                 info!("    -> PID {} is a candidate for {} on port {}. Performing TCP check...", pid, expected_name_for_logging, port);
-                if time::timeout(Duration::from_secs(1), TcpStream::connect(format!("127.0.0.1:{}", port))).await.is_ok_and(|res| res.is_ok()) {
+                if tokio::time::timeout(Duration::from_secs(1), TcpStream::connect(format!("127.0.0.1:{}", port))).await.is_ok_and(|res| res.is_ok()) {
                     info!("    -> TCP check successful for PID {} (port {}). CONFIRMED.", pid.as_u32(), port);
                     return Some(pid.as_u32());
                 } else {
-                    warn!("    -> TCP check failed for PID {} (port {}). Process likely not fully listening yet or connection timed out.", pid.as_u32(), port);
+                    warn!("    -> TCP check failed for PID {} (port {}). Process not fully listening yet or connection timed out.", pid.as_u32(), port);
                 }
             }
         }
@@ -409,34 +326,35 @@ pub async fn get_listening_port_for_pid(pid: u32) -> Option<u16> {
 
     if let Ok(output) = output_result {
         let stdout = String::from_utf8_lossy(&output.stdout);
-        // Example lsof output line: COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
-        // graphdb-c 51905 user 9u IPv4 0x... 0t0 TCP 127.0.0.1:8082 (LISTEN)
-        // New parsing logic to robustly extract the port number
+        // Regex to capture the port number from lines like "TCP 127.0.0.1:8082 (LISTEN)" or "TCP *:8080 (LISTEN)"
+        let re = Regex::new(r":(\d+)\s+\(LISTEN\)").expect("Failed to create regex for port parsing");
         for line in stdout.lines() {
-            if line.contains("(LISTEN)") {
-                // Find the network address part, e.g., "127.0.0.1:8082" or "*:8080"
-                if let Some(tcp_pos) = line.rfind("TCP ") {
-                    let network_info_slice = &line[tcp_pos + 4..]; // +4 for "TCP "
-                    if let Some(space_after_network_info) = network_info_slice.find(' ') {
-                        let network_address_port = &network_info_slice[..space_after_network_info];
-                        
-                        // Now, find the last colon and parse the part after it
-                        if let Some(colon_pos) = network_address_port.rfind(':') {
-                            let port_str = &network_address_port[colon_pos + 1..];
-                            if let Ok(port) = port_str.parse::<u16>() {
-                                return Some(port);
-                            }
-                        }
+            if let Some(captures) = re.captures(line) {
+                if let Some(port_match) = captures.get(1) {
+                    if let Ok(port) = port_match.as_str().parse::<u16>() {
+                        debug!("  -> Parsed listening port {} from lsof output: {}", port, line);
+                        return Some(port);
+                    }
+                }
+            }
+            // Also check for processes that might be listening on IPv6 addresses
+            let re_ipv6 = Regex::new(r":\[[0-9a-fA-F:]+\]:(\d+)\s+\(LISTEN\)").expect("Failed to create regex for IPv6 port parsing");
+            if let Some(captures) = re_ipv6.captures(line) {
+                if let Some(port_match) = captures.get(1) {
+                    if let Ok(port) = port_match.as_str().parse::<u16>() {
+                        debug!("  -> Parsed listening port {} from lsof IPv6 output: {}", port, line);
+                        return Some(port);
                     }
                 }
             }
         }
     }
+    debug!("No listening port found for PID {} from lsof output.", pid);
     None
 }
 
 /// Helper to get all running daemon processes (main, REST, storage) and their associated ports.
-/// This version relies primarily on sysinfo and lsof for discovery.
+/// This version prioritizes DaemonRegistry and falls back to sysinfo/lsof scan for verification.
 pub async fn get_all_daemon_processes_with_ports() -> HashMap<u16, (u32, String)> {
     let mut found_daemons: HashMap<u16, (u32, String)> = HashMap::new();
     let mut sys = System::new();
@@ -446,61 +364,130 @@ pub async fn get_all_daemon_processes_with_ports() -> HashMap<u16, (u32, String)
         .ok()
         .and_then(|p| p.file_name().and_then(|s| s.to_str()).map(|s| s.to_owned()))
         .unwrap_or_else(|| "graphdb-cli".to_string());
+    
     let cli_name_pattern = Regex::new(&format!(r"(?i){}|graphdb-c", regex::escape(&cli_exe_name_full)))
         .expect("Failed to create cli_name_pattern regex");
 
+    // 1. Query the DaemonRegistry first (source of truth for registered daemons)
+    let registered_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
+
+    for metadata in registered_daemons {
+        let is_running = is_process_running(metadata.pid).await;
+        let is_listening = is_port_listening(metadata.port).await;
+
+        if is_running && is_listening {
+            info!("Verified registered {} daemon (PID {}) on port {}.", metadata.service_type, metadata.pid, metadata.port);
+            found_daemons.insert(metadata.port, (metadata.pid, metadata.service_type));
+        } else {
+            warn!("Registered {} daemon (PID {}) on port {} is stale (running: {}, listening: {}). Unregistering.",
+                  metadata.service_type, metadata.pid, metadata.port, is_running, is_listening);
+            GLOBAL_DAEMON_REGISTRY.unregister_daemon(metadata.port).await.ok(); // Clean up stale entry
+        }
+    }
+
+    // 2. Perform a secondary scan with sysinfo/lsof for any daemons not in the registry
+    // This catches processes not started by our CLI or with missing/corrupted registry entries.
+    let storage_cli_config = load_storage_config(None)
+        .unwrap_or_else(|e| {
+            warn!("Could not load storage config for daemon discovery (secondary scan): {}. Using defaults.", e);
+            CliStorageConfig::default()
+        });
+    
+    let storage_cluster_ports = if storage_cli_config.cluster_range.is_empty() {
+        Vec::new()
+    } else {
+        parse_cluster_range(&storage_cli_config.cluster_range).unwrap_or_else(|e| {
+            warn!("Failed to parse storage cluster range '{}': {}. Ignoring.", storage_cli_config.cluster_range, e);
+            Vec::new()
+        })
+    };
+
+    let graphdb_component_names = vec![
+        cli_exe_name_full.as_str(),
+        "graphdb-c",
+        "rest_api_server",
+        "storage_daemon_server",
+    ];
+
     for (pid, process) in sys.processes() {
-        let process_name_lower = process.name().to_string_lossy().to_lowercase();
-        let cmd_args: Vec<String> = process.cmd().iter().map(|s| s.to_string_lossy().into_owned()).collect();
-        let first_cmd_arg_lower = cmd_args.first().map_or("".to_string(), |s| s.to_lowercase());
+        let l_port_opt = get_listening_port_for_pid(pid.as_u32()).await;
 
-        let is_our_cli_process = cli_name_pattern.is_match(&process_name_lower) ||
-                                     cli_name_pattern.is_match(&first_cmd_arg_lower);
-
-        if is_our_cli_process {
-            let mut service_type_found: Option<&str> = None;
-            let mut port_from_args: Option<u16> = None;
-
-            // Try to determine service type from internal arguments
-            if cmd_args.contains(&"--internal-daemon-run".to_string()) {
-                service_type_found = Some("main");
-            } else if cmd_args.contains(&"--internal-rest-api-run".to_string()) {
-                service_type_found = Some("rest");
-            } else if cmd_args.contains(&"--internal-storage-daemon-run".to_string()) {
-                service_type_found = Some("storage");
+        if let Some(l_port) = l_port_opt {
+            // If already found and verified via registry, skip this process
+            if found_daemons.contains_key(&l_port) {
+                debug!("Secondary scan: Process PID {} on port {} already found via registry. Skipping.", pid, l_port);
+                continue;
             }
 
-            // Extract port from command arguments if --internal-port is present
+            let process_name_lower = process.name().to_string_lossy().to_lowercase();
+            let cmd_args: Vec<String> = process.cmd().iter().map(|s| s.to_string_lossy().into_owned()).collect();
+            let full_cmd_line = cmd_args.join(" ");
+
+            debug!("  -> Secondary scan: Process PID {} is listening on port {}. Name='{:?}'", pid, l_port, process.name());
+            debug!("     Full command line args for PID {}: '{}'", pid, full_cmd_line);
+
+            let mut service_type_found: Option<&str> = None;
+            let mut internal_arg_port: Option<u16> = None;
+
             if let Some(pos) = cmd_args.iter().position(|arg| arg == "--internal-port") {
                 if let Some(port_str) = cmd_args.get(pos + 1) {
                     if let Ok(p) = port_str.parse::<u16>() {
-                        port_from_args = Some(p);
+                        internal_arg_port = Some(p);
                     }
                 }
             }
 
-            // Now, try to get the actual listening port using lsof if service type is determined
-            if let Some(s_type) = service_type_found {
-                let actual_listening_port = get_listening_port_for_pid(pid.as_u32()).await;
-
-                if let Some(l_port) = actual_listening_port {
-                    // Prioritize the port found by lsof, but ensure it matches the one from args if present
-                    if port_from_args.is_none() || port_from_args == Some(l_port) {
-                        if found_daemons.insert(l_port, (pid.as_u32(), s_type.to_string())).is_none() {
-                            debug!("Found {} daemon (PID {}) on port {} via sysinfo/lsof scan.", s_type, pid, l_port);
-                        }
-                    } else {
-                        warn!("Process PID {} has internal-port {} but is listening on {}. Using listening port.", pid, port_from_args.unwrap(), l_port);
-                        if found_daemons.insert(l_port, (pid.as_u32(), s_type.to_string())).is_none() {
-                             debug!("Found {} daemon (PID {}) on port {} via sysinfo/lsof scan (port mismatch corrected).", s_type, pid, l_port);
+            // Primary classification: based on explicit internal flags
+            if full_cmd_line.contains("--internal-daemon-run") {
+                service_type_found = Some("main");
+            } else if full_cmd_line.contains("--internal-rest-api-run") {
+                service_type_found = Some("rest");
+            } else if full_cmd_line.contains("--internal-storage-daemon-run") {
+                service_type_found = Some("storage");
+            } else {
+                // Secondary classification: based on process name
+                if graphdb_component_names.iter().any(|name| process_name_lower.contains(name)) {
+                    if process_name_lower.contains("rest_api_server") {
+                        service_type_found = Some("rest");
+                    } else if process_name_lower.contains("storage_daemon_server") {
+                        service_type_found = Some("storage");
+                    }
+                    // Tertiary classification: based on default ports or configured cluster ranges
+                    if service_type_found.is_none() {
+                        if l_port == DEFAULT_DAEMON_PORT { service_type_found = Some("main"); }
+                        else if l_port == DEFAULT_REST_API_PORT { service_type_found = Some("rest"); }
+                        else if l_port == DEFAULT_STORAGE_PORT { service_type_found = Some("storage"); }
+                        // New heuristic: if it's a graphdb-cli process and listening on a port within the configured storage cluster range
+                        else if storage_cluster_ports.contains(&l_port) {
+                            service_type_found = Some("storage");
                         }
                     }
-                } else {
-                    debug!("Process PID {} identified as {} daemon but no listening port found via lsof.", pid, s_type);
+                }
+            }
+
+            let final_service_type = service_type_found.unwrap_or("unknown");
+            let port_matches_arg_or_not_specified = internal_arg_port.map_or(true, |arg_p| arg_p == l_port);
+
+            if final_service_type != "unknown" && port_matches_arg_or_not_specified {
+                if found_daemons.insert(l_port, (pid.as_u32(), final_service_type.to_string())).is_none() {
+                    info!("Found {} daemon (PID {}) on port {} via secondary sysinfo/lsof scan.", final_service_type, pid, l_port);
+                    // Also register this newly found daemon in the registry
+                    let new_metadata = DaemonMetadata {
+                        service_type: final_service_type.to_string(),
+                        port: l_port,
+                        pid: pid.as_u32(),
+                        ip_address: "127.0.0.1".to_string(),
+                        data_dir: None, // Cannot determine from here without more parsing
+                        config_path: None, // Cannot determine from here without more parsing
+                        engine_type: None, // Cannot determine from here without more parsing
+                    };
+                    GLOBAL_DAEMON_REGISTRY.register_daemon(new_metadata).await.ok(); // Register and ignore error
                 }
             } else {
-                debug!("Process PID {} is graphdb-cli but not identified as internal daemon type.", pid);
+                debug!("Secondary scan: Process PID {} listening on port {} not classified as known GraphDB daemon type ('{}') or port mismatch (arg: {:?}, actual: {}).", pid, l_port, final_service_type, internal_arg_port, l_port);
             }
+        } else {
+            debug!("Process PID {} is not listening on any TCP port.", pid);
         }
     }
     found_daemons
@@ -637,36 +624,8 @@ pub async fn stop_managed_daemon(
 
 /// Lists all daemon processes found by `sysinfo`.
 pub async fn list_daemon_processes() -> Result<Vec<u32>> {
-    let mut sys = System::new();
-    sys.refresh_all();
-    let current_exe_name_full = std::env::current_exe()
-        .map(|p| p.file_name().and_then(|s| s.to_str()).map(|s| s.to_owned()))
-        .unwrap_or(None)
-        .unwrap_or_else(|| "graphdb-cli".to_string());
-    let cli_name_pattern = Regex::new(&format!(r"(?i){}|graphdb-c", regex::escape(&current_exe_name_full)))
-        .expect("Failed to create cli_name_pattern regex for list_daemon_processes");
-
-
-    let mut pids = Vec::new();
-    for (pid, process) in sys.processes() {
-        let process_name_lower = process.name().to_string_lossy().to_lowercase();
-        let cmd_args: Vec<String> = process.cmd().iter().map(|s| s.to_string_lossy().into_owned()).collect();
-        let first_cmd_arg_lower = cmd_args.first().map_or("".to_string(), |s| s.to_lowercase()); 
-
-        let is_graphdb_process = cli_name_pattern.is_match(&process_name_lower) ||
-                                     cli_name_pattern.is_match(&first_cmd_arg_lower) ||
-                                     process_name_lower.contains("rest_api_server") || 
-                                     process_name_lower.contains("storage_daemon_server"); 
-
-        let is_daemonized = cmd_args.contains(&"--internal-daemon-run".to_string()) ||
-                                 cmd_args.contains(&"--internal-rest-api-run".to_string()) ||
-                                 cmd_args.contains(&"--internal-storage-daemon-run".to_string());
-
-        if is_graphdb_process && is_daemonized {
-            pids.push(pid.as_u32());
-        }
-    }
-    Ok(pids)
+    let all_daemons = get_all_daemon_processes_with_ports().await;
+    Ok(all_daemons.values().map(|(pid, _)| *pid).collect())
 }
 
 /// Kills a daemon process by PID.
@@ -708,57 +667,40 @@ pub async fn is_port_free(port: u16) -> bool {
 pub async fn clear_all_daemon_processes() -> Result<(), anyhow::Error> {
     println!("Attempting to clear all GraphDB daemon processes...");
 
+    // First, try to stop all daemons gracefully via the daemon_api's global stop
     let stop_result = stop_daemon_api_call();
     match stop_result {
         Ok(()) => println!("Global daemon stop signal sent successfully."),
         Err(ref e) => eprintln!("Failed to send global stop signal: {:?}", e),
     }
 
-    let mut sys = System::new();
-    sys.refresh_all();
+    // Then, iterate through the registry and kill any remaining processes
+    let registered_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
+    let mut pids_to_kill = Vec::new();
+    for metadata in registered_daemons {
+        if is_process_running(metadata.pid).await {
+            pids_to_kill.push((metadata.pid, metadata.port.to_string())); // Store port as string for unregistration
+        }
+    }
 
-    let current_exe_name_full = std::env::current_exe()
-        .map(|p| p.file_name().and_then(|s| s.to_str()).map(|s| s.to_owned()))
-        .unwrap_or(None)
-        .unwrap_or_else(|| "graphdb-cli".to_string());
-    let cli_name_pattern = Regex::new(&format!(r"(?i){}|graphdb-c", regex::escape(&current_exe_name_full)))
-        .expect("Failed to create cli_name_pattern regex for clear_all_daemon_processes");
-
-
-    let processes_to_kill: Vec<(u32, String)> = sys.processes().iter()
-        .filter_map(|(pid, process)| {
-            let process_name_lower = process.name().to_string_lossy().to_lowercase();
-            let cmd_args: Vec<String> = process.cmd().iter().map(|s| s.to_string_lossy().into_owned()).collect();
-            let first_cmd_arg_lower = cmd_args.first().map_or("".to_string(), |s| s.to_lowercase()); 
-
-            let is_graphdb_process = cli_name_pattern.is_match(&process_name_lower) ||
-                                         cli_name_pattern.is_match(&first_cmd_arg_lower) ||
-                                         process_name_lower.contains("rest_api_server") ||
-                                         process_name_lower.contains("storage_daemon_server");
-
-            let is_daemonized = cmd_args.contains(&"--internal-daemon-run".to_string()) ||
-                                 cmd_args.contains(&"--internal-rest-api-run".to_string()) ||
-                                 cmd_args.contains(&"--internal-storage-daemon-run".to_string());
-
-            if is_graphdb_process && is_daemonized {
-                Some((pid.as_u32(), process.name().to_string_lossy().into_owned()))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    if processes_to_kill.is_empty() {
+    if pids_to_kill.is_empty() {
         println!("No GraphDB daemon processes found to kill.");
     } else {
-        for (pid, name) in processes_to_kill {
-            println!("Killing process {} ({}) with SIGTERM...", pid, name);
+        for (pid, port_str) in pids_to_kill {
+            println!("Killing process {} (port {})...", pid, port_str);
             match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), nix::sys::signal::Signal::SIGTERM) {
                 Ok(_) => println!("Successfully sent SIGTERM to PID {}.", pid),
                 Err(e) => eprintln!("Failed to send SIGTERM to PID {}: {}", pid, e),
             }
+            // After attempting to kill, unregister from the registry
+            if let Ok(port) = port_str.parse::<u16>() {
+                GLOBAL_DAEMON_REGISTRY.unregister_daemon(port).await.ok(); 
+            }
         }
     }
+    
+    // Finally, clear the entire registry to ensure a clean state
+    GLOBAL_DAEMON_REGISTRY.clear_all_daemons().await?;
 
     Ok(())
 }
@@ -781,51 +723,16 @@ pub async fn stop_specific_storage_daemon(port: u16, should_reclaim: bool) -> Re
     stop_daemon_by_pid_or_scan("Storage daemon", port, "storage", should_reclaim).await
 }
 
-async fn write_pid_file(service_port: u16, pid: u32, service_type: &str) -> Result<()> {
-    let _pid_file = match service_type {
-        "main" => get_pid_file_path(service_port),
-        "rest" => get_rest_pid_file_path(service_port),
-        "storage" => get_storage_pid_file_path(service_port), 
-        _ => return Err(anyhow!("Invalid service type: {}", service_type)),
-    };
-    tokio::fs::write(&_pid_file, pid.to_string()).await
-        .with_context(|| format!("Failed to write PID {} for {} service to {:?}", pid, service_type, _pid_file))?;
-    info!("Wrote PID {} for {} service to {:?}", pid, service_type, _pid_file);
-    Ok(())
-}
+// Removed: async fn write_pid_file, read_pid_from_file, delete_pid_file, get_pid_file_path, etc.
+// These are replaced by DaemonRegistry operations.
 
+// This function is kept as a helper for `read_pid_file` which is a fallback in `stop_daemon_by_pid_or_scan`
 async fn read_pid_from_file(path: &PathBuf) -> Result<u32, anyhow::Error> {
     let pid_str = tokio::fs::read_to_string(path).await
         .with_context(|| format!("Failed to read PID from file: {:?}", path))?;
     let pid = pid_str.trim().parse::<u32>()
         .with_context(|| format!("Failed to parse PID from file: '{}'", pid_str))?;
     Ok(pid)
-}
-
-async fn delete_pid_file(service_port: u16, service_type: &ServiceType) -> Result<()> {
-    let _pid_file = match service_type {
-        ServiceType::Daemon => get_pid_file_path(service_port),
-        ServiceType::RestAPI => get_rest_pid_file_path(service_port),
-        ServiceType::StorageDaemon => get_storage_pid_file_path(service_port), 
-    };
-    if _pid_file.exists() {
-        tokio::fs::remove_file(&_pid_file).await
-            .with_context(|| format!("Failed to delete {:?} PID file: {:?}", service_type, _pid_file))?;
-        info!("Deleted {:?} PID file: {:?}", service_type, _pid_file);
-    }
-    Ok(())
-}
-
-fn get_pid_file_path(port: u16) -> PathBuf {
-    std::env::temp_dir().join(format!("graphdb_daemon_{}.pid", port))
-}
-
-fn get_rest_pid_file_path(port: u16) -> PathBuf {
-    std::env::temp_dir().join(format!("graphdb_rest_{}.pid", port))
-}
-
-fn get_storage_pid_file_path(port: u16) -> PathBuf {
-    std::env::temp_dir().join(format!("graphdb_storage_{}.pid", port))
 }
 
 async fn is_process_running(pid: u32) -> bool {
@@ -848,24 +755,23 @@ impl fmt::Display for ServiceType {
     }
 }
 
-// Helper to get PID file path based on ServiceType
-async fn get_pid_file_path_for_service(port: u16, service_type: &ServiceType) -> PathBuf {
-    match service_type {
-        ServiceType::Daemon => get_pid_file_path(port),
-        ServiceType::RestAPI => get_rest_pid_file_path(port),
-        ServiceType::StorageDaemon => get_storage_pid_file_path(port),
-    }
-}
-
-// Helper to read PID from file for a given ServiceType
+// Helper to read PID from file for a given ServiceType (kept for stop_daemon_by_pid_or_scan's fallback)
 async fn read_pid_file(port: u16, service_type: &ServiceType) -> Result<u32, anyhow::Error> {
-    let path = get_pid_file_path_for_service(port, service_type).await;
+    let path = match service_type {
+        ServiceType::Daemon => std::env::temp_dir().join(format!("graphdb_daemon_{}.pid", port)),
+        ServiceType::RestAPI => std::env::temp_dir().join(format!("graphdb_rest_{}.pid", port)),
+        ServiceType::StorageDaemon => std::env::temp_dir().join(format!("graphdb_storage_{}.pid", port)),
+    };
     read_pid_from_file(&path).await
 }
 
-// Helper to remove PID file for a given ServiceType
+// Helper to remove PID file for a given ServiceType (kept for stop_daemon_by_pid_or_scan's fallback)
 async fn remove_pid_file(port: u16, service_type: &ServiceType) -> Result<()> {
-    let path = get_pid_file_path_for_service(port, service_type).await;
+    let path = match service_type {
+        ServiceType::Daemon => std::env::temp_dir().join(format!("graphdb_daemon_{}.pid", port)),
+        ServiceType::RestAPI => std::env::temp_dir().join(format!("graphdb_rest_{}.pid", port)),
+        ServiceType::StorageDaemon => std::env::temp_dir().join(format!("graphdb_storage_{}.pid", port)),
+    };
     if path.exists() {
         tokio::fs::remove_file(&path).await
             .with_context(|| format!("Failed to delete {:?} PID file: {:?}", service_type, path))?;
@@ -887,26 +793,43 @@ pub async fn stop_daemon_by_pid_or_scan(
         _ => return Err(anyhow!("Invalid service type: {}", service_type_str)),
     };
 
-    let mut pid_from_file: Option<u32> = None;
-    if let Ok(pid_read) = read_pid_file(port, &service_type).await {
-        if is_process_running(pid_read).await {
-            pid_from_file = Some(pid_read);
+    // First, try to get PID from the DaemonRegistry
+    let metadata_from_registry = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await?;
+    let mut target_pid: Option<u32> = None;
+
+    if let Some(metadata) = metadata_from_registry {
+        if is_process_running(metadata.pid).await {
+            target_pid = Some(metadata.pid);
+            info!("Found {} (PID {}) on port {} in registry.", daemon_name, metadata.pid, port);
         } else {
-            warn!("PID file for {} on port {} exists (PID {}), but process is not running.", daemon_name, port, pid_read);
-            remove_pid_file(port, &service_type).await?;
+            warn!("Registry entry for {} on port {} (PID {}) is stale. Unregistering.", daemon_name, port, metadata.pid);
+            GLOBAL_DAEMON_REGISTRY.unregister_daemon(port).await.ok();
         }
     }
 
-    let target_pid = if let Some(pid) = pid_from_file {
-        Some(pid)
-    } else {
+    // Fallback: If not found in registry or registry entry is stale, scan processes directly
+    if target_pid.is_none() {
         let expected_arg = match service_type {
             ServiceType::Daemon => "--internal-daemon-run",
             ServiceType::RestAPI => "--internal-rest-api-run",
             ServiceType::StorageDaemon => "--internal-storage-daemon-run",
         };
-        find_daemon_process_on_port_with_args(port, daemon_name, expected_arg).await
-    };
+        target_pid = find_daemon_process_on_port_with_args(port, daemon_name, expected_arg).await;
+        if let Some(pid) = target_pid {
+            info!("Found {} (PID {}) on port {} via direct scan. Registering in registry.", daemon_name, pid, port);
+            // Register this newly found daemon in the registry
+            let new_metadata = DaemonMetadata {
+                service_type: service_type_str.to_string(),
+                port: port,
+                pid: pid,
+                ip_address: "127.0.0.1".to_string(),
+                data_dir: None,
+                config_path: None,
+                engine_type: None,
+            };
+            GLOBAL_DAEMON_REGISTRY.register_daemon(new_metadata).await.ok();
+        }
+    }
 
     if let Some(pid) = target_pid {
         if !should_reclaim && !is_port_free(port).await {
@@ -914,7 +837,6 @@ pub async fn stop_daemon_by_pid_or_scan(
         }
         info!("Stopping {} (PID {}) on port {}...", daemon_name, pid, port);
         
-        // Create a new System instance for the current state, avoiding borrow conflict
         let mut sys = System::new_all(); 
         sys.refresh_all(); 
 
@@ -922,18 +844,16 @@ pub async fn stop_daemon_by_pid_or_scan(
             if process.kill_with(sysinfo::Signal::Term).unwrap_or(false) {
                 let mut attempts = 0;
                 while is_process_running(pid).await && attempts < 5 {
-                    time::sleep(Duration::from_secs(1)).await;
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                     attempts += 1;
-                    // is_process_running already refreshes its own sysinfo, so no need to refresh here
                 }
                 if is_process_running(pid).await {
                     error!("Failed to stop {} (PID {}) on port {}: Process still running after SIGTERM.", daemon_name, pid, port);
-                    // Re-fetch process after potential refresh in is_process_running if needed for kill_with
                     let mut sys_force_kill = System::new_all();
                     sys_force_kill.refresh_all();
                     if let Some(process_force_kill) = sys_force_kill.process(Pid::from_u32(pid)) {
                         if process_force_kill.kill_with(sysinfo::Signal::Kill).unwrap_or(false) {
-                            time::sleep(Duration::from_secs(1)).await; 
+                            tokio::time::sleep(Duration::from_secs(1)).await; 
                             if is_process_running(pid).await {
                                 return Err(anyhow!("Failed to force stop {} (PID {}) on port {}.", daemon_name, pid, port));
                             }
@@ -944,7 +864,7 @@ pub async fn stop_daemon_by_pid_or_scan(
                         warn!("Process {} (PID {}) not found for force kill attempt.", daemon_name, pid);
                     }
                 }
-                remove_pid_file(port, &service_type).await?;
+                GLOBAL_DAEMON_REGISTRY.unregister_daemon(port).await?; // Unregister from registry
                 info!("Successfully stopped {} (PID {}) on port {}.", daemon_name, pid, port);
             } else {
                 error!("Failed to send termination signal to {} (PID {}) on port {}.", daemon_name, pid, port);
@@ -952,13 +872,12 @@ pub async fn stop_daemon_by_pid_or_scan(
             }
         } else {
             warn!("Service {} (PID {}) on port {} not found after initial scan.", daemon_name, pid, port);
-            remove_pid_file(port, &service_type).await?; 
+            GLOBAL_DAEMON_REGISTRY.unregister_daemon(port).await?; // Unregister from registry if not found
         }
     } else {
         info!("No {} found on port {}.", daemon_name, port);
-        if let Ok(_) = read_pid_file(port, &service_type).await {
-             remove_pid_file(port, &service_type).await?; 
-        }
+        // If no PID was found, ensure it's not in the registry either (e.g., if it crashed)
+        GLOBAL_DAEMON_REGISTRY.unregister_daemon(port).await.ok();
     }
     Ok(())
 }
@@ -969,19 +888,13 @@ pub fn load_storage_config_path_or_default(path: Option<PathBuf>) -> Result<CliS
 
 /// Helper to check if a process is running and listening on a given TCP port using lsof.
 pub async fn check_process_status_by_port(_process_name: &str, port: u16) -> bool {
-    let output_result = run_command_with_timeout(
-        "lsof",
-        &["-i", &format!("TCP:{}", port), "-s", "TCP:LISTEN", "-t"],
-        Duration::from_secs(3), 
-    ).await;
-
-    if let Ok(output) = output_result {
-        let pids = String::from_utf8_lossy(&output.stdout);
-        if !pids.trim().is_empty() {
-            return true;
-        }
+    // This function can now directly query the DaemonRegistry
+    let metadata = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await.ok().flatten();
+    if let Some(m) = metadata {
+        is_process_running(m.pid).await && is_port_listening(m.port).await
+    } else {
+        false
     }
-    false
 }
 
 pub fn parse_cluster_range(range_str: &str) -> Result<Vec<u16>> {
@@ -1021,6 +934,22 @@ pub fn parse_cluster_range(range_str: &str) -> Result<Vec<u16>> {
 pub async fn stop_process_by_port(process_name: &str, port: u16) -> Result<(), anyhow::Error> {
     println!("Attempting to find and kill process for {} on port {}...", process_name, port);
     
+    // First, try to stop using the registry-based method
+    let service_type_str = if process_name.contains("Storage") { "storage" }
+                           else if process_name.contains("REST") { "rest" }
+                           else { "main" }; // Default to main if not explicitly storage/rest
+
+    let stop_result = stop_daemon_by_pid_or_scan(process_name, port, service_type_str, true).await;
+
+    if stop_result.is_ok() {
+        println!("Process for {} on port {} stopped successfully via registry/PID based method.", process_name, port);
+        return Ok(());
+    } else {
+        eprintln!("Registry/PID based stop failed for {} on port {}: {:?}", process_name, port, stop_result.err());
+        println!("Falling back to direct lsof/kill -9 for {} on port {}...", process_name, port);
+    }
+
+    // Fallback to direct lsof/kill -9 if registry/PID method failed
     let output = run_command_with_timeout(
         "lsof",
         &["-i", &format!(":{}", port), "-t"],
@@ -1069,6 +998,7 @@ pub async fn is_port_listening(port: u16) -> bool {
 
 /// Helper function to find a process by a given port and a keyword in its command line.
 /// This is a basic approach and might need refinement for more robust PID finding.
+/// This function is now less critical as DaemonRegistry is primary.
 pub fn find_process_by_port(port: u16, keyword_in_cmd: &str, system: &System) -> Option<Pid> {
     for (pid, process) in system.processes() {
         // Convert OsStr slices to Cow<str> for string operations that require UTF-8
