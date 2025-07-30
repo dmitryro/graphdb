@@ -7,7 +7,7 @@ use clap::ValueEnum;
 use std::path::PathBuf;
 use std::process;
 use std::str::FromStr;
-use std::time::{Instant};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
 use std::collections::{HashSet, HashMap};
 use std::ffi::OsStr;
@@ -246,12 +246,39 @@ pub async fn start_daemon_process(
 
 /// Helper function to find a running storage daemon's port.
 /// Scans a range of common ports using `lsof`.
-pub async fn find_running_storage_daemon_port() -> Option<u16> {
+pub async fn find_running_storage_daemon_port() -> Vec<u16> {
+    let mut running_ports = Vec::new();
     let all_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
-    all_daemons.iter()
-        .filter(|metadata| metadata.service_type == "storage")
-        .map(|metadata| metadata.port)
-        .next()
+    let storage_daemons: Vec<DaemonMetadata> = all_daemons
+        .into_iter()
+        .filter(|d| d.service_type == "storage")
+        .collect();
+
+    for daemon in storage_daemons {
+        if is_process_running(daemon.pid).await && is_port_listening(daemon.port).await {
+            // Update last_seen_nanos to keep registry fresh
+            let metadata = DaemonMetadata {
+                service_type: daemon.service_type,
+                port: daemon.port,
+                pid: daemon.pid,
+                ip_address: daemon.ip_address,
+                data_dir: daemon.data_dir,
+                config_path: daemon.config_path,
+                engine_type: daemon.engine_type,
+                last_seen_nanos: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as i64)
+                    .unwrap_or(0),
+            };
+            let _ = GLOBAL_DAEMON_REGISTRY.register_daemon(metadata).await;
+            running_ports.push(daemon.port);
+        } else {
+            // Remove stale entry
+            let _ = GLOBAL_DAEMON_REGISTRY.unregister_daemon(daemon.port).await;
+        }
+    }
+
+    running_ports
 }
 
 /// Calls the `daemon_api::stop_daemon` function.
