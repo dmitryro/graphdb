@@ -437,6 +437,7 @@ pub enum StorageAction {
     Health,
     /// Get the version of the REST API server.
     Version,
+    List,
 }
 
 #[derive(Args, Debug, PartialEq, Clone)]

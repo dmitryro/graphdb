@@ -134,11 +134,12 @@ impl Default for DaemonYamlConfig {
     }
 }
 
+// Keeping StorageConfig as is, as per user's feedback
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct StorageConfig {
     #[serde(default = "default_config_root_directory_for_yaml")]
     pub config_root_directory: PathBuf,
-    pub data_directory: String,
+    pub data_directory: PathBuf,
     pub log_directory: String,
     pub default_port: u16,
     pub cluster_range: String,
@@ -146,26 +147,29 @@ pub struct StorageConfig {
     pub min_disk_space_gb: u64,
     pub use_raft_for_scale: bool,
     pub max_open_files: u64,
-    pub storage_engine_type: String,
+    pub storage_engine_type: DaemonApiStorageEngineType,
+    pub engine_specific_config: Option<String>,
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
         StorageConfig {
             config_root_directory: default_config_root_directory_for_yaml(),
-            data_directory: format!("{}/storage_data", DEFAULT_CONFIG_ROOT_DIRECTORY_STR),
+            data_directory: PathBuf::from(format!("{}/storage_data", DEFAULT_CONFIG_ROOT_DIRECTORY_STR)),
             log_directory: "/var/log/graphdb".to_string(),
             default_port: DEFAULT_STORAGE_PORT,
             cluster_range: "9050-9054".to_string(),
             max_disk_space_gb: 1000,
             min_disk_space_gb: 10,
             use_raft_for_scale: true,
-            storage_engine_type: "sled".to_string(),
             max_open_files: 1024,
+            storage_engine_type: DaemonApiStorageEngineType::Sled,
+            engine_specific_config: None,
         }
     }
 }
 
+// StorageConfigWrapper still uses StorageConfig
 #[derive(Debug, Deserialize)]
 pub struct StorageConfigWrapper {
     pub storage: StorageConfig,
@@ -480,6 +484,15 @@ impl From<StorageEngineType> for DaemonApiStorageEngineType {
     }
 }
 
+// Helper function to convert DaemonApiStorageEngineType to String
+fn daemon_api_storage_engine_type_to_string(engine_type: &DaemonApiStorageEngineType) -> String {
+    match engine_type {
+        DaemonApiStorageEngineType::Sled => "sled".to_string(),
+        DaemonApiStorageEngineType::RocksDB => "rocksdb".to_string(),
+        DaemonApiStorageEngineType::InMemory => "inmemory".to_string(),
+    }
+}
+
 // --- CLI Config Loading ---
 impl CliConfig {
     pub fn load() -> Result<Self> {
@@ -630,8 +643,7 @@ impl CliConfig {
                 if data_directory.is_none() {
                     *data_directory = storage_yaml_config
                         .as_ref()
-                        .and_then(|c| Some(c.data_directory.clone()))
-                        .or_else(|| Some(format!("{}/storage_data", DEFAULT_CONFIG_ROOT_DIRECTORY_STR)));
+                        .and_then(|c| Some(c.data_directory.to_string_lossy().into_owned())); // Fixed: Convert PathBuf to String
                 }
                 if log_directory.is_none() {
                     *log_directory = storage_yaml_config
@@ -660,8 +672,11 @@ impl CliConfig {
                 if storage_engine_type.is_none() {
                     *storage_engine_type = storage_yaml_config
                         .as_ref()
-                        .and_then(|c| Some(c.storage_engine_type.clone()))
-                        .or_else(|| Some("sled".to_string()));
+                        .and_then(|c| {
+                            // Convert daemon_api::StorageEngineType to String using the helper function
+                            Some(daemon_api_storage_engine_type_to_string(&c.storage_engine_type))
+                        })
+                        .or_else(|| Some(StorageEngineType::Sled.to_string())); // Ensure this is also a String
                 }
             }
             _ => {}
@@ -1051,8 +1066,11 @@ pub fn get_rest_cluster_range() -> String {
         .unwrap_or_else(|_| RestApiConfig::default().cluster_range)
 }
 
-pub fn load_storage_config(config_file_path: Option<PathBuf>) -> Result<StorageConfig> {
-    let default_config_path = PathBuf::from(DEFAULT_CONFIG_ROOT_DIRECTORY_STR)
+// Renamed from load_storage_config to load_storage_config_from_yaml
+pub fn load_storage_config_from_yaml(config_file_path: Option<PathBuf>) -> Result<StorageConfig> {
+    let default_config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("Failed to get parent directory of server crate")
         .join(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
 
     let path_to_use = config_file_path.unwrap_or(default_config_path);
@@ -1072,19 +1090,21 @@ pub fn load_storage_config(config_file_path: Option<PathBuf>) -> Result<StorageC
     }
 }
 
+// This function is still needed if there are calls that pass &str
 pub fn load_storage_config_str(config_file_path: Option<&str>) -> Result<StorageConfig> {
     let path = config_file_path.map(PathBuf::from);
-    load_storage_config(path)
+    load_storage_config_from_yaml(path)
 }
 
+
 pub fn get_default_storage_port_from_config_or_cli_default() -> u16 {
-    load_storage_config(None)
+    load_storage_config_from_yaml(None)
         .map(|config| config.default_port)
         .unwrap_or(CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS)
 }
 
 pub fn get_storage_cluster_range() -> String {
-    load_storage_config(None)
+    load_storage_config_from_yaml(None)
         .map(|cfg| cfg.cluster_range)
         .unwrap_or_else(|_| StorageConfig::default().cluster_range)
 }

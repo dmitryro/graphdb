@@ -1,4 +1,3 @@
-
 // server/src/cli/daemon_management.rs
 // This file contains logic for daemonizing and managing background processes
 // (REST API, Storage, and GraphDB daemons).
@@ -29,7 +28,7 @@ use nix::unistd::Pid as NixPid;
 
 use crate::cli::config::{
     get_default_rest_port_from_config,
-    load_storage_config,
+    load_storage_config_str as load_storage_config,
     CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS,
     StorageConfig,
     DEFAULT_DAEMON_PORT,
@@ -105,11 +104,15 @@ pub async fn handle_internal_daemon_run(
     if is_rest_api_run {
         let daemon_listen_port = internal_port.unwrap_or_else(get_default_rest_port_from_config);
 
-        let cli_storage_config = load_storage_config(internal_storage_config_path.clone())
-            .unwrap_or_else(|e| {
-                eprintln!("[DAEMON PROCESS] Warning: Could not load storage config for REST API: {}. Using defaults for CLI config.", e);
-                StorageConfig::default()
-            });
+        let cli_storage_config = load_storage_config(
+            internal_storage_config_path
+                .as_ref()
+                .and_then(|path| path.to_str())
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("[DAEMON PROCESS] Warning: Could not load storage config for REST API: {}. Using defaults for CLI config.", e);
+            StorageConfig::default()
+        });
 
         info!("[DAEMON PROCESS] Starting REST API server (daemonized) on port {}...", daemon_listen_port);
         let (_tx_shutdown, rx_shutdown) = tokio::sync::oneshot::channel::<()>();
@@ -117,7 +120,7 @@ pub async fn handle_internal_daemon_run(
         let result = start_rest_server(
             daemon_listen_port,
             rx_shutdown,
-            cli_storage_config.data_directory.clone(),
+            cli_storage_config.data_directory.to_string_lossy().into_owned(),
         ).await;
 
         if let Err(e) = result {
@@ -570,7 +573,7 @@ pub fn spawn_rest_api_server(
         match start_rest_server(
             port,
             shutdown_rx,
-            data_directory.clone(),
+            data_directory.to_string_lossy().into_owned(), // <--- fix here
         ).await {
             Ok(_) => info!("REST API server on port {} stopped successfully.", port),
             Err(e) => error!("REST API server on port {} exited with error: {:?}", port, e),
@@ -894,7 +897,9 @@ pub async fn stop_daemon_by_pid_or_scan(
 }
 
 pub fn load_storage_config_path_or_default(path: Option<PathBuf>) -> Result<StorageConfig> {
-    load_storage_config(path)
+    let path_owned: Option<String> = path.map(|p| p.to_string_lossy().into_owned());
+    let path_str: Option<&str> = path_owned.as_deref();
+    load_storage_config(path_str)
 }
 
 pub async fn check_process_status_by_port(_process_name: &str, port: u16) -> bool {

@@ -17,7 +17,8 @@ pub use cli::{start_cli, CliArgs, Commands}; // Corrected: Changed run_cli to st
 
 pub use config::{
     load_cli_config,
-    load_storage_config,
+    load_storage_config_str,
+    load_storage_config_from_yaml,
     get_default_rest_port_from_config,
     get_default_storage_port_from_config_or_cli_default,
     get_storage_cluster_range,
