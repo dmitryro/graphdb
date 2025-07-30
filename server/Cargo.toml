@@ -20,6 +20,7 @@ tonic = "0.12.0"
 async-std = "1.13.0"
 chrono = { version = "0.4.39", features = ["serde"] }
 serde = { version = "1.0.219", features = ["derive"] }
+serde_with = "3.14.0"
 # YAML-rust2 dependencies (replacing serde_yaml)
 yaml-rust2 = "0.10.3"
 serde_yaml2= "0.1.3"

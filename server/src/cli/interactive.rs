@@ -344,7 +344,28 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                 CommandType::StopAll
             } else {
                 match remaining_args[0].to_lowercase().as_str() {
-                    "rest" => CommandType::StopRest,
+                    "rest" => {
+                        let mut port = None;
+                        let mut i = 1; // Start after "rest"
+                        while i < remaining_args.len() {
+                            match remaining_args[i].to_lowercase().as_str() {
+                                "--port" | "-p" => {
+                                    if i + 1 < remaining_args.len() {
+                                        port = remaining_args[i + 1].parse::<u16>().ok();
+                                        i += 2;
+                                    } else {
+                                        eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                                        i += 1;
+                                    }
+                                }
+                                _ => {
+                                    eprintln!("Warning: Unknown argument for 'stop rest': {}", remaining_args[i]);
+                                    i += 1;
+                                }
+                            }
+                        }
+                        CommandType::StopRest(port)
+                    }
                     "daemon" => {
                         let mut port = None;
                         let mut i = 1; // Start after "daemon"
@@ -359,11 +380,13 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                         i += 1;
                                     }
                                 }
-                                _ => { i += 1; }
+                                _ => {
+                                    i += 1;
+                                }
                             }
                         }
                         CommandType::StopDaemon(port)
-                    },
+                    }
                     "storage" => {
                         let mut port = None;
                         let mut i = 1; // Start after "storage"
@@ -378,11 +401,13 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                         i += 1;
                                     }
                                 }
-                                _ => { i += 1; }
+                                _ => {
+                                    i += 1;
+                                }
                             }
                         }
                         CommandType::StopStorage(port)
-                    },
+                    }
                     "all" => CommandType::StopAll,
                     _ => CommandType::Unknown,
                 }
@@ -837,7 +862,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
 
                 match rest_subcommand.as_str() {
                     "start" => CommandType::Rest(RestCliCommand::Start { port, cluster }),
-                    "stop" => CommandType::Rest(RestCliCommand::Stop),
+                    "stop" => CommandType::Rest(RestCliCommand::Stop { port } ),
                     "status" => CommandType::Rest(RestCliCommand::Status { port, cluster }), // Pass the parsed port and cluster
                     "health" => CommandType::Rest(RestCliCommand::Health),
                     "version" => CommandType::Rest(RestCliCommand::Version),
@@ -1072,8 +1097,9 @@ pub async fn handle_interactive_command(
             )
             .await
         }
-        CommandType::StopRest => {
+        CommandType::StopRest(port) => {
             handlers::stop_rest_api_interactive(
+                port,
                 rest_api_shutdown_tx_opt,
                 rest_api_port_arc,
                 rest_api_handle,

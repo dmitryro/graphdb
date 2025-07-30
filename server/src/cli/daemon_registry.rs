@@ -3,7 +3,7 @@
 // Updated: 2025-07-29 - Added `last_seen` timestamp for cleanup and `Pid` for direct process lookup.
 // Added bincode for serialization/deserialization.
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, Context}; // Added Context import
 use serde::{Serialize, Deserialize};
 use sled::{Db, IVec};
 use std::path::PathBuf;
@@ -26,122 +26,94 @@ pub struct DaemonMetadata {
     pub ip_address: String, // For now, always "127.0.0.1"
     pub data_dir: Option<PathBuf>,
     pub config_path: Option<PathBuf>,
-    pub engine_type: Option<String>, // e.g., "Sled", "RocksDB" for storage, None for others
-    #[serde(rename = "last_seen")] // Keep serde field name for compatibility with existing data if any
-    pub last_seen_nanos: i64, // Store as nanoseconds timestamp for bincode compatibility
+    pub engine_type: Option<String>, // e.g., "sled", "rocksdb" for storage daemons
+    pub last_seen_nanos: i64, // Timestamp in nanoseconds since epoch
 }
 
-impl DaemonMetadata {
-    /// Helper to get the last_seen timestamp as DateTime<Utc>.
-    pub fn last_seen_datetime(&self) -> DateTime<Utc> {
-        Utc.timestamp_nanos(self.last_seen_nanos)
-    }
-}
-
-/// A centralized registry for managing daemon metadata using Sled.
+/// Manages the registration and lookup of daemon processes.
 pub struct DaemonRegistry {
     db: Arc<TokioMutex<Db>>,
 }
 
 impl DaemonRegistry {
-    /// Initializes the DaemonRegistry, opening or creating the Sled database.
+    /// Creates a new `DaemonRegistry` instance, opening the Sled database.
     pub fn new() -> Result<Self> {
-        let db = sled::open(DAEMON_REGISTRY_DB_PATH)
-            .map_err(|e| anyhow!("Failed to open daemon registry database: {}", e))?;
-        info!("Daemon registry database opened at: {}", DAEMON_REGISTRY_DB_PATH);
+        let db_path = PathBuf::from(DAEMON_REGISTRY_DB_PATH);
+        let db = sled::open(&db_path)
+            .with_context(|| format!("Failed to open daemon registry database at {:?}", db_path))?;
+        info!("Daemon registry initialized at {:?}", db_path);
         Ok(DaemonRegistry {
             db: Arc::new(TokioMutex::new(db)),
         })
     }
 
-    /// Registers a new daemon process with its metadata.
-    /// If a daemon with the same port exists, it updates its metadata.
-    pub async fn register_daemon(&self, mut metadata: DaemonMetadata) -> Result<()> {
+    /// Registers a new daemon process or updates an existing one.
+    /// Uses the port as the key for the database.
+    pub async fn register_daemon(&self, metadata: DaemonMetadata) -> Result<()> {
         let db = self.db.lock().await;
-        let key = metadata.port.to_string();
-        metadata.last_seen_nanos = Utc::now().timestamp_nanos(); // Update last_seen_nanos on registration/update
-
-        let bincode_config = config::standard(); // Use standard bincode config
-        let serialized_metadata = encode_to_vec(&metadata, bincode_config) // Use encode_to_vec
-            .map_err(|e| anyhow!("Failed to serialize daemon metadata for port {}: {}", metadata.port, e))?;
+        let key = metadata.port.to_string().into_bytes();
+        let encoded_metadata = encode_to_vec(metadata.clone(), config::standard())
+            .context("Failed to encode daemon metadata")?;
         
-        db.insert(key.as_bytes(), serialized_metadata)
-            .map_err(|e| anyhow!("Failed to insert/update daemon metadata for port {}: {}", metadata.port, e))?;
+        db.insert(&key, encoded_metadata)
+            .map_err(|e| anyhow!("Failed to insert daemon metadata for port {}: {}", metadata.port, e))?;
         db.flush_async().await
-            .map_err(|e| anyhow!("Failed to flush daemon registry to disk for port {}: {}", metadata.port, e))?;
-        info!("Registered/Updated {} daemon: port={}, pid={}, last_seen_nanos={}", metadata.service_type, metadata.port, metadata.pid, metadata.last_seen_nanos);
+            .map_err(|e| anyhow!("Failed to flush daemon registry after registration: {}", e))?;
+        info!("Registered daemon: {:?} on port {}", metadata.service_type, metadata.port);
         Ok(())
     }
 
     /// Unregisters a daemon process by its port.
     pub async fn unregister_daemon(&self, port: u16) -> Result<()> {
         let db = self.db.lock().await;
-        let key = port.to_string();
-        if db.remove(key.as_bytes()).map_err(|e| anyhow!("Failed to remove daemon metadata for port {}: {}", port, e))?.is_some() {
-            db.flush_async().await
-                .map_err(|e| anyhow!("Failed to flush daemon registry to disk after removing port {}: {}", port, e))?;
-            info!("Unregistered daemon on port: {}", port);
-        } else {
-            debug!("No daemon found to unregister on port: {}", port);
-        }
+        let key = port.to_string().into_bytes();
+        db.remove(&key)
+            .map_err(|e| anyhow!("Failed to remove daemon metadata for port {}: {}", port, e))?;
+        db.flush_async().await
+            .map_err(|e| anyhow!("Failed to flush daemon registry after unregistration: {}", e))?;
+        info!("Unregistered daemon on port {}", port);
         Ok(())
     }
 
     /// Retrieves metadata for a specific daemon by its port.
     pub async fn get_daemon_metadata(&self, port: u16) -> Result<Option<DaemonMetadata>> {
         let db = self.db.lock().await;
-        let key = port.to_string();
-        let result = db.get(key.as_bytes())
-            .map_err(|e| anyhow!("Failed to retrieve daemon metadata for port {}: {}", port, e))?;
-        match result {
+        let key = port.to_string().into_bytes();
+        match db.get(&key)
+            .map_err(|e| anyhow!("Failed to retrieve daemon metadata for port {}: {}", port, e))?
+        {
             Some(ivec) => {
-                let bincode_config = config::standard();
-                let (metadata, _): (DaemonMetadata, usize) = decode_from_slice(&ivec, bincode_config) // Use decode_from_slice
-                    .map_err(|e| {
-                        error!("Failed to deserialize daemon metadata for port {}: {}", port, e);
-                        anyhow!("Failed to deserialize daemon metadata for port {}: {}", port, e)
-                    })?;
+                let (metadata, _len) = decode_from_slice::<DaemonMetadata, _>(&ivec, config::standard())
+                    .context("Failed to decode daemon metadata from database")?;
                 Ok(Some(metadata))
             }
             None => Ok(None),
         }
     }
 
-    /// Retrieves metadata for all registered daemon processes.
+    /// Retrieves metadata for all registered daemons, cleaning up corrupted entries.
     pub async fn get_all_daemon_metadata(&self) -> Result<Vec<DaemonMetadata>> {
         let db = self.db.lock().await;
         let mut all_metadata = Vec::new();
-        let bincode_config = config::standard();
-        // Collect keys to remove problematic entries outside the iteration
         let mut keys_to_remove = Vec::new();
 
-        for item in db.iter() {
-            let (key_ivec, ivec) = match item {
-                Ok(pair) => pair,
-                Err(e) => {
-                    // This error indicates an issue with fetching the item itself from Sled.
-                    // It's less common than a deserialization error but should still be handled.
-                    error!("Failed to iterate daemon registry item: {}", e);
-                    continue; // Skip this problematic item
-                }
-            };
-            let key_str = String::from_utf8_lossy(&key_ivec); // Get key for logging
-
-            match decode_from_slice(&ivec, bincode_config) { // Use decode_from_slice
-                Ok((metadata, _)) => {
+        for item_result in db.iter() {
+            let (key, ivec) = item_result
+                .map_err(|e| anyhow!("Failed to iterate daemon registry: {}", e))?;
+            
+            match decode_from_slice::<DaemonMetadata, _>(&ivec, config::standard()) {
+                Ok((metadata, _len)) => {
                     all_metadata.push(metadata);
-                },
+                }
                 Err(e) => {
-                    // This is the core fix: if deserialization fails, the data is corrupted.
-                    // Log the error and mark the key for removal to prevent future failures.
-                    error!("Failed to deserialize daemon metadata for key '{}' during iteration: {}. Marking for removal.", key_str, e);
-                    keys_to_remove.push(key_ivec.to_vec()); // Store as Vec<u8> to avoid lifetime issues
+                    // Log the error and mark the key for removal
+                    error!("Corrupted daemon registry entry for key '{:?}': {}. Marking for removal.", key, e);
+                    keys_to_remove.push(key.to_vec()); // Convert IVec to Vec<u8> for storage
                 }
             }
         }
 
-        // After iterating through all entries, remove the corrupted ones.
-        // This is done outside the loop to avoid modifying the database while iterating,
+        // Remove corrupted entries outside the iteration to avoid iterator invalidation,
         // which can lead to deadlocks or unexpected behavior with some database systems.
         // Iterate over a reference `&keys_to_remove` so that `keys_to_remove` is not moved.
         // This is the fix for the E0382 "borrow of moved value" error.
@@ -176,3 +148,4 @@ lazy_static! {
     pub static ref GLOBAL_DAEMON_REGISTRY: DaemonRegistry = DaemonRegistry::new()
         .expect("Failed to initialize GLOBAL_DAEMON_REGISTRY");
 }
+

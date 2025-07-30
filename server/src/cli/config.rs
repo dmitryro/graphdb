@@ -1,23 +1,111 @@
 // server/src/cli/config.rs
-
 // This file handles loading CLI and Storage daemon configurations.
+// Updated: 2025-07-30 - Added path_buf_serde module to handle PathBuf serialization/deserialization for serde_yaml2.
+// Updated: 2025-07-30 - Added storage_engine_type_serde module to handle StorageEngineType deserialization.
+// Updated: 2025-07-30 - Added option_path_buf_serde module to handle Option<PathBuf> for GlobalYamlConfig.
+// Updated: 2025-07-30 - Added default_config_root_directory_for_yaml_option for GlobalYamlConfig.
+// Updated: 2025-07-30 - Kept default_config_root_directory_for_yaml for StorageConfig.
+// Updated: 2025-07-30 - Kept max_open_files as u64 to match YAML, added #[serde(default)].
+// Updated: 2025-07-30 - Retained detailed error logging for serde_yaml2 parsing.
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand};
-use log::{debug, info, warn};
-use serde::{Deserialize, Serialize};
+use log::{debug, error, info, warn};
+use serde::{Deserialize, Serialize, Serializer, Deserializer};
 use serde_yaml2;
 use std::env;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::time::Duration;
 use dirs;
 use toml;
 
-// Added import for daemon_api::StorageEngineType
-use daemon_api::StorageEngineType as DaemonApiStorageEngineType;
+pub use lib::storage_engine::config::StorageEngineType;
+
+// --- Custom PathBuf Serialization Module ---
+mod path_buf_serde {
+    use super::*;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(path: &PathBuf, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&path.to_string_lossy())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<PathBuf, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(PathBuf::from(s))
+    }
+}
+
+// --- Custom Option<PathBuf> Serialization Module ---
+mod option_path_buf_serde {
+    use super::*;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(opt_path: &Option<PathBuf>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match opt_path {
+            Some(path) => path_buf_serde::serialize(path, serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<PathBuf>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let opt_s = Option::<String>::deserialize(deserializer)?;
+        Ok(opt_s.map(PathBuf::from))
+    }
+}
+
+// --- Custom StorageEngineType Serialization Module ---
+mod storage_engine_type_serde {
+    use super::*;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::str::FromStr;
+
+    pub fn serialize<S>(engine_type: &StorageEngineType, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&engine_type.to_string())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<StorageEngineType, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        StorageEngineType::from_str(&s).map_err(serde::de::Error::custom)
+    }
+
+    // Handle mapping format (e.g., { name: "sled" })
+    #[derive(Deserialize)]
+    struct StorageEngineTypeWrapper {
+        name: String,
+    }
+
+    pub mod mapping {
+        use super::*;
+        pub fn deserialize<'de, D>(deserializer: D) -> Result<StorageEngineType, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            let wrapper = StorageEngineTypeWrapper::deserialize(deserializer)?;
+            StorageEngineType::from_str(&wrapper.name).map_err(serde::de::Error::custom)
+        }
+    }
+}
 
 // --- Constants ---
 pub const DAEMON_REGISTRY_DB_PATH: &str = "./daemon_registry_db";
@@ -53,6 +141,14 @@ fn default_config_root_directory_for_yaml() -> PathBuf {
     dirs::home_dir()
         .map(|home| home.join(DEFAULT_CONFIG_ROOT_DIRECTORY_STR))
         .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_ROOT_DIRECTORY_STR))
+}
+
+fn default_config_root_directory_for_yaml_option() -> Option<PathBuf> {
+    Some(
+        dirs::home_dir()
+            .map(|home| home.join(DEFAULT_CONFIG_ROOT_DIRECTORY_STR))
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_ROOT_DIRECTORY_STR)),
+    )
 }
 
 // --- YAML Configuration Structs ---
@@ -107,7 +203,7 @@ struct RestApiConfigWrapper {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct DaemonYamlConfig {
-    pub config_root_directory: PathBuf,
+    pub config_root_directory: String,
     pub data_directory: String,
     pub log_directory: String,
     pub default_port: u16,
@@ -121,7 +217,7 @@ pub struct DaemonYamlConfig {
 impl Default for DaemonYamlConfig {
     fn default() -> Self {
         DaemonYamlConfig {
-            config_root_directory: default_config_root_directory_for_yaml(),
+            config_root_directory: default_config_root_directory_for_yaml().to_string_lossy().into_owned(),
             data_directory: format!("{}/daemon_data", DEFAULT_CONFIG_ROOT_DIRECTORY_STR),
             log_directory: "/var/log/graphdb/daemon".to_string(),
             default_port: DEFAULT_DAEMON_PORT,
@@ -134,11 +230,12 @@ impl Default for DaemonYamlConfig {
     }
 }
 
-// Keeping StorageConfig as is, as per user's feedback
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct StorageConfig {
     #[serde(default = "default_config_root_directory_for_yaml")]
+    #[serde(with = "path_buf_serde")]
     pub config_root_directory: PathBuf,
+    #[serde(with = "path_buf_serde")]
     pub data_directory: PathBuf,
     pub log_directory: String,
     pub default_port: u16,
@@ -146,9 +243,11 @@ pub struct StorageConfig {
     pub max_disk_space_gb: u64,
     pub min_disk_space_gb: u64,
     pub use_raft_for_scale: bool,
-    pub max_open_files: u64,
-    pub storage_engine_type: DaemonApiStorageEngineType,
+    #[serde(with = "storage_engine_type_serde")]
+    pub storage_engine_type: StorageEngineType,
     pub engine_specific_config: Option<String>,
+    #[serde(default)]
+    pub max_open_files: u64, // Kept as u64 to match YAML
 }
 
 impl Default for StorageConfig {
@@ -162,17 +261,21 @@ impl Default for StorageConfig {
             max_disk_space_gb: 1000,
             min_disk_space_gb: 10,
             use_raft_for_scale: true,
-            max_open_files: 1024,
-            storage_engine_type: DaemonApiStorageEngineType::Sled,
+            storage_engine_type: StorageEngineType::Sled,
             engine_specific_config: None,
+            max_open_files: 1024,
         }
     }
 }
 
-// StorageConfigWrapper still uses StorageConfig
 #[derive(Debug, Deserialize)]
 pub struct StorageConfigWrapper {
     pub storage: StorageConfig,
+}
+
+// Helper function to convert StorageEngineType to String
+fn daemon_api_storage_engine_type_to_string(engine_type: &StorageEngineType) -> String {
+    engine_type.to_string()
 }
 
 // --- CLI Configuration ---
@@ -443,56 +546,6 @@ pub enum StatusAction {
     Cluster,
 }
 
-// --- Storage Engine Type ---
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum StorageEngineType {
-    Sled,
-    RocksDB,
-    InMemory,
-}
-
-impl FromStr for StorageEngineType {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self> {
-        match s.to_lowercase().as_str() {
-            "sled" => Ok(StorageEngineType::Sled),
-            "rocksdb" => Ok(StorageEngineType::RocksDB),
-            "inmemory" => Ok(StorageEngineType::InMemory),
-            _ => Err(anyhow!("Unknown storage engine type: {}", s)),
-        }
-    }
-}
-
-impl ToString for StorageEngineType {
-    fn to_string(&self) -> String {
-        match self {
-            StorageEngineType::Sled => "sled".to_string(),
-            StorageEngineType::RocksDB => "rocksdb".to_string(),
-            StorageEngineType::InMemory => "inmemory".to_string(),
-        }
-    }
-}
-
-impl From<StorageEngineType> for DaemonApiStorageEngineType {
-    fn from(cli_type: StorageEngineType) -> Self {
-        match cli_type {
-            StorageEngineType::Sled => DaemonApiStorageEngineType::Sled,
-            StorageEngineType::RocksDB => DaemonApiStorageEngineType::RocksDB,
-            StorageEngineType::InMemory => DaemonApiStorageEngineType::InMemory,
-        }
-    }
-}
-
-// Helper function to convert DaemonApiStorageEngineType to String
-fn daemon_api_storage_engine_type_to_string(engine_type: &DaemonApiStorageEngineType) -> String {
-    match engine_type {
-        DaemonApiStorageEngineType::Sled => "sled".to_string(),
-        DaemonApiStorageEngineType::RocksDB => "rocksdb".to_string(),
-        DaemonApiStorageEngineType::InMemory => "inmemory".to_string(),
-    }
-}
-
 // --- CLI Config Loading ---
 impl CliConfig {
     pub fn load() -> Result<Self> {
@@ -643,7 +696,7 @@ impl CliConfig {
                 if data_directory.is_none() {
                     *data_directory = storage_yaml_config
                         .as_ref()
-                        .and_then(|c| Some(c.data_directory.to_string_lossy().into_owned())); // Fixed: Convert PathBuf to String
+                        .and_then(|c| Some(c.data_directory.to_string_lossy().into_owned()));
                 }
                 if log_directory.is_none() {
                     *log_directory = storage_yaml_config
@@ -672,11 +725,8 @@ impl CliConfig {
                 if storage_engine_type.is_none() {
                     *storage_engine_type = storage_yaml_config
                         .as_ref()
-                        .and_then(|c| {
-                            // Convert daemon_api::StorageEngineType to String using the helper function
-                            Some(daemon_api_storage_engine_type_to_string(&c.storage_engine_type))
-                        })
-                        .or_else(|| Some(StorageEngineType::Sled.to_string())); // Ensure this is also a String
+                        .and_then(|c| Some(daemon_api_storage_engine_type_to_string(&c.storage_engine_type)))
+                        .or_else(|| Some(StorageEngineType::Sled.to_string()));
                 }
             }
             _ => {}
@@ -706,7 +756,10 @@ impl CliConfig {
                         info!("Successfully loaded {} from CLI path.", config_name_for_log);
                         return Some(config);
                     }
-                    Err(e) => warn!("Failed to parse {} YAML from {:?}: {}", config_name_for_log, path, e),
+                    Err(e) => {
+                        error!("Detailed YAML parsing error for {}: {:?}", config_name_for_log, e);
+                        warn!("Failed to parse {} YAML from {:?}: {}", config_name_for_log, path, e);
+                    }
                 },
                 Err(e) => warn!("Failed to read {} file from {:?}: {}", config_name_for_log, path, e),
             }
@@ -725,7 +778,10 @@ impl CliConfig {
                         info!("Successfully loaded {} from default path.", config_name_for_log);
                         return Some(config);
                     }
-                    Err(e) => warn!("Failed to parse {} YAML from {:?}: {}", config_name_for_log, default_path, e),
+                    Err(e) => {
+                        error!("Detailed YAML parsing error for {}: {:?}", config_name_for_log, e);
+                        warn!("Failed to parse {} YAML from {:?}: {}", config_name_for_log, default_path, e);
+                    }
                 },
                 Err(e) => warn!("Failed to read {} file from {:?}: {}", config_name_for_log, default_path, e),
             }
@@ -979,6 +1035,8 @@ impl CliConfig {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct GlobalYamlConfig {
+    #[serde(default = "default_config_root_directory_for_yaml_option")]
+    #[serde(with = "option_path_buf_serde")]
     config_root_directory: Option<PathBuf>,
     storage: Option<StorageConfig>,
     rest_api: Option<RestApiConfig>,
@@ -1066,7 +1124,6 @@ pub fn get_rest_cluster_range() -> String {
         .unwrap_or_else(|_| RestApiConfig::default().cluster_range)
 }
 
-// Renamed from load_storage_config to load_storage_config_from_yaml
 pub fn load_storage_config_from_yaml(config_file_path: Option<PathBuf>) -> Result<StorageConfig> {
     let default_config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -1081,7 +1138,10 @@ pub fn load_storage_config_from_yaml(config_file_path: Option<PathBuf>) -> Resul
         let config_content = fs::read_to_string(&path_to_use)
             .context(format!("Failed to read storage config file: {}", path_to_use.display()))?;
         let wrapper: StorageConfigWrapper = serde_yaml2::from_str(&config_content)
-            .context(format!("Failed to parse storage config YAML: {}", path_to_use.display()))?;
+            .map_err(|e| {
+                error!("Detailed YAML parsing error: {:?}", e);
+                anyhow!("Failed to parse storage config YAML: {}", path_to_use.display())
+            })?;
         info!("Loaded Storage config: {:?}", wrapper.storage);
         Ok(wrapper.storage)
     } else {
@@ -1090,12 +1150,10 @@ pub fn load_storage_config_from_yaml(config_file_path: Option<PathBuf>) -> Resul
     }
 }
 
-// This function is still needed if there are calls that pass &str
 pub fn load_storage_config_str(config_file_path: Option<&str>) -> Result<StorageConfig> {
     let path = config_file_path.map(PathBuf::from);
     load_storage_config_from_yaml(path)
 }
-
 
 pub fn get_default_storage_port_from_config_or_cli_default() -> u16 {
     load_storage_config_from_yaml(None)

@@ -16,7 +16,7 @@ pub mod storage_engine; // This declares the directory `storage_engine`
 pub mod transact_indexing;
 pub mod indexing_caching;
 pub mod util;
-
+pub use storage_engine::config::StorageEngineType;
 // REMOVED: pub mod rdb; // Obsolete after RocksDB consolidation
 
 // Now, import directly from the 'models' crate.

@@ -6,7 +6,7 @@
 use clap::{Parser, Subcommand, Arg, Args, ValueEnum}; // Added ValueEnum for StorageEngineType
 use std::path::PathBuf;
 use uuid::Uuid; // Corrected: Ensure Uuid is imported
-
+use lib::storage_engine::config::StorageEngineType;
 // Re-defining HelpArgs here to ensure consistency with interactive.rs parsing
 // If HelpArgs is truly meant to be in a separate help_display.rs, it should be imported from there.
 // For this update, I'll define it here for clarity based on the interactive.rs context.
@@ -47,7 +47,7 @@ pub enum CommandType {
 
     // Top-level Stop commands (can also be subcommands of 'stop')
     StopAll,
-    StopRest,
+    StopRest(Option<u16>),
     StopDaemon(Option<u16>), // Takes an optional port
     StopStorage(Option<u16>), // Takes an optional port
 
@@ -128,7 +128,7 @@ pub struct CliArgs {
     #[clap(long, hide = true)]
     pub internal_storage_config_path: Option<PathBuf>,
     #[clap(long, hide = true)]
-    pub internal_storage_engine: Option<crate::cli::config::StorageEngineType>, // Use config_mod alias
+    pub internal_storage_engine: Option<StorageEngineType>, // Use config_mod alias
 }
 
 #[derive(Subcommand, Debug, PartialEq, Clone)] // Added PartialEq and Clone
@@ -371,7 +371,10 @@ pub enum RestCliCommand {
         cluster: Option<String>,
     },
     /// Stop the REST API server.
-    Stop,
+    Stop {
+        #[clap(long)]
+        port: Option<u16>,
+    },
     /// Get the status of the REST API server.
     Status {
        /// Port for the Storage daemon.

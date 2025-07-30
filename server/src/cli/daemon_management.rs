@@ -41,8 +41,9 @@ use crate::cli::config::{
     DAEMON_REGISTRY_DB_PATH,
     load_main_daemon_config,
 };
-use crate::cli::daemon_registry::{DaemonRegistry, DaemonMetadata, GLOBAL_DAEMON_REGISTRY};
-use lib::storage_engine::config::{StorageEngineType, StorageConfig as LibStorageConfig};
+use crate::cli::daemon_registry::{DaemonRegistry, DaemonMetadata};
+pub use crate::cli::daemon_registry::{GLOBAL_DAEMON_REGISTRY};
+use lib::storage_engine::config::{StorageEngineType};
 use daemon_api::{stop_daemon, DaemonError};
 use rest_api::start_server as start_rest_server;
 use storage_daemon_server::run_storage_daemon as start_storage_server;
@@ -912,6 +913,11 @@ pub async fn check_process_status_by_port(_process_name: &str, port: u16) -> boo
 }
 
 pub fn parse_cluster_range(range_str: &str) -> Result<Vec<u16>> {
+    // Handle null or empty input
+    if range_str.is_empty() || range_str == "null" {
+        return Err(anyhow!("Cluster range is empty or null"));
+    }
+
     let parts: Vec<&str> = range_str.split('-').collect();
     if parts.len() == 2 {
         let start_port: u16 = parts[0]
@@ -934,14 +940,17 @@ pub fn parse_cluster_range(range_str: &str) -> Result<Vec<u16>> {
             ));
         }
         Ok(ports)
+    } else if parts.len() == 1 {
+        let port: u16 = range_str
+            .trim()
+            .parse()
+            .context(format!("Invalid port: {}", range_str))?;
+        Ok(vec![port])
     } else {
-        match range_str.parse::<u16>() {
-            Ok(port) => Ok(vec![port]),
-            Err(_) => Err(anyhow!(
-                "Invalid cluster range size. Expected 'start-end' or a single port: {}",
-                range_str
-            )),
-        }
+        Err(anyhow!(
+            "Invalid cluster range format. Expected 'start-end' or a single port: {}",
+            range_str
+        ))
     }
 }
 
@@ -1022,7 +1031,7 @@ pub async fn is_daemon_running(port: u16) -> bool {
     !is_port_free(port).await
 }
 
-async fn is_process_running(pid: u32) -> bool {
+pub async fn is_process_running(pid: u32) -> bool {
     let mut sys = System::new();
     sys.refresh_processes(ProcessesToUpdate::All, true);
     sys.process(Pid::from_u32(pid)).is_some()

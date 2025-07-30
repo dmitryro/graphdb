@@ -1,16 +1,43 @@
 // lib/src/storage_engine/config.rs
 // Updated: 2025-07-04 - Added InMemory to StorageEngineType.
+// Fixed: 2025-07-30 - Added #[serde(rename_all = "lowercase")] to StorageEngineType.
 
+use anyhow::{anyhow, Context, Result};
 use serde::{Serialize, Deserialize};
 use clap::ValueEnum;
+use std::str::FromStr;
 
 /// Enum to specify the type of storage engine to use.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")] // <--- THIS IS THE CRITICAL ADDITION
 pub enum StorageEngineType {
     Sled,
     RocksDB,
     InMemory, // Added InMemory option
     // Add other storage types like PostgreSQL, Redis, etc., as needed
+}
+
+impl FromStr for StorageEngineType {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_lowercase().as_str() {
+            "sled" => Ok(StorageEngineType::Sled),
+            "rocksdb" => Ok(StorageEngineType::RocksDB),
+            "inmemory" => Ok(StorageEngineType::InMemory),
+            _ => Err(anyhow!("Unknown storage engine type: {}", s)),
+        }
+    }
+}
+
+impl ToString for StorageEngineType {
+    fn to_string(&self) -> String {
+        match self {
+            StorageEngineType::Sled => "sled".to_string(),
+            StorageEngineType::RocksDB => "rocksdb".to_string(),
+            StorageEngineType::InMemory => "inmemory".to_string(),
+        }
+    }
 }
 
 /// Configuration for the storage engine.
@@ -39,4 +66,3 @@ impl Default for StorageConfig {
         }
     }
 }
-
