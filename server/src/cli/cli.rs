@@ -14,8 +14,15 @@
 // FIXED: 2025-07-27 - Corrected handle_internal_daemon_run import and call path.
 // UPDATED: 2025-07-28 - Synchronized with latest commands.rs and interactive.rs changes.
 // FIXED: 2025-07-28 - Removed unused FromArgMatches import from clap.
+// FIXED: 2025-07-29 - Added missing internal arguments to CliArgs struct and fixed handle_internal_daemon_run call.
+// FIXED: 2025-07-30 - Adjusted StartAction::Storage to use `--port` instead of `--storage-port` to resolve argument conflict with top-level 'start' command.
+// FIXED: 2025-07-30 - Removed redundant top-level storage_port, storage_cluster, and storage_config from Commands::Start.
+// FIXED: 2025-07-30 - Corrected parsing of storage-specific flags for 'start storage' subcommand.
+// RESTORED: 2025-07-30 - Restored missing internal flags in CliArgs and corrected handle_internal_daemon_run arguments.
+// RESTORED: 2025-07-30 - Restored top-level arguments for Commands::Start and refined implicit action logic.
+// REVERTED: 2025-07-30 - Reverted `handle_internal_daemon_run` call to 5 arguments and removed corresponding `CliArgs` fields.
 
-use clap::{Parser, Subcommand, CommandFactory}; // Removed FromArgMatches
+use clap::{Parser, Subcommand, CommandFactory};
 use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -31,15 +38,13 @@ use crate::cli::commands::{
     DaemonCliCommand, RestCliCommand, StorageAction,
     StatusArgs, StopArgs, ReloadArgs, RestartArgs,
     ReloadAction, RestartAction, StartAction, StopAction, StatusAction,
-    HelpArgs // Import HelpArgs from commands.rs for consistency
+    HelpArgs
 };
 use crate::cli::config as config_mod;
 use crate::cli::handlers as handlers_mod;
 use crate::cli::interactive as interactive_mod;
-use crate::cli::help_display as help_display_mod; // Still needed for print functions
-use crate::cli::daemon_management; // Import daemon_management directly
-
-
+use crate::cli::help_display as help_display_mod;
+use crate::cli::daemon_management;
 use lib::query_parser::{parse_query_from_string, QueryType};
 
 /// GraphDB Command Line Interface
@@ -66,11 +71,18 @@ pub struct CliArgs {
     #[clap(long, hide = true)]
     pub internal_storage_daemon_run: bool,
     #[clap(long, hide = true)]
+    pub internal_daemon_run: bool,
+    #[clap(long, hide = true)]
     pub internal_port: Option<u16>,
     #[clap(long, hide = true)]
     pub internal_storage_config_path: Option<PathBuf>,
     #[clap(long, hide = true)]
-    pub internal_storage_engine: Option<config_mod::StorageEngineType>, // Use config_mod alias
+    pub internal_storage_engine: Option<config_mod::StorageEngineType>,
+    // Removed internal_data_directory and internal_cluster_range as they are not expected by handle_internal_daemon_run
+    // #[clap(long, hide = true)]
+    // pub internal_data_directory: Option<PathBuf>,
+    // #[clap(long, hide = true)]
+    // pub internal_cluster_range: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -78,6 +90,7 @@ pub enum Commands {
     /// Start GraphDB components (daemon, rest, storage, or all)
     Start {
         // These arguments capture top-level args for 'start' that implicitly mean 'start all'.
+        // They are restored here as per the original file.
         #[arg(long, value_parser = clap::value_parser!(u16), help = "Port for the daemon. Conflicts with --daemon-port if both specified.")]
         port: Option<u16>,
         #[arg(long, value_parser = clap::value_parser!(String), help = "Cluster range for the daemon. Conflicts with --daemon-cluster if both specified.")]
@@ -92,15 +105,14 @@ pub enum Commands {
         rest_port: Option<u16>,
         #[arg(long, value_parser = clap::value_parser!(String), help = "Cluster name for the REST API.")]
         rest_cluster: Option<String>,
-        #[arg(long, value_parser = clap::value_parser!(u16), help = "Port for the Storage Daemon.")]
+        #[arg(long, value_parser = clap::value_parser!(u16), help = "Port for the Storage Daemon. Synonym for --port in `start storage`.")]
         storage_port: Option<u16>,
-        #[arg(long, value_parser = clap::value_parser!(String), help = "Cluster name for the Storage Daemon.")]
+        #[arg(long, value_parser = clap::value_parser!(String), help = "Cluster name for the Storage Daemon. Synonym for --cluster in `start storage`.")]
         storage_cluster: Option<String>,
         #[arg(long, value_parser = clap::value_parser!(String), help = "Path to the Storage Daemon configuration file.")]
-        storage_config: Option<String>, // Keep as String here
-
+        storage_config: Option<String>,
         #[clap(subcommand)]
-        action: Option<StartAction>, // This captures explicit subcommands like `start rest` or `start all`
+        action: Option<StartAction>,
     },
     /// Stop GraphDB components (daemon, rest, storage, or all)
     Stop(StopArgs),
@@ -141,7 +153,7 @@ pub enum Commands {
     /// Perform a health check on the REST API server
     Health,
     /// Display help message
-    Help(HelpArgs), // Use the HelpArgs struct from commands.rs
+    Help(HelpArgs),
     /// Clear the terminal screen
     Clear,
     /// Exit the CLI
@@ -151,9 +163,6 @@ pub enum Commands {
 }
 
 /// Main entry point for CLI command handling.
-///
-/// This function dispatches commands based on `CliArgs` and manages the lifecycle
-/// of daemon and REST API processes.
 pub async fn start_cli() -> Result<()> {
     // --- Custom Help Command Handling ---
     let args_vec: Vec<String> = env::args().collect();
@@ -172,18 +181,20 @@ pub async fn start_cli() -> Result<()> {
 
     let args = CliArgs::parse();
 
-    if args.internal_rest_api_run || args.internal_storage_daemon_run {
+    // If any internal daemon run flag is set, handle it and exit
+    if args.internal_rest_api_run || args.internal_storage_daemon_run || args.internal_daemon_run {
         let converted_storage_engine = args.internal_storage_engine.map(|se_cli| {
             se_cli.into()
         });
 
         // Call directly from daemon_management
-        return daemon_management::handle_internal_daemon_run( // Corrected import path
+        return daemon_management::handle_internal_daemon_run(
             args.internal_rest_api_run,
             args.internal_storage_daemon_run,
             args.internal_port,
             args.internal_storage_config_path,
             converted_storage_engine,
+            // Removed args.internal_data_directory and args.internal_cluster_range
         ).await;
     }
     let config = match config_mod::load_cli_config() {
@@ -193,7 +204,7 @@ pub async fn start_cli() -> Result<()> {
 
     if let Some(query_string) = args.query {
         println!("Executing direct query: {}", query_string);
-        match lib::query_parser::parse_query_from_string(&query_string) { // Fully qualified path
+        match lib::query_parser::parse_query_from_string(&query_string) {
             Ok(parsed_query) => match parsed_query {
                 QueryType::Cypher => println!("  -> Identified as Cypher query."),
                 QueryType::SQL => println!("  -> Identified as SQL query."),
@@ -230,7 +241,7 @@ pub async fn start_cli() -> Result<()> {
                 rest_cluster: top_rest_cluster,
                 storage_port: top_storage_port,
                 storage_cluster: top_storage_cluster,
-                storage_config: top_storage_config_str, // Renamed to avoid conflict
+                storage_config: top_storage_config_str,
                 action,
             } => {
                 let effective_action = match action {
@@ -244,29 +255,41 @@ pub async fn start_cli() -> Result<()> {
                             port, cluster, daemon_port, daemon_cluster,
                             listen_port, rest_port, rest_cluster,
                             storage_port, storage_cluster,
-                            storage_config, // This is already PathBuf from commands.rs
+                            storage_config,
                         }
                     },
-                    Some(other_action) => other_action, // Other explicit subcommands
+                    Some(other_action) => other_action,
                     None => {
-                        // No explicit subcommand; check if top-level arguments for 'all' were provided.
+                        // If no explicit subcommand is given, check for top-level arguments
+                        // to determine if it's an implicit 'start all' or 'start storage'.
                         if top_port.is_some() || top_cluster.is_some() || top_daemon_port.is_some() || top_daemon_cluster.is_some() ||
                             top_listen_port.is_some() || top_rest_port.is_some() || top_rest_cluster.is_some() ||
                             top_storage_port.is_some() || top_storage_cluster.is_some() || top_storage_config_str.is_some() {
-                            StartAction::All {
-                                port: top_port,
-                                cluster: top_cluster,
-                                daemon_port: top_daemon_port,
-                                daemon_cluster: top_daemon_cluster,
-                                listen_port: top_listen_port,
-                                rest_port: top_rest_port,
-                                rest_cluster: top_rest_cluster,
-                                storage_port: top_storage_port,
-                                storage_cluster: top_storage_cluster,
-                                storage_config: top_storage_config_str.map(PathBuf::from), // Convert String to PathBuf
+                            
+                            // If storage-specific top-level arguments are present, treat as 'start storage'
+                            if top_storage_port.is_some() || top_storage_cluster.is_some() || top_storage_config_str.is_some() {
+                                StartAction::Storage {
+                                    port: top_storage_port.or(top_port),
+                                    cluster: top_storage_cluster.clone().or(top_cluster.clone()),
+                                    config_file: top_storage_config_str.clone().map(PathBuf::from),
+                                }
+                            } else {
+                                // Otherwise, treat as 'start all' with the provided top-level arguments
+                                StartAction::All {
+                                    port: top_port,
+                                    cluster: top_cluster.clone(),
+                                    daemon_port: top_daemon_port,
+                                    daemon_cluster: top_daemon_cluster,
+                                    listen_port: top_listen_port,
+                                    rest_port: top_rest_port,
+                                    rest_cluster: top_rest_cluster,
+                                    storage_port: top_storage_port,
+                                    storage_cluster: top_storage_cluster.clone(),
+                                    storage_config: top_storage_config_str.clone().map(PathBuf::from),
+                                }
                             }
                         } else {
-                            // No explicit subcommand and no top-level 'all' arguments, default to 'start all' without arguments.
+                            // Default to 'start all' without any arguments if nothing specific is provided
                             StartAction::All {
                                 port: None, cluster: None, daemon_port: None, daemon_cluster: None,
                                 listen_port: None, rest_port: None, rest_cluster: None,
@@ -280,17 +303,16 @@ pub async fn start_cli() -> Result<()> {
                     StartAction::All {
                         port, cluster, daemon_port, daemon_cluster,
                         listen_port, rest_port, rest_cluster,
-                        storage_port, storage_cluster, storage_config, // Now PathBuf
+                        storage_port, storage_cluster, storage_config,
                     } => {
-                        // Call handle_start_all_interactive with the correct arguments
                         handlers_mod::handle_start_all_interactive(
-                            port.or(daemon_port), // Consolidate daemon port
-                            cluster.or(daemon_cluster), // Consolidate daemon cluster
-                            listen_port.or(rest_port), // Consolidate rest port
-                            rest_cluster, // Pass rest_cluster
+                            port.or(daemon_port),
+                            cluster.or(daemon_cluster),
+                            listen_port.or(rest_port),
+                            rest_cluster,
                             storage_port,
-                            storage_cluster, // Pass storage_cluster
-                            storage_config, // This is already Option<PathBuf>
+                            storage_cluster,
+                            storage_config,
                             daemon_handles.clone(),
                             rest_api_shutdown_tx_opt.clone(),
                             rest_api_port_arc.clone(),
@@ -310,14 +332,13 @@ pub async fn start_cli() -> Result<()> {
                         handlers_mod::handle_rest_command_interactive(
                             RestCliCommand::Start { port: rest_start_port, cluster: rest_start_cluster },
                             rest_api_shutdown_tx_opt.clone(),
-                            rest_api_handle.clone(), // Corrected order
-                            rest_api_port_arc.clone(), // Corrected order
+                            rest_api_handle.clone(),
+                            rest_api_port_arc.clone(),
                         ).await?;
                     }
-                    StartAction::Storage { port, config_file: storage_start_config_file, cluster: storage_start_cluster } => {
-                        // `config_file` here is PathBuf because that's what `StorageAction::Start` expects from `commands.rs`.
+                    StartAction::Storage { port, config_file, cluster } => {
                         handlers_mod::handle_storage_command_interactive(
-                            StorageAction::Start { port, config_file: storage_start_config_file, cluster: storage_start_cluster },
+                            StorageAction::Start { port, config_file, cluster },
                             storage_daemon_shutdown_tx_opt.clone(),
                             storage_daemon_handle.clone(),
                             storage_daemon_port_arc.clone(),
@@ -326,11 +347,9 @@ pub async fn start_cli() -> Result<()> {
                 }
             }
             Commands::Stop(stop_args) => {
-                // FIX: Make `stop` synonymous with `stop all` if no subcommand is provided.
                 let updated_stop_args = StopArgs {
                     action: Some(stop_args.action.unwrap_or(StopAction::All))
                 };
-
                 handlers_mod::handle_stop_command(updated_stop_args).await?;
             }
             Commands::Status(status_args) => {
@@ -343,11 +362,6 @@ pub async fn start_cli() -> Result<()> {
             Commands::Reload(reload_args) => {
                 handlers_mod::handle_reload_command_interactive(
                     reload_args,
-                    // Remove the extra arguments here, as handlers.rs::handle_reload_command_interactive only takes one.
-                    // The interactive state (daemon_handles, rest_api_shutdown_tx_opt, etc.) should be managed within
-                    // handle_reload_command (which handle_reload_command_interactive calls) or passed differently
-                    // if they are truly needed by the interactive reload logic itself.
-                    // Based on the provided signature, only reload_args is expected.
                 ).await?;
             }
             Commands::Restart(restart_args) => {
@@ -363,7 +377,6 @@ pub async fn start_cli() -> Result<()> {
                 ).await?;
             }
             Commands::Storage(storage_action) => {
-                // This now calls the non-interactive version, which spawns a new process.
                 handlers_mod::handle_storage_command(storage_action).await?;
             }
             Commands::Daemon(daemon_cmd) => {
@@ -373,8 +386,8 @@ pub async fn start_cli() -> Result<()> {
                 handlers_mod::handle_rest_command_interactive(
                     rest_cmd,
                     rest_api_shutdown_tx_opt.clone(),
-                    rest_api_handle.clone(), // Corrected order
-                    rest_api_port_arc.clone(), // Corrected order
+                    rest_api_handle.clone(),
+                    rest_api_port_arc.clone(),
                 ).await?;
             }
             Commands::Interactive => {

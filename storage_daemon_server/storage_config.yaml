@@ -2,7 +2,7 @@ storage:
   config_root_directory: "./storage_daemon_server"
   data_directory: "/opt/graphdb/storage_data"
   log_directory: "/var/log/graphdb"
-  default_port: 8085
+  default_port: 8084
   cluster_range: null
   max_disk_space_gb: 1000
   min_disk_space_gb: 10

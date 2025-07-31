@@ -3,14 +3,12 @@
 // This file defines the command-line arguments and subcommands
 // for the GraphDB CLI using the `clap` crate.
 
-use clap::{Parser, Subcommand, Arg, Args, ValueEnum}; // Added ValueEnum for StorageEngineType
+use clap::{Parser, Subcommand, Arg, Args, ValueEnum};
 use std::path::PathBuf;
-use uuid::Uuid; // Corrected: Ensure Uuid is imported
+use uuid::Uuid;
 use lib::storage_engine::config::StorageEngineType;
-// Re-defining HelpArgs here to ensure consistency with interactive.rs parsing
-// If HelpArgs is truly meant to be in a separate help_display.rs, it should be imported from there.
-// For this update, I'll define it here for clarity based on the interactive.rs context.
-#[derive(Debug, PartialEq, Clone, Args)] // Added #[derive(Args)]
+
+#[derive(Debug, PartialEq, Clone, Args)]
 pub struct HelpArgs {
     pub filter_command: Option<String>,
     pub command_path: Vec<String>,
@@ -48,20 +46,19 @@ pub enum CommandType {
     // Top-level Stop commands (can also be subcommands of 'stop')
     StopAll,
     StopRest(Option<u16>),
-    StopDaemon(Option<u16>), // Takes an optional port
-    StopStorage(Option<u16>), // Takes an optional port
+    StopDaemon(Option<u16>),
+    StopStorage(Option<u16>),
 
     // Top-level Status commands (can also be subcommands of 'status')
-    StatusSummary, // 'status' or 'status all' or 'status summary'
-    //StatusRest(Option<u16>),
+    StatusSummary,
     StatusDaemon(Option<u16>),
     StatusStorage(Option<u16>),
     StatusCluster,
 
     // Authentication and User Management
-    Auth { username: String, password: String }, // Alias for Authenticate
+    Auth { username: String, password: String },
     Authenticate { username: String, password: String },
-    RegisterUser { username: String, password: String }, // Renamed from Register for clarity
+    RegisterUser { username: String, password: String },
 
     // General Information
     Version,
@@ -94,9 +91,9 @@ pub enum CommandType {
 
     // Utility Commands
     Clear,
-    Help(HelpArgs), // Uses the HelpArgs struct
-    Exit, // 'exit', 'quit', 'q'
-    Unknown, // For unparsable commands
+    Help(HelpArgs),
+    Exit,
+    Unknown,
 }
 
 
@@ -124,41 +121,27 @@ pub struct CliArgs {
     #[clap(long, hide = true)]
     pub internal_storage_daemon_run: bool,
     #[clap(long, hide = true)]
+    pub internal_daemon_run: bool, // Added missing field
+    #[clap(long, hide = true)]
     pub internal_port: Option<u16>,
     #[clap(long, hide = true)]
     pub internal_storage_config_path: Option<PathBuf>,
     #[clap(long, hide = true)]
-    pub internal_storage_engine: Option<StorageEngineType>, // Use config_mod alias
+    pub internal_storage_engine: Option<StorageEngineType>,
+    #[clap(long, hide = true)] // Added missing field
+    pub internal_data_directory: Option<PathBuf>,
+    #[clap(long, hide = true)] // Added missing field
+    pub internal_cluster_range: Option<String>,
 }
 
-#[derive(Subcommand, Debug, PartialEq, Clone)] // Added PartialEq and Clone
+#[derive(Subcommand, Debug, PartialEq, Clone)]
 pub enum Commands {
     /// Start GraphDB components (daemon, rest, storage, or all)
     Start {
-        // These arguments capture top-level args for 'start' that implicitly mean 'start all'.
-        #[arg(long, value_parser = clap::value_parser!(u16), help = "Port for the daemon. Conflicts with --daemon-port if both specified.")]
-        port: Option<u16>,
-        #[arg(long, value_parser = clap::value_parser!(String), help = "Cluster range for the daemon. Conflicts with --daemon-cluster if both specified.")]
-        cluster: Option<String>,
-        #[arg(long, value_parser = clap::value_parser!(u16), help = "Port for the daemon (synonym for --port).")]
-        daemon_port: Option<u16>,
-        #[arg(long, value_parser = clap::value_parser!(String), help = "Cluster range for the daemon (synonym for --cluster).")]
-        daemon_cluster: Option<String>,
-        #[arg(long, value_parser = clap::value_parser!(u16), help = "Listen port for the REST API.")]
-        listen_port: Option<u16>,
-        #[arg(long, value_parser = clap::value_parser!(u16), help = "Port for the REST API. Conflicts with --listen-port if both specified.")]
-        rest_port: Option<u16>,
-        #[arg(long, value_parser = clap::value_parser!(String), help = "Cluster name for the REST API.")]
-        rest_cluster: Option<String>,
-        #[arg(long, value_parser = clap::value_parser!(u16), help = "Port for the Storage Daemon.")]
-        storage_port: Option<u16>,
-        #[arg(long, value_parser = clap::value_parser!(String), help = "Cluster name for the Storage Daemon.")]
-        storage_cluster: Option<String>,
-        #[arg(long, value_parser = clap::value_parser!(String), help = "Path to the Storage Daemon configuration file.")]
-        storage_config: Option<String>, // Keep as String here, convert to PathBuf in handler
-
+        // Removed redundant top-level daemon, rest, storage specific flags
+        // These are now handled exclusively by the `action` subcommand
         #[clap(subcommand)]
-        action: Option<StartAction>, // This captures explicit subcommands like `start rest` or `start all`
+        action: Option<StartAction>,
     },
     /// Stop GraphDB components (daemon, rest, storage, or all)
     Stop(StopArgs),
@@ -199,7 +182,7 @@ pub enum Commands {
     /// Perform a health check on the REST API server
     Health,
     /// Display help message
-    Help(HelpArgs), // Use the HelpArgs struct
+    Help(HelpArgs),
     /// Clear the terminal screen
     Clear,
     /// Exit the CLI
@@ -231,7 +214,7 @@ pub enum StartAction {
         #[arg(long, value_parser = clap::value_parser!(String), help = "Cluster name for the Storage Daemon.")]
         storage_cluster: Option<String>,
         #[arg(long, value_parser = clap::value_parser!(PathBuf), help = "Path to the Storage Daemon configuration file.")]
-        storage_config: Option<PathBuf>, // Changed to PathBuf
+        storage_config: Option<PathBuf>,
     },
     /// Start the GraphDB daemon.
     Daemon {
@@ -243,6 +226,7 @@ pub enum StartAction {
         cluster: Option<String>,
     },
     /// Start the REST API server.
+    #[clap(name = "rest")] // Explicitly set name for 'start rest'
     Rest {
         /// Port for the REST API.
         #[clap(long, short = 'p', name = "listen-port")]
@@ -252,6 +236,7 @@ pub enum StartAction {
         cluster: Option<String>,
     },
     /// Start the standalone Storage daemon.
+    #[clap(name = "storage")] // Explicitly set name for 'start storage'
     Storage {
         /// Port for the Storage daemon.
         #[clap(long, short = 'p', name = "storage-port")]
@@ -311,18 +296,24 @@ pub enum StatusAction {
         /// Port of the daemon to check.
         #[clap(long, short = 'p')]
         port: Option<u16>,
+        #[clap(long)]
+        cluster: Option<String>, // Added cluster field
     },
     /// Get the status of a specific GraphDB daemon instance by port.
     Daemon {
         /// Port of the daemon to check.
         #[clap(long, short = 'p')]
         port: Option<u16>,
+        #[clap(long)]
+        cluster: Option<String>,
     },
     /// Get the status of the standalone Storage daemon by port.
     Storage {
         /// Port of the storage daemon to check.
         #[clap(long, short = 'p')]
         port: Option<u16>,
+        #[clap(long)]
+        cluster: Option<String>,
     },
     /// Get the status of the entire cluster.
     Cluster,
@@ -378,8 +369,8 @@ pub enum RestCliCommand {
     /// Get the status of the REST API server.
     Status {
        /// Port for the Storage daemon.
-        #[clap(long)] 
-        cluster: Option<String>,  
+        #[clap(long)]
+        cluster: Option<String>,
         #[clap(long, short = 'p')]
         port: Option<u16>,
     },
