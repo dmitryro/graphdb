@@ -26,7 +26,8 @@ use crate::cli::config::{load_storage_config_str as load_storage_config, DEFAULT
                          DEFAULT_STORAGE_PORT, DEFAULT_STORAGE_CONFIG_PATH_RELATIVE, DEFAULT_CONFIG_ROOT_DIRECTORY_STR,
                          StorageConfig};
 use crate::cli::daemon_management::{find_running_storage_daemon_port, clear_all_daemon_processes, start_daemon_process, 
-                                    stop_daemon_api_call, handle_internal_daemon_run, load_storage_config_path_or_default}; // Added handle_internal_daemon_run
+                                    stop_daemon_api_call, handle_internal_daemon_run, load_storage_config_path_or_default,
+                                    find_all_running_daemon_ports}; // Added handle_internal_daemon_run
 use daemon_api::{stop_daemon, start_daemon};
 use crate::cli::daemon_registry::{GLOBAL_DAEMON_REGISTRY};
 
@@ -272,36 +273,68 @@ pub async fn display_rest_api_status(port_arg: Option<u16>, rest_api_port_arc: A
     println!("--------------------------------------------------");
 }
 
-/// Displays detailed status for a specific GraphDB daemon or lists common ones.
+/// Displays detailed status for the GraphDB daemon.
 pub async fn display_daemon_status(port_arg: Option<u16>) {
+    use crate::cli::daemon_registry::GLOBAL_DAEMON_REGISTRY;
+    use tokio::time::Duration;
+
+    // Fetch running GraphDB daemon ports
+    let mut running_daemon_ports = find_all_running_daemon_ports(None).await;
+
+    // Filter ports based on the port_arg parameter
+    if let Some(p) = port_arg {
+        // If a port is specified and it is running, only show that port.
+        if running_daemon_ports.contains(&p) {
+            running_daemon_ports = vec![p];
+        }
+        // If the specified port is not running, the list of ports remains the same,
+        // and the main loop will not display the specified port.
+    }
+
+    // Fetch cluster information from GLOBAL_DAEMON_REGISTRY
+    let all_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
+    let cluster_ports: Vec<u16> = all_daemons
+        .iter()
+        .filter(|d| d.service_type == "main" && running_daemon_ports.contains(&d.port))
+        .map(|d| d.port)
+        .collect();
+
+    // Format ports and cluster for the status message
+    let ports_str = if running_daemon_ports.is_empty() {
+        "None".to_string()
+    } else {
+        running_daemon_ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
+    };
+    let cluster_str = if cluster_ports.is_empty() {
+        "None".to_string()
+    } else {
+        cluster_ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
+    };
+
+    // Print the status message
+    println!("Checking GraphDB Daemon status with ports: {}, cluster: {}", ports_str, cluster_str);
+
     println!("\n--- GraphDB Daemon Status ---");
     println!("{:<15} {:<10} {:<40}", "Status", "Port", "Details");
     println!("{:-<15} {:-<10} {:-<40}", "", "", "");
 
-    // GraphDB Daemon Status
-    let common_daemon_ports = [DEFAULT_DAEMON_PORT, 8081, 9001, 9002, 9003, 9004, 9005];
-    let daemon_checks: Vec<_> = common_daemon_ports.iter().map(|&port| {
-        tokio::spawn(async move {
-            (port, check_process_status_by_port("GraphDB Daemon", port).await)
-        })
-    }).collect();
+    if running_daemon_ports.is_empty() {
+        println!("{:<15} {:<10} {:<40}", "Down", "N/A", "No GraphDB daemons found in registry.");
+    } else {
+        for &port in &running_daemon_ports {
+            let daemon_status = if check_process_status_by_port("GraphDB Daemon", port).await {
+                "Running".to_string()
+            } else {
+                "Down".to_string()
+            };
 
-    let results = future::join_all(daemon_checks).await;
-    let mut running_daemon_ports = Vec::new();
-    for result in results {
-        if let Ok((port, is_running)) = result {
-            if is_running {
-                running_daemon_ports.push(port.to_string());
-            }
+            // Basic details; extend with health/version checks if available
+            let daemon_details = "Core Graph Processing".to_string();
+
+            println!("{:<15} {:<10} {:<40}", daemon_status, port, daemon_details);
         }
     }
 
-    let daemon_status_msg = if !running_daemon_ports.is_empty() {
-        format!("Running on: {}", running_daemon_ports.join(", "))
-    } else {
-        "Down".to_string()
-    };
-    println!("{:<20} {:<15} {:<10} {:<40}", "GraphDB Daemon", daemon_status_msg, "N/A", "Core Graph Processing");
     println!("--------------------------------------------------");
 }
 

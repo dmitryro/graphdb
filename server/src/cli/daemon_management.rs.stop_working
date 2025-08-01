@@ -256,34 +256,28 @@ pub async fn find_running_storage_daemon_port() -> Vec<u16> {
 
     for daemon in storage_daemons {
         if is_process_running(daemon.pid).await && is_port_listening(daemon.port).await {
-            running_ports.push(daemon.port);
+            // Update last_seen_nanos to keep registry fresh
             let metadata = DaemonMetadata {
-                service_type: daemon.service_type.clone(),
+                service_type: daemon.service_type,
                 port: daemon.port,
                 pid: daemon.pid,
-                ip_address: daemon.ip_address.clone(),
-                data_dir: daemon.data_dir.clone(),
-                config_path: daemon.config_path.clone(),
-                engine_type: daemon.engine_type.clone(),
-                last_seen_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
+                ip_address: daemon.ip_address,
+                data_dir: daemon.data_dir,
+                config_path: daemon.config_path,
+                engine_type: daemon.engine_type,
+                last_seen_nanos: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as i64)
+                    .unwrap_or(0),
             };
             let _ = GLOBAL_DAEMON_REGISTRY.register_daemon(metadata).await;
+            running_ports.push(daemon.port);
         } else {
+            // Remove stale entry
             let _ = GLOBAL_DAEMON_REGISTRY.unregister_daemon(daemon.port).await;
         }
     }
 
-    // Fallback to system scan
-    if running_ports.is_empty() {
-        let all_daemons = get_all_daemon_processes_with_ports().await;
-        running_ports.extend(
-            all_daemons.into_iter()
-                .filter(|(_port, (_pid, service_type))| service_type == "storage")
-                .map(|(port, _)| port)
-        );
-    }
-    running_ports.sort_unstable();
-    running_ports.dedup();
     running_ports
 }
 
@@ -695,7 +689,9 @@ pub async fn is_storage_daemon_running(port: u16) -> bool {
     all_daemons.get(&port).map_or(false, |(_pid, service_type)| service_type == "storage")
 }
 
-
+pub async fn is_port_free(port: u16) -> bool {
+    tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await.is_ok()
+}
 
 pub async fn clear_all_daemon_processes() -> Result<(), anyhow::Error> {
     println!("Attempting to clear all GraphDB daemon processes...");
@@ -764,7 +760,7 @@ async fn read_pid_from_file(path: &PathBuf) -> Result<u32, anyhow::Error> {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub enum ServiceType {
+enum ServiceType {
     Daemon,
     RestAPI,
     StorageDaemon,
@@ -800,7 +796,7 @@ impl ValueEnum for ServiceType {
     }
 }
 
-pub async fn read_pid_file(port: u16, service_type: &ServiceType) -> Result<u32, anyhow::Error> {
+async fn read_pid_file(port: u16, service_type: &ServiceType) -> Result<u32, anyhow::Error> {
     let path = match service_type {
         ServiceType::Daemon => std::env::temp_dir().join(format!("graphdb_daemon_{}.pid", port)),
         ServiceType::RestAPI => std::env::temp_dir().join(format!("graphdb_rest_{}.pid", port)),
@@ -809,7 +805,7 @@ pub async fn read_pid_file(port: u16, service_type: &ServiceType) -> Result<u32,
     read_pid_from_file(&path).await
 }
 
-pub async fn remove_pid_file(port: u16, service_type: &ServiceType) -> Result<()> {
+async fn remove_pid_file(port: u16, service_type: &ServiceType) -> Result<()> {
     let path = match service_type {
         ServiceType::Daemon => std::env::temp_dir().join(format!("graphdb_daemon_{}.pid", port)),
         ServiceType::RestAPI => std::env::temp_dir().join(format!("graphdb_rest_{}.pid", port)),
@@ -985,23 +981,13 @@ pub fn parse_cluster_range(range_str: &str) -> Result<Vec<u16>> {
     }
 }
 
-pub async fn is_port_free(port: u16) -> bool {
-    !is_port_listening(port).await
-}
-
-pub async fn is_port_listening(port: u16) -> bool {
-    tokio::time::timeout(Duration::from_secs(1), async {
-        TcpStream::connect(format!("127.0.0.1:{}", port)).await.is_ok()
-    }).await.unwrap_or(false)
-}
-
 pub async fn stop_process_by_port(process_name: &str, port: u16) -> Result<(), anyhow::Error> {
     println!("Attempting to find and kill process for {} on port {}...", process_name, port);
     
     let service_type_str = if process_name.contains("Storage") { "storage" }
-                             else if process_name.contains("REST") { "rest" }
-                             else { "main" };
-    
+                           else if process_name.contains("REST") { "rest" }
+                           else { "main" };
+
     let stop_result = stop_daemon_by_pid_or_scan(process_name, port, service_type_str, true).await;
 
     if stop_result.is_ok() {
@@ -1017,10 +1003,10 @@ pub async fn stop_process_by_port(process_name: &str, port: u16) -> Result<(), a
         &["-i", &format!(":{}", port), "-t"],
         Duration::from_secs(3),
     ).await?;
-    
+
     let pids = String::from_utf8_lossy(&output.stdout);
     let pids: Vec<i32> = pids.trim().lines().filter_map(|s| s.parse::<i32>().ok()).collect();
-    
+
     if pids.is_empty() {
         println!("No {} process found running on port {}.", process_name, port);
         return Ok(());
@@ -1029,22 +1015,18 @@ pub async fn stop_process_by_port(process_name: &str, port: u16) -> Result<(), a
     for pid in pids {
         println!("Killing process {} (for {} on port {})...", pid, process_name, port);
         match TokioCommand::new("kill").arg("-9").arg(pid.to_string()).status().await {
-            Ok(status) if status.success() => {
-                println!("Process {} killed successfully.", pid);
-            }
-            Ok(_) => eprintln!("Failed to kill process {}.", pid), 
+            Ok(status) if status.success() => println!("Process {} killed successfully.", pid),
+            Ok(_) => eprintln!("Failed to kill process {}.", pid),
             Err(e) => eprintln!("Error killing process {}: {}", pid, e),
         }
     }
-    
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
     let start_time = Instant::now();
     let _wait_timeout = Duration::from_secs(5);
     let poll_interval = Duration::from_millis(200);
 
     while start_time.elapsed() < _wait_timeout {
-        if !is_port_listening(port).await {
+        if is_port_free(port).await {
             println!("Port {} is now free.", port);
             return Ok(());
         }
@@ -1052,6 +1034,24 @@ pub async fn stop_process_by_port(process_name: &str, port: u16) -> Result<(), a
     }
 
     Err(anyhow!("Port {} remained in use after killing processes within {:?}", port, _wait_timeout))
+}
+
+pub async fn is_port_listening(port: u16) -> bool {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        TcpStream::connect(format!("127.0.0.1:{}", port)).await.is_ok()
+    }).await.unwrap_or(false)
+}
+
+pub fn find_process_by_port(port: u16, keyword_in_cmd: &str, system: &System) -> Option<Pid> {
+    for (pid, process) in system.processes() {
+        let cmd_line_parts: Vec<Cow<str>> = process.cmd().iter().map(|s| s.to_string_lossy()).collect();
+        let cmd_line = cmd_line_parts.join(" ");
+
+        if cmd_line.contains(keyword_in_cmd) && cmd_line.contains(&format!("--port {}", port)) {
+            return Some(*pid);
+        }
+    }
+    None
 }
 
 pub async fn is_daemon_running(port: u16) -> bool {
@@ -1063,22 +1063,3 @@ pub async fn is_process_running(pid: u32) -> bool {
     sys.refresh_processes(ProcessesToUpdate::All, true);
     sys.process(Pid::from_u32(pid)).is_some()
 }
-
-/// Finds the PID of a process bound to a specific port using sysinfo.
-pub fn find_pid_by_port(port: u16) -> Option<u32> {
-    let mut system = System::new_all();
-    system.refresh_all();
-    for (pid, process) in system.processes() {
-        // Convert process name to string and check if it contains "graphdb"
-        let process_name = process.name().to_string_lossy().to_lowercase();
-        if process_name.contains("graphdb") {
-            // Since check_process_status_by_port is called before, assume port is in use
-            // In production, use `lsof` or netstat for precise port binding check
-            return Some(pid.as_u32());
-        }
-    }
-    None
-}
-
-
-

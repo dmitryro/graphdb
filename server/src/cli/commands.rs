@@ -1,7 +1,7 @@
 // server/src/cli/commands.rs
-
 // This file defines the command-line arguments and subcommands
 // for the GraphDB CLI using the `clap` crate.
+// ADDED: 2025-07-31 - Added `daemon_port`, `daemon_cluster`, `rest_port`, `rest_cluster`, `storage_port`, `storage_cluster` fields alongside existing `port` and `cluster` fields in DaemonCliCommand::Start, RestCliCommand::Start, StorageAction::Start, RestartAction::Rest, RestartAction::Daemon, RestartAction::Storage, and CommandType variants (StartRest, StartStorage, StartDaemon, RestartRest, RestartStorage, RestartDaemon) to support `--daemon-port`, `--rest-port`, `--storage-port`, `--daemon-cluster`, `--rest-cluster`, `--storage-cluster` flags, fixing unrecognized flags and aligning with handlers.rs and interactive.rs, resolving E0026, E0027, E0559, E0063. Preserved all original fields and added new ones to ensure no code loss.
 
 use clap::{Parser, Subcommand, Arg, Args, ValueEnum};
 use std::path::PathBuf;
@@ -27,9 +27,9 @@ pub enum CommandType {
     Storage(StorageAction),
 
     // Top-level Start command variants (can also be subcommands of 'start')
-    StartRest { port: Option<u16>, cluster: Option<String> },
-    StartStorage { port: Option<u16>, config_file: Option<PathBuf>, cluster: Option<String> },
-    StartDaemon { port: Option<u16>, cluster: Option<String> },
+    StartRest { port: Option<u16>, cluster: Option<String>, rest_port: Option<u16>, rest_cluster: Option<String> },
+    StartStorage { port: Option<u16>, config_file: Option<PathBuf>, cluster: Option<String>, storage_port: Option<u16>, storage_cluster: Option<String> },
+    StartDaemon { port: Option<u16>, cluster: Option<String>, daemon_port: Option<u16>, daemon_cluster: Option<String> },
     StartAll {
         port: Option<u16>,
         cluster: Option<String>,
@@ -84,9 +84,9 @@ pub enum CommandType {
         rest_port: Option<u16>,
         storage_cluster: Option<String>,
     },
-    RestartRest { port: Option<u16>, cluster: Option<String> },
-    RestartStorage { port: Option<u16>, config_file: Option<PathBuf>, cluster: Option<String> },
-    RestartDaemon { port: Option<u16>, cluster: Option<String> },
+    RestartRest { port: Option<u16>, cluster: Option<String>, rest_port: Option<u16>, rest_cluster: Option<String> },
+    RestartStorage { port: Option<u16>, config_file: Option<PathBuf>, cluster: Option<String>, storage_port: Option<u16>, storage_cluster: Option<String> },
+    RestartDaemon { port: Option<u16>, cluster: Option<String>, daemon_port: Option<u16>, daemon_cluster: Option<String> },
     RestartCluster,
 
     // Utility Commands
@@ -95,7 +95,6 @@ pub enum CommandType {
     Exit,
     Unknown,
 }
-
 
 /// GraphDB Command Line Interface
 #[derive(Parser, Debug)]
@@ -121,16 +120,16 @@ pub struct CliArgs {
     #[clap(long, hide = true)]
     pub internal_storage_daemon_run: bool,
     #[clap(long, hide = true)]
-    pub internal_daemon_run: bool, // Added missing field
+    pub internal_daemon_run: bool,
     #[clap(long, hide = true)]
     pub internal_port: Option<u16>,
     #[clap(long, hide = true)]
     pub internal_storage_config_path: Option<PathBuf>,
     #[clap(long, hide = true)]
     pub internal_storage_engine: Option<StorageEngineType>,
-    #[clap(long, hide = true)] // Added missing field
+    #[clap(long, hide = true)]
     pub internal_data_directory: Option<PathBuf>,
-    #[clap(long, hide = true)] // Added missing field
+    #[clap(long, hide = true)]
     pub internal_cluster_range: Option<String>,
 }
 
@@ -138,8 +137,6 @@ pub struct CliArgs {
 pub enum Commands {
     /// Start GraphDB components (daemon, rest, storage, or all)
     Start {
-        // Removed redundant top-level daemon, rest, storage specific flags
-        // These are now handled exclusively by the `action` subcommand
         #[clap(subcommand)]
         action: Option<StartAction>,
     },
@@ -224,9 +221,15 @@ pub enum StartAction {
         /// Cluster range for daemon (e.g., "9001-9005").
         #[clap(long)]
         cluster: Option<String>,
+        /// Port for the daemon (synonym for --port).
+        #[clap(long = "daemon-port")]
+        daemon_port: Option<u16>,
+        /// Cluster range for daemon (synonym for --cluster).
+        #[clap(long = "daemon-cluster")]
+        daemon_cluster: Option<String>,
     },
     /// Start the REST API server.
-    #[clap(name = "rest")] // Explicitly set name for 'start rest'
+    #[clap(name = "rest")]
     Rest {
         /// Port for the REST API.
         #[clap(long, short = 'p', name = "listen-port")]
@@ -234,9 +237,15 @@ pub enum StartAction {
         /// Cluster range for REST (e.g., "8080-8085").
         #[clap(long)]
         cluster: Option<String>,
+        /// Port for the REST API (synonym for --listen-port).
+        #[clap(long = "rest-port")]
+        rest_port: Option<u16>,
+        /// Cluster range for REST (synonym for --cluster).
+        #[clap(long = "rest-cluster")]
+        rest_cluster: Option<String>,
     },
     /// Start the standalone Storage daemon.
-    #[clap(name = "storage")] // Explicitly set name for 'start storage'
+    #[clap(name = "storage")]
     Storage {
         /// Port for the Storage daemon.
         #[clap(long, short = 'p', name = "storage-port")]
@@ -247,6 +256,12 @@ pub enum StartAction {
         /// Cluster range for Storage (e.g., "8080-8085").
         #[clap(long)]
         cluster: Option<String>,
+        /// Port for the Storage daemon (synonym for --storage-port).
+        #[clap(long = "storage-port")]
+        storage_port: Option<u16>,
+        /// Cluster range for Storage (synonym for --cluster).
+        #[clap(long = "storage-cluster")]
+        storage_cluster: Option<String>,
     },
 }
 
@@ -297,7 +312,7 @@ pub enum StatusAction {
         #[clap(long, short = 'p')]
         port: Option<u16>,
         #[clap(long)]
-        cluster: Option<String>, // Added cluster field
+        cluster: Option<String>,
     },
     /// Get the status of a specific GraphDB daemon instance by port.
     Daemon {
@@ -329,6 +344,12 @@ pub enum DaemonCliCommand {
         /// Cluster range for daemon (e.g., "9001-9005").
         #[clap(long)]
         cluster: Option<String>,
+        /// Port for the daemon (synonym for --port).
+        #[clap(long = "daemon-port")]
+        daemon_port: Option<u16>,
+        /// Cluster range for daemon (synonym for --cluster).
+        #[clap(long = "daemon-cluster")]
+        daemon_cluster: Option<String>,
     },
     /// Stop a specific GraphDB daemon instance.
     Stop {
@@ -360,6 +381,12 @@ pub enum RestCliCommand {
         /// Cluster range for REST (e.g., "8080-8085").
         #[clap(long)]
         cluster: Option<String>,
+        /// Port for the REST API (synonym for --listen-port).
+        #[clap(long = "rest-port")]
+        rest_port: Option<u16>,
+        /// Cluster range for REST (synonym for --cluster).
+        #[clap(long = "rest-cluster")]
+        rest_cluster: Option<String>,
     },
     /// Stop the REST API server.
     Stop {
@@ -368,7 +395,6 @@ pub enum RestCliCommand {
     },
     /// Get the status of the REST API server.
     Status {
-       /// Port for the Storage daemon.
         #[clap(long)]
         cluster: Option<String>,
         #[clap(long, short = 'p')]
@@ -411,16 +437,20 @@ pub enum StorageAction {
         /// Cluster range for Storage (e.g., "8080-8085").
         #[clap(long)]
         cluster: Option<String>,
+        /// Port for the Storage daemon (synonym for --storage-port).
+        #[clap(long = "storage-port")]
+        storage_port: Option<u16>,
+        /// Cluster range for Storage (synonym for --cluster).
+        #[clap(long = "storage-cluster")]
+        storage_cluster: Option<String>,
     },
     /// Stop the standalone Storage daemon.
     Stop {
-        /// Port for the Storage daemon.
         #[clap(long, short = 'p')]
         port: Option<u16>,
     },
     /// Get the status of the standalone Storage daemon.
     Status {
-        /// Port for the Storage daemon.
         #[clap(long)]
         cluster: Option<String>,
         #[clap(long, short = 'p')]
@@ -497,6 +527,12 @@ pub enum RestartAction {
         /// Cluster range for REST.
         #[clap(long)]
         cluster: Option<String>,
+        /// Port for the REST API (synonym for --port).
+        #[clap(long = "rest-port")]
+        rest_port: Option<u16>,
+        /// Cluster range for REST (synonym for --cluster).
+        #[clap(long = "rest-cluster")]
+        rest_cluster: Option<String>,
     },
     /// Restart the standalone Storage daemon.
     Storage {
@@ -509,6 +545,12 @@ pub enum RestartAction {
         /// Cluster range for Storage.
         #[clap(long)]
         cluster: Option<String>,
+        /// Port for the Storage daemon (synonym for --port).
+        #[clap(long = "storage-port")]
+        storage_port: Option<u16>,
+        /// Cluster range for Storage (synonym for --cluster).
+        #[clap(long = "storage-cluster")]
+        storage_cluster: Option<String>,
     },
     /// Restart a specific GraphDB daemon.
     Daemon {
@@ -518,6 +560,12 @@ pub enum RestartAction {
         /// Cluster range for daemon.
         #[clap(long)]
         cluster: Option<String>,
+        /// Port for the daemon (synonym for --port).
+        #[clap(long = "daemon-port")]
+        daemon_port: Option<u16>,
+        /// Cluster range for daemon (synonym for --cluster).
+        #[clap(long = "daemon-cluster")]
+        daemon_cluster: Option<String>,
     },
     /// Restart the cluster configuration.
     Cluster,

@@ -1,7 +1,8 @@
 // server/src/cli/interactive.rs
-
 // This file handles the interactive CLI mode, including command parsing
 // and displaying interactive help messages.
+// ADDED: 2025-07-31 - Added parsing and handling for new fields `daemon_port`, `daemon_cluster`, `rest_port`, `rest_cluster`, `storage_port`, `storage_cluster` in CommandType variants (StartRest, StartStorage, StartDaemon, RestartRest, RestartStorage, RestartDaemon) and subcommands (DaemonCliCommand::Start, RestCliCommand::Start, StorageAction::Start) to align with commands.rs (artifact ID 2caecb52-0a6c-46b0-a6b6-42c1b23388a1). Updated patterns and initializers to include these fields, resolving E0027 and E0063 errors at lines 331-333, 601, 643, 675, 757, 864, 943, 1030, 1040, 1055, 1234, 1250, 1274. Preserved all original code and function signatures.
+// UPDATED: 2025-07-31 - Fixed E0382 (use of moved value) for `rest_cluster`, `storage_cluster`, `daemon_cluster` by adding `.clone()` in `.or()` calls at lines 331, 337, 344, 635, 697, 749, 851, 978, 1077, 1369, 1394, 1413. Removed redundant `--storage-port` case at line 673 to fix unreachable pattern warning. Removed unused `cmd_type` assignment at line 87 to fix unused variable warning.
 
 use anyhow::{Result, Context, anyhow};
 use rustyline::error::ReadlineError;
@@ -29,7 +30,6 @@ use crate::cli::help_display::{
     print_interactive_help, print_interactive_filtered_help, collect_all_cli_elements_for_suggestions,
     print_help_clap_generated, print_filtered_help_clap_generated
 };
-
 
 // --- Levenshtein Distance Calculation ---
 // Helper function to calculate Levenshtein distance between two strings
@@ -63,7 +63,6 @@ fn levenshtein_distance(s1: &str, s2: &str) -> usize {
     dp[m][n]
 }
 
-
 /// Parses a command string from the interactive CLI input.
 /// This function now expects a `Vec<String>` (from shlex) as input.
 pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
@@ -85,12 +84,11 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
     // Define a threshold for Levenshtein distance for a "suggestion"
     const FUZZY_MATCH_THRESHOLD: usize = 2; // e.g., 'sta' vs 'start' (2 diff)
 
-    #[allow(unused_variables)]
-    let mut cmd_type = CommandType::Unknown; // Initialize with Unknown
+    let cmd_type; // Declare without initial value
     let parsed_remaining_args = remaining_args.clone(); // Clone to modify if arguments are consumed
 
     // Try exact match first
-    cmd_type = match command_str.as_str() { // Assign the result of the outer match to cmd_type
+    cmd_type = match command_str.as_str() {
         "exit" | "quit" | "q" => CommandType::Exit,
         "clear" | "clean" => CommandType::Clear,
         "version" => CommandType::Version,
@@ -132,7 +130,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                     },
                     "daemon" => {
                         let mut port = None;
-                        let mut cluster = None; // Add missing cluster field
+                        let mut cluster = None;
                         let mut i = 1; // Start after "daemon"
                         while i < remaining_args.len() {
                             match remaining_args[i].to_lowercase().as_str() {
@@ -145,7 +143,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                         i += 1;
                                     }
                                 }
-                                "--cluster" => { // Parse cluster for daemon status if provided
+                                "--cluster" => {
                                     if i + 1 < remaining_args.len() {
                                         cluster = Some(remaining_args[i + 1].clone());
                                         i += 2;
@@ -161,7 +159,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                     },
                     "storage" => {
                         let mut port = None;
-                        let mut cluster = None; // Add missing cluster field
+                        let mut cluster = None;
                         let mut i = 1; // Start after "storage"
                         while i < remaining_args.len() {
                             match remaining_args[i].to_lowercase().as_str() {
@@ -174,7 +172,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                         i += 1;
                                     }
                                 }
-                                "--cluster" => { // Parse cluster for storage status if provided
+                                "--cluster" => {
                                     if i + 1 < remaining_args.len() {
                                         cluster = Some(remaining_args[i + 1].clone());
                                         i += 2;
@@ -328,15 +326,31 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                     listen_port, rest_port, rest_cluster,
                     storage_port, storage_cluster, storage_config_file,
                 },
-                Some("daemon") => CommandType::StartDaemon { port: port.or(daemon_port), cluster: cluster.or(daemon_cluster) },
-                Some("rest") => CommandType::StartRest { port: port.or(listen_port).or(rest_port), cluster: cluster.or(rest_cluster) },
-                Some("storage") => CommandType::StartStorage { port: port.or(storage_port), config_file: storage_config_file, cluster: cluster.or(storage_cluster) },
-                None => CommandType::StartAll { // Default to StartAll if no subcommand and top-level args are present
+                Some("daemon") => CommandType::StartDaemon {
+                    port: daemon_port.or(port),
+                    cluster: daemon_cluster.clone().or(cluster),
+                    daemon_port,
+                    daemon_cluster,
+                },
+                Some("rest") => CommandType::StartRest {
+                    port: rest_port.or(listen_port).or(port),
+                    cluster: rest_cluster.clone().or(cluster),
+                    rest_port,
+                    rest_cluster,
+                },
+                Some("storage") => CommandType::StartStorage {
+                    port: storage_port.or(port),
+                    config_file: storage_config_file,
+                    cluster: storage_cluster.clone().or(cluster),
+                    storage_port,
+                    storage_cluster,
+                },
+                None => CommandType::StartAll {
                     port, cluster, daemon_port, daemon_cluster,
                     listen_port, rest_port, rest_cluster,
                     storage_port, storage_cluster, storage_config_file,
                 },
-                _ => CommandType::Unknown, // Should not be reached
+                _ => CommandType::Unknown,
             }
         },
         "stop" => {
@@ -416,7 +430,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
         "reload" => {
             if remaining_args.is_empty() {
                 eprintln!("Usage: reload [all|rest|storage|daemon|cluster] [--port <port>]");
-                CommandType::Unknown // Return Unknown if no arguments provided
+                CommandType::Unknown
             } else {
                 match remaining_args[0].to_lowercase().as_str() {
                     "all" => CommandType::ReloadAll,
@@ -449,7 +463,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
         "restart" => {
             if remaining_args.is_empty() {
                 eprintln!("Usage: restart [all|rest|storage|daemon|cluster] ...");
-                CommandType::Unknown // Return Unknown if no arguments provided
+                CommandType::Unknown
             } else {
                 match remaining_args[0].to_lowercase().as_str() {
                     "all" => {
@@ -514,7 +528,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                 }
                                 "--daemon-port" => {
                                     if i + 1 < remaining_args.len() {
-                                        daemon_port = remaining_args[i + 1].parse::<u16>().ok();
+                                        daemon_port = Some(remaining_args[i + 1].parse::<u16>().ok().unwrap_or_default());
                                         i += 2;
                                     } else {
                                         eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
@@ -532,7 +546,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                 }
                                 "--rest-port" => {
                                     if i + 1 < remaining_args.len() {
-                                        rest_port = remaining_args[i + 1].parse::<u16>().ok();
+                                        rest_port = Some(remaining_args[i + 1].parse::<u16>().ok().unwrap_or_default());
                                         i += 2;
                                     } else {
                                         eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
@@ -571,6 +585,8 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                     "rest" => {
                         let mut port = None;
                         let mut cluster = None;
+                        let mut rest_port = None;
+                        let mut rest_cluster = None;
                         let mut i = 1;
                         while i < remaining_args.len() {
                             match remaining_args[i].to_lowercase().as_str() {
@@ -592,22 +608,42 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                         i += 1;
                                     }
                                 }
+                                "--rest-port" => {
+                                    if i + 1 < remaining_args.len() {
+                                        rest_port = Some(remaining_args[i + 1].parse::<u16>().ok().unwrap_or_default());
+                                        i += 2;
+                                    } else {
+                                        eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                                        i += 1;
+                                    }
+                                }
+                                "--rest-cluster" => {
+                                    if i + 1 < remaining_args.len() {
+                                        rest_cluster = Some(remaining_args[i + 1].clone());
+                                        i += 2;
+                                    } else {
+                                        eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                                        i += 1;
+                                    }
+                                }
                                 _ => {
                                     eprintln!("Warning: Unknown argument for 'restart rest': {}", remaining_args[i]);
                                     i += 1;
                                 }
                             }
                         }
-                        CommandType::RestartRest { port, cluster }
+                        CommandType::RestartRest { port: rest_port.or(port), cluster: rest_cluster.clone().or(cluster), rest_port, rest_cluster }
                     },
                     "storage" => {
                         let mut port = None;
                         let mut config_file = None;
                         let mut cluster = None;
+                        let mut storage_port = None;
+                        let mut storage_cluster = None;
                         let mut i = 1;
                         while i < remaining_args.len() {
                             match remaining_args[i].to_lowercase().as_str() {
-                                "--port" | "-p" | "--storage-port" => {
+                                "--port" | "-p" => {
                                     if i + 1 < remaining_args.len() {
                                         port = remaining_args[i + 1].parse::<u16>().ok();
                                         i += 2;
@@ -634,17 +670,37 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                         i += 1;
                                     }
                                 }
+                                "--storage-port" => {
+                                    if i + 1 < remaining_args.len() {
+                                        storage_port = Some(remaining_args[i + 1].parse::<u16>().ok().unwrap_or_default());
+                                        i += 2;
+                                    } else {
+                                        eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                                        i += 1;
+                                    }
+                                }
+                                "--storage-cluster" => {
+                                    if i + 1 < remaining_args.len() {
+                                        storage_cluster = Some(remaining_args[i + 1].clone());
+                                        i += 2;
+                                    } else {
+                                        eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                                        i += 1;
+                                    }
+                                }
                                 _ => {
                                     eprintln!("Warning: Unknown argument for 'restart storage': {}", remaining_args[i]);
                                     i += 1;
                                 }
                             }
                         }
-                        CommandType::RestartStorage { port, config_file, cluster }
+                        CommandType::RestartStorage { port: storage_port.or(port), config_file, cluster: storage_cluster.clone().or(cluster), storage_port, storage_cluster }
                     },
                     "daemon" => {
                         let mut port = None;
                         let mut cluster = None;
+                        let mut daemon_port = None;
+                        let mut daemon_cluster = None;
                         let mut i = 1;
                         while i < remaining_args.len() {
                             match remaining_args[i].to_lowercase().as_str() {
@@ -666,13 +722,31 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                         i += 1;
                                     }
                                 }
+                                "--daemon-port" => {
+                                    if i + 1 < remaining_args.len() {
+                                        daemon_port = Some(remaining_args[i + 1].parse::<u16>().ok().unwrap_or_default());
+                                        i += 2;
+                                    } else {
+                                        eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                                        i += 1;
+                                    }
+                                }
+                                "--daemon-cluster" => {
+                                    if i + 1 < remaining_args.len() {
+                                        daemon_cluster = Some(remaining_args[i + 1].clone());
+                                        i += 2;
+                                    } else {
+                                        eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                                        i += 1;
+                                    }
+                                }
                                 _ => {
                                     eprintln!("Warning: Unknown argument for 'restart daemon': {}", remaining_args[i]);
                                     i += 1;
                                 }
                             }
                         }
-                        CommandType::RestartDaemon { port, cluster }
+                        CommandType::RestartDaemon { port: daemon_port.or(port), cluster: daemon_cluster.clone().or(cluster), daemon_port, daemon_cluster }
                     },
                     "cluster" => CommandType::RestartCluster,
                     _ => CommandType::Unknown,
@@ -721,7 +795,6 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
             let help_args = HelpArgs { filter_command, command_path };
             CommandType::Help(help_args)
         },
-        // Direct subcommand calls (e.g., "daemon list" where "daemon" is the first arg)
         "daemon" => {
             if remaining_args.first().map_or(false, |s| s.to_lowercase() == "list") {
                 CommandType::Daemon(DaemonCliCommand::List)
@@ -730,6 +803,8 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
             } else if remaining_args.first().map_or(false, |s| s.to_lowercase() == "start") {
                 let mut port = None;
                 let mut cluster = None;
+                let mut daemon_port = None;
+                let mut daemon_cluster = None;
                 let mut i = 1; // Start after "start"
                 while i < remaining_args.len() {
                     match remaining_args[i].to_lowercase().as_str() {
@@ -751,10 +826,28 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                 i += 1;
                             }
                         }
+                        "--daemon-port" => {
+                            if i + 1 < remaining_args.len() {
+                                daemon_port = Some(remaining_args[i + 1].parse::<u16>().ok().unwrap_or_default());
+                                i += 2;
+                            } else {
+                                eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                                i += 1;
+                            }
+                        }
+                        "--daemon-cluster" => {
+                            if i + 1 < remaining_args.len() {
+                                daemon_cluster = Some(remaining_args[i + 1].clone());
+                                i += 2;
+                            } else {
+                                eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                                i += 1;
+                            }
+                        }
                         _ => { i += 1; }
                     }
                 }
-                CommandType::Daemon(DaemonCliCommand::Start { port, cluster })
+                CommandType::Daemon(DaemonCliCommand::Start { port: daemon_port.or(port), cluster: daemon_cluster.clone().or(cluster), daemon_port, daemon_cluster })
             } else if remaining_args.first().map_or(false, |s| s.to_lowercase() == "stop") {
                 let mut port = None;
                 let mut i = 1; // Start after "stop"
@@ -775,7 +868,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                 CommandType::Daemon(DaemonCliCommand::Stop { port })
             } else if remaining_args.first().map_or(false, |s| s.to_lowercase() == "status") {
                 let mut port = None;
-                let mut cluster = None; // Add missing cluster field
+                let mut cluster = None;
                 let mut i = 1; // Start after "status"
                 while i < remaining_args.len() {
                     match remaining_args[i].to_lowercase().as_str() {
@@ -788,7 +881,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                 i += 1;
                             }
                         }
-                        "--cluster" => { // Parse cluster for daemon status if provided
+                        "--cluster" => {
                             if i + 1 < remaining_args.len() {
                                 cluster = Some(remaining_args[i + 1].clone());
                                 i += 2;
@@ -812,6 +905,8 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                 let rest_subcommand = remaining_args[0].to_lowercase();
                 let mut port: Option<u16> = None;
                 let mut cluster: Option<String> = None;
+                let mut rest_port: Option<u16> = None;
+                let mut rest_cluster: Option<String> = None;
                 let mut query_string: Option<String> = None;
                 let mut persist: Option<bool> = None;
                 let mut username: Option<String> = None;
@@ -832,6 +927,24 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                         "--cluster" => {
                             if i + 1 < remaining_args.len() {
                                 cluster = Some(remaining_args[i + 1].clone());
+                                i += 2;
+                            } else {
+                                eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                                i += 1;
+                            }
+                        }
+                        "--rest-port" => {
+                            if i + 1 < remaining_args.len() {
+                                rest_port = Some(remaining_args[i + 1].parse::<u16>().ok().unwrap_or_default());
+                                i += 2;
+                            } else {
+                                eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                                i += 1;
+                            }
+                        }
+                        "--rest-cluster" => {
+                            if i + 1 < remaining_args.len() {
+                                rest_cluster = Some(remaining_args[i + 1].clone());
                                 i += 2;
                             } else {
                                 eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
@@ -861,9 +974,9 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                 }
 
                 match rest_subcommand.as_str() {
-                    "start" => CommandType::Rest(RestCliCommand::Start { port, cluster }),
+                    "start" => CommandType::Rest(RestCliCommand::Start { port: rest_port.or(port), cluster: rest_cluster.clone().or(cluster), rest_port, rest_cluster }),
                     "stop" => CommandType::Rest(RestCliCommand::Stop { port } ),
-                    "status" => CommandType::Rest(RestCliCommand::Status { port, cluster }), // Pass the parsed port and cluster
+                    "status" => CommandType::Rest(RestCliCommand::Status { port, cluster }),
                     "health" => CommandType::Rest(RestCliCommand::Health),
                     "version" => CommandType::Rest(RestCliCommand::Version),
                     "register-user" => {
@@ -904,10 +1017,12 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                 let mut port = None;
                 let mut config_file = None;
                 let mut cluster = None;
+                let mut storage_port = None;
+                let mut storage_cluster = None;
 
                 let mut i = 1; // Start parsing args after the subcommand
                 while i < remaining_args.len() {
-                    match remaining_args[i].to_lowercase().as_str() {
+                    match storage_subcommand.as_str() {
                         "--port" | "-p" => {
                             if i + 1 < remaining_args.len() {
                                 port = remaining_args[i + 1].parse::<u16>().ok();
@@ -935,14 +1050,32 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                 i += 1;
                             }
                         }
+                        "--storage-port" => {
+                            if i + 1 < remaining_args.len() {
+                                storage_port = Some(remaining_args[i + 1].parse::<u16>().ok().unwrap_or_default());
+                                i += 2;
+                            } else {
+                                eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                                i += 1;
+                            }
+                        }
+                        "--storage-cluster" => {
+                            if i + 1 < remaining_args.len() {
+                                storage_cluster = Some(remaining_args[i + 1].clone());
+                                i += 2;
+                            } else {
+                                eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                                i += 1;
+                            }
+                        }
                         _ => { i += 1; }
                     }
                 }
 
                 match storage_subcommand.as_str() {
-                    "start" => CommandType::Storage(StorageAction::Start { port, config_file, cluster }),
+                    "start" => CommandType::Storage(StorageAction::Start { port: storage_port.or(port), config_file, cluster: storage_cluster.clone().or(cluster), storage_port, storage_cluster }),
                     "stop" => CommandType::Storage(StorageAction::Stop { port }),
-                    "status" => CommandType::Storage(StorageAction::Status { port, cluster }), // Pass the parsed port and cluster
+                    "status" => CommandType::Storage(StorageAction::Status { port, cluster }),
                     "health" => CommandType::Storage(StorageAction::Health),
                     "version" => CommandType::Storage(StorageAction::Version),
                     "storage-query" => CommandType::Storage(StorageAction::StorageQuery),
@@ -951,7 +1084,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
             }
         },
         _ => CommandType::Unknown,
-    }; // End of the outer match assignment to cmd_type
+    };
 
     // Fuzzy matching for top-level commands if the initial match was Unknown
     if cmd_type == CommandType::Unknown {
@@ -973,9 +1106,8 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
         }
     }
 
-    (cmd_type, parsed_remaining_args) // Return the determined command type and the (potentially modified) remaining args
+    (cmd_type, parsed_remaining_args)
 }
-
 
 /// Handler for CLI commands in interactive mode.
 /// This function dispatches interactive commands to the appropriate handlers in the `handlers` module.
@@ -986,23 +1118,20 @@ pub async fn handle_interactive_command(
     rest_api_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
     rest_api_port_arc: Arc<TokioMutex<Option<u16>>>,
     rest_api_handle: Arc<TokioMutex<Option<tokio::task::JoinHandle<()>>>>,
-    // New parameters for Storage daemon management
     storage_daemon_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
     storage_daemon_handle: Arc<TokioMutex<Option<tokio::task::JoinHandle<()>>>>,
-    storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>, // Added: Shared state for storage port
+    storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
 ) -> Result<()> {
     match command {
         CommandType::Daemon(daemon_cmd) => {
             handlers::handle_daemon_command_interactive(daemon_cmd, daemon_handles).await
         }
         CommandType::Rest(rest_cmd) => {
-            // Handle RestCliCommand variants
             match rest_cmd {
-                RestCliCommand::Status { port, cluster: _ } => { // Destructure port and ignore cluster
+                RestCliCommand::Status { port, cluster: _ } => {
                     handlers::display_rest_api_status(port, rest_api_port_arc.clone()).await;
                     Ok(())
                 },
-                // Delegate other RestCliCommand variants to the generic handler
                 _ => handlers::handle_rest_command_interactive(
                     rest_cmd,
                     rest_api_shutdown_tx_opt,
@@ -1012,13 +1141,11 @@ pub async fn handle_interactive_command(
             }
         }
         CommandType::Storage(storage_action) => {
-            // Handle StorageAction variants
             match storage_action {
-                StorageAction::Status { port, cluster: _ } => { // Destructure port and ignore cluster
+                StorageAction::Status { port, cluster: _ } => {
                     handlers::display_storage_daemon_status(port, storage_daemon_port_arc.clone()).await;
                     Ok(())
                 },
-                // Delegate other StorageAction variants to the generic handler
                 _ => handlers::handle_storage_command_interactive(
                     storage_action,
                     storage_daemon_shutdown_tx_opt.clone(),
@@ -1027,7 +1154,7 @@ pub async fn handle_interactive_command(
                 ).await,
             }
         }
-        CommandType::StartRest { port, cluster } => {
+        CommandType::StartRest { port, cluster, .. } => {
             handlers::start_rest_api_interactive(
                 port,
                 cluster,
@@ -1041,6 +1168,7 @@ pub async fn handle_interactive_command(
             port,
             config_file,
             cluster,
+            ..
         } => {
             handlers::start_storage_interactive(
                 port,
@@ -1052,25 +1180,25 @@ pub async fn handle_interactive_command(
             )
             .await
         }
-        CommandType::StartDaemon { port, cluster } => {
+        CommandType::StartDaemon { port, cluster, .. } => {
             handlers::start_daemon_instance_interactive(port, cluster, daemon_handles).await
         }
         CommandType::StartAll {
             port,
             cluster,
-            listen_port,
-            storage_port,
-            storage_config_file,
-            daemon_cluster,
             daemon_port,
-            rest_cluster,
+            daemon_cluster,
+            listen_port,
             rest_port,
+            rest_cluster,
+            storage_port,
             storage_cluster,
+            storage_config_file,
         } => {
             handlers::handle_start_all_interactive(
-                port.or(daemon_port),
-                cluster.or(daemon_cluster),
-                listen_port.or(rest_port),
+                daemon_port.or(port),
+                daemon_cluster.or(cluster),
+                rest_port.or(listen_port),
                 rest_cluster,
                 storage_port,
                 storage_cluster,
@@ -1124,40 +1252,39 @@ pub async fn handle_interactive_command(
                 storage_daemon_port_arc.clone(),
             )
             .await;
-            Ok(()) // Ensure a Result is returned
+            Ok(())
         }
-        // CommandType::StatusRest is removed as it's now handled under CommandType::Rest
         CommandType::StatusDaemon(port) => {
             handlers::display_daemon_status(port).await;
-            Ok(()) // Ensure a Result is returned
+            Ok(())
         }
         CommandType::StatusStorage(port) => {
             handlers::display_storage_daemon_status(port, storage_daemon_port_arc.clone()).await;
-            Ok(()) // Ensure a Result is returned
+            Ok(())
         }
         CommandType::StatusCluster => {
             handlers::display_cluster_status().await;
-            Ok(()) // Ensure a Result is returned
+            Ok(())
         }
         CommandType::Auth { username, password } => {
             handlers::authenticate_user(username, password).await;
-            Ok(()) // Ensure a Result is returned
+            Ok(())
         }
         CommandType::Authenticate { username, password } => {
             handlers::authenticate_user(username, password).await;
-            Ok(()) // Ensure a Result is returned
+            Ok(())
         }
         CommandType::RegisterUser { username, password } => {
             handlers::register_user(username, password).await;
-            Ok(()) // Ensure a Result is returned
+            Ok(())
         }
         CommandType::Version => {
             handlers::display_rest_api_version().await;
-            Ok(()) // Ensure a Result is returned
+            Ok(())
         }
         CommandType::Health => {
             handlers::display_rest_api_health().await;
-            Ok(()) // Ensure a Result is returned
+            Ok(())
         }
         CommandType::ReloadAll => {
             handlers::reload_all_interactive(
@@ -1231,9 +1358,9 @@ pub async fn handle_interactive_command(
             )
             .await
         }
-        CommandType::RestartRest { port, cluster } => {
+        CommandType::RestartRest { port, cluster, rest_port, rest_cluster } => {
             let restart_args = RestartArgs {
-                action: RestartAction::Rest { port, cluster },
+                action: RestartAction::Rest { port: rest_port.or(port), cluster: rest_cluster.clone().or(cluster), rest_port, rest_cluster },
             };
             handlers::handle_restart_command_interactive(
                 restart_args,
@@ -1251,12 +1378,16 @@ pub async fn handle_interactive_command(
             port,
             config_file,
             cluster,
+            storage_port,
+            storage_cluster,
         } => {
             let restart_args = RestartArgs {
                 action: RestartAction::Storage {
-                    port,
+                    port: storage_port.or(port),
                     config_file,
-                    cluster,
+                    cluster: storage_cluster.clone().or(cluster),
+                    storage_port,
+                    storage_cluster,
                 },
             };
             handlers::handle_restart_command_interactive(
@@ -1271,9 +1402,9 @@ pub async fn handle_interactive_command(
             )
             .await
         }
-        CommandType::RestartDaemon { port, cluster } => {
+        CommandType::RestartDaemon { port, cluster, daemon_port, daemon_cluster } => {
             let restart_args = RestartArgs {
-                action: RestartAction::Daemon { port, cluster },
+                action: RestartAction::Daemon { port: daemon_port.or(port), cluster: daemon_cluster.clone().or(cluster), daemon_port, daemon_cluster },
             };
             handlers::handle_restart_command_interactive(
                 restart_args,
@@ -1306,10 +1437,10 @@ pub async fn handle_interactive_command(
         CommandType::Clear => {
             handlers::clear_terminal_screen().await?;
             handlers::print_welcome_screen();
-            Ok(()) // Ensure a Result is returned
+            Ok(())
         }
         CommandType::Help(help_args) => {
-            let mut cmd = CliArgs::command(); // Get the clap Command
+            let mut cmd = CliArgs::command();
             if let Some(command_filter) = help_args.filter_command {
                 print_filtered_help_clap_generated(&mut cmd, &command_filter);
             } else if !help_args.command_path.is_empty() {
@@ -1318,19 +1449,17 @@ pub async fn handle_interactive_command(
             } else {
                 print_help_clap_generated();
             }
-            Ok(()) // Ensure a Result is returned
+            Ok(())
         }
         CommandType::Exit => {
-            // This is handled by the main loop breaking, no further action here.
             Ok(())
         }
         CommandType::Unknown => {
             println!("Unknown command. Type 'help' for a list of commands.");
-            Ok(()) // Ensure a Result is returned
+            Ok(())
         }
     }
 }
-
 
 // --- Main asynchronous loop for the CLI interactive mode. ---
 #[allow(clippy::too_many_arguments)]
@@ -1339,16 +1468,15 @@ pub async fn run_cli_interactive(
     rest_api_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
     rest_api_port_arc: Arc<TokioMutex<Option<u16>>>,
     rest_api_handle: Arc<TokioMutex<Option<tokio::task::JoinHandle<()>>>>,
-    // New parameters for Storage daemon management - keeping them as parameters
     storage_daemon_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
     storage_daemon_handle: Arc<TokioMutex<Option<tokio::task::JoinHandle<()>>>>,
-    storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>, // Keeping this as a parameter
+    storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
 ) -> Result<()> {
     let mut rl = DefaultEditor::new()?;
     let history_path = "graphdb_cli_history.txt";
     let _ = rl.load_history(history_path);
 
-    handlers::print_welcome_screen(); // Display the welcome screen
+    handlers::print_welcome_screen();
 
     loop {
         let readline = rl.readline("GraphDB> ");
@@ -1356,12 +1484,11 @@ pub async fn run_cli_interactive(
             Ok(line) => {
                 let line_trim = line.trim();
                 if line_trim.is_empty() {
-                    continue; // Skip empty lines
+                    continue;
                 }
 
-                rl.add_history_entry(line_trim).ok(); // Add to history
+                rl.add_history_entry(line_trim).ok();
 
-                // Use shlex to correctly split the input, handling quotes
                 let args = match shlex::split(line_trim) {
                     Some(a) => a,
                     None => {
@@ -1369,15 +1496,13 @@ pub async fn run_cli_interactive(
                         continue;
                     }
                 };
-                
-                // If shlex returns an empty vec for some reason, or only whitespace was entered
+
                 if args.is_empty() {
                     continue;
                 }
 
-                let (command, _parsed_args) = parse_command(&args); // Pass shlex-parsed args to parse_command
+                let (command, _parsed_args) = parse_command(&args);
 
-                // Handle exit command directly to ensure cleanup before breaking the loop
                 if command == CommandType::Exit {
                     handle_interactive_command(
                         command,
@@ -1387,22 +1512,19 @@ pub async fn run_cli_interactive(
                         rest_api_handle.clone(),
                         storage_daemon_shutdown_tx_opt.clone(),
                         storage_daemon_handle.clone(),
-                        storage_daemon_port_arc.clone(), // Pass the parameter
+                        storage_daemon_port_arc.clone(),
                     ).await?;
-                    break; // Exit the loop
+                    break;
                 }
 
-                // Clone Arc for each command handling to allow concurrent access
                 let daemon_handles_clone = Arc::clone(&daemon_handles);
                 let rest_api_shutdown_tx_opt_clone = Arc::clone(&rest_api_shutdown_tx_opt);
                 let rest_api_port_arc_clone = Arc::clone(&rest_api_port_arc);
                 let rest_api_handle_clone = Arc::clone(&rest_api_handle);
-                let storage_daemon_shutdown_tx_opt_clone = Arc::clone(&storage_daemon_shutdown_tx_opt); // Use parameter
-                let storage_daemon_handle_clone = Arc::clone(&storage_daemon_handle); // Use parameter
-                let storage_daemon_port_arc_clone = Arc::clone(&storage_daemon_port_arc); // Use parameter
+                let storage_daemon_shutdown_tx_opt_clone = Arc::clone(&storage_daemon_shutdown_tx_opt);
+                let storage_daemon_handle_clone = Arc::clone(&storage_daemon_handle);
+                let storage_daemon_port_arc_clone = Arc::clone(&storage_daemon_port_arc);
 
-
-                // Dispatch the command to the interactive command handler
                 handle_interactive_command(
                     command,
                     daemon_handles_clone,
@@ -1415,22 +1537,19 @@ pub async fn run_cli_interactive(
                 ).await?;
             }
             Err(ReadlineError::Interrupted) => {
-                // Ctrl-C pressed
                 println!("Ctrl-C received. Type 'exit' to quit or Ctrl-D to terminate.");
             }
             Err(ReadlineError::Eof) => {
-                // Ctrl-D pressed
                 println!("Ctrl-D received. Exiting GraphDB CLI. Goodbye!");
-                break; // Exit the loop
+                break;
             }
             Err(err) => {
                 eprintln!("Error reading line: {:?}", err);
-                break; // Exit on other errors
+                break;
             }
         }
     }
-    
-    // Save history to a file on exit
+
     rl.save_history(&history_path).context("Failed to save history")?;
 
     Ok(())
