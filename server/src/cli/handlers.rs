@@ -1606,6 +1606,7 @@ pub async fn start_storage_interactive(
     Err(anyhow!("Storage daemon failed to start on port {}", selected_port))
 }
 
+/// Starts the REST API in interactive mode.
 pub async fn start_rest_api_interactive(
     port: Option<u16>,
     _cluster: Option<String>,
@@ -1630,17 +1631,29 @@ pub async fn start_rest_api_interactive(
         .ok();
 
     let actual_port = port.unwrap_or(DEFAULT_REST_API_PORT);
+    info!("Starting REST API on port {}", actual_port);
+
+    // Check if the port is used by a registered GraphDB component
+    let all_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
+    let is_graphdb_process = all_daemons.iter().any(|d| d.port == actual_port && (d.service_type == "main" || d.service_type == "rest" || d.service_type == "storage"));
 
     if check_process_status_by_port("REST API", actual_port).await {
-        info!("REST API already running on port {}", actual_port);
-        return Ok(());
+        info!("REST API already running on port {}. Allowing multiple instances.", actual_port);
+        // Skip stopping to allow multiple REST API instances
+    } else if !is_port_free(actual_port).await && !is_graphdb_process {
+        info!("Port {} is in use by a non-GraphDB process. Attempting to stop.", actual_port);
+        stop_process_by_port("REST API", actual_port)
+            .await
+            .map_err(|e| anyhow!("Failed to stop existing process on port {}: {}", actual_port, e))?;
+    } else if is_graphdb_process {
+        info!("Port {} is in use by a GraphDB component (main, rest, or storage). Allowing multiple instances.", actual_port);
+    } else {
+        info!("No process found running on port {}", actual_port);
     }
 
-    info!("Starting REST API on port {}", actual_port);
-    stop_process_by_port("REST API", actual_port).await?;
-
-    if !is_port_free(actual_port).await {
-        return Err(anyhow!("Port {} is already in use.", actual_port));
+    // Verify port is free only if not allowing multiple instances
+    if !is_port_free(actual_port).await && !is_graphdb_process {
+        warn!("Port {} is still in use by a non-GraphDB process after attempting to stop. Proceeding to start additional REST API.", actual_port);
     }
 
     let config = config.unwrap_or_else(|| {
@@ -1654,6 +1667,9 @@ pub async fn start_rest_api_interactive(
     });
 
     let data_dir = PathBuf::from(&config.data_directory);
+
+    // Log registry state before starting daemon
+    debug!("Registry state before starting REST API: {:?}", all_daemons);
 
     start_daemon(Some(actual_port), None, vec![DEFAULT_DAEMON_PORT, DEFAULT_STORAGE_PORT], "rest")
         .await
@@ -1684,6 +1700,9 @@ pub async fn start_rest_api_interactive(
         match GLOBAL_DAEMON_REGISTRY.register_daemon(metadata.clone()).await {
             Ok(_) => {
                 info!("Successfully registered REST API with PID {} on port {}", pid, actual_port);
+                // Log registry state after registration
+                let new_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
+                debug!("Registry state after registering REST API: {:?}", new_daemons);
                 break;
             }
             Err(e) => {
