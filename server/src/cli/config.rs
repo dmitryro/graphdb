@@ -1,17 +1,8 @@
-// server/src/cli/config.rs
-// This file handles loading CLI and Storage daemon configurations.
-// Updated: 2025-07-30 - Added path_buf_serde module to handle PathBuf serialization/deserialization for serde_yaml2.
-// Updated: 2025-07-30 - Added storage_engine_type_serde module to handle StorageEngineType deserialization.
-// Updated: 2025-07-30 - Added option_path_buf_serde module to handle Option<PathBuf> for GlobalYamlConfig.
-// Updated: 2025-07-30 - Added default_config_root_directory_for_yaml_option for GlobalYamlConfig.
-// Updated: 2025-07-30 - Kept default_config_root_directory_for_yaml for StorageConfig.
-// Updated: 2025-07-30 - Kept max_open_files as u64 to match YAML, added #[serde(default)].
-// Updated: 2025-07-30 - Retained detailed error logging for serde_yaml2 parsing.
-
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize, Serializer, Deserializer};
+use serde_json::Value;
 use serde_yaml2;
 use std::env;
 use std::fs;
@@ -89,7 +80,6 @@ mod storage_engine_type_serde {
         StorageEngineType::from_str(&s).map_err(serde::de::Error::custom)
     }
 
-    // Handle mapping format (e.g., { name: "sled" })
     #[derive(Deserialize)]
     struct StorageEngineTypeWrapper {
         name: String,
@@ -144,11 +134,7 @@ fn default_config_root_directory_for_yaml() -> PathBuf {
 }
 
 fn default_config_root_directory_for_yaml_option() -> Option<PathBuf> {
-    Some(
-        dirs::home_dir()
-            .map(|home| home.join(DEFAULT_CONFIG_ROOT_DIRECTORY_STR))
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_ROOT_DIRECTORY_STR)),
-    )
+    Some(default_config_root_directory_for_yaml())
 }
 
 // --- YAML Configuration Structs ---
@@ -187,10 +173,10 @@ pub struct RestApiConfig {
 impl Default for RestApiConfig {
     fn default() -> Self {
         RestApiConfig {
-            data_directory: format!("{}/storage_data", DEFAULT_CONFIG_ROOT_DIRECTORY_STR),
+            data_directory: format!("{}/rest_api_data", DEFAULT_CONFIG_ROOT_DIRECTORY_STR),
             log_directory: "/var/log/graphdb".to_string(),
             default_port: DEFAULT_REST_API_PORT,
-            cluster_range: "8082-8086".to_string(),
+            cluster_range: format!("{}", DEFAULT_REST_API_PORT),
         }
     }
 }
@@ -221,7 +207,7 @@ impl Default for DaemonYamlConfig {
             data_directory: format!("{}/daemon_data", DEFAULT_CONFIG_ROOT_DIRECTORY_STR),
             log_directory: "/var/log/graphdb/daemon".to_string(),
             default_port: DEFAULT_DAEMON_PORT,
-            cluster_range: "9001-9004".to_string(),
+            cluster_range: format!("{}", DEFAULT_DAEMON_PORT),
             max_connections: 1000,
             max_open_files: 1024,
             use_raft_for_scale: true,
@@ -246,8 +232,7 @@ pub struct StorageConfig {
     #[serde(with = "storage_engine_type_serde")]
     pub storage_engine_type: StorageEngineType,
     pub engine_specific_config: Option<String>,
-    #[serde(default)]
-    pub max_open_files: u64, // Kept as u64 to match YAML
+    pub max_open_files: u64,
 }
 
 impl Default for StorageConfig {
@@ -257,7 +242,7 @@ impl Default for StorageConfig {
             data_directory: PathBuf::from(format!("{}/storage_data", DEFAULT_CONFIG_ROOT_DIRECTORY_STR)),
             log_directory: "/var/log/graphdb".to_string(),
             default_port: DEFAULT_STORAGE_PORT,
-            cluster_range: "9050-9054".to_string(),
+            cluster_range: format!("{}", DEFAULT_STORAGE_PORT),
             max_disk_space_gb: 1000,
             min_disk_space_gb: 10,
             use_raft_for_scale: true,
@@ -274,7 +259,7 @@ pub struct StorageConfigWrapper {
 }
 
 // Helper function to convert StorageEngineType to String
-fn daemon_api_storage_engine_type_to_string(engine_type: &StorageEngineType) -> String {
+pub fn daemon_api_storage_engine_type_to_string(engine_type: &StorageEngineType) -> String {
     engine_type.to_string()
 }
 
@@ -326,13 +311,13 @@ pub struct CliConfig {
     #[clap(long, help = "Port for the REST API")]
     pub rest_port: Option<u16>,
 
-    #[clap(long, help = "Cluster range for the REST API (e.g., '8082-8086')")]
+    #[clap(long, help = "Cluster range for the REST API")]
     pub rest_cluster: Option<String>,
 
     #[clap(long, help = "Port for the Storage Daemon")]
     pub storage_port: Option<u16>,
 
-    #[clap(long, help = "Cluster range for the Storage Daemon (e.g., '9000-9002')")]
+    #[clap(long, help = "Cluster range for the Storage Daemon")]
     pub storage_cluster: Option<String>,
 
     #[clap(long, help = "Path to the storage daemon configuration YAML")]
@@ -594,53 +579,59 @@ impl CliConfig {
             "server/main_app_config.yaml",
         );
 
+        // Prioritize CLI arguments over config defaults
         if args.daemon_port.is_none() {
-            args.daemon_port = main_daemon_yaml_config
-                .as_ref()
-                .and_then(|c| Some(c.default_port));
-            if args.daemon_port.is_none() {
-                args.daemon_port = Some(DEFAULT_DAEMON_PORT);
-            }
+            args.daemon_port = match &args.command {
+                Command::Start { port, .. } => *port,
+                Command::Stop { port } => *port,
+                Command::Cli { port, .. } => *port,
+                _ => main_daemon_yaml_config.as_ref().map(|c| c.default_port),
+            };
         }
         if args.daemon_cluster.is_none() {
-            args.daemon_cluster = main_daemon_yaml_config
-                .as_ref()
-                .and_then(|c| Some(c.cluster_range.clone()));
-            if args.daemon_cluster.is_none() {
-                args.daemon_cluster = Some(DEFAULT_CLUSTER_RANGE.to_string());
-            }
+            args.daemon_cluster = match &args.command {
+                Command::Start { cluster_range, .. } => cluster_range.clone(),
+                _ => main_daemon_yaml_config.as_ref().map(|c| c.cluster_range.clone()),
+            };
         }
 
         if args.rest_port.is_none() {
-            args.rest_port = rest_api_yaml_config.as_ref().and_then(|c| Some(c.default_port));
-            if args.rest_port.is_none() {
-                args.rest_port = Some(DEFAULT_REST_API_PORT);
-            }
+            args.rest_port = match &args.command {
+                Command::RestApi {
+                    command: RestCliCommand::Start { port, .. },
+                } => *port,
+                Command::RestApi {
+                    command: RestCliCommand::Stop { port },
+                } => *port,
+                _ => rest_api_yaml_config.as_ref().map(|c| c.default_port),
+            };
         }
+        // Ensure rest_cluster is set to the single REST port to avoid cluster range issues
         if args.rest_cluster.is_none() {
-            args.rest_cluster = rest_api_yaml_config
-                .as_ref()
-                .and_then(|c| Some(c.cluster_range.clone()));
-            if args.rest_cluster.is_none() {
-                args.rest_cluster = Some("8082-8086".to_string());
-            }
+            args.rest_cluster = Some(args.rest_port.unwrap_or(DEFAULT_REST_API_PORT).to_string());
         }
 
         if args.storage_port.is_none() {
-            args.storage_port = storage_yaml_config
-                .as_ref()
-                .and_then(|c| Some(c.default_port));
-            if args.storage_port.is_none() {
-                args.storage_port = Some(DEFAULT_STORAGE_PORT);
-            }
+            args.storage_port = match &args.command {
+                Command::Storage {
+                    command: StorageAction::Start { port, .. },
+                } => *port,
+                Command::Storage {
+                    command: StorageAction::Stop { port, .. },
+                } => *port,
+                _ => storage_yaml_config
+                    .as_ref()
+                    .map(|c| c.default_port)
+                    .or(Some(get_default_storage_port_from_config_or_cli_default())),
+            };
         }
         if args.storage_cluster.is_none() {
-            args.storage_cluster = storage_yaml_config
-                .as_ref()
-                .and_then(|c| Some(c.cluster_range.clone()));
-            if args.storage_cluster.is_none() {
-                args.storage_cluster = Some("9050-9054".to_string());
-            }
+            args.storage_cluster = match &args.command {
+                Command::Storage {
+                    command: StorageAction::Start { cluster_range, .. },
+                } => cluster_range.clone(),
+                _ => storage_yaml_config.as_ref().map(|c| c.cluster_range.clone()),
+            };
         }
 
         match &mut args.command {
@@ -652,14 +643,12 @@ impl CliConfig {
                 if data_directory.is_none() {
                     *data_directory = main_daemon_yaml_config
                         .as_ref()
-                        .and_then(|c| Some(c.data_directory.clone()))
-                        .or_else(|| Some(format!("{}/daemon_data", DEFAULT_CONFIG_ROOT_DIRECTORY_STR)));
+                        .map(|c| c.data_directory.clone());
                 }
                 if log_directory.is_none() {
                     *log_directory = main_daemon_yaml_config
                         .as_ref()
-                        .and_then(|c| Some(c.log_directory.clone()))
-                        .or_else(|| Some("/var/log/graphdb/daemon".to_string()));
+                        .map(|c| c.log_directory.clone());
                 }
             }
             Command::RestApi {
@@ -672,14 +661,12 @@ impl CliConfig {
                 if data_directory.is_none() {
                     *data_directory = rest_api_yaml_config
                         .as_ref()
-                        .and_then(|c| Some(c.data_directory.clone()))
-                        .or_else(|| Some(format!("{}/rest_api_data", DEFAULT_CONFIG_ROOT_DIRECTORY_STR)));
+                        .map(|c| c.data_directory.clone());
                 }
                 if log_directory.is_none() {
                     *log_directory = rest_api_yaml_config
                         .as_ref()
-                        .and_then(|c| Some(c.log_directory.clone()))
-                        .or_else(|| Some("/var/log/graphdb".to_string()));
+                        .map(|c| c.log_directory.clone());
                 }
             }
             Command::Storage {
@@ -696,37 +683,32 @@ impl CliConfig {
                 if data_directory.is_none() {
                     *data_directory = storage_yaml_config
                         .as_ref()
-                        .and_then(|c| Some(c.data_directory.to_string_lossy().into_owned()));
+                        .map(|c| c.data_directory.to_string_lossy().into_owned());
                 }
                 if log_directory.is_none() {
                     *log_directory = storage_yaml_config
                         .as_ref()
-                        .and_then(|c| Some(c.log_directory.clone()))
-                        .or_else(|| Some("/var/log/graphdb".to_string()));
+                        .map(|c| c.log_directory.clone());
                 }
                 if max_disk_space_gb.is_none() {
                     *max_disk_space_gb = storage_yaml_config
                         .as_ref()
-                        .and_then(|c| Some(c.max_disk_space_gb))
-                        .or(Some(1000));
+                        .map(|c| c.max_disk_space_gb);
                 }
                 if min_disk_space_gb.is_none() {
                     *min_disk_space_gb = storage_yaml_config
                         .as_ref()
-                        .and_then(|c| Some(c.min_disk_space_gb))
-                        .or(Some(10));
+                        .map(|c| c.min_disk_space_gb);
                 }
                 if use_raft_for_scale.is_none() {
                     *use_raft_for_scale = storage_yaml_config
                         .as_ref()
-                        .and_then(|c| Some(c.use_raft_for_scale))
-                        .or(Some(true));
+                        .map(|c| c.use_raft_for_scale);
                 }
                 if storage_engine_type.is_none() {
                     *storage_engine_type = storage_yaml_config
                         .as_ref()
-                        .and_then(|c| Some(daemon_api_storage_engine_type_to_string(&c.storage_engine_type)))
-                        .or_else(|| Some(StorageEngineType::Sled.to_string()));
+                        .map(|c| daemon_api_storage_engine_type_to_string(&c.storage_engine_type));
                 }
             }
             _ => {}
@@ -753,11 +735,11 @@ impl CliConfig {
             match fs::read_to_string(path) {
                 Ok(content) => match serde_yaml2::from_str(&content) {
                     Ok(config) => {
-                        info!("Successfully loaded {} from CLI path.", config_name_for_log);
+                        info!("Successfully loaded {} from CLI path: {:?}", config_name_for_log, path);
                         return Some(config);
                     }
                     Err(e) => {
-                        error!("Detailed YAML parsing error for {}: {:?}", config_name_for_log, e);
+                        error!("Detailed YAML parsing error for {} at {:?}: {:?}", config_name_for_log, path, e);
                         warn!("Failed to parse {} YAML from {:?}: {}", config_name_for_log, path, e);
                     }
                 },
@@ -775,11 +757,11 @@ impl CliConfig {
             match fs::read_to_string(default_path) {
                 Ok(content) => match serde_yaml2::from_str(&content) {
                     Ok(config) => {
-                        info!("Successfully loaded {} from default path.", config_name_for_log);
+                        info!("Successfully loaded {} from default path: {:?}", config_name_for_log, default_path);
                         return Some(config);
                     }
                     Err(e) => {
-                        error!("Detailed YAML parsing error for {}: {:?}", config_name_for_log, e);
+                        error!("Detailed YAML parsing error for {} at {:?}: {:?}", config_name_for_log, default_path, e);
                         warn!("Failed to parse {} YAML from {:?}: {}", config_name_for_log, default_path, e);
                     }
                 },
@@ -884,7 +866,7 @@ impl CliConfig {
                 command: StorageAction::Start { port, .. },
             }
             | Command::Storage {
-                command: StorageAction::Stop { port },
+                command: StorageAction::Stop { port, .. },
             } => port
                 .or(self.storage_port)
                 .with_context(|| "Storage Daemon port not specified and no default found."),
@@ -1043,7 +1025,7 @@ struct GlobalYamlConfig {
     main_daemon: Option<MainDaemonConfig>,
 }
 
-// --- Existing Functions from Original Code ---
+// --- Config Loading Functions ---
 pub fn load_main_daemon_config(config_file_path: Option<&str>) -> Result<MainDaemonConfig> {
     let default_config_path = PathBuf::from(DEFAULT_CONFIG_ROOT_DIRECTORY_STR)
         .join(DEFAULT_MAIN_APP_CONFIG_PATH_RELATIVE);
@@ -1057,8 +1039,15 @@ pub fn load_main_daemon_config(config_file_path: Option<&str>) -> Result<MainDae
     if path_to_use.exists() {
         let config_content = fs::read_to_string(&path_to_use)
             .context(format!("Failed to read main daemon config file: {}", path_to_use.display()))?;
+        debug!("Main Daemon config content: {}", config_content);
         let wrapper: MainConfigWrapper = serde_yaml2::from_str(&config_content)
-            .context(format!("Failed to parse main daemon config YAML: {}", path_to_use.display()))?;
+            .map_err(|e| {
+                error!("YAML parsing error for Main Daemon at {:?}: {:?}", path_to_use, e);
+                if let Ok(partial) = serde_yaml2::from_str::<Value>(&config_content) {
+                    error!("Partial YAML parse: {:?}", partial);
+                }
+                anyhow!("Failed to parse main daemon config YAML: {}", path_to_use.display())
+            })?;
         info!("Successfully loaded Main Daemon config: {:?}", wrapper.main_daemon);
         Ok(wrapper.main_daemon)
     } else {
@@ -1080,9 +1069,15 @@ pub fn load_rest_config(config_file_path: Option<&str>) -> Result<RestApiConfig>
     if path_to_use.exists() {
         let config_content = fs::read_to_string(&path_to_use)
             .context(format!("Failed to read REST API config file: {}", path_to_use.display()))?;
-        info!("Successfully read config file: {}", path_to_use.display());
+        debug!("REST API config content: {}", config_content);
         let wrapper: RestApiConfigWrapper = serde_yaml2::from_str(&config_content)
-            .context(format!("Failed to parse REST API config YAML: {}", path_to_use.display()))?;
+            .map_err(|e| {
+                error!("YAML parsing error for REST API at {:?}: {:?}", path_to_use, e);
+                if let Ok(partial) = serde_yaml2::from_str::<Value>(&config_content) {      
+                    error!("Partial YAML parse: {:?}", partial);
+                }
+                anyhow!("Failed to parse REST API config YAML: {}", path_to_use.display())
+            })?;
         info!("Loaded REST API config: {:?}", wrapper.rest_api);
         Ok(wrapper.rest_api)
     } else {
@@ -1125,29 +1120,48 @@ pub fn get_rest_cluster_range() -> String {
 }
 
 pub fn load_storage_config_from_yaml(config_file_path: Option<PathBuf>) -> Result<StorageConfig> {
-    let default_config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("Failed to get parent directory of server crate")
+    let default_config_path = PathBuf::from(DEFAULT_CONFIG_ROOT_DIRECTORY_STR)
         .join(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
-
     let path_to_use = config_file_path.unwrap_or(default_config_path);
+    info!("Loading Storage config from {:?}", path_to_use);
 
-    info!("Attempting to load Storage config from {:?}", path_to_use);
-
-    if path_to_use.exists() {
-        let config_content = fs::read_to_string(&path_to_use)
-            .context(format!("Failed to read storage config file: {}", path_to_use.display()))?;
-        let wrapper: StorageConfigWrapper = serde_yaml2::from_str(&config_content)
-            .map_err(|e| {
-                error!("Detailed YAML parsing error: {:?}", e);
-                anyhow!("Failed to parse storage config YAML: {}", path_to_use.display())
-            })?;
-        info!("Loaded Storage config: {:?}", wrapper.storage);
-        Ok(wrapper.storage)
-    } else {
+    if !path_to_use.exists() {
         warn!("Config file not found at {}. Using default Storage config.", path_to_use.display());
-        Ok(StorageConfig::default())
+        return Ok(StorageConfig::default());
     }
+
+    let config_content = fs::read_to_string(&path_to_use)
+        .context(format!("Failed to read storage config file: {}", path_to_use.display()))?;
+    debug!("Storage config content: {}", config_content);
+
+    let wrapper: StorageConfigWrapper = serde_yaml2::from_str(&config_content)
+        .map_err(|e| {
+            error!("YAML parsing error for Storage at {:?}: {:?}", path_to_use, e);
+            if let Ok(partial) = serde_yaml2::from_str::<Value>(&config_content) {
+                error!("Partial YAML parse: {:?}", partial);
+            }
+            anyhow!("Failed to parse storage config YAML at {}: {}", path_to_use.display(), e)
+        })?;
+
+    let config = wrapper.storage;
+    if config.data_directory.as_os_str().is_empty() {
+        warn!("data_directory is empty in {}. Using default: {:?}", path_to_use.display(), StorageConfig::default().data_directory);
+        return Ok(StorageConfig {
+            data_directory: StorageConfig::default().data_directory,
+            ..config
+        });
+    }
+
+    if config.default_port == 0 {
+        warn!("default_port is invalid (0) in {}. Using default: {}", path_to_use.display(), DEFAULT_STORAGE_PORT);
+        return Ok(StorageConfig {
+            default_port: DEFAULT_STORAGE_PORT,
+            ..config
+        });
+    }
+
+    info!("Loaded Storage config: {:?}", config);
+    Ok(config)
 }
 
 pub fn load_storage_config_str(config_file_path: Option<&str>) -> Result<StorageConfig> {
@@ -1186,8 +1200,15 @@ pub fn load_daemon_config(config_file_path: Option<&str>) -> Result<DaemonYamlCo
     if path_to_use.exists() {
         let config_content = fs::read_to_string(&path_to_use)
             .context(format!("Failed to read daemon config file: {}", path_to_use.display()))?;
+        debug!("Daemon config content: {}", config_content);
         let config: DaemonYamlConfig = serde_yaml2::from_str(&config_content)
-            .context(format!("Failed to parse daemon config YAML: {}", path_to_use.display()))?;
+            .map_err(|e| {
+                error!("YAML parsing error for Daemon at {:?}: {:?}", path_to_use, e);
+                if let Ok(partial) = serde_yaml2::from_str::<Value>(&config_content) {
+                    error!("Partial YAML parse: {:?}", partial);
+                }
+                anyhow!("Failed to parse daemon config YAML: {}", path_to_use.display())
+            })?;
         info!("Loaded Daemon config: {:?}", config);
         Ok(config)
     } else {

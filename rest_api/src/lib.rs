@@ -1,42 +1,36 @@
-// rest_api/src/lib.rs
-
 use axum::{
     extract::{Path, State},
-    http::{Method, StatusCode}, // Use axum's StatusCode
+    http::{Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
-    // Removed: Server, // FIX: Use axum::Server directly, not hyper::Server
 };
-use tokio::net::TcpListener; // FIX: Import TcpListener for binding
-// Removed: use hyper::Server; // FIX: Remove explicit import of hyper::Server
+use tokio::net::TcpListener;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex};
-use tokio::time::{sleep, Duration};
-use tower_http::cors::{Any, CorsLayer}; // For CORS configuration
-use thiserror::Error; // FIX: Import thiserror::Error trait
+use tokio::time::{Duration};
+use tower_http::cors::{Any, CorsLayer};
+use thiserror::Error;
 use daemon_api::{
     start_daemon, stop_daemon_api_call, stop_port_daemon,
     CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS,
-}; // Import daemon_api functions
-use daemon_api::find_running_storage_daemon_port; // Import the new function
-use lib::query_parser::{parse_query_from_string, QueryType}; // Import query parser
-use anyhow::Context; // FIX: Import Context trait for .context() method
-use anyhow::Error as AnyhowError; // FIX: Alias anyhow::Error to avoid conflict with thiserror::Error
+};
+use daemon_api::find_running_storage_daemon_port;
+use lib::query_parser::{parse_query_from_string, QueryType};
+use anyhow::Context;
+use anyhow::Error as AnyhowError;
 
-// FIX: Import help generators from daemon_api
 use daemon_api::help_generator::{generate_full_help, generate_help_for_path};
 
-mod config; // FIX: Declare local config module
-use crate::config::{load_rest_api_config, load_storage_config, RestApiConfig, StorageConfig, StorageEngineType}; // FIX: Import from local config module
-
+mod config;
+use crate::config::{load_rest_api_config, load_storage_config, StorageConfig};
 
 // Define the REST API error enum
-#[derive(Debug, Error)] // FIX: Use Error from thiserror
+#[derive(Debug, Error)]
 pub enum RestApiError {
     #[error("Daemon API error: {0}")]
     DaemonApi(#[from] daemon_api::DaemonError),
@@ -51,10 +45,10 @@ pub enum RestApiError {
     #[error("Storage daemon error: {0}")]
     StorageDaemon(String),
     #[error("Configuration error: {0}")]
-    Config(String), // FIX: Change to String as ConfigError from external crate is not used directly
+    Config(String),
     #[error("Anyhow error: {0}")]
-    Anyhow(#[from] AnyhowError), // FIX: Use aliased AnyhowError
-    #[error("General error: {0}")] // FIX: Add GeneralError variant
+    Anyhow(#[from] AnyhowError),
+    #[error("General error: {0}")]
     GeneralError(String),
 }
 
@@ -68,9 +62,9 @@ impl IntoResponse for RestApiError {
             RestApiError::SerdeJson(e) => (StatusCode::BAD_REQUEST, format!("JSON error: {}", e)),
             RestApiError::InvalidInput(msg) => (StatusCode::BAD_REQUEST, msg),
             RestApiError::StorageDaemon(msg) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Storage daemon error: {}", msg)),
-            RestApiError::Config(msg) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Configuration error: {}", msg)), // Handle as String
+            RestApiError::Config(msg) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Configuration error: {}", msg)),
             RestApiError::Anyhow(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Internal error: {}", e)),
-            RestApiError::GeneralError(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg), // Handle GeneralError
+            RestApiError::GeneralError(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
         };
 
         let body = Json(json!({
@@ -88,7 +82,7 @@ struct AppState {
     daemon_handles: Arc<Mutex<HashMap<u16, tokio::task::JoinHandle<Result<(), daemon_api::DaemonError>>>>>,
     rest_api_shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     rest_api_port: Arc<Mutex<u16>>,
-    storage_config: Arc<StorageConfig>, // FIX: Use StorageConfig from local config module
+    storage_config: Arc<StorageConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -144,7 +138,7 @@ async fn start_daemon_handler(
     println!("Attempting to start daemon on port {}...", port);
 
     let daemon_join_handle = tokio::spawn(async move {
-        start_daemon(Some(port), cluster_range, skip_ports).await
+        start_daemon(Some(port), cluster_range, skip_ports, "rest").await
     });
 
     handles.insert(port, daemon_join_handle);
@@ -164,17 +158,14 @@ async fn stop_daemon_handler(
         let mut handles = state.daemon_handles.lock().await;
         if let Some(handle) = handles.remove(&port) {
             println!("Attempting to stop daemon on port {}...", port);
-            // Abort the task (this will drop the Future and associated resources)
             handle.abort();
-            // Additionally, send a SIGTERM to the process itself in case it's a true daemon
-            stop_port_daemon(port)?;
+            stop_port_daemon(port, "rest").await?;
             Ok(Json(json!({
                 "status": "success",
                 "message": format!("Daemon on port {} stopped.", port)
             })))
         } else {
-            // If not managed by this API, try to stop it externally
-            match stop_port_daemon(port) {
+            match stop_port_daemon(port, "rest").await {
                 Ok(_) => Ok(Json(json!({
                     "status": "success",
                     "message": format!("Daemon on port {} stopped (externally).", port)
@@ -183,7 +174,6 @@ async fn stop_daemon_handler(
             }
         }
     } else {
-        // Stop all daemons managed by this API
         let mut handles = state.daemon_handles.lock().await;
         let ports_to_stop: Vec<u16> = handles.keys().cloned().collect();
         for port in ports_to_stop {
@@ -191,18 +181,16 @@ async fn stop_daemon_handler(
                 handle.abort();
                 println!("Aborted task for daemon on port {}.", port);
             }
-            // Also send a SIGTERM to the process itself
-            if let Err(e) = stop_port_daemon(port) {
+            if let Err(e) = stop_port_daemon(port, "rest").await {
                 eprintln!("Failed to stop daemon on port {}: {:?}", port, e);
             }
         }
-        // Also send a global stop signal to unmanaged daemons
-        match stop_daemon_api_call() {
+        match stop_daemon_api_call().await {
             Ok(_) => Ok(Json(json!({
                 "status": "success",
                 "message": "All daemons stopped."
             }))),
-            Err(e) => Err(RestApiError::Anyhow(e)), // Use anyhow error conversion
+            Err(e) => Err(RestApiError::Anyhow(e)),
         }
     }
 }
@@ -225,7 +213,7 @@ async fn shutdown_handler(
 ) -> Result<Json<Value>, RestApiError> {
     let mut tx_guard = state.rest_api_shutdown_tx.lock().await;
     if let Some(tx) = tx_guard.take() {
-        let _ = tx.send(()); // Send shutdown signal
+        let _ = tx.send(());
         Ok(Json(json!({
             "status": "success",
             "message": "Shutting down REST API server."
@@ -249,10 +237,6 @@ async fn version_handler() -> (StatusCode, Json<Value>) {
 async fn register_user_handler(
     Json(payload): Json<RegisterUserRequest>,
 ) -> (StatusCode, Json<Value>) {
-    // In a real application, you would:
-    // 1. Hash the password
-    // 2. Store the username and hashed password in your database
-    // 3. Handle potential errors (e.g., username already exists)
     println!("Registering user: {}", payload.username);
     (StatusCode::OK, Json(json!({
         "status": "success",
@@ -264,16 +248,12 @@ async fn register_user_handler(
 async fn authenticate_handler(
     Json(payload): Json<AuthenticateRequest>,
 ) -> (StatusCode, Json<Value>) {
-    // In a real application, you would:
-    // 1. Retrieve hashed password for the username from your database
-    // 2. Verify the provided password against the hashed one
-    // 3. Generate a JWT or session token upon successful authentication
     println!("Authenticating user: {}", payload.username);
     if payload.username == "testuser" && payload.password == "testpass" {
         (StatusCode::OK, Json(json!({
             "status": "success",
             "message": "Authentication successful (mock).",
-            "token": "mock-jwt-token-12345" // Placeholder token
+            "token": "mock-jwt-token-12345"
         })))
     } else {
         (StatusCode::UNAUTHORIZED, Json(json!({
@@ -300,7 +280,7 @@ async fn query_handler(
                 "status": "success",
                 "message": response_message,
                 "query_type": format!("{:?}", query_type),
-                "results": [] // Placeholder for actual query results
+                "results": []
             })))
         },
         Err(e) => {
@@ -309,26 +289,22 @@ async fn query_handler(
     }
 }
 
-/// Handler for the /api/v1/help endpoint (returns full CLI help).
+// Handler for the /api/v1/help endpoint
 async fn get_full_help_rest() -> Json<serde_json::Value> {
     let help_text = generate_full_help();
     Json(serde_json::json!({"response": help_text}))
 }
 
-/// Handler for the /api/v1/help/{path} endpoint (returns filtered CLI help).
-/// The 'path' parameter captures the subcommand path (e.g., "start/daemon").
-async fn get_filtered_help_rest(axum::extract::Path(path): axum::extract::Path<String>) -> Json<serde_json::Value> {
-    // Split the path string into individual command segments
+// Handler for the /api/v1/help/{path} endpoint
+async fn get_filtered_help_rest(Path(path): Path<String>) -> Json<serde_json::Value> {
     let command_path: Vec<String> = path.split('/').map(|s| s.to_string()).collect();
-    // Call the synchronous help generator function
     let help_text = generate_help_for_path(&command_path);
     Json(serde_json::json!({"response": help_text}))
 }
 
-
 // Helper functions for status endpoints
 async fn get_rest_api_status_string() -> String {
-    let rest_port = load_rest_api_config().map(|c| c.port).unwrap_or(8082); // FIX: Use load_rest_api_config from local config
+    let rest_port = load_rest_api_config().map(|c| c.port).unwrap_or(8082);
     let rest_health_url = format!("http://127.0.0.1:{}/api/v1/health", rest_port);
     let rest_version_url = format!("http://127.0.0.1:{}/api/v1/version", rest_port);
     let client = reqwest::Client::builder()
@@ -406,10 +382,10 @@ async fn get_storage_daemon_status_string(port_arg: Option<u16>) -> String {
         find_running_storage_daemon_port().await.unwrap_or(CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS)
     };
 
-    let storage_config = load_storage_config(None) // FIX: Use load_storage_config from local config
+    let storage_config = load_storage_config(None)
         .unwrap_or_else(|e| {
             eprintln!("Warning: Could not load storage config for status check: {}. Using defaults.", e);
-            StorageConfig { // FIX: Use StorageConfig from local config
+            StorageConfig {
                 data_directory: "/tmp/graphdb_data".to_string(),
                 log_directory: "/var/log/graphdb".to_string(),
                 default_port: CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS,
@@ -449,56 +425,76 @@ async fn get_full_status_summary_string() -> String {
 }
 
 // Handler for /api/v1/status/*path
-async fn get_status_handler(
-    Path(path_segments): Path<Vec<String>>,
-) -> Result<Response, RestApiError> {
-    let status_text = match path_segments.as_slice() {
-        [] => get_full_status_summary_string().await,
-        [s] if s == "rest" => get_rest_api_status_string().await,
-        [s] if s == "daemon" => get_daemon_status_string(None).await,
-        [s, port_str] if s == "daemon" => {
-            if let Ok(port) = port_str.parse::<u16>() {
-                get_daemon_status_string(Some(port)).await
-            } else {
-                return Ok((StatusCode::BAD_REQUEST, format!("Invalid port number: {}", port_str)).into_response());
-            }
+async fn get_status_handler(Path(path): Path<String>) -> impl IntoResponse {
+    // Split the path into segments and filter out empty ones
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    
+    match segments.as_slice() {
+        [] => {
+            let status_text = get_full_status_summary_string().await;
+            (StatusCode::OK, status_text)
         }
-        [s] if s == "storage" => get_storage_daemon_status_string(None).await,
-        [s, port_str] if s == "storage" => {
-            if let Ok(port) = port_str.parse::<u16>() {
-                get_storage_daemon_status_string(Some(port)).await
-            } else {
-                return Ok((StatusCode::BAD_REQUEST, format!("Invalid port number: {}", port_str)).into_response());
-            }
+        ["rest"] => {
+            let status_text = get_rest_api_status_string().await;
+            (StatusCode::OK, status_text)
         }
-        _ => return Ok((StatusCode::NOT_FOUND, "Unknown status path".to_string()).into_response()),
-    };
-    Ok((StatusCode::OK, status_text).into_response())
+        ["daemon"] => {
+            let status_text = get_daemon_status_string(None).await;
+            (StatusCode::OK, status_text)
+        }
+        ["daemon", port_str] => match port_str.parse::<u16>() {
+            Ok(port) => {
+                let status_text = get_daemon_status_string(Some(port)).await;
+                (StatusCode::OK, status_text)
+            }
+            Err(_) => (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid port number: {}", port_str),
+            ),
+        },
+        ["storage"] => {
+            let status_text = get_storage_daemon_status_string(None).await;
+            (StatusCode::OK, status_text)
+        }
+        ["storage", port_str] => match port_str.parse::<u16>() {
+            Ok(port) => {
+                let status_text = get_storage_daemon_status_string(Some(port)).await;
+                (StatusCode::OK, status_text)
+            }
+            Err(_) => (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid port number: {}", port_str),
+            ),
+        },
+        _ => (
+            StatusCode::NOT_FOUND,
+            "Unknown status path".to_string(),
+        ),
+    }
 }
 
-/// Main function to start the REST API server.
+// Main function to start the REST API server
 pub async fn start_server(
     port: u16,
     shutdown_rx: oneshot::Receiver<()>,
-    storage_data_directory: String, // Path to storage data directory for REST API's use
-) -> Result<(), AnyhowError> { // FIX: Use AnyhowError
-    let rest_api_config = load_rest_api_config() // FIX: Use load_rest_api_config from local config
+    storage_data_directory: String,
+) -> Result<(), AnyhowError> {
+    let rest_api_config = load_rest_api_config()
         .context("Failed to load REST API configuration")?;
 
-    let storage_config = load_storage_config(None) // FIX: Use load_storage_config from local config
+    let storage_config = load_storage_config(None)
         .context("Failed to load storage configuration for REST API")?;
 
     let app_state = AppState {
         daemon_handles: Arc::new(Mutex::new(HashMap::new())),
-        rest_api_shutdown_tx: Arc::new(Mutex::new(None)), // This will be set by the oneshot channel provided by the CLI
+        rest_api_shutdown_tx: Arc::new(Mutex::new(None)),
         rest_api_port: Arc::new(Mutex::new(port)),
         storage_config: Arc::new(storage_config),
     };
 
-    // Configure CORS
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST])
-        .allow_origin(Any); // Be more restrictive in production!
+        .allow_origin(Any);
 
     let app = Router::new()
         .route("/api/v1/daemon/start", post(start_daemon_handler))
@@ -510,10 +506,8 @@ pub async fn start_server(
         .route("/api/v1/register", post(register_user_handler))
         .route("/api/v1/auth", post(authenticate_handler))
         .route("/api/v1/query", post(query_handler))
-        .route("/api/v1/status/*path", get(get_status_handler)) // Dynamic status path
-        // FIX: Add new help endpoints
-        .route("/api/v1/help", get(get_full_help_rest)) // Route for full help
-        // Route for filtered help, capturing the rest of the path as 'path'
+        .route("/api/v1/status/*path", get(get_status_handler))
+        .route("/api/v1/help", get(get_full_help_rest))
         .route("/api/v1/help/*path", get(get_filtered_help_rest))
         .with_state(app_state.clone())
         .layer(cors);
@@ -521,11 +515,9 @@ pub async fn start_server(
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     println!("REST API server listening on {}", addr);
 
-    // Store the sender part of the shutdown channel in the state
     let (tx, rx_internal) = oneshot::channel();
     *app_state.rest_api_shutdown_tx.lock().await = Some(tx);
 
-    // Combine the external shutdown signal with the internal one
     let combined_shutdown_signal = async {
         tokio::select! {
             _ = shutdown_rx => {
@@ -537,8 +529,8 @@ pub async fn start_server(
         }
     };
 
-    // FIX: Use tokio::net::TcpListener and axum::serve
-    let listener = TcpListener::bind(&addr).await
+    let listener = TcpListener::bind(&addr)
+        .await
         .context(format!("Failed to bind to address: {}", addr))?;
 
     axum::serve(listener, app.into_make_service())
@@ -549,4 +541,3 @@ pub async fn start_server(
     println!("REST API server stopped.");
     Ok(())
 }
-

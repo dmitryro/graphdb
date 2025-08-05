@@ -10,7 +10,6 @@ pub mod daemon_management;
 pub mod handlers;
 pub mod help_display;
 pub mod interactive;
-pub mod daemon_registry;
 
 // Re-export the main CLI entry point from cli.rs
 pub use cli::{start_cli, CliArgs, Commands}; // Corrected: Changed run_cli to start_cli
@@ -71,10 +70,10 @@ pub use help_display::{
     print_interactive_help,
     print_interactive_filtered_help,
 };
+
 pub use daemon_management::{
     start_daemon_process,
     stop_daemon_api_call,
     find_running_storage_daemon_port,
     clear_all_daemon_processes,
 };
-

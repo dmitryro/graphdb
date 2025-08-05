@@ -1,30 +1,31 @@
-// server/src/cli/daemon_management.rs
-// This file contains logic for daemonizing and managing background processes
-// (REST API, Storage, and GraphDB daemons).
-
-use anyhow::{anyhow, Context, Result, Error};
+use anyhow::{anyhow, Context, Result};
 use clap::ValueEnum;
 use std::path::PathBuf;
 use std::process;
-use std::str::FromStr;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use std::sync::Arc;
+use std::time::{Instant, SystemTime, UNIX_EPOCH, Duration};
+use std::sync::{Arc, LazyLock};
 use std::collections::{HashSet, HashMap};
-use std::ffi::OsStr;
-use std::borrow::Cow;
 use std::fmt;
 use regex::Regex;
 use sysinfo::{System, Pid, Process, ProcessStatus, ProcessesToUpdate};
 use tokio::task::JoinHandle;
 use tokio::sync::{oneshot, Mutex as TokioMutex};
 use tokio::net::TcpStream;
-use tokio::process::Command as TokioCommand;
-use tokio::time::{self, Duration};
-use tokio::io::{AsyncWriteExt, ErrorKind};
+use tokio::process::{Command as TokioCommand, Child};
+use tokio::time::{self, Duration as TokioDuration};
+use tokio::io::{AsyncWriteExt, AsyncBufReadExt, BufReader, ErrorKind};
 use log::{info, error, warn, debug};
 use chrono::Utc;
-use serde::{Serialize, Deserialize};
 use nix::unistd::Pid as NixPid;
+use nix::sys::signal::{kill, Signal};
+use daemon_api::{start_daemon, stop_daemon, stop_port_daemon, DaemonError};
+use rest_api::start_server as start_rest_server;
+use storage_daemon_server::run_storage_daemon as start_storage_server;
+use futures::future;
+use std::process::Stdio;
+use tokio::process::Command;
+use std::os::unix::process::ExitStatusExt;
+use std::fs;
 
 use crate::cli::config::{
     get_default_rest_port_from_config,
@@ -40,13 +41,10 @@ use crate::cli::config::{
     EXECUTABLE_NAME,
     DAEMON_REGISTRY_DB_PATH,
     load_main_daemon_config,
+    load_rest_config,
 };
-use crate::cli::daemon_registry::{DaemonRegistry, DaemonMetadata};
-pub use crate::cli::daemon_registry::{GLOBAL_DAEMON_REGISTRY};
-use lib::storage_engine::config::{StorageEngineType};
-use daemon_api::{stop_daemon, DaemonError};
-use rest_api::start_server as start_rest_server;
-use storage_daemon_server::run_storage_daemon as start_storage_server;
+use daemon_api::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
+use lib::storage_engine::config::StorageEngineType;
 
 /// Helper to run an external command with a timeout.
 pub async fn run_command_with_timeout(
@@ -63,7 +61,384 @@ pub async fn run_command_with_timeout(
         .context(format!("Failed to run command '{} {}'", command_name, args.join(" ")))
 }
 
-async fn start_graphdb_daemon_core(port: u16) -> Result<()> {
+/// Helper to check if a process is running by PID.
+pub async fn check_process_status_by_pid(pid: Pid) -> bool {
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+    system.process(pid).is_some()
+}
+
+// Helper function to check if a string is a valid cluster range (e.g., "8081-8084")
+fn is_valid_cluster_range(range: &str) -> bool {
+    range.contains('-') && range.split('-').all(|s| s.parse::<u16>().is_ok())
+}
+
+/// Checks if a process is running on the specified port.
+pub async fn check_process_status_by_port(
+    process_name: &str,
+    port: u16,
+) -> bool {
+    // Early return if port is not listening to avoid unnecessary registry checks
+    if !is_port_listening(port).await {
+        debug!("Port {} is not listening for {}.", port, process_name);
+        return false;
+    }
+    let metadata = match tokio::time::timeout(
+        Duration::from_secs(2),
+        GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port),
+    ).await {
+        Ok(Ok(Some(meta))) => Some(meta),
+        Ok(Ok(None)) => None,
+        Ok(Err(e)) => {
+            error!("Failed to get daemon metadata for port {}: {}", port, e);
+            None
+        }
+        Err(_) => {
+            error!("Timeout accessing daemon metadata for port {}", port);
+            None
+        }
+    };
+    if let Some(meta) = metadata {
+        if check_process_status_by_pid(Pid::from_u32(meta.pid)).await {
+            let updated_metadata = DaemonMetadata {
+                last_seen_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
+                ..meta
+            };
+            if let Err(e) = tokio::time::timeout(
+                Duration::from_secs(2),
+                GLOBAL_DAEMON_REGISTRY.register_daemon(updated_metadata),
+            ).await {
+                error!("Failed to update daemon metadata for port {}: {:?}", port, e);
+            }
+            return true;
+        }
+        // Unregister stale entry
+        if let Err(e) = tokio::time::timeout(
+            Duration::from_secs(2),
+            GLOBAL_DAEMON_REGISTRY.unregister_daemon(port),
+        ).await {
+            error!("Failed to unregister daemon for port {}: {:?}", port, e);
+        }
+    }
+    // Fallback to system scan if no registry entry
+    match find_pid_by_port(port).await {
+        Some(pid) => {
+            let service_type = if process_name.contains("Storage") {
+                "storage"
+            } else if process_name.contains("REST") {
+                "rest"
+            } else {
+                "main"
+            };
+            let metadata = DaemonMetadata {
+                service_type: service_type.to_string(),
+                port,
+                pid, // pid is already u32
+                ip_address: "127.0.0.1".to_string(),
+                data_dir: None,
+                config_path: None,
+                engine_type: None,
+                last_seen_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
+            };
+            if let Err(e) = tokio::time::timeout(
+                Duration::from_secs(2),
+                GLOBAL_DAEMON_REGISTRY.register_daemon(metadata),
+            ).await {
+                error!("Failed to register daemon for port {}: {:?}", port, e);
+            }
+            true
+        }
+        None => false,
+    }
+}
+
+/// Stops a process running on the specified port.
+pub async fn stop_process_by_port(
+    process_name: &str,
+    port: u16
+) -> Result<(), anyhow::Error> {
+    println!("Attempting to stop {} on port {}...", process_name, port);
+    let service_type_str = if process_name.contains("Storage") { "storage" }
+        else if process_name.contains("REST") { "rest" }
+        else { "main" };
+    let service_type = ServiceType::from_str(service_type_str, true)
+        .map_err(|e| anyhow!("Invalid service type: {}", e))?;
+    // This call is now safe assuming GLOBAL_DAEMON_REGISTRY uses a tokio::sync::Mutex.
+    let metadata = match tokio::time::timeout(
+        Duration::from_secs(2),
+        GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port),
+    ).await {
+        Ok(Ok(Some(meta))) => Some(meta),
+        Ok(Ok(None)) => None,
+        Ok(Err(e)) => {
+            error!("Failed to get daemon metadata for port {}: {}", port, e);
+            None
+        }
+        Err(_) => {
+            error!("Timeout accessing daemon metadata for port {}", port);
+            None
+        }
+    };
+    let mut pid_to_stop: Option<u32> = metadata.map(|meta| meta.pid);
+    // Fallback to lsof if no registry entry
+    if pid_to_stop.is_none() {
+        pid_to_stop = find_pid_by_port(port).await; // This line is correct.
+    }
+    if let Some(pid) = pid_to_stop {
+        let nix_pid = NixPid::from_raw(pid as i32);
+        // Try SIGTERM first
+        if let Err(e) = kill(nix_pid, Signal::SIGTERM) {
+            error!("Failed to send SIGTERM to PID {}: {}", pid, e);
+        } else {
+            println!("Sent SIGTERM to PID {} for {} on port {}.", pid, process_name, port);
+            let start_time = Instant::now();
+            let wait_timeout = Duration::from_secs(5);
+            let poll_interval = Duration::from_millis(200);
+            while start_time.elapsed() < wait_timeout {
+                if is_port_free(port).await {
+                    break;
+                }
+                tokio::time::sleep(poll_interval).await;
+            }
+            // Check if process is still running
+            if is_process_running(pid).await {
+                warn!("Process {} (PID {}) on port {} still running after SIGTERM. Sending SIGKILL.", process_name, pid, port);
+                if let Err(e) = kill(nix_pid, Signal::SIGKILL) {
+                    error!("Failed to send SIGKILL to PID {}: {}", pid, e);
+                } else {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    if is_process_running(pid).await {
+                        return Err(anyhow!("Failed to stop {} (PID {}) on port {}.", process_name, pid, port));
+                    }
+                }
+            }
+        }
+        // Clean up registry and PID file
+        if let Err(e) = tokio::time::timeout(
+            Duration::from_secs(2),
+            GLOBAL_DAEMON_REGISTRY.unregister_daemon(port),
+        ).await {
+            error!("Failed to unregister daemon for port {}: {:?}", port, e);
+        }
+        remove_pid_file(port, &service_type).await?;
+    } else {
+        println!("No process found for {} on port {}.", process_name, port);
+    }
+    if is_port_free(port).await {
+        println!("Port {} is now free.", port);
+        Ok(())
+    } else {
+        Err(anyhow!("Port {} remained in use after termination attempts.", port))
+    }
+}
+
+/// Signal-based reload for a daemon process.
+pub async fn reload_daemon_process(
+    process_name: &str,
+    port: u16,
+) -> Result<(), anyhow::Error> {
+    let metadata = match tokio::time::timeout(
+        Duration::from_secs(2),
+        GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port),
+    ).await {
+        Ok(Ok(Some(meta))) => Some(meta),
+        Ok(Ok(None)) => None,
+        Ok(Err(e)) => {
+            error!("Failed to get daemon metadata for port {}: {}", port, e);
+            None
+        }
+        Err(_) => {
+            error!("Timeout accessing daemon metadata for port {}", port);
+            None
+        }
+    };
+
+    if let Some(meta) = metadata {
+        if let Err(e) = kill(NixPid::from_raw(meta.pid as i32), Signal::SIGHUP) {
+            return Err(anyhow!("Failed to send SIGHUP to PID {} for {} on port {}: {}", meta.pid, process_name, port, e));
+        }
+        println!("Sent SIGHUP to PID {} for {} on port {}.", meta.pid, process_name, port);
+        
+        let updated_metadata = DaemonMetadata {
+            last_seen_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
+            ..meta
+        };
+        if let Err(e) = tokio::time::timeout(
+            Duration::from_secs(2),
+            GLOBAL_DAEMON_REGISTRY.register_daemon(updated_metadata),
+        ).await {
+            error!("Failed to update daemon metadata for port {}: {:?}", port, e);
+        }
+        Ok(())
+    } else {
+        Err(anyhow!("No {} process found in registry for port {}.", process_name, port))
+    }
+}
+
+/// Signal-based restart (stop and start) for a daemon process.
+pub async fn restart_daemon_process(
+    process_name: &str,
+    port: u16,
+    is_rest_api_server: bool,
+    is_storage_daemon: bool,
+    config_path: Option<PathBuf>,
+    engine_type: Option<StorageEngineType>,
+) -> Result<(), anyhow::Error> {
+    let engine_type_str = engine_type.map(|et| et.to_string());
+    
+    // Stop the process first
+    stop_process_by_port(process_name, port).await?;
+    
+    // Start the daemon process
+    start_daemon_process(
+        is_rest_api_server,
+        is_storage_daemon,
+        Some(port),
+        config_path,
+        engine_type_str,
+    )
+    .await?;
+    
+    Ok(())
+}
+
+/// Cleans up stale entries in the daemon registry by checking if their PIDs are still running.
+pub async fn cleanup_daemon_registry_stale_entries() -> Result<(), anyhow::Error> {
+    let all_metadata = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await?;
+    let mut cleaned_up_count = 0;
+
+    for metadata in all_metadata {
+        if !is_pid_running(metadata.pid).await {
+            warn!("Found stale registry entry for PID {} on port {}. Unregistering.", metadata.pid, metadata.port);
+            if let Err(e) = tokio::time::timeout(
+                Duration::from_secs(2),
+                GLOBAL_DAEMON_REGISTRY.unregister_daemon(metadata.port),
+            ).await {
+                error!("Failed to unregister daemon for port {}: {:?}", metadata.port, e);
+            } else {
+                cleaned_up_count += 1;
+            }
+        }
+    }
+
+    if cleaned_up_count > 0 {
+        info!("Successfully cleaned up {} stale daemon registry entries.", cleaned_up_count);
+    } else {
+        debug!("No stale daemon registry entries found.");
+    }
+
+    Ok(())
+}
+
+/// Finds all ports for a given service type.
+pub async fn find_all_ports_with_service_type(service_type: &str) -> Vec<u16> {
+    let all_daemons = match tokio::time::timeout(Duration::from_secs(2), GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata()).await {
+        Ok(Ok(daemons)) => daemons,
+        Ok(Err(e)) => {
+            error!("Failed to get all daemon metadata from registry: {}", e);
+            return Vec::new();
+        }
+        Err(_) => {
+            error!("Timeout accessing daemon metadata");
+            return Vec::new();
+        }
+    };
+
+    let tasks: Vec<_> = all_daemons
+        .into_iter()
+        .filter(|d| d.service_type == service_type)
+        .map(|d| {
+            tokio::spawn(async move {
+                if is_process_running(d.pid).await && is_port_listening(d.port).await {
+                    Some(d.port)
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+
+    let mut ports = future::join_all(tasks)
+        .await
+        .into_iter()
+        .filter_map(|res| res.unwrap_or(None))
+        .collect::<Vec<u16>>();
+    ports.sort_unstable();
+    ports
+}
+
+/// Lists and reports the status of all registered daemons.
+pub async fn list_and_report_running_daemons() -> Result<(), anyhow::Error> {
+    let mut running_daemons = match tokio::time::timeout(Duration::from_secs(2), GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata()).await {
+        Ok(Ok(daemons)) => daemons,
+        Ok(Err(e)) => {
+            warn!("Failed to get daemon metadata: {}", e);
+            Vec::new()
+        }
+        Err(_) => {
+            warn!("Timeout accessing daemon metadata");
+            Vec::new()
+        }
+    };
+
+    if running_daemons.is_empty() {
+        let scanned_daemons = get_all_daemon_processes_with_ports().await
+            .context("Failed to fetch daemon processes with ports")?;
+        for (port, (pid, service_type)) in scanned_daemons {
+            let metadata = DaemonMetadata {
+                service_type,
+                port,
+                pid,
+                ip_address: "127.0.0.1".to_string(),
+                data_dir: None,
+                config_path: None,
+                engine_type: None,
+                last_seen_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
+            };
+            if let Err(e) = tokio::time::timeout(
+                Duration::from_secs(2),
+                GLOBAL_DAEMON_REGISTRY.register_daemon(metadata.clone()),
+            ).await {
+                error!("Failed to register daemon for port {}: {:?}", port, e);
+            }
+            running_daemons.push(metadata);
+        }
+    }
+
+    if running_daemons.is_empty() {
+        println!("No daemons are currently registered.");
+        return Ok(());
+    }
+
+    println!("Registered Daemons:");
+    println!("{:<15} {:<10} {:<10} {:<20}", "Service Type", "Port", "PID", "Status");
+
+    let tasks: Vec<_> = running_daemons.into_iter().map(|daemon| {
+        tokio::spawn(async move {
+            let status = check_process_status_by_pid(Pid::from_u32(daemon.pid)).await;
+            (daemon, status)
+        })
+    }).collect();
+
+    let results = future::join_all(tasks).await;
+    for res in results {
+        let (daemon, status) = res.unwrap_or((DaemonMetadata {
+            service_type: "unknown".to_string(),
+            port: 0,
+            pid: 0,
+            ip_address: "".to_string(),
+            data_dir: None,
+            config_path: None,
+            engine_type: None,
+            last_seen_nanos: 0,
+        }, false));
+        let status_str = if status { "Running" } else { "Stopped" };
+        println!("{:<15} {:<10} {:<10} {:<20}", daemon.service_type, daemon.port, daemon.pid, status_str);
+    }
+    Ok(())
+}
+
+async fn start_graphdb_daemon_core(port: u16) -> Result<(), anyhow::Error> {
     info!("[DAEMON PROCESS] Attempting to start ACTUAL GraphDB core daemon on port {}...", port);
     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await
         .with_context(|| format!("Failed to bind GraphDB Daemon to port {}", port))?;
@@ -93,39 +468,32 @@ async fn start_graphdb_daemon_core(port: u16) -> Result<()> {
     }
 }
 
-/// Handles the internal execution of daemonized processes (REST API or Storage).
-/// This function is called when the CLI is invoked with `--internal-rest-api-run` or `--internal-storage-daemon-run`.
 pub async fn handle_internal_daemon_run(
     is_rest_api_run: bool,
     is_storage_daemon_run: bool,
     internal_port: Option<u16>,
     internal_storage_config_path: Option<PathBuf>,
     _internal_storage_engine: Option<StorageEngineType>,
-) -> Result<()> {
+) -> Result<(), anyhow::Error> {
     if is_rest_api_run {
         let daemon_listen_port = internal_port.unwrap_or_else(get_default_rest_port_from_config);
-
-        let cli_storage_config = load_storage_config(
-            internal_storage_config_path
-                .as_ref()
-                .and_then(|path| path.to_str())
-        )
-        .unwrap_or_else(|e| {
-            eprintln!("[DAEMON PROCESS] Warning: Could not load storage config for REST API: {}. Using defaults for CLI config.", e);
-            StorageConfig::default()
-        });
+        let (tx_shutdown, rx_shutdown) = tokio::sync::oneshot::channel::<()>();
+        let rest_api_shutdown_tx_opt = Arc::new(TokioMutex::new(Some(tx_shutdown)));
+        let rest_api_port_arc = Arc::new(TokioMutex::new(None));
+        let rest_api_handle = Arc::new(TokioMutex::new(None));
 
         info!("[DAEMON PROCESS] Starting REST API server (daemonized) on port {}...", daemon_listen_port);
-        let (_tx_shutdown, rx_shutdown) = tokio::sync::oneshot::channel::<()>();
-        
-        let result = start_rest_server(
-            daemon_listen_port,
-            rx_shutdown,
-            cli_storage_config.data_directory.to_string_lossy().into_owned(),
+        let result = crate::cli::handlers::start_rest_api_interactive(
+            Some(daemon_listen_port),
+            None,
+            rest_api_shutdown_tx_opt.clone(),
+            rest_api_port_arc.clone(),
+            rest_api_handle.clone(),
         ).await;
 
         if let Err(e) = result {
             error!("[DAEMON PROCESS] REST API server failed: {:?}", e);
+            return Err(e);
         }
         info!("[DAEMON PROCESS] REST API server (daemonized) stopped.");
         Ok(())
@@ -137,11 +505,22 @@ pub async fn handle_internal_daemon_run(
             PathBuf::from(DEFAULT_CONFIG_ROOT_DIRECTORY_STR)
                 .join(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE)
         });
+        let storage_daemon_shutdown_tx_opt = Arc::new(TokioMutex::new(None));
+        let storage_daemon_port_arc = Arc::new(TokioMutex::new(None));
+        let storage_daemon_handle = Arc::new(TokioMutex::new(None));
 
         info!("[DAEMON PROCESS] Starting Storage daemon (daemonized) on port {}...", daemon_listen_port);
-        let result = start_storage_server(Some(daemon_listen_port), storage_config_path).await;
+        let result = crate::cli::handlers::start_storage_interactive(
+            Some(daemon_listen_port),
+            Some(storage_config_path),
+            None,
+            storage_daemon_shutdown_tx_opt,
+            storage_daemon_handle,
+            storage_daemon_port_arc,
+        ).await;
         if let Err(e) = result {
             error!("[DAEMON PROCESS] Storage daemon failed: {:?}", e);
+            return Err(e);
         }
         info!("[DAEMON PROCESS] Storage daemon (daemonized) stopped.");
         Ok(())
@@ -159,53 +538,79 @@ pub async fn handle_internal_daemon_run(
         let result = start_graphdb_daemon_core(daemon_listen_port).await;
         if let Err(e) = result {
             error!("[DAEMON PROCESS] GraphDB Daemon failed: {:?}", e);
+            return Err(e);
         }
         info!("[DAEMON PROCESS] GraphDB Daemon (daemonized) stopped.");
         Ok(())
     }
 }
 
-/// Spawns a daemon process (REST, Storage, or Main) and writes its PID to the DaemonRegistry.
-pub async fn start_daemon_process(
+/// Starts a main daemon process and registers it.
+pub async fn start_daemon_with_port(p: u16, service_type: &str) -> Result<(), anyhow::Error> {
+    if !is_port_free(p).await {
+        return Err(anyhow!("Port {} is already in use.", p));
+    }
+
+    if GLOBAL_DAEMON_REGISTRY.find_daemon_by_port(p).await?.is_some() {
+        warn!("Daemon already registered on port {}.", p);
+        return Ok(());
+    }
+
+    start_daemon(Some(p), None, Vec::new(), service_type)
+        .await
+        .map_err(|e| anyhow!("Failed to start daemon via daemon_api: {}", e))?;
+
+    let pid = find_pid_by_port(p).await.ok_or_else(|| anyhow!("Failed to find PID for newly started daemon on port {}. Registration failed.", p))?;
+
+    if pid == 0 {
+        return Err(anyhow!("Invalid PID for newly started daemon on port {}. Registration failed.", p));
+    }
+
+    let details = DaemonMetadata {
+        service_type: service_type.to_string(),
+        port: p,
+        pid,
+        ip_address: "127.0.0.1".to_string(),
+        data_dir: None,
+        config_path: None,
+        engine_type: None,
+        last_seen_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
+    };
+
+    tokio::time::timeout(Duration::from_secs(2), GLOBAL_DAEMON_REGISTRY.register_daemon(details))
+        .await
+        .map_err(|_| anyhow!("Timeout registering daemon"))?
+        .context("Failed to register daemon in registry")?;
+
+    Ok(())
+}
+
+/// Starts a daemon process based on the service type and returns its PID.
+pub async fn spawn_daemon_process(
+    port: Option<u16>,
+    cluster_range: Option<String>,
     is_rest: bool,
     is_storage: bool,
-    port: Option<u16>,
-    config_path: Option<PathBuf>,
-    engine_type: Option<StorageEngineType>,
-) -> Result<()> {
-    let current_exe = std::env::current_exe().context("Failed to get current executable path")?;
-    let mut command = TokioCommand::new(&current_exe);
-
-    if is_rest {
-        command.arg("--internal-rest-api-run");
+) -> Result<u32> {
+    let actual_port = port.unwrap_or(if is_rest {
+        DEFAULT_REST_API_PORT
     } else if is_storage {
-        command.arg("--internal-storage-daemon-run");
+        DEFAULT_STORAGE_PORT
     } else {
-        command.arg("--internal-daemon-run");
-    }
+        DEFAULT_DAEMON_PORT
+    });
 
-    if let Some(p) = port {
-        command.arg("--internal-port").arg(p.to_string());
-    }
+    // Define skip_ports based on service type
+    let skip_ports = if is_rest {
+        vec![DEFAULT_STORAGE_PORT] // Skip storage port for REST API
+    } else if is_storage {
+        vec![DEFAULT_REST_API_PORT] // Skip REST API port for storage
+    } else {
+        vec![DEFAULT_REST_API_PORT, DEFAULT_STORAGE_PORT] // Skip both for main daemon
+    };
 
-    if let Some(path) = config_path.clone() {
-        command.arg("--internal-storage-config-path").arg(path);
-    }
-
-    if let Some(ref engine) = engine_type {
-        command.arg("--internal-storage-engine")
-               .arg(engine.to_possible_value().unwrap().get_name());
-    }
-
-    command.stdin(std::process::Stdio::null())
-           .stdout(std::process::Stdio::null())
-           .stderr(std::process::Stdio::null());
-
-    let child = command.spawn().context("Failed to spawn daemon process")?;
-    let spawned_pid = child.id().unwrap_or(0);
-    info!("Daemonized process spawned with PID {}", spawned_pid);
-
-    let service_type_str = if is_rest {
+    // Determine service type
+    let service_type = if is_rest {
         "rest"
     } else if is_storage {
         "storage"
@@ -213,88 +618,300 @@ pub async fn start_daemon_process(
         "main"
     };
 
+    // Use cluster_range only for main daemon, pass None for REST and storage
+    let effective_cluster = if is_rest || is_storage {
+        None
+    } else {
+        cluster_range
+    };
+
+    debug!("Starting daemon: port={}, cluster_range={:?}, skip_ports={:?}, service_type={}", actual_port, effective_cluster, skip_ports, service_type);
+    start_daemon(Some(actual_port), effective_cluster, skip_ports, service_type)
+        .await
+        .map_err(|e| {
+            error!("Failed to start daemon: port={}, error={}", actual_port, e);
+            anyhow!("Failed to start daemon process: {}", e)
+        })?;
+
+    // Read PID from file
+    let pid_file = format!("/tmp/graphdb-{}-{}.pid", service_type, actual_port);
+    let pid = fs::read_to_string(&pid_file)
+        .map_err(|e| anyhow!("Failed to read PID file {}: {}", pid_file, e))?
+        .trim()
+        .parse::<u32>()
+        .map_err(|e| anyhow!("Invalid PID in {}: {}", pid_file, e))?;
+
+    info!("Spawned daemon process with PID {} on port {}", pid, actual_port);
+    Ok(pid)
+}
+
+pub async fn start_daemon_process(
+    is_rest: bool,
+    is_storage: bool,
+    port: Option<u16>,
+    config_path: Option<PathBuf>,
+    engine_type: Option<String>,
+) -> Result<u32> {
+    let config_path_str = config_path.as_ref().map(|p| p.to_string_lossy().into_owned());
     let actual_port = port.unwrap_or_else(|| {
         if is_rest {
-            get_default_rest_port_from_config()
-        } else if is_storage {
-            load_storage_config(None)
+            load_rest_config(config_path_str.as_deref())
                 .map(|c| c.default_port)
-                .unwrap_or(CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS)
+                .unwrap_or(DEFAULT_REST_API_PORT)
+        } else if is_storage {
+            load_storage_config(config_path_str.as_deref())
+                .map(|c| c.default_port)
+                .unwrap_or(DEFAULT_STORAGE_PORT)
         } else {
-            load_main_daemon_config(None)
+            load_main_daemon_config(config_path_str.as_deref())
                 .map(|c| c.default_port)
                 .unwrap_or(DEFAULT_DAEMON_PORT)
         }
     });
 
+    if !is_port_free(actual_port).await {
+        error!("Port {} is already in use", actual_port);
+        return Err(anyhow!("Port {} is already in use", actual_port));
+    }
+
+    let process_name = if is_rest {
+        "REST API"
+    } else if is_storage {
+        "Storage Daemon"
+    } else {
+        "GraphDB Daemon"
+    };
+    info!("Starting {} process on port {}", process_name, actual_port);
+
+    let _config_content = if let Some(ref path) = config_path {
+        if !path.exists() {
+            warn!("Config file not found at {}. Using defaults.", path.display());
+            None
+        } else {
+            let content = fs::read_to_string(path)
+                .context(format!("Failed to read config file: {}", path.display()))?;
+            debug!("Config content for {}: {}", process_name, content);
+            Some(content)
+        }
+    } else {
+        None
+    };
+
+    let data_dir = if is_storage {
+        load_storage_config(config_path_str.as_deref())
+            .map(|c| PathBuf::from(c.data_directory))
+            .unwrap_or_else(|_| PathBuf::from(format!("{}/storage_data", DEFAULT_CONFIG_ROOT_DIRECTORY_STR)))
+    } else if is_rest {
+        load_rest_config(config_path_str.as_deref())
+            .map(|c| PathBuf::from(c.data_directory))
+            .unwrap_or_else(|_| PathBuf::from(format!("{}/rest_api_data", DEFAULT_CONFIG_ROOT_DIRECTORY_STR)))
+    } else {
+        load_main_daemon_config(config_path_str.as_deref())
+            .map(|c| PathBuf::from(c.data_directory))
+            .unwrap_or_else(|_| PathBuf::from(format!("{}/daemon_data", DEFAULT_CONFIG_ROOT_DIRECTORY_STR)))
+    };
+
+    let pid = if is_rest {
+        let (tx_shutdown, rx_shutdown) = tokio::sync::oneshot::channel::<()>();
+        let rest_api_shutdown_tx_opt = Arc::new(TokioMutex::new(Some(tx_shutdown)));
+        let rest_api_port_arc = Arc::new(TokioMutex::new(None));
+        let rest_api_handle = Arc::new(TokioMutex::new(None));
+
+        crate::cli::handlers::start_rest_api_interactive(
+            Some(actual_port),
+            None,
+            rest_api_shutdown_tx_opt.clone(),
+            rest_api_port_arc.clone(),
+            rest_api_handle.clone(),
+        )
+        .await
+        .map_err(|e| anyhow!("Failed to start REST API process on port {}: {}", actual_port, e))?;
+
+        let pid = find_pid_by_port(actual_port)
+            .await
+            .ok_or_else(|| anyhow!("Failed to find PID for REST API process on port {}", actual_port))?;
+        pid
+    } else if is_storage {
+        let storage_daemon_shutdown_tx_opt = Arc::new(TokioMutex::new(None));
+        let storage_daemon_port_arc = Arc::new(TokioMutex::new(None));
+        let storage_daemon_handle = Arc::new(TokioMutex::new(None));
+
+        crate::cli::handlers::start_storage_interactive(
+            Some(actual_port),
+            config_path.clone(), // Clone here to avoid move
+            None,
+            storage_daemon_shutdown_tx_opt,
+            storage_daemon_handle,
+            storage_daemon_port_arc,
+        )
+        .await
+        .map_err(|e| anyhow!("Failed to start Storage Daemon process on port {}: {}", actual_port, e))?;
+
+        let pid = find_pid_by_port(actual_port)
+            .await
+            .ok_or_else(|| anyhow!("Failed to find PID for Storage Daemon process on port {}", actual_port))?;
+        pid
+    } else {
+        spawn_daemon_process(Some(actual_port), None, false, false)
+            .await
+            .map_err(|e| anyhow!("Failed to spawn GraphDB Daemon process on port {}: {}", actual_port, e))?
+    };
+
+    let addr = format!("127.0.0.1:{}", actual_port);
+    let health_check_timeout = Duration::from_secs(5);
+    let poll_interval = Duration::from_millis(200);
+    let start_time = Instant::now();
+
+    while start_time.elapsed() < health_check_timeout {
+        if tokio::net::TcpStream::connect(&addr).await.is_ok() {
+            info!("{} process started successfully with PID {} on port {}", process_name, pid, actual_port);
+
+            let metadata = DaemonMetadata {
+                service_type: if is_rest { "rest" } else if is_storage { "storage" } else { "main" }.to_string(),
+                port: actual_port,
+                pid,
+                ip_address: "127.0.0.1".to_string(),
+                data_dir: Some(data_dir),
+                config_path, // Now we can use config_path here since we cloned it above
+                engine_type,
+                last_seen_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
+            };
+
+            GLOBAL_DAEMON_REGISTRY.register_daemon(metadata).await
+                .with_context(|| format!("Failed to register {} daemon on port {}", process_name, actual_port))?;
+
+            return Ok(pid);
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+
+    // Check stderr file for errors
+    let stderr_file = format!("/tmp/daemon-{}.err", actual_port);
+    if let Ok(stderr_content) = fs::read_to_string(&stderr_file) {
+        error!("{} process stderr: {}", process_name, stderr_content);
+    }
+
+    error!("{} process on port {} failed to become reachable after {} seconds", process_name, actual_port, health_check_timeout.as_secs());
+    Err(anyhow!("{} process on port {} failed to start", process_name, actual_port))
+}
+
+/// Wraps `start_daemon` from daemon_api to start a daemon process and return its PID.
+/// Wraps `start_daemon` from daemon_api to start a daemon process and return its PID.
+pub async fn start_daemon_with_pid(
+    port: Option<u16>,
+    cluster: Option<String>,
+    args: Vec<String>,
+    service_type: &str,
+) -> Result<u32, anyhow::Error> {
+    let args_u16: Result<Vec<u16>> = args
+        .into_iter()
+        .map(|arg| {
+            arg.parse::<u16>()
+                .map_err(|e| anyhow!("Failed to parse argument '{}' as u16: {}", arg, e))
+        })
+        .collect();
+    let args_u16 = args_u16.context("Failed to convert arguments to u16")?;
+
+    let actual_port = port.unwrap_or(DEFAULT_DAEMON_PORT);
+    if !is_port_free(actual_port).await {
+        return Err(anyhow!("Port {} is already in use.", actual_port));
+    }
+
+    let mut command = Command::new(std::env::current_exe().context("Failed to get current executable path")?);
+    
+    if let Some(port) = port {
+        command.arg("--port").arg(port.to_string());
+    }
+    
+    if let Some(cluster) = &cluster {
+        command.arg("--cluster").arg(cluster);
+    }
+    
+    for arg in &args_u16 {
+        command.arg(arg.to_string());
+    }
+    
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+    
+    let child = command
+        .spawn()
+        .context("Failed to spawn daemon process")?;
+    
+    let pid = child.id().context("Failed to get PID of spawned daemon process")?;
+    
+    start_daemon(port, cluster.clone(), args_u16, service_type)
+        .await
+        .context("Failed to initialize daemon via daemon_api")?;
+
+    // Handle cluster ports
+    let cluster_ports = if let Some(cluster_range) = cluster {
+        parse_cluster_range(&cluster_range).context("Failed to parse cluster range")?
+    } else {
+        Vec::new()
+    };
+
     let metadata = DaemonMetadata {
-        service_type: service_type_str.to_string(),
+        service_type: service_type.to_string(),
         port: actual_port,
-        pid: spawned_pid,
+        pid,
         ip_address: "127.0.0.1".to_string(),
         data_dir: None,
-        config_path,
-        engine_type: engine_type
-            .as_ref()
-            .map(|e| e.to_possible_value().unwrap().get_name().to_string()),
+        config_path: None,
+        engine_type: None,
         last_seen_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
     };
 
-    GLOBAL_DAEMON_REGISTRY.register_daemon(metadata).await?;
-    Ok(())
-}
+    tokio::time::timeout(Duration::from_secs(2), GLOBAL_DAEMON_REGISTRY.register_daemon(metadata))
+        .await
+        .map_err(|_| anyhow!("Timeout registering daemon"))?
+        .context("Failed to register daemon in registry")?;
 
-/// Helper function to find a running storage daemon's port.
-/// Scans a range of common ports using `lsof`.
-pub async fn find_running_storage_daemon_port() -> Vec<u16> {
-    let mut running_ports = Vec::new();
-    let all_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
-    let storage_daemons: Vec<DaemonMetadata> = all_daemons
-        .into_iter()
-        .filter(|d| d.service_type == "storage")
-        .collect();
-
-    for daemon in storage_daemons {
-        if is_process_running(daemon.pid).await && is_port_listening(daemon.port).await {
-            running_ports.push(daemon.port);
-            let metadata = DaemonMetadata {
-                service_type: daemon.service_type.clone(),
-                port: daemon.port,
-                pid: daemon.pid,
-                ip_address: daemon.ip_address.clone(),
-                data_dir: daemon.data_dir.clone(),
-                config_path: daemon.config_path.clone(),
-                engine_type: daemon.engine_type.clone(),
+    // Register additional cluster ports if specified
+    for cluster_port in cluster_ports {
+        if cluster_port != actual_port {
+            let cluster_metadata = DaemonMetadata {
+                service_type: service_type.to_string(),
+                port: cluster_port,
+                pid,
+                ip_address: "127.0.0.1".to_string(),
+                data_dir: None,
+                config_path: None,
+                engine_type: None,
                 last_seen_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
             };
-            let _ = GLOBAL_DAEMON_REGISTRY.register_daemon(metadata).await;
-        } else {
-            let _ = GLOBAL_DAEMON_REGISTRY.unregister_daemon(daemon.port).await;
+            tokio::time::timeout(Duration::from_secs(2), GLOBAL_DAEMON_REGISTRY.register_daemon(cluster_metadata))
+                .await
+                .map_err(|_| anyhow!("Timeout registering cluster daemon"))?
+                .context("Failed to register cluster daemon in registry")?;
         }
     }
 
-    // Fallback to system scan
-    if running_ports.is_empty() {
-        let all_daemons = get_all_daemon_processes_with_ports().await;
-        running_ports.extend(
-            all_daemons.into_iter()
-                .filter(|(_port, (_pid, service_type))| service_type == "storage")
-                .map(|(port, _)| port)
-        );
-    }
+    Ok(pid)
+}
+
+/// Helper function to find a running storage daemon's port.
+pub async fn find_running_storage_daemon_port() -> Vec<u16> {
+    let all_daemons = get_all_daemon_processes_with_ports().await.unwrap_or_default();
+    let mut running_ports: Vec<u16> = all_daemons
+        .into_iter()
+        .filter(|(_port, (_pid, service_type))| service_type == "storage")
+        .map(|(port, _)| port)
+        .collect();
     running_ports.sort_unstable();
-    running_ports.dedup();
     running_ports
 }
 
 /// Calls the `daemon_api::stop_daemon` function.
-/// Renamed to avoid name collision with `commands::DaemonCliCommand::Stop`.
-pub fn stop_daemon_api_call() -> Result<(), anyhow::Error> {
-    stop_daemon().map_err(|e| anyhow!("Daemon API error: {:?}", e))
+pub async fn stop_daemon_api_call() -> Result<(), anyhow::Error> {
+    stop_daemon().await.map_err(|e| anyhow!("Daemon stop failed: {}", e))
+}
+
+/// A wrapper to stop a specific daemon instance using `stop_port_daemon` from daemon_api.
+pub async fn stop_port_daemon_call(port: u16, daemon_type: &str) -> Result<(), anyhow::Error> {
+    stop_port_daemon(port, daemon_type).await.map_err(|e| anyhow::anyhow!("Daemon stop failed: {}", e))
 }
 
 /// Attempts to find a daemon process by checking its internal arguments and performing a TCP health check.
-/// This function is primarily used by `stop_daemon_by_pid_or_scan` as a fallback.
 pub async fn find_daemon_process_on_port_with_args(
     port: u16,
     expected_name_for_logging: &str,
@@ -392,8 +1009,7 @@ pub async fn get_listening_port_for_pid(pid: u32) -> Option<u16> {
 }
 
 /// Helper to get all running daemon processes (main, REST, storage) and their associated ports.
-/// This version prioritizes DaemonRegistry and falls back to sysinfo/lsof scan for verification.
-pub async fn get_all_daemon_processes_with_ports() -> HashMap<u16, (u32, String)> {
+pub async fn get_all_daemon_processes_with_ports() -> Result<HashMap<u16, (u32, String)>, anyhow::Error> {
     let mut found_daemons: HashMap<u16, (u32, String)> = HashMap::new();
     let mut sys = System::new();
     sys.refresh_processes(ProcessesToUpdate::All, true);
@@ -403,10 +1019,14 @@ pub async fn get_all_daemon_processes_with_ports() -> HashMap<u16, (u32, String)
         .and_then(|p| p.file_name().and_then(|s| s.to_str()).map(|s| s.to_owned()))
         .unwrap_or_else(|| "graphdb-cli".to_string());
     
-    let cli_name_pattern = Regex::new(&format!(r"(?i){}|graphdb-c", regex::escape(&cli_exe_name_full)))
-        .expect("Failed to create cli_name_pattern regex");
+    let graphdb_component_names = vec![
+        cli_exe_name_full.clone(),
+        String::from("graphdb-c"),
+        String::from("rest_api_server"),
+        String::from("storage_daemon_server"),
+    ];
 
-    let registered_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
+    let registered_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await?;
 
     for metadata in registered_daemons {
         let is_running = is_process_running(metadata.pid).await;
@@ -419,7 +1039,7 @@ pub async fn get_all_daemon_processes_with_ports() -> HashMap<u16, (u32, String)
         } else if age > chrono::Duration::seconds(300) {
             warn!("Registered {} daemon (PID {}) on port {} is stale (running: {}, listening: {}). Unregistering.",
                   metadata.service_type, metadata.pid, metadata.port, is_running, is_listening);
-            GLOBAL_DAEMON_REGISTRY.unregister_daemon(metadata.port).await.ok();
+            tokio::time::timeout(Duration::from_secs(2), GLOBAL_DAEMON_REGISTRY.unregister_daemon(metadata.port)).await??;
         }
     }
 
@@ -438,141 +1058,176 @@ pub async fn get_all_daemon_processes_with_ports() -> HashMap<u16, (u32, String)
         })
     };
 
-    let graphdb_component_names = vec![
-        cli_exe_name_full.as_str(),
-        "graphdb-c",
-        "rest_api_server",
-        "storage_daemon_server",
-    ];
+    // Fallback to ps and grep for additional process discovery
+    let ps_output = run_command_with_timeout(
+        "ps",
+        &["-eo", "pid,cmd"],
+        Duration::from_secs(3),
+    ).await.unwrap_or_else(|e| {
+        warn!("Failed to run ps command for process discovery: {}", e);
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(1),
+            stdout: Vec::new(),
+            stderr: format!("ps error: {}", e).into_bytes(),
+        }
+    });
+    let ps_lines = String::from_utf8_lossy(&ps_output.stdout);
+    let ps_regex = Regex::new(r"^\s*(\d+)\s+.*graphdb.*").expect("Failed to create ps regex");
 
-    for (pid, process) in sys.processes() {
-        let l_port_opt = get_listening_port_for_pid(pid.as_u32()).await;
-
-        if let Some(l_port) = l_port_opt {
-            if found_daemons.contains_key(&l_port) {
-                debug!("Secondary scan: Process PID {} on port {} already found via registry. Skipping.", pid, l_port);
-                continue;
-            }
-
-            let process_name_lower = process.name().to_string_lossy().to_lowercase();
-            let cmd_args: Vec<String> = process.cmd().iter().map(|s| s.to_string_lossy().into_owned()).collect();
-            let full_cmd_line = cmd_args.join(" ");
-
-            debug!("  -> Secondary scan: Process PID {} is listening on port {}. Name='{:?}'", pid, l_port, process.name());
-            debug!("     Full command line args for PID {}: '{}'", pid, full_cmd_line);
-
-            let mut service_type_found: Option<&str> = None;
-            let mut internal_arg_port: Option<u16> = None;
-
-            if let Some(pos) = cmd_args.iter().position(|arg| arg == "--internal-port") {
-                if let Some(port_str) = cmd_args.get(pos + 1) {
-                    if let Ok(p) = port_str.parse::<u16>() {
-                        internal_arg_port = Some(p);
-                    }
+    let mut ps_pids = Vec::new();
+    for line in ps_lines.lines() {
+        if let Some(captures) = ps_regex.captures(line) {
+            if let Some(pid_str) = captures.get(1) {
+                if let Ok(pid) = pid_str.as_str().parse::<u32>() {
+                    ps_pids.push(pid);
                 }
             }
-
-            if full_cmd_line.contains("--internal-daemon-run") {
-                service_type_found = Some("main");
-            } else if full_cmd_line.contains("--internal-rest-api-run") {
-                service_type_found = Some("rest");
-            } else if full_cmd_line.contains("--internal-storage-daemon-run") {
-                service_type_found = Some("storage");
-            } else {
-                if graphdb_component_names.iter().any(|name| process_name_lower.contains(name)) {
-                    if process_name_lower.contains("rest_api_server") {
-                        service_type_found = Some("rest");
-                    } else if process_name_lower.contains("storage_daemon_server") {
-                        service_type_found = Some("storage");
-                    }
-                    if service_type_found.is_none() {
-                        if l_port == DEFAULT_DAEMON_PORT { service_type_found = Some("main"); }
-                        else if l_port == DEFAULT_REST_API_PORT { service_type_found = Some("rest"); }
-                        else if l_port == DEFAULT_STORAGE_PORT { service_type_found = Some("storage"); }
-                        else if storage_cluster_ports.contains(&l_port) {
-                            service_type_found = Some("storage");
-                        }
-                    }
-                }
-            }
-
-            let final_service_type = service_type_found.unwrap_or("unknown");
-            let port_matches_arg_or_not_specified = internal_arg_port.map_or(true, |arg_p| arg_p == l_port);
-
-            if final_service_type != "unknown" && port_matches_arg_or_not_specified {
-                if found_daemons.insert(l_port, (pid.as_u32(), final_service_type.to_string())).is_none() {
-                    info!("Found {} daemon (PID {}) on port {} via secondary sysinfo/lsof scan.", final_service_type, pid, l_port);
-                    let new_metadata = DaemonMetadata {
-                        service_type: final_service_type.to_string(),
-                        port: l_port,
-                        pid: pid.as_u32(),
-                        ip_address: "127.0.0.1".to_string(),
-                        data_dir: None,
-                        config_path: None,
-                        engine_type: None,
-                        last_seen_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
-                    };
-                    GLOBAL_DAEMON_REGISTRY.register_daemon(new_metadata).await.ok();
-                }
-            } else {
-                debug!("Secondary scan: Process PID {} listening on port {} not classified as known GraphDB daemon type ('{}') or port mismatch (arg: {:?}, actual: {}).", pid, l_port, final_service_type, internal_arg_port, l_port);
-            }
-        } else {
-            debug!("Process PID {} is not listening on any TCP port.", pid);
         }
     }
-    found_daemons
+
+    let tasks: Vec<_> = sys.processes().iter().filter_map(|(pid, process)| {
+        let pid_u32 = pid.as_u32();
+        let graphdb_component_names = graphdb_component_names.clone();
+        let storage_cluster_ports = storage_cluster_ports.clone();
+        if ps_pids.contains(&pid_u32) || graphdb_component_names.iter().any(|name| process.name().to_string_lossy().contains(name)) {
+            let cmd_args: Vec<String> = process.cmd().iter().map(|s| s.to_string_lossy().into_owned()).collect();
+            Some(tokio::spawn(async move {
+                let l_port_opt = get_listening_port_for_pid(pid_u32).await;
+                if let Some(l_port) = l_port_opt {
+                    let full_cmd_line = cmd_args.join(" ");
+                    let mut service_type_found: Option<&str> = None;
+                    let mut internal_arg_port: Option<u16> = None;
+
+                    if let Some(pos) = cmd_args.iter().position(|arg| arg == "--internal-port") {
+                        if let Some(port_str) = cmd_args.get(pos + 1) {
+                            if let Ok(p) = port_str.parse::<u16>() {
+                                internal_arg_port = Some(p);
+                            }
+                        }
+                    }
+
+                    if full_cmd_line.contains("--internal-daemon-run") {
+                        service_type_found = Some("main");
+                    } else if full_cmd_line.contains("--internal-rest-api-run") {
+                        service_type_found = Some("rest");
+                    } else if full_cmd_line.contains("--internal-storage-daemon-run") {
+                        service_type_found = Some("storage");
+                    } else {
+                        if graphdb_component_names.iter().any(|name| full_cmd_line.contains(name)) {
+                            if full_cmd_line.contains("rest_api_server") {
+                                service_type_found = Some("rest");
+                            } else if full_cmd_line.contains("storage_daemon_server") {
+                                service_type_found = Some("storage");
+                            }
+                            if service_type_found.is_none() {
+                                if l_port == DEFAULT_DAEMON_PORT { service_type_found = Some("main"); }
+                                else if l_port == DEFAULT_REST_API_PORT { service_type_found = Some("rest"); }
+                                else if l_port == DEFAULT_STORAGE_PORT { service_type_found = Some("storage"); }
+                                else if storage_cluster_ports.contains(&l_port) {
+                                    service_type_found = Some("storage");
+                                }
+                            }
+                        }
+                    }
+
+                    let final_service_type = service_type_found.unwrap_or("unknown");
+                    let port_matches_arg_or_not_specified = internal_arg_port.map_or(true, |arg_p| arg_p == l_port);
+
+                    if final_service_type != "unknown" && port_matches_arg_or_not_specified {
+                        info!("Found {} daemon (PID {}) on port {} via secondary sysinfo/lsof/ps scan.", final_service_type, pid_u32, l_port);
+                        let new_metadata = DaemonMetadata {
+                            service_type: final_service_type.to_string(),
+                            port: l_port,
+                            pid: pid_u32,
+                            ip_address: "127.0.0.1".to_string(),
+                            data_dir: None,
+                            config_path: None,
+                            engine_type: None,
+                            last_seen_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
+                        };
+                        tokio::time::timeout(Duration::from_secs(2), GLOBAL_DAEMON_REGISTRY.register_daemon(new_metadata)).await.ok();
+                        Some((l_port, (pid_u32, final_service_type.to_string())))
+                    } else {
+                        debug!("Secondary scan: Process PID {} listening on port {} not classified as known GraphDB daemon type ('{}') or port mismatch (arg: {:?}, actual: {}).", pid_u32, l_port, final_service_type, internal_arg_port, l_port);
+                        None
+                    }
+                } else {
+                    debug!("Process PID {} is not listening on any TCP port.", pid_u32);
+                    None
+                }
+            }))
+        } else {
+            None
+        }
+    }).collect();
+
+    let results = future::join_all(tasks).await;
+    for res in results {
+        if let Ok(Some((port, daemon_info))) = res {
+            found_daemons.insert(port, daemon_info);
+        }
+    }
+
+    Ok(found_daemons)
 }
 
-pub async fn find_all_running_rest_api_ports(
+pub async fn find_all_running_rest_ports(
     _rest_api_port_arc: Arc<TokioMutex<Option<u16>>>,
     _rest_cluster: Option<String>,
 ) -> Vec<u16> {
-    let all_daemons = get_all_daemon_processes_with_ports().await;
-    let mut running_ports = Vec::new();
-    for (port, (_pid, service_type)) in all_daemons {
-        if service_type == "rest" {
-            running_ports.push(port);
-        }
-    }
+    let all_daemons = get_all_daemon_processes_with_ports().await.unwrap_or_default();
+    let mut running_ports: Vec<u16> = all_daemons
+        .into_iter()
+        .filter(|(_port, (_pid, service_type))| service_type == "rest")
+        .map(|(port, _)| port)
+        .collect();
     running_ports.sort_unstable();
     running_ports
 }
 
 pub async fn find_all_running_daemon_ports(
-    _cluster: Option<String>,
+    cluster: Option<String>,
 ) -> Vec<u16> {
-    let all_daemons = get_all_daemon_processes_with_ports().await;
-    let mut running_ports = Vec::new();
-    for (port, (_pid, service_type)) in all_daemons {
-        if service_type == "main" {
-            running_ports.push(port);
-        }
-    }
+    let all_daemons = get_all_daemon_processes_with_ports().await.unwrap_or_default();
+    let cluster_ports = if let Some(cluster_range) = cluster {
+        parse_cluster_range(&cluster_range).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let mut running_ports: Vec<u16> = all_daemons
+        .into_iter()
+        .filter(|(port, (_pid, service_type))| service_type == "main" && (cluster_ports.is_empty() || cluster_ports.contains(port)))
+        .map(|(port, _)| port)
+        .collect();
+
     running_ports.sort_unstable();
     running_ports
 }
 
-pub async fn find_all_running_storage_daemon_ports(_cluster: Option<String>) -> Vec<u16> {
-    let all_daemons = get_all_daemon_processes_with_ports().await;
-    let mut running_ports = Vec::new();
-    for (port, (_pid, service_type)) in all_daemons {
-        if service_type == "storage" {
-            running_ports.push(port);
-        }
-    }
+pub async fn find_all_running_storage_daemon_ports(cluster: Option<String>) -> Vec<u16> {
+    let all_daemons = get_all_daemon_processes_with_ports().await.unwrap_or_default();
+    let cluster_ports = if let Some(cluster_range) = cluster {
+        parse_cluster_range(&cluster_range).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let mut running_ports: Vec<u16> = all_daemons
+        .into_iter()
+        .filter(|(port, (_pid, service_type))| service_type == "storage" && (cluster_ports.is_empty() || cluster_ports.contains(port)))
+        .map(|(port, _)| port)
+        .collect();
+
     running_ports.sort_unstable();
     running_ports
 }
 
-/// Launches a main GraphDB daemon process. This is for the `daemon start` command.
-/// Note: Cluster handling for the main daemon should be managed by the calling CLI logic
-/// (e.g., iterating through cluster ports and calling this function for each).
 pub fn launch_daemon_process(
     port: u16,
     _cluster: Option<String>,
     shutdown_rx: oneshot::Receiver<()>,
-) -> Result<JoinHandle<()>> {
+) -> Result<JoinHandle<()>, anyhow::Error> {
     let handle = tokio::spawn(async move {
         info!("GraphDB daemon spawned on port {}.", port);
         tokio::select! {
@@ -587,11 +1242,10 @@ pub fn launch_daemon_process(
     Ok(handle)
 }
 
-/// Spawns the REST API server in a separate Tokio task.
 pub fn spawn_rest_api_server(
     port: u16,
     shutdown_rx: oneshot::Receiver<()>,
-) -> Result<JoinHandle<()>> {
+) -> Result<JoinHandle<()>, anyhow::Error> {
     let cli_storage_config = match load_storage_config(None) {
         Ok(config) => config,
         Err(e) => {
@@ -607,7 +1261,7 @@ pub fn spawn_rest_api_server(
         match start_rest_server(
             port,
             shutdown_rx,
-            data_directory.to_string_lossy().into_owned(), // <--- fix here
+            data_directory.to_string_lossy().into_owned(),
         ).await {
             Ok(_) => info!("REST API server on port {} stopped successfully.", port),
             Err(e) => error!("REST API server on port {} exited with error: {:?}", port, e),
@@ -616,12 +1270,11 @@ pub fn spawn_rest_api_server(
     Ok(handle)
 }
 
-/// Spawns the Storage daemon in a separate Tokio task.
 pub fn spawn_storage_daemon(
     port: u16,
     config_file: Option<PathBuf>,
     _shutdown_rx: oneshot::Receiver<()>,
-) -> Result<JoinHandle<()>> {
+) -> Result<JoinHandle<()>, anyhow::Error> {
     let storage_config_path = config_file.unwrap_or_else(|| {
         PathBuf::from(DEFAULT_CONFIG_ROOT_DIRECTORY_STR)
             .join(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE)
@@ -637,11 +1290,10 @@ pub fn spawn_storage_daemon(
     Ok(handle)
 }
 
-/// Stops a managed daemon process by sending a shutdown signal.
 pub async fn stop_managed_daemon(
     port: u16,
     daemon_handles: Arc<TokioMutex<std::collections::HashMap<u16, (JoinHandle<()>, oneshot::Sender<()>)>>>,
-) -> Result<bool> {
+) -> Result<bool, anyhow::Error> {
     let mut handles = daemon_handles.lock().await;
     if let Some((handle, tx)) = handles.remove(&port) {
         if tx.send(()).is_ok() {
@@ -657,14 +1309,12 @@ pub async fn stop_managed_daemon(
     }
 }
 
-/// Lists all daemon processes found by `sysinfo`.
-pub async fn list_daemon_processes() -> Result<Vec<u32>> {
-    let all_daemons = get_all_daemon_processes_with_ports().await;
+pub async fn list_daemon_processes() -> Result<Vec<u32>, anyhow::Error> {
+    let all_daemons = get_all_daemon_processes_with_ports().await?;
     Ok(all_daemons.values().map(|(pid, _)| *pid).collect())
 }
 
-/// Kills a daemon process by PID.
-pub fn kill_daemon_process(pid: u32) -> Result<()> {
+pub async fn kill_daemon_process(pid: u32) -> Result<(), anyhow::Error> {
     let mut sys = System::new();
     sys.refresh_processes(ProcessesToUpdate::All, true);
     if let Some(process) = sys.process(Pid::from_u32(pid)) {
@@ -681,76 +1331,132 @@ pub fn kill_daemon_process(pid: u32) -> Result<()> {
 }
 
 pub async fn is_main_daemon_running(port: u16) -> bool {
-    let all_daemons = get_all_daemon_processes_with_ports().await;
+    let all_daemons = get_all_daemon_processes_with_ports().await.unwrap_or_default();
     all_daemons.get(&port).map_or(false, |(_pid, service_type)| service_type == "main")
 }
 
 pub async fn is_rest_api_running(port: u16) -> bool {
-    let all_daemons = get_all_daemon_processes_with_ports().await;
+    let all_daemons = get_all_daemon_processes_with_ports().await.unwrap_or_default();
     all_daemons.get(&port).map_or(false, |(_pid, service_type)| service_type == "rest")
 }
 
 pub async fn is_storage_daemon_running(port: u16) -> bool {
-    let all_daemons = get_all_daemon_processes_with_ports().await;
+    let all_daemons = get_all_daemon_processes_with_ports().await.unwrap_or_default();
     all_daemons.get(&port).map_or(false, |(_pid, service_type)| service_type == "storage")
 }
 
-
-
+/// Clears all running daemon processes.
 pub async fn clear_all_daemon_processes() -> Result<(), anyhow::Error> {
     println!("Attempting to clear all GraphDB daemon processes...");
 
-    let stop_result = stop_daemon_api_call();
-    match stop_result {
-        Ok(()) => println!("Global daemon stop signal sent successfully."),
-        Err(ref e) => eprintln!("Failed to send global stop signal: {:?}", e),
+    // Call stop_daemon_api_call asynchronously
+    if let Err(e) = stop_daemon_api_call().await {
+        error!("Failed to send global stop signal: {:?}", e);
+    } else {
+        println!("Global daemon stop signal sent successfully.");
     }
 
-    let registered_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
-    let mut pids_to_kill = Vec::new();
+    let registered_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await?;
+    let mut pids_to_kill: HashMap<u16, (u32, String)> = HashMap::new();
+    let mut ports_to_unregister: Vec<u16> = Vec::new();
+
     for metadata in registered_daemons {
         let is_running = is_process_running(metadata.pid).await;
         let age = Utc::now().signed_duration_since(chrono::DateTime::<Utc>::from_timestamp_nanos(metadata.last_seen_nanos));
         if !is_running && age > chrono::Duration::seconds(300) {
             warn!("Removing stale registry entry for {} daemon on port {} (PID {}).", metadata.service_type, metadata.port, metadata.pid);
-            GLOBAL_DAEMON_REGISTRY.unregister_daemon(metadata.port).await.ok();
-            continue;
-        }
-        if is_running {
-            pids_to_kill.push((metadata.pid, metadata.port.to_string()));
+            ports_to_unregister.push(metadata.port);
+        } else if is_running {
+            pids_to_kill.insert(metadata.port, (metadata.pid, metadata.service_type.clone()));
         }
     }
 
-    if pids_to_kill.is_empty() {
-        println!("No GraphDB daemon processes found to kill.");
+    // Unregister stale daemons after collecting them, to avoid holding a lock across an await
+    for port in ports_to_unregister {
+        if let Err(e) = tokio::time::timeout(Duration::from_secs(2), GLOBAL_DAEMON_REGISTRY.unregister_daemon(port)).await {
+            error!("Failed to unregister daemon for port {}: {:?}", port, e);
+        }
+    }
+
+    let output = run_command_with_timeout(
+        "lsof",
+        &["-i", "TCP", "-s", "TCP:LISTEN", "-a", "-c", "graphdb"],
+        Duration::from_secs(3),
+    ).await.unwrap_or_else(|e| {
+        warn!("Failed to run lsof command for process discovery: {}", e);
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(1),
+            stdout: Vec::new(),
+            stderr: format!("lsof error: {}", e).into_bytes(),
+        }
+    });
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let re = Regex::new(r":(\d+)\s+\(LISTEN\)").expect("Failed to create regex for port parsing");
+    
+    for line in stdout.lines() {
+        if let Some(captures) = re.captures(line) {
+            if let Some(port_match) = captures.get(1) {
+                if let Ok(port) = port_match.as_str().parse::<u16>() {
+                    if let Some(pid) = find_pid_by_port(port).await {
+                        if !pids_to_kill.contains_key(&port) {
+                            let service_type = if is_storage_daemon_running(port).await {
+                                "storage".to_string()
+                            } else if is_rest_api_running(port).await {
+                                "rest".to_string()
+                            } else {
+                                "main".to_string()
+                            };
+                            pids_to_kill.insert(port, (pid, service_type));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut errors = Vec::new();
+    if !pids_to_kill.is_empty() {
+        println!("Found {} daemon processes to terminate.", pids_to_kill.len());
+        let tasks: Vec<_> = pids_to_kill.into_iter().map(|(port, (pid, service_type))| {
+            println!("Attempting to stop {} process {} (port {})...", service_type, pid, port);
+            tokio::spawn(async move {
+                stop_process_by_port(&service_type, port).await.map_err(|e| (port, service_type, e))
+            })
+        }).collect();
+
+        let results = future::join_all(tasks).await;
+        for res in results {
+            if let Ok(Err((port, service_type, e))) = res {
+                errors.push(format!("Failed to stop {} on port {}: {}", service_type, port, e));
+            }
+        }
     } else {
-        for (pid, port_str) in pids_to_kill {
-            println!("Killing process {} (port {})...", pid, port_str);
-            match nix::sys::signal::kill(NixPid::from_raw(pid as i32), nix::sys::signal::Signal::SIGTERM) {
-                Ok(_) => println!("Successfully sent SIGTERM to PID {}.", pid),
-                Err(e) => eprintln!("Failed to send SIGTERM to PID {}: {}", pid, e),
-            }
-            if let Ok(port) = port_str.parse::<u16>() {
-                GLOBAL_DAEMON_REGISTRY.unregister_daemon(port).await.ok();
-            }
-        }
+        println!("No GraphDB daemon processes found to kill.");
     }
 
-    GLOBAL_DAEMON_REGISTRY.clear_all_daemons().await?;
-    Ok(())
+    if let Err(e) = GLOBAL_DAEMON_REGISTRY.clear_all_daemons().await {
+        errors.push(format!("Failed to clear daemon registry: {}", e));
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!("Errors occurred during daemon cleanup:\n{}", errors.join("\n")))
+    }
 }
 
-pub async fn stop_specific_main_daemon(port: u16, should_reclaim: bool) -> Result<()> {
+pub async fn stop_specific_main_daemon(port: u16, should_reclaim: bool) -> Result<(), anyhow::Error> {
     println!("Attempting to stop GraphDB Daemon on port {}...", port);
     stop_daemon_by_pid_or_scan("GraphDB Daemon", port, "main", should_reclaim).await
 }
 
-pub async fn stop_specific_rest_api_daemon(port: u16, should_reclaim: bool) -> Result<()> {
+pub async fn stop_specific_rest_api_daemon(port: u16, should_reclaim: bool) -> Result<(), anyhow::Error> {
     println!("Attempting to stop REST API on port {}...", port);
     stop_daemon_by_pid_or_scan("REST API daemon", port, "rest", should_reclaim).await
 }
 
-pub async fn stop_specific_storage_daemon(port: u16, should_reclaim: bool) -> Result<()> {
+pub async fn stop_specific_storage_daemon(port: u16, should_reclaim: bool) -> Result<(), anyhow::Error> {
     println!("Attempting to stop Storage daemon on port {}...", port);
     stop_daemon_by_pid_or_scan("Storage daemon", port, "storage", should_reclaim).await
 }
@@ -809,7 +1515,7 @@ pub async fn read_pid_file(port: u16, service_type: &ServiceType) -> Result<u32,
     read_pid_from_file(&path).await
 }
 
-pub async fn remove_pid_file(port: u16, service_type: &ServiceType) -> Result<()> {
+pub async fn remove_pid_file(port: u16, service_type: &ServiceType) -> Result<(), anyhow::Error> {
     let path = match service_type {
         ServiceType::Daemon => std::env::temp_dir().join(format!("graphdb_daemon_{}.pid", port)),
         ServiceType::RestAPI => std::env::temp_dir().join(format!("graphdb_rest_{}.pid", port)),
@@ -828,18 +1534,12 @@ pub async fn stop_daemon_by_pid_or_scan(
     port: u16,
     service_type_str: &str,
     should_reclaim: bool,
-) -> Result<()> {
-    let service_type = match service_type_str {
-        "main" => ServiceType::Daemon,
-        "rest" => ServiceType::RestAPI,
-        "storage" => ServiceType::StorageDaemon,
-        _ => return Err(anyhow!("Invalid service type: {}", service_type_str)),
-    };
+) -> Result<(), anyhow::Error> {
+    let service_type = ServiceType::from_str(service_type_str, true)
+        .map_err(|e| anyhow!("Invalid service type: {}", e))?;
 
-    let metadata_from_registry = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await?;
     let mut target_pid: Option<u32> = None;
-
-    if let Some(metadata) = metadata_from_registry {
+    if let Ok(Some(metadata)) = tokio::time::timeout(Duration::from_secs(2), GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port)).await? {
         let is_running = is_process_running(metadata.pid).await;
         let age = Utc::now().signed_duration_since(chrono::DateTime::<Utc>::from_timestamp_nanos(metadata.last_seen_nanos));
         if is_running {
@@ -847,7 +1547,7 @@ pub async fn stop_daemon_by_pid_or_scan(
             info!("Found {} (PID {}) on port {} in registry.", daemon_name, metadata.pid, port);
         } else if age > chrono::Duration::seconds(300) {
             warn!("Registry entry for {} on port {} (PID {}) is stale. Unregistering.", daemon_name, port, metadata.pid);
-            GLOBAL_DAEMON_REGISTRY.unregister_daemon(port).await.ok();
+            tokio::time::timeout(Duration::from_secs(2), GLOBAL_DAEMON_REGISTRY.unregister_daemon(port)).await??;
         }
     }
 
@@ -870,7 +1570,7 @@ pub async fn stop_daemon_by_pid_or_scan(
                 engine_type: None,
                 last_seen_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
             };
-            GLOBAL_DAEMON_REGISTRY.register_daemon(new_metadata).await.ok();
+            tokio::time::timeout(Duration::from_secs(2), GLOBAL_DAEMON_REGISTRY.register_daemon(new_metadata)).await??;
         }
     }
 
@@ -885,30 +1585,26 @@ pub async fn stop_daemon_by_pid_or_scan(
 
         if let Some(process) = sys.process(Pid::from_u32(pid)) {
             if process.kill_with(sysinfo::Signal::Term).unwrap_or(false) {
-                let _wait_timeout = Duration::from_secs(5);
-                let mut attempts = 0;
-                while is_process_running(pid).await && attempts < 5 {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    attempts += 1;
+                let start_time = Instant::now();
+                let wait_timeout = Duration::from_secs(5);
+                while start_time.elapsed() < wait_timeout {
+                    if !is_process_running(pid).await {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
                 }
                 if is_process_running(pid).await {
-                    error!("Failed to stop {} (PID {}) on port {}: Process still running after SIGTERM.", daemon_name, pid, port);
-                    let mut sys_force_kill = System::new();
-                    sys_force_kill.refresh_processes(ProcessesToUpdate::All, true);
-                    if let Some(process_force_kill) = sys_force_kill.process(Pid::from_u32(pid)) {
-                        if process_force_kill.kill_with(sysinfo::Signal::Kill).unwrap_or(false) {
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                            if is_process_running(pid).await {
-                                return Err(anyhow!("Failed to force stop {} (PID {}) on port {}.", daemon_name, pid, port));
-                            }
-                        } else {
-                            return Err(anyhow!("Failed to send SIGKILL to {} (PID {}) on port {}.", daemon_name, pid, port));
+                    warn!("Failed to stop {} (PID {}) on port {}: Process still running after SIGTERM. Sending SIGKILL.", daemon_name, pid, port);
+                    if process.kill_with(sysinfo::Signal::Kill).unwrap_or(false) {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        if is_process_running(pid).await {
+                            return Err(anyhow!("Failed to force stop {} (PID {}) on port {}.", daemon_name, pid, port));
                         }
                     } else {
-                        warn!("Process {} (PID {}) not found for force kill attempt.", daemon_name, pid);
+                        return Err(anyhow!("Failed to send SIGKILL to {} (PID {}) on port {}.", daemon_name, pid, port));
                     }
                 }
-                GLOBAL_DAEMON_REGISTRY.unregister_daemon(port).await?;
+                tokio::time::timeout(Duration::from_secs(2), GLOBAL_DAEMON_REGISTRY.unregister_daemon(port)).await??;
                 remove_pid_file(port, &service_type).await?;
                 info!("Successfully stopped {} (PID {}) on port {}.", daemon_name, pid, port);
             } else {
@@ -917,36 +1613,31 @@ pub async fn stop_daemon_by_pid_or_scan(
             }
         } else {
             warn!("Service {} (PID {}) on port {} not found after initial scan.", daemon_name, pid, port);
-            GLOBAL_DAEMON_REGISTRY.unregister_daemon(port).await?;
+            tokio::time::timeout(Duration::from_secs(2), GLOBAL_DAEMON_REGISTRY.unregister_daemon(port)).await??;
             remove_pid_file(port, &service_type).await?;
         }
     } else {
         info!("No {} found on port {}.", daemon_name, port);
-        GLOBAL_DAEMON_REGISTRY.unregister_daemon(port).await.ok();
+        tokio::time::timeout(Duration::from_secs(2), GLOBAL_DAEMON_REGISTRY.unregister_daemon(port)).await??;
         remove_pid_file(port, &service_type).await?;
     }
     Ok(())
 }
 
-pub fn load_storage_config_path_or_default(path: Option<PathBuf>) -> Result<StorageConfig> {
+pub fn load_storage_config_path_or_default(path: Option<PathBuf>) -> Result<StorageConfig, anyhow::Error> {
     let path_owned: Option<String> = path.map(|p| p.to_string_lossy().into_owned());
     let path_str: Option<&str> = path_owned.as_deref();
     load_storage_config(path_str)
 }
 
-pub async fn check_process_status_by_port(_process_name: &str, port: u16) -> bool {
-    let metadata = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await.ok().flatten();
-    if let Some(m) = metadata {
-        is_process_running(m.pid).await && is_port_listening(m.port).await
-    } else {
-        false
-    }
-}
-
-pub fn parse_cluster_range(range_str: &str) -> Result<Vec<u16>> {
-    // Handle null or empty input
+pub fn parse_cluster_range(range_str: &str) -> Result<Vec<u16>, anyhow::Error> {
     if range_str.is_empty() || range_str == "null" {
         return Err(anyhow!("Cluster range is empty or null"));
+    }
+
+    // Validate input format
+    if !range_str.chars().all(|c| c.is_digit(10) || c == '-') {
+        return Err(anyhow!("Invalid characters in cluster range: {}", range_str));
     }
 
     let parts: Vec<&str> = range_str.split('-').collect();
@@ -959,6 +1650,9 @@ pub fn parse_cluster_range(range_str: &str) -> Result<Vec<u16>> {
             .trim()
             .parse()
             .context(format!("Invalid end port: {}", parts[1]))?;
+        if start_port < 1024 || end_port < 1024 {
+            return Err(anyhow!("Ports must be >= 1024: start={}, end={}", start_port, end_port));
+        }
         if start_port > end_port {
             return Err(anyhow!("Start port cannot be greater than end port."));
         }
@@ -976,6 +1670,9 @@ pub fn parse_cluster_range(range_str: &str) -> Result<Vec<u16>> {
             .trim()
             .parse()
             .context(format!("Invalid port: {}", range_str))?;
+        if port < 1024 {
+            return Err(anyhow!("Port must be >= 1024: {}", port));
+        }
         Ok(vec![port])
     } else {
         Err(anyhow!(
@@ -995,90 +1692,79 @@ pub async fn is_port_listening(port: u16) -> bool {
     }).await.unwrap_or(false)
 }
 
-pub async fn stop_process_by_port(process_name: &str, port: u16) -> Result<(), anyhow::Error> {
-    println!("Attempting to find and kill process for {} on port {}...", process_name, port);
-    
-    let service_type_str = if process_name.contains("Storage") { "storage" }
-                             else if process_name.contains("REST") { "rest" }
-                             else { "main" };
-    
-    let stop_result = stop_daemon_by_pid_or_scan(process_name, port, service_type_str, true).await;
-
-    if stop_result.is_ok() {
-        println!("Process for {} on port {} stopped successfully via registry/PID based method.", process_name, port);
-        return Ok(());
-    } else {
-        eprintln!("Registry/PID based stop failed for {} on port {}: {:?}", process_name, port, stop_result.err());
-        println!("Falling back to direct lsof/kill -9 for {} on port {}...", process_name, port);
-    }
-
-    let output = run_command_with_timeout(
-        "lsof",
-        &["-i", &format!(":{}", port), "-t"],
-        Duration::from_secs(3),
-    ).await?;
-    
-    let pids = String::from_utf8_lossy(&output.stdout);
-    let pids: Vec<i32> = pids.trim().lines().filter_map(|s| s.parse::<i32>().ok()).collect();
-    
-    if pids.is_empty() {
-        println!("No {} process found running on port {}.", process_name, port);
-        return Ok(());
-    }
-
-    for pid in pids {
-        println!("Killing process {} (for {} on port {})...", pid, process_name, port);
-        match TokioCommand::new("kill").arg("-9").arg(pid.to_string()).status().await {
-            Ok(status) if status.success() => {
-                println!("Process {} killed successfully.", pid);
-            }
-            Ok(_) => eprintln!("Failed to kill process {}.", pid), 
-            Err(e) => eprintln!("Error killing process {}: {}", pid, e),
-        }
-    }
-    
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let start_time = Instant::now();
-    let _wait_timeout = Duration::from_secs(5);
-    let poll_interval = Duration::from_millis(200);
-
-    while start_time.elapsed() < _wait_timeout {
-        if !is_port_listening(port).await {
-            println!("Port {} is now free.", port);
-            return Ok(());
-        }
-        tokio::time::sleep(poll_interval).await;
-    }
-
-    Err(anyhow!("Port {} remained in use after killing processes within {:?}", port, _wait_timeout))
-}
-
 pub async fn is_daemon_running(port: u16) -> bool {
     !is_port_free(port).await
 }
 
 pub async fn is_process_running(pid: u32) -> bool {
     let mut sys = System::new();
-    sys.refresh_processes(ProcessesToUpdate::All, true);
+    sys.refresh_processes(ProcessesToUpdate::Some(&[Pid::from_u32(pid)]), true);
     sys.process(Pid::from_u32(pid)).is_some()
 }
 
-/// Finds the PID of a process bound to a specific port using sysinfo.
-pub fn find_pid_by_port(port: u16) -> Option<u32> {
-    let mut system = System::new_all();
-    system.refresh_all();
-    for (pid, process) in system.processes() {
-        // Convert process name to string and check if it contains "graphdb"
-        let process_name = process.name().to_string_lossy().to_lowercase();
-        if process_name.contains("graphdb") {
-            // Since check_process_status_by_port is called before, assume port is in use
-            // In production, use `lsof` or netstat for precise port binding check
-            return Some(pid.as_u32());
+pub async fn find_pid_by_port(port: u16) -> Option<u32> {
+    for attempt in 0..5 {
+        let output = TokioCommand::new("lsof")
+            .arg("-i")
+            .arg(format!(":{}", port))
+            .arg("-sTCP:LISTEN")
+            .arg("-t")
+            .output()
+            .await
+            .ok()?;
+
+        if output.status.success() {
+            let pid_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !pid_str.is_empty() {
+                if let Ok(pid) = pid_str.parse::<u32>() {
+                    if is_process_running(pid).await {
+                        println!("[DEBUG] Found PID {} for port {} on attempt {}", pid, port, attempt);
+                        return Some(pid);
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    println!("[DEBUG] No valid PID found for port {} after 5 attempts", port);
+    None
+}
+
+pub async fn find_all_running_rest_api_ports() -> Vec<u16> {
+    let all_daemons = get_all_daemon_processes_with_ports().await.unwrap_or_default();
+    let mut running_ports: Vec<u16> = all_daemons
+        .into_iter()
+        .filter(|(_port, (_pid, service_type))| service_type == "rest")
+        .map(|(port, _)| port)
+        .collect();
+    running_ports.sort_unstable();
+    running_ports
+}
+
+pub async fn is_pid_running(pid: u32) -> bool {
+    let mut sys = sysinfo::System::new();
+    let sysinfo_pid = sysinfo::Pid::from_u32(pid);
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[sysinfo_pid]), true);
+    sys.process(sysinfo_pid).is_some()
+}
+
+pub async fn find_port_by_pid(pid: u32) -> Option<u16> {
+    let output = TokioCommand::new("lsof")
+        .arg("-P")
+        .arg("-iTCP")
+        .arg("-sTCP:LISTEN")
+        .arg("-p")
+        .arg(pid.to_string())
+        .output().await.ok()?;
+
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let re = Regex::new(r"TCP.*:(\d+)\s+\(LISTEN\)").unwrap();
+        if let Some(captures) = re.captures(&stdout) {
+            if let Some(port_match) = captures.get(1) {
+                return port_match.as_str().parse::<u16>().ok();
+            }
         }
     }
     None
 }
-
-
-

@@ -13,6 +13,7 @@ daemon = { path = "../daemon" }
 config = "0.15.8" # Consistent
 lazy_static = "1.5.0" # Aligned with lib
 clap = { version = "4.5.29", features = ["derive"] } # Added clap
+sysinfo = { version = "0.36.1", features = ["default", "serde"] }
 anyhow = "1.0.98" # Added anyhow for FromStr error type
 reqwest = { version = "0.12.22", features = ["json"] } # Added with json feature
 thiserror = "2.0.12" # Consistent
@@ -20,4 +21,16 @@ bincode = "2.0.1"
 tokio = { version = "1.44.2", features = ["net", "time"] } # Updated to latest stable, retaining specific features
 lib = { path = "../lib" }
 log = "0.4.27"
-
+chrono = { version = "0.4.39", features = ["serde"] }
+serde_with = "3.14.0"
+nom = "8.0.0"
+futures = "0.3.31"
+sled = "0.34.7"
+dirs= "6.0.0"
+dotenvy = "0.15.7"
+serde_json = "1.0.140"
+base64 = "0.22.1"
+toml = "0.8.23"
+# YAML-rust2 dependencies (replacing serde_yaml)
+yaml-rust2 = "0.10.3"
+serde_yaml2= "0.1.3"

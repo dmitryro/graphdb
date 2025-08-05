@@ -3,7 +3,7 @@ storage:
   data_directory: "/opt/graphdb/storage_data"
   log_directory: "/var/log/graphdb"
   default_port: 8084
-  cluster_range: null
+  cluster_range: 8084
   max_disk_space_gb: 1000
   min_disk_space_gb: 10
   use_raft_for_scale: true
