@@ -5,6 +5,15 @@
 // ensuring --storage-port and --storage-cluster are accepted without conflicts. Added conflicts_with and
 // overrides_with to clarify argument relationships, allowing --port (daemon), --listen-port (REST API),
 // and --storage-port (storage daemon) to coexist. Preserved all original fields and functionality.
+// FIXED: 2025-08-05 - Removed conflicts_with = "port" from storage_port in StartAction::Storage to allow
+// --storage-port with --cluster and --listen-port in StartAction::All. Changed storage_config type in
+// Commands::Start to PathBuf to match StartAction::All and ensure consistency with cli.rs and handlers.rs.
+// FIXED: 2025-08-05 - Restored top-level fields (port, cluster, daemon_port, daemon_cluster, listen_port,
+// rest_port, rest_cluster, storage_port, storage_cluster, storage_config) in Commands::Start to fix
+// pattern mismatch errors in handlers.rs (E0027).
+// FIXED: 2025-08-05 - Removed invalid token 'হালকা' from RestartAction::Rest to fix syntax error (E0277).
+// FIXED: 2025-08-05 - Added #[derive(Subcommand)] to RestartAction to implement Subcommand and FromArgMatches traits,
+// resolving trait bound errors (E0277).
 
 use clap::{Parser, Subcommand, Arg, Args, ValueEnum};
 use std::path::PathBuf;
@@ -140,6 +149,26 @@ pub struct CliArgs {
 pub enum Commands {
     /// Start GraphDB components (daemon, rest, storage, or all)
     Start {
+        #[arg(long, value_parser = clap::value_parser!(u16), help = "Port for the daemon. Conflicts with --daemon-port if both specified.")]
+        port: Option<u16>,
+        #[arg(long, value_parser = clap::value_parser!(String), help = "Cluster range for the daemon. Conflicts with --daemon-cluster if both specified.")]
+        cluster: Option<String>,
+        #[arg(long, value_parser = clap::value_parser!(u16), help = "Port for the daemon (synonym for --port).")]
+        daemon_port: Option<u16>,
+        #[arg(long, value_parser = clap::value_parser!(String), help = "Cluster range for the daemon (synonym for --cluster).")]
+        daemon_cluster: Option<String>,
+        #[arg(long, value_parser = clap::value_parser!(u16), help = "Listen port for the REST API.")]
+        listen_port: Option<u16>,
+        #[arg(long, value_parser = clap::value_parser!(u16), help = "Port for the REST API. Conflicts with --listen-port if both specified.")]
+        rest_port: Option<u16>,
+        #[arg(long, value_parser = clap::value_parser!(String), help = "Cluster name for the REST API.")]
+        rest_cluster: Option<String>,
+        #[arg(long, value_parser = clap::value_parser!(u16), help = "Port for the Storage Daemon. Synonym for --port in `start storage`.")]
+        storage_port: Option<u16>,
+        #[arg(long, value_parser = clap::value_parser!(String), help = "Cluster name for the Storage Daemon. Synonym for --cluster in `start storage`.")]
+        storage_cluster: Option<String>,
+        #[arg(long, value_parser = clap::value_parser!(PathBuf), help = "Path to the Storage Daemon configuration file.")]
+        storage_config: Option<PathBuf>,
         #[clap(subcommand)]
         action: Option<StartAction>,
     },
@@ -235,10 +264,10 @@ pub enum StartAction {
         #[clap(long)]
         cluster: Option<String>,
         /// Port for the daemon (synonym for --port).
-        #[clap(long = "daemon-port")]
+        #[clap(long = "daemon-port", conflicts_with = "port")]
         daemon_port: Option<u16>,
         /// Cluster range for daemon (synonym for --cluster).
-        #[clap(long = "daemon-cluster")]
+        #[clap(long = "daemon-cluster", conflicts_with = "cluster")]
         daemon_cluster: Option<String>,
     },
     /// Start the REST API server.
@@ -251,10 +280,10 @@ pub enum StartAction {
         #[clap(long)]
         cluster: Option<String>,
         /// Port for the REST API (synonym for --listen-port).
-        #[clap(long = "rest-port")]
+        #[clap(long = "rest-port", conflicts_with = "port")]
         rest_port: Option<u16>,
         /// Cluster range for REST (synonym for --cluster).
-        #[clap(long = "rest-cluster")]
+        #[clap(long = "rest-cluster", conflicts_with = "cluster")]
         rest_cluster: Option<String>,
     },
     /// Start the standalone Storage daemon.
@@ -273,7 +302,7 @@ pub enum StartAction {
         #[clap(long = "storage-port")]
         storage_port: Option<u16>,
         /// Cluster range for Storage (synonym for --cluster).
-        #[clap(long = "storage-cluster")]
+        #[clap(long = "storage-cluster", conflicts_with = "cluster")]
         storage_cluster: Option<String>,
     },
 }
@@ -451,7 +480,7 @@ pub enum StorageAction {
         #[clap(long)]
         cluster: Option<String>,
         /// Port for the Storage daemon (synonym for --storage-port).
-        #[clap(long = "storage-port", conflicts_with = "port")]
+        #[clap(long = "storage-port")]
         storage_port: Option<u16>,
         /// Cluster range for Storage (synonym for --cluster).
         #[clap(long = "storage-cluster", conflicts_with = "cluster")]

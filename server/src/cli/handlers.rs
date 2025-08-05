@@ -1410,12 +1410,12 @@ pub async fn start_storage_interactive(
 
     // Determine the config file path
     let config_path = match &cli_config.command {
-        Commands::Start { action: Some(StartAction::All { storage_config, .. }) } => {
+        Commands::Start { action: Some(StartAction::All { storage_config, .. }), .. } => {
             storage_config.clone()
                 .or(config_file)
                 .unwrap_or_else(|| default_config_root_directory().join("storage_config.yaml"))
         }
-        Commands::Start { action: Some(StartAction::Storage { config_file: action_config_file, .. }) } => {
+        Commands::Start { action: Some(StartAction::Storage { config_file: action_config_file, .. }), .. } => {
             action_config_file.clone()
                 .or(config_file)
                 .unwrap_or_else(|| default_config_root_directory().join("storage_config.yaml"))
@@ -1448,13 +1448,13 @@ pub async fn start_storage_interactive(
 
     // Select port: CLI --storage-port > CLI --port > YAML default_port > DEFAULT_STORAGE_PORT
     let selected_port = match &cli_config.command {
-        Commands::Start { action: Some(StartAction::All { storage_port, port: cmd_port, .. }) } => {
+        Commands::Start { action: Some(StartAction::All { storage_port, port: cmd_port, .. }), .. } => {
             if port.is_some() {
                 warn!("Ignoring port parameter ({:?}) as it should be set via CLI arguments", port);
             }
             storage_port.or(*cmd_port).unwrap_or(storage_config.default_port)
         }
-        Commands::Start { action: Some(StartAction::Storage { storage_port, port: cmd_port, .. }) } => {
+        Commands::Start { action: Some(StartAction::Storage { storage_port, port: cmd_port, .. }), .. } => {
             if port.is_some() {
                 warn!("Ignoring port parameter ({:?}) as it should be set via CLI arguments", port);
             }
