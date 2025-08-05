@@ -474,6 +474,91 @@ impl DaemonRegistry {
         Ok(())
     }
 
+    pub async fn remove_daemon_by_type(&self, service_type: &str, port: u16) -> Result<Option<DaemonMetadata>> {
+        let metadata = {
+            let mut memory_store = self.memory_store.lock().await;
+            if let Some(metadata) = memory_store.get(&port) {
+                if metadata.service_type == service_type {
+                    memory_store.remove(&port)
+                } else {
+                    return Ok(None);
+                }
+            } else {
+                None
+            }
+        };
+
+        if let Some(metadata) = &metadata {
+            info!("Unregistered {} daemon from memory on port {} with PID {}", metadata.service_type, port, metadata.pid);
+            let pid_files = vec![
+                format!("/tmp/{}{}.pid", DAEMON_PID_FILE_NAME_PREFIX, port),
+                format!("/tmp/{}{}.pid", REST_PID_FILE_NAME_PREFIX, port),
+                format!("/tmp/{}{}.pid", STORAGE_PID_FILE_NAME_PREFIX, port),
+                format!("/tmp/graphdb-daemon-{}.pid", port),
+                format!("/tmp/graphdb-cli-{}.pid", port),
+            ];
+            for pid_file in pid_files {
+                if PathBuf::from(&pid_file).exists() {
+                    if let Err(e) = fs::remove_file(&pid_file) {
+                        warn!("Failed to remove PID file {}: {}", pid_file, e);
+                    } else {
+                        info!("Removed PID file {}", pid_file);
+                    }
+                }
+            }
+            let mut memory_store = self.memory_store.lock().await;
+            self.save_fallback_file(&memory_store.values().cloned().collect::<Vec<_>>())?;
+        }
+
+        if !self.is_fallback_mode {
+            let db = self.db.lock().await;
+            if let Some(db) = db.as_ref() {
+                let key = port.to_string().into_bytes();
+                match db.get(&key) {
+                    Ok(Some(ivec)) => {
+                        match decode_from_slice::<DaemonMetadata, _>(&ivec, config::standard()) {
+                            Ok((stored_metadata, _)) => {
+                                if stored_metadata.service_type == service_type {
+                                    match db.remove(&key) {
+                                        Ok(_) => {
+                                            let db_clone = db.clone();
+                                            tokio::spawn(async move {
+                                                if let Err(e) = db_clone.flush_async().await {
+                                                    warn!("Failed to flush registry: {}", e);
+                                                }
+                                            });
+                                            info!("Unregistered {} daemon from sled on port {}", service_type, port);
+                                        }
+                                        Err(e) => {
+                                            warn!("Failed to remove {} daemon from sled on port {}: {}", service_type, port, e);
+                                            return Err(anyhow!("Failed to remove {} daemon from sled: {}", service_type, e));
+                                        }
+                                    }
+                                } else {
+                                    debug!("No {} daemon found in sled on port {}", service_type, port);
+                                    return Ok(None);
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to decode daemon metadata for port {}: {}", port, e);
+                                return Err(anyhow!("Failed to decode daemon metadata: {}", e));
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        debug!("No daemon found in sled on port {}", port);
+                    }
+                    Err(e) => {
+                        warn!("Failed to access sled database for port {}: {}", port, e);
+                        return Err(anyhow!("Failed to access sled database: {}", e));
+                    }
+                }
+            }
+        }
+
+        Ok(metadata)
+    }
+
     pub async fn get_daemon_metadata(&self, port: u16) -> Result<Option<DaemonMetadata>> {
         self.load_fallback_file().await?;
         let _ = self.migrate_to_memory_if_needed().await;
