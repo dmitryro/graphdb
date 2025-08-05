@@ -801,12 +801,17 @@ pub async fn handle_start_command(
     let start_rest_requested = listen_port.is_some();
     let start_storage_requested = storage_port.is_some() || storage_config_file.is_some();
 
+    let mut errors = Vec::new();
+
     if start_daemon_requested {
         let actual_port = port.unwrap_or(DEFAULT_DAEMON_PORT);
         let daemon_result = start_daemon_instance_interactive(Some(actual_port), cluster.clone(), daemon_handles.clone()).await;
         daemon_status_msg = match daemon_result {
             Ok(()) => format!("Running on port: {}", actual_port),
-            Err(e) => format!("Failed to start ({:?})", e),
+            Err(e) => {
+                errors.push(format!("Daemon on port {}: {}", actual_port, e));
+                format!("Failed to start ({:?})", e)
+            }
         };
     }
 
@@ -815,7 +820,10 @@ pub async fn handle_start_command(
         let rest_result = start_rest_api_interactive(Some(actual_port), None, rest_api_shutdown_tx_opt.clone(), rest_api_port_arc.clone(), rest_api_handle.clone()).await;
         rest_api_status_msg = match rest_result {
             Ok(()) => format!("Running on port: {}", actual_port),
-            Err(e) => format!("Failed to start ({:?})", e),
+            Err(e) => {
+                errors.push(format!("REST API on port {}: {}", actual_port, e));
+                format!("Failed to start ({:?})", e)
+            }
         };
     }
 
@@ -826,13 +834,16 @@ pub async fn handle_start_command(
             Some(actual_port),
             Some(actual_config_file),
             None,
-            Arc::new(TokioMutex::new(None)),
-            Arc::new(TokioMutex::new(None)),
-            Arc::new(TokioMutex::new(None)),
+            rest_api_shutdown_tx_opt.clone(), // Reuse existing mutex to avoid registry conflicts
+            rest_api_handle.clone(), // Reuse existing handle
+            rest_api_port_arc.clone(), // Reuse existing port arc
         ).await;
         storage_status_msg = match storage_result {
             Ok(()) => format!("Running on port: {}", actual_port),
-            Err(e) => format!("Failed to start ({:?})", e),
+            Err(e) => {
+                errors.push(format!("Storage Daemon on port {}: {}", actual_port, e));
+                format!("Failed to start ({:?})", e)
+            }
         };
     }
 
@@ -843,7 +854,12 @@ pub async fn handle_start_command(
     println!("{:<15} {:<50}", "REST API", rest_api_status_msg);
     println!("{:<15} {:<50}", "Storage", storage_status_msg);
     println!("---------------------------------\n");
-    Ok(())
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!("Failed to start one or more components: {:?}", errors))
+    }
 }
 
 /// Handles `stop` subcommand for direct CLI execution.
@@ -1478,22 +1494,27 @@ pub async fn start_storage_interactive(
     let addr = SocketAddr::new(ip_addr, selected_port);
     info!("Starting storage daemon on {}", addr);
 
-    // Check if process is already running on the port
+    // Check if the port is used by a registered GraphDB component
+    let all_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
+    let is_graphdb_process = all_daemons.iter().any(|d| d.port == selected_port && (d.service_type == "main" || d.service_type == "rest" || d.service_type == "storage"));
+
     if check_process_status_by_port("Storage Daemon", selected_port).await {
         info!("Storage Daemon already running on port {}. Allowing multiple instances.", selected_port);
         // Skip stopping to allow multiple Storage Daemons
-    } else if !is_port_free(selected_port).await {
-        info!("Port {} is in use by a non-Storage Daemon process. Attempting to stop.", selected_port);
+    } else if !is_port_free(selected_port).await && !is_graphdb_process {
+        info!("Port {} is in use by a non-GraphDB process. Attempting to stop.", selected_port);
         stop_process_by_port("Storage Daemon", selected_port)
             .await
             .map_err(|e| anyhow!("Failed to stop existing process on port {}: {}", selected_port, e))?;
+    } else if is_graphdb_process {
+        info!("Port {} is in use by a GraphDB component (main, rest, or storage). Allowing multiple instances.", selected_port);
     } else {
         info!("No process found running on port {}", selected_port);
     }
 
     // Verify port is free only if not allowing multiple instances
-    if !is_port_free(selected_port).await {
-        warn!("Port {} is still in use after attempting to stop non-Storage Daemon process. Proceeding to start additional Storage Daemon.", selected_port);
+    if !is_port_free(selected_port).await && !is_graphdb_process {
+        warn!("Port {} is still in use by a non-GraphDB process after attempting to stop. Proceeding to start additional Storage Daemon.", selected_port);
     }
 
     // Use config values directly
