@@ -5,10 +5,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+fs2 = "0.4.3"
 glob = "0.3.2"
+libc = "0.2" 
 serde = { version = "1.0.219", features = ["derive"] } # Aligned with models and lib
 regex = "1.11.1" # Consistent
-nix = "0.29.0" # Consistent
+nix =  { version = "0.29.0", features = ["resource"] } 
 daemonize = "0.5.0" # Consistent
 daemon = { path = "../daemon" }
 config = "0.15.8" # Consistent
