@@ -14,6 +14,7 @@ use sysinfo::{System, Pid as SysinfoPid, ProcessesToUpdate};
 use lazy_static::lazy_static;
 use tokio::process::Command;
 use tokio::time::{sleep, Duration};
+use serde_json; // Added for serializing configuration
 
 pub mod cli_schema;
 pub mod help_generator;
@@ -27,8 +28,8 @@ pub use daemon_registry::{
     DaemonRegistry, DaemonMetadata,
 };
 pub use crate::daemon_config::{
-    CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS, 
-    DEFAULT_DAEMON_PORT, 
+    CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS,
+    DEFAULT_DAEMON_PORT,
     DEFAULT_REST_API_PORT,
     DAEMON_REGISTRY_DB_PATH,
     DAEMON_PID_FILE_NAME_PREFIX,
@@ -40,6 +41,15 @@ pub use crate::daemon_config::{
 pub struct DaemonData {
     pub port: u16,
     pub pid: u32,
+}
+
+// New struct to hold configuration for the daemonized child process
+#[derive(Serialize, Deserialize, Debug)]
+pub struct DaemonStartConfig {
+    pub daemon_type: String,
+    pub port: u16,
+    pub skip_ports: Vec<u16>,
+    pub host: String,
 }
 
 lazy_static! {
@@ -120,6 +130,8 @@ pub enum DaemonError {
     Reqwest(#[from] reqwest::Error),
     #[error("Anyhow error: {0}")]
     Anyhow(#[from] anyhow::Error),
+    #[error("Serde error: {0}")]
+    Serde(#[from] serde_json::Error),
 }
 
 impl From<DaemonizeError> for DaemonError {
@@ -135,6 +147,7 @@ pub async fn start_daemon(
     daemon_type: &str,
 ) -> Result<(), DaemonError> {
     let config_path = "server/src/cli/config.toml";
+    let main_config_yaml = "server/main_app_config.yaml";
     let rest_config_yaml = "rest_api/rest_api_config.yaml";
     let storage_config_yaml = "storage_daemon_server/storage_config.yaml";
     let mut host_to_use = "127.0.0.1".to_string();
@@ -149,6 +162,9 @@ pub async fn start_daemon(
     let mut config_builder = Config::builder();
     if Path::new(config_path).exists() {
         config_builder = config_builder.add_source(ConfigFile::with_name(config_path));
+    }
+    if daemon_type == "main" && Path::new(main_config_yaml).exists() {
+        config_builder = config_builder.add_source(ConfigFile::with_name(main_config_yaml));
     }
     if daemon_type == "rest" && Path::new(rest_config_yaml).exists() {
         config_builder = config_builder.add_source(ConfigFile::with_name(rest_config_yaml));
@@ -179,9 +195,8 @@ pub async fn start_daemon(
 
     let mut ports_to_start: Vec<u16> = Vec::new();
     if let Some(range_str) = cluster_range {
-        if daemon_type == "rest" || daemon_type == "storage" {
-            ports_to_start.push(port.unwrap_or(default_port));
-        } else {
+        // Explicitly handle cluster range for the "main" daemon
+        if daemon_type == "main" {
             let parts: Vec<&str> = range_str.split('-').collect();
             if parts.len() != 2 {
                 return Err(DaemonError::InvalidClusterFormat(range_str));
@@ -205,6 +220,13 @@ pub async fn start_daemon(
             for p in start_port..=end_port {
                 ports_to_start.push(p);
             }
+        // Handle rest and storage daemons for a single port when a range is specified
+        } else if daemon_type == "rest" || daemon_type == "storage" {
+            ports_to_start.push(port.unwrap_or(default_port));
+        } else {
+            // This case should be unreachable due to the initial daemon_type check,
+            // but is a good practice as a fallback.
+            return Err(DaemonError::GeneralError("Invalid daemon type for cluster range".to_string()));
         }
     } else {
         ports_to_start.push(port.unwrap_or(default_port));
@@ -260,39 +282,38 @@ pub async fn start_daemon(
             Ok(child_pid) => {
                 if child_pid == 0 {
                     // Child process
+                    let config = DaemonStartConfig {
+                        daemon_type: daemon_type.to_string(),
+                        port: current_port,
+                        skip_ports: skip_ports.clone(),
+                        host: host_to_use.clone(),
+                    };
+                    let config_json = serde_json::to_string(&config)?;
+                    
                     let args = vec![
-                        format!("--internal-{}-run", daemon_type),
-                        "--internal-port".to_string(),
-                        current_port.to_string(),
+                        format!("--internal-run"),
+                        format!("--config-json"),
+                        config_json,
                     ];
                     let mut cmd = Command::new(std::env::current_exe()?);
                     cmd.args(&args).stdout(Stdio::null()).stderr(Stdio::null());
                     cmd.spawn()?.wait().await?;
                     std::process::exit(0);
                 }
-                // Parent process: write PID file manually
-                fs::write(&pid_file_path, child_pid.to_string())?;
-                // Register in daemon registry
-                let metadata = DaemonMetadata {
-                    service_type: daemon_type.to_string(),
-                    port: current_port,
-                    pid: child_pid,
-                    ip_address: host_to_use.clone(),
-                    data_dir: if daemon_type == "storage" { Some(std::path::PathBuf::from("/opt/graphdb/storage_data")) } else { None },
-                    config_path: None,
-                    engine_type: if daemon_type == "storage" { Some("sled".to_string()) } else { None },
-                    last_seen_nanos: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
-                };
-                if let Err(e) = GLOBAL_DAEMON_REGISTRY.register_daemon(metadata).await {
-                    error!("Failed to register daemon {} on port {}: {}", daemon_type, current_port, e);
-                }
-                // Verify the daemon is running
+                // --- Parent process logic starts here ---
+
+                // Wait for the daemon to start and listen on the port.
+                let mut confirmed_pid = 0;
                 for attempt in 0..max_port_check_attempts {
                     sleep(Duration::from_millis(port_check_interval_ms)).await;
                     if TcpStream::connect(&socket_addr).is_ok() {
                         info!("{} daemon successfully started on port {} with PID {}", daemon_type, current_port, child_pid);
-                        any_started = true;
-                        break;
+                        
+                        // After confirming the port is open, find the correct PID.
+                        confirmed_pid = find_pid_by_port(current_port).await.unwrap_or(0);
+                        if confirmed_pid != 0 {
+                            break;
+                        }
                     }
                     if attempt == max_port_check_attempts - 1 {
                         error!("{} daemon (PID {}) failed to bind to port {} after {} attempts", daemon_type, child_pid, current_port, max_port_check_attempts);
@@ -302,6 +323,35 @@ pub async fn start_daemon(
                         )));
                     }
                 }
+                
+                // If we couldn't find the PID, it's a failure.
+                if confirmed_pid == 0 {
+                    return Err(DaemonError::GeneralError(format!(
+                        "Failed to find PID for daemon on port {} after it started.",
+                        current_port
+                    )));
+                }
+
+                // Write PID file with the confirmed PID.
+                fs::write(&pid_file_path, confirmed_pid.to_string())?;
+
+                // Register in daemon registry with the confirmed PID.
+                let metadata = DaemonMetadata {
+                    service_type: daemon_type.to_string(),
+                    port: current_port,
+                    pid: confirmed_pid,
+                    ip_address: host_to_use.clone(),
+                    data_dir: if daemon_type == "storage" { Some(std::path::PathBuf::from("/opt/graphdb/storage_data")) } else { None },
+                    config_path: None,
+                    engine_type: if daemon_type == "storage" { Some("sled".to_string()) } else { None },
+                    last_seen_nanos: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+                };
+                
+                if let Err(e) = GLOBAL_DAEMON_REGISTRY.register_daemon(metadata).await {
+                    error!("Failed to register daemon {} on port {}: {}", daemon_type, current_port, e);
+                }
+
+                any_started = true;
             }
             Err(e) => {
                 error!("Failed to start {} daemon on port {}: {}", daemon_type, current_port, e);

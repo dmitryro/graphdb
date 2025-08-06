@@ -23,6 +23,7 @@
 // FIXED: 2025-07-31 - Added missing fields `storage_port`, `storage_cluster` to StartAction::Storage initializer (line 271).
 // FIXED: 2025-07-31 - Added missing fields `daemon_port`, `daemon_cluster`, `rest_port`, `rest_cluster`, `storage_port`, `storage_cluster` to patterns and initializers for StartAction::Daemon, StartAction::Rest, StartAction::Storage (lines 325, 331, 339, 327, 333, 341).
 // FIXED: 2025-07-31 - Corrected `filter_command` to `command_filter` in Commands::Help block (line 404) to resolve E0425.
+// FIXED: 2025-08-05 - Modified effective_action logic to prioritize StartAction::All when non-storage-specific arguments (e.g., --cluster, --listen-port) are present alongside --storage-port, fixing incorrect `Cannot specify both --port and --storage-port` error.
 
 use clap::{Parser, Subcommand, CommandFactory};
 use anyhow::Result;
@@ -86,8 +87,6 @@ pub struct CliArgs {
 pub enum Commands {
     /// Start GraphDB components (daemon, rest, storage, or all)
     Start {
-        // These arguments capture top-level args for 'start' that implicitly mean 'start all'.
-        // They are restored here as per the original file.
         #[arg(long, value_parser = clap::value_parser!(u16), help = "Port for the daemon. Conflicts with --daemon-port if both specified.")]
         port: Option<u16>,
         #[arg(long, value_parser = clap::value_parser!(String), help = "Cluster range for the daemon. Conflicts with --daemon-cluster if both specified.")]
@@ -256,35 +255,29 @@ pub async fn start_cli() -> Result<()> {
                     },
                     Some(other_action) => other_action,
                     None => {
-                        // If no explicit subcommand is given, check for top-level arguments
-                        // to determine if it's an implicit 'start all' or 'start storage'.
+                        // Prioritize StartAction::All if non-storage-specific arguments are present
                         if top_port.is_some() || top_cluster.is_some() || top_daemon_port.is_some() || top_daemon_cluster.is_some() ||
-                            top_listen_port.is_some() || top_rest_port.is_some() || top_rest_cluster.is_some() ||
-                            top_storage_port.is_some() || top_storage_cluster.is_some() || top_storage_config_str.is_some() {
-                            
-                            // If storage-specific top-level arguments are present, treat as 'start storage'
-                            if top_storage_port.is_some() || top_storage_cluster.is_some() || top_storage_config_str.is_some() {
-                                StartAction::Storage {
-                                    port: top_storage_port.or(top_port),
-                                    cluster: top_storage_cluster.clone().or(top_cluster.clone()),
-                                    config_file: top_storage_config_str.clone().map(PathBuf::from),
-                                    storage_port: top_storage_port,
-                                    storage_cluster: top_storage_cluster,
-                                }
-                            } else {
-                                // Otherwise, treat as 'start all' with the provided top-level arguments
-                                StartAction::All {
-                                    port: top_port,
-                                    cluster: top_cluster.clone(),
-                                    daemon_port: top_daemon_port,
-                                    daemon_cluster: top_daemon_cluster,
-                                    listen_port: top_listen_port,
-                                    rest_port: top_rest_port,
-                                    rest_cluster: top_rest_cluster,
-                                    storage_port: top_storage_port,
-                                    storage_cluster: top_storage_cluster.clone(),
-                                    storage_config: top_storage_config_str.clone().map(PathBuf::from),
-                                }
+                           top_listen_port.is_some() || top_rest_port.is_some() || top_rest_cluster.is_some() {
+                            StartAction::All {
+                                port: top_port,
+                                cluster: top_cluster.clone(),
+                                daemon_port: top_daemon_port,
+                                daemon_cluster: top_daemon_cluster,
+                                listen_port: top_listen_port,
+                                rest_port: top_rest_port,
+                                rest_cluster: top_rest_cluster,
+                                storage_port: top_storage_port,
+                                storage_cluster: top_storage_cluster,
+                                storage_config: top_storage_config_str.clone().map(PathBuf::from),
+                            }
+                        } else if top_storage_port.is_some() || top_storage_cluster.is_some() || top_storage_config_str.is_some() {
+                            // Only trigger StartAction::Storage if only storage-specific arguments are provided
+                            StartAction::Storage {
+                                port: top_storage_port,
+                                cluster: top_storage_cluster.clone(),
+                                config_file: top_storage_config_str.clone().map(PathBuf::from),
+                                storage_port: top_storage_port,
+                                storage_cluster: top_storage_cluster,
                             }
                         } else {
                             // Default to 'start all' without any arguments if nothing specific is provided
