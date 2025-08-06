@@ -153,6 +153,8 @@ pub async fn check_process_status_by_port(
 }
 
 /// Stops a process running on the specified port.
+/// This version is now more robust against race conditions where the process
+/// is killed but a subsequent check fails.
 pub async fn stop_process_by_port(
     process_name: &str,
     port: u16
@@ -163,7 +165,7 @@ pub async fn stop_process_by_port(
         else { "main" };
     let service_type = ServiceType::from_str(service_type_str, true)
         .map_err(|e| anyhow!("Invalid service type: {}", e))?;
-    // This call is now safe assuming GLOBAL_DAEMON_REGISTRY uses a tokio::sync::Mutex.
+    
     let metadata = match tokio::time::timeout(
         Duration::from_secs(2),
         GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port),
@@ -179,14 +181,15 @@ pub async fn stop_process_by_port(
             None
         }
     };
+    
     let mut pid_to_stop: Option<u32> = metadata.map(|meta| meta.pid);
-    // Fallback to lsof if no registry entry
     if pid_to_stop.is_none() {
-        pid_to_stop = find_pid_by_port(port).await; // This line is correct.
+        pid_to_stop = find_pid_by_port(port).await;
     }
+
     if let Some(pid) = pid_to_stop {
         let nix_pid = NixPid::from_raw(pid as i32);
-        // Try SIGTERM first
+        
         if let Err(e) = kill(nix_pid, Signal::SIGTERM) {
             error!("Failed to send SIGTERM to PID {}: {}", pid, e);
         } else {
@@ -200,7 +203,7 @@ pub async fn stop_process_by_port(
                 }
                 tokio::time::sleep(poll_interval).await;
             }
-            // Check if process is still running
+
             if is_process_running(pid).await {
                 warn!("Process {} (PID {}) on port {} still running after SIGTERM. Sending SIGKILL.", process_name, pid, port);
                 if let Err(e) = kill(nix_pid, Signal::SIGKILL) {
@@ -213,17 +216,18 @@ pub async fn stop_process_by_port(
                 }
             }
         }
-        // Clean up registry and PID file
-        if let Err(e) = tokio::time::timeout(
-            Duration::from_secs(2),
-            GLOBAL_DAEMON_REGISTRY.unregister_daemon(port),
-        ).await {
-            error!("Failed to unregister daemon for port {}: {:?}", port, e);
-        }
-        remove_pid_file(port, &service_type).await?;
     } else {
         println!("No process found for {} on port {}.", process_name, port);
     }
+
+    if let Err(e) = tokio::time::timeout(
+        Duration::from_secs(2),
+        GLOBAL_DAEMON_REGISTRY.unregister_daemon(port),
+    ).await {
+        error!("Failed to unregister daemon for port {}: {:?}", port, e);
+    }
+    remove_pid_file(port, &service_type).await?;
+
     if is_port_free(port).await {
         println!("Port {} is now free.", port);
         Ok(())
