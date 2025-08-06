@@ -1715,13 +1715,14 @@ pub async fn start_storage_interactive(
 }
 
 /// Starts the REST API in interactive mode.
+/// Starts the REST API in interactive mode.
 pub async fn start_rest_api_interactive(
     port: Option<u16>,
     _cluster: Option<String>,
     rest_api_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
     rest_api_port_arc: Arc<TokioMutex<Option<u16>>>,
     rest_api_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
-) -> Result<()> {
+) -> Result<(), anyhow::Error> {
     let config_path = PathBuf::from(DEFAULT_CONFIG_ROOT_DIRECTORY_STR).join("rest_api/rest_api_config.yaml");
     let config_path_str = config_path.to_string_lossy().into_owned();
     let config = load_rest_config(Some(&config_path_str))
@@ -1767,14 +1768,14 @@ pub async fn start_rest_api_interactive(
     let config = config.unwrap_or_else(|| {
         warn!("Using default REST API configuration");
         RestApiConfig {
-            data_directory: format!("{}/rest_api_data", DEFAULT_CONFIG_ROOT_DIRECTORY_STR),
-            log_directory: "/var/log/graphdb".to_string(),
+            data_directory: PathBuf::from(format!("{}/rest_api_data", DEFAULT_CONFIG_ROOT_DIRECTORY_STR)).display().to_string(),
+            log_directory: PathBuf::from("/var/log/graphdb").display().to_string(),
             default_port: actual_port,
             cluster_range: format!("{}", actual_port),
         }
     });
 
-    let data_dir = PathBuf::from(&config.data_directory);
+    let data_dir_for_metadata = config.data_directory.clone();
 
     // Log registry state before starting daemon
     debug!("Registry state before starting REST API: {:?}", all_daemons);
@@ -1783,27 +1784,47 @@ pub async fn start_rest_api_interactive(
         .await
         .map_err(|e| anyhow!("Failed to start REST API via daemon_api: {}", e))?;
 
-    let pid = find_pid_by_port(actual_port).await.ok_or_else(|| {
-        anyhow!("Failed to find PID for REST API on port {}. Ensure the process is binding to the port.", actual_port)
-    })?;
-
-    if pid == 0 {
-        return Err(anyhow!("Invalid PID for REST API on port {}. Registration failed.", actual_port));
-    }
+    // Find PID with proper Option handling
+    let pid = match find_pid_by_port(actual_port).await {
+        Some(0) | None => {
+            log::warn!("No valid PID found via lsof for REST API on port {}. Checking registry.", actual_port);
+            match GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(actual_port).await {
+                Ok(Some(metadata)) if metadata.service_type == "rest" => metadata.pid,
+                Ok(Some(metadata)) => {
+                    log::error!("Port {} is registered to a non-REST service: {}", actual_port, metadata.service_type);
+                    return Err(anyhow!("Port {} is registered to a non-REST service: {}. Cannot start REST API.", actual_port, metadata.service_type));
+                }
+                Ok(None) => {
+                    log::error!("No registry metadata found for port {}.", actual_port);
+                    return Err(anyhow!("Failed to find PID for REST API on port {}. Ensure the process is binding to the port.", actual_port));
+                }
+                Err(e) => {
+                    log::error!("Error accessing registry for port {}: {}", actual_port, e);
+                    return Err(anyhow!("Failed to access registry for port {}: {}.", actual_port, e));
+                }
+            }
+        }
+        Some(p) => p,
+    };
 
     let metadata = DaemonMetadata {
         service_type: "rest".to_string(),
         port: actual_port,
         pid,
         ip_address: "127.0.0.1".to_string(),
-        data_dir: Some(data_dir),
+        data_dir: Some(PathBuf::from(data_dir_for_metadata)),
         config_path: Some(config_path),
         engine_type: None,
         last_seen_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
     };
 
-    // Serialize registry state to fallback file if sled fails
+    // Ensure directory exists for fallback file
     let fallback_path = PathBuf::from("/Users/dmitryroitman/.graphdb/daemon_registry_fallback.json");
+    let fallback_dir = fallback_path.parent().ok_or_else(|| anyhow!("Invalid fallback path: {:?}", fallback_path))?;
+    tokio::fs::create_dir_all(fallback_dir)
+        .await
+        .map_err(|e| anyhow!("Failed to create directory {:?}: {}", fallback_dir, e))?;
+
     let mut attempts = 0;
     let max_attempts = 3;
     while attempts < max_attempts {
@@ -3145,3 +3166,4 @@ pub async fn stop_daemon_instance_interactive(
 
     Ok(())
 }          
+
