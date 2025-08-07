@@ -1,5 +1,3 @@
-// server/src/cli/config.rs
-
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use log::{debug, error, info, warn};
@@ -353,7 +351,6 @@ pub struct CliConfig {
 // --- CLI Config Loading ---
 impl CliConfig {
     pub fn load(interactive_command: Option<CommandType>) -> Result<Self> {
-        println!("Loading Config ==> STEP 0");
         let mut args = if let Some(cmd) = interactive_command {
             // Construct CliConfig from CommandType in interactive mode
             let mut config = CliConfig {
@@ -389,14 +386,12 @@ impl CliConfig {
                 CommandType::Exit => {
                     config.command = Commands::Exit;
                 }
-                // Add other CommandType variants as needed
                 _ => {
                     return Err(anyhow!("Unsupported interactive command: {:?}", cmd));
                 }
             }
             config
         } else {
-            // Non-interactive mode: parse from std::env::args_os()
             match <Self as clap::Parser>::try_parse() {
                 Ok(args) => args,
                 Err(e) => {
@@ -405,7 +400,6 @@ impl CliConfig {
                 }
             }
         };
-        println!("Loading Config ==> STEP 1");
         let config_root = args
             .config_root_directory
             .clone()
@@ -428,26 +422,31 @@ impl CliConfig {
                 Err(e) => warn!("Failed to read global config file {:?}: {}", global_config_path, e),
             }
         }
-        println!("Loading Config ==> STEP 3");
-        let storage_yaml_config = Self::load_specific_yaml(
-            args.storage_config_path.as_ref(),
-            global_yaml_config.as_ref().and_then(|g| g.storage.clone()),
-            &PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH),
-            "storage_config.yaml",
-        );
-        
+        let storage_yaml_config = load_storage_config_from_yaml(args.storage_config_path.clone())
+            .map_err(|e| anyhow!("Failed to load storage config: {}", e))
+            .unwrap_or_else(|e| {
+                warn!("Failed to load storage config, using default: {}", e);
+                StorageConfig::default()
+            });
+
         let rest_api_yaml_config = Self::load_specific_yaml(
             args.rest_api_config_path.as_ref(),
             global_yaml_config.as_ref().and_then(|g| g.rest_api.clone()),
             &PathBuf::from(DEFAULT_REST_CONFIG_PATH_RELATIVE),
             "rest_api_config.yaml",
         );
-        
+
         let main_daemon_yaml_config = Self::load_specific_yaml(
             args.main_daemon_config_path.as_ref(),
             global_yaml_config.as_ref().and_then(|g| g.main_daemon.clone()),
             &PathBuf::from(DEFAULT_MAIN_APP_CONFIG_PATH_RELATIVE),
             "main_app_config.yaml",
+        );
+
+        // Store storage config path for use in getters
+        args.storage_config_path = Some(
+            args.storage_config_path
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE))
         );
 
         // Resolve Daemon Port
@@ -523,9 +522,7 @@ impl CliConfig {
                 Commands::Storage(StorageAction::Status { port, .. }) => *port,
                 Commands::Restart(RestartArgs { action: RestartAction::Storage { port, storage_port, .. } }) => storage_port.or(*port),
                 Commands::Restart(RestartArgs { action: RestartAction::All { storage_port, .. } }) => *storage_port,
-                _ => storage_yaml_config
-                    .as_ref()
-                    .map(|c| c.default_port),
+                _ => Some(storage_yaml_config.default_port),
             };
         }
 
@@ -539,10 +536,13 @@ impl CliConfig {
                 Commands::Storage(StorageAction::Status { cluster, .. }) => cluster.clone(),
                 Commands::Restart(RestartArgs { action: RestartAction::Storage { cluster, storage_cluster, .. } }) => storage_cluster.clone().or_else(|| cluster.clone()),
                 Commands::Restart(RestartArgs { action: RestartAction::All { storage_cluster, .. } }) => storage_cluster.clone(),
-                _ => storage_yaml_config.as_ref().map(|c| c.cluster_range.clone()),
+                _ => Some(storage_yaml_config.cluster_range.clone()),
             };
         }
 
+        println!("SUCCESS: CLI config loaded.");
+        info!("SUCCESS: Determined config path: {:?}", args.storage_config_path);
+        info!("SUCCESS: Storage config loaded: {:?}", storage_yaml_config);
         Ok(args)
     }
 
@@ -609,7 +609,7 @@ impl CliConfig {
     }
 
     pub fn get_daemon_address(&self) -> Result<SocketAddr> {
-        let ip_str = "127.0.0.1"; // Default IP since 'ip' field is not available
+        let ip_str = "127.0.0.1";
         let ip: IpAddr = ip_str.parse().with_context(|| format!("Invalid IP address: {}", ip_str))?;
         let port = self.get_daemon_port()?;
         Ok(SocketAddr::new(ip, port))
@@ -638,7 +638,7 @@ impl CliConfig {
     }
 
     pub fn get_storage_daemon_address(&self) -> Result<SocketAddr> {
-        let ip_str = "127.0.0.1"; // Default IP since 'ip' field is not available
+        let ip_str = "127.0.0.1";
         let ip: IpAddr = ip_str.parse().with_context(|| format!("Invalid IP address: {}", ip_str))?;
         let port = self.get_storage_daemon_port()?;
         Ok(SocketAddr::new(ip, port))
@@ -656,7 +656,7 @@ impl CliConfig {
     }
 
     pub fn get_rest_api_address(&self) -> Result<SocketAddr> {
-        let ip_str = "127.0.0.1"; // Default IP since 'ip' field is not available in RestCliCommand::Start
+        let ip_str = "127.0.0.1";
         let ip: IpAddr = ip_str.parse().with_context(|| format!("Invalid IP address: {}", ip_str))?;
         let port = self.get_rest_api_port()?;
         Ok(SocketAddr::new(ip, port))
@@ -783,7 +783,7 @@ pub fn load_main_daemon_config(config_file_path: Option<&str>) -> Result<MainDae
                 Ok(wrapper.main_daemon)
             }
             Err(e) => {
-                warn!("Failed to canonicalize Main Daemon config path {:?}: {}", path_to_use, e);
+                warn!("Failed to canonicalize Main Daemon config path {:?}", path_to_use);
                 warn!("Config file not found at {}. Using default Main Daemon config.", path_to_use.display());
                 Ok(MainDaemonConfig::default())
             }
@@ -821,7 +821,7 @@ pub fn load_rest_config(config_file_path: Option<&str>) -> Result<RestApiConfig>
                 Ok(wrapper.rest_api)
             }
             Err(e) => {
-                warn!("Failed to canonicalize REST API config path {:?}: {}", path_to_use, e);
+                warn!("Failed to canonicalize REST API config path {:?}", path_to_use);
                 warn!("Config file not found at {}. Using default REST API config.", path_to_use.display());
                 Ok(RestApiConfig::default())
             }
@@ -852,7 +852,7 @@ pub fn save_rest_config(config: &RestApiConfig) -> Result<()> {
     Ok(())
 }
 
-pub fn get_default_rest_port() -> u16 {
+pub fn get_default_rest_port_from_config() -> u16 {
     load_rest_config(None)
         .map(|cfg| cfg.default_port)
         .unwrap_or(DEFAULT_REST_API_PORT)
@@ -868,18 +868,22 @@ pub fn get_rest_cluster_range() -> String {
 /// Prints the loaded configuration to the terminal.
 pub fn load_storage_config_from_yaml(config_file_path: Option<PathBuf>) -> Result<StorageConfig> {
     let default_config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH);
-    let project_config_path = PathBuf::from("storage_daemon_server/storage_config.yaml");
+    let project_config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
     let path_to_use = config_file_path
         .or_else(|| project_config_path.exists().then(|| project_config_path))
         .unwrap_or(default_config_path);
 
     info!("Loading storage config from {:?}", path_to_use);
     let config = if path_to_use.exists() {
-        let config_content = std::fs::read_to_string(&path_to_use)
+        let config_content = fs::read_to_string(&path_to_use)
             .context(format!("Failed to read storage config file: {}", path_to_use.display()))?;
+        debug!("Raw YAML content for storage_config.yaml: {}", config_content);
         let wrapper: StorageConfigWrapper = serde_yaml::from_str(&config_content)
             .map_err(|e| {
                 error!("Failed to parse storage config YAML at {}: {}", path_to_use.display(), e);
+                if let Ok(partial) = serde_yaml::from_str::<Value>(&config_content) {
+                    error!("Partial YAML parse: {:?}", partial);
+                }
                 anyhow!("Failed to parse storage config YAML: {}", e)
             })?;
         wrapper.storage
@@ -888,7 +892,7 @@ pub fn load_storage_config_from_yaml(config_file_path: Option<PathBuf>) -> Resul
         StorageConfig::default()
     };
 
-    // Log and print the loaded configuration
+    // Log the loaded configuration
     info!(
         "Loaded storage config: default_port={}, cluster_range={}, data_directory={:?}, storage_engine_type={:?}, log_directory={}, max_disk_space_gb={}, min_disk_space_gb={}, use_raft_for_scale={}",
         config.default_port,
@@ -900,25 +904,9 @@ pub fn load_storage_config_from_yaml(config_file_path: Option<PathBuf>) -> Resul
         config.min_disk_space_gb,
         config.use_raft_for_scale
     );
-    /*
-    println!(
-        "Loaded Storage Config:\n  Default Port: {}\n  Cluster Range: {}\n  Data Directory: {}\n  Storage Engine Type: {}\n  Log Directory: {}\n  Max Disk Space (GB): {}\n  Min Disk Space (GB): {}\n  Use Raft for Scale: {}\n  Max Open Files: {}\n  Config Root Directory: {}\n  Engine Specific Config: {}",
-        config.default_port,
-        config.cluster_range,
-        config.data_directory.display(),
-        daemon_api_storage_engine_type_to_string(&config.storage_engine_type),
-        config.log_directory,
-        config.max_disk_space_gb,
-        config.min_disk_space_gb,
-        config.use_raft_for_scale,
-        config.max_open_files,
-        config.config_root_directory.display(),
-        config.engine_specific_config.as_deref().unwrap_or("none")
-    );
-    */
+
     Ok(config)
 }
-
 
 pub fn load_storage_config_str(config_file_path: Option<&str>) -> Result<StorageConfig> {
     let path = config_file_path.map(PathBuf::from);
@@ -937,7 +925,7 @@ pub fn get_storage_cluster_range() -> String {
         .unwrap_or_else(|_| StorageConfig::default().cluster_range)
 }
 
-pub fn get_default_rest_port_from_config() -> u16 {
+pub fn get_default_rest_port() -> u16 {
     load_rest_config(None)
         .map(|cfg| cfg.default_port)
         .unwrap_or(DEFAULT_REST_API_PORT)
@@ -970,7 +958,7 @@ pub fn load_daemon_config(config_file_path: Option<&str>) -> Result<DaemonYamlCo
                 Ok(config)
             }
             Err(e) => {
-                warn!("Failed to canonicalize Daemon config path {:?}: {}", path_to_use, e);
+                warn!("Failed to canonicalize Daemon config path {:?}", path_to_use);
                 warn!("Config file not found at {}. Using default Daemon config.", path_to_use.display());
                 Ok(DaemonYamlConfig::default())
             }
