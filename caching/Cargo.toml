@@ -2,5 +2,21 @@
 name = "caching"
 version = "0.1.0"
 edition = "2024"
+authors = ["Med Robotix"]
 
 [dependencies]
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+moka = { version = "0.12.10", features = ["sync", "future"] }  # In-memory caching
+rdkafka = "0.38.0"  # Redpanda for distributed cache updates
+prometheus = { version = "0.13", optional = true }  # Metrics for enterprise
+anyhow = "1.0.98"
+tokio = { version = "1.44.2", features = ["full"] }
+
+[dev-dependencies]
+tempfile = "3.20.0"
+serde_json = "1.0.140"
+
+[features]
+default = []
+enterprise = ["prometheus"]  # Metrics for enterprise edition
