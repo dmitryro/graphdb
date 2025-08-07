@@ -1,0 +1,22 @@
+[package]
+name = "indexing_service"
+version = "0.1.0"
+edition = "2024"
+description = "Indexing service for GraphDB, providing key-value and full-text indexing for medical data"
+license = "MIT"  # Adjust based on your project's license (e.g., MIT for open-source, proprietary for enterprise)
+authors = ["Medical Robotix"]  # Replace with your team or organization name
+
+[dependencies]
+lib = { path = "../lib" }  # Core GraphDB library for GraphStorage and notifications
+serde = { version = "1.0.219", features = ["derive"] }  # Serialization for node properties
+serde_json = "1.0.140"  # JSON handling for node data and notifications
+rdkafka = "0.38.0"  # Redpanda client for real-time index updates
+tantivy = "0.24.2"  # Rust-native full-text indexing for enterprise features
+dashmap = "6.1.0"   # Concurrent hash map for key-value indexing
+anyhow = "1.0.98"    # Error handling
+tokio = { version = "1.45.0", features = ["full"] }  # Async runtime for Redpanda integration
+chrono = { version = "0.4.39", features = ["serde"] }    # Timestamps
+
+[dev-dependencies]
+tempfile = "3.8"  # Temporary directories for testing tantivy indexes
+serde_json = "1.0"  # JSON for test data

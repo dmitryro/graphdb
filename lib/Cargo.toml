@@ -5,7 +5,7 @@
 [package]
 name = "lib"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 ordered-float = "5.0.0" # Consistent
@@ -13,6 +13,10 @@ rand = "0.8.5" # Consistent
 actix-web = "4.11.0" # Crucial: Updated to match security crate's version
 actix-rt = "2.10.0" # Updated to match server crate's version
 dotenv = "0.15.0" # Aligned with server
+dashmap = "6.1.0"  # Concurrent hash map for Raft state
+rdkafka = "0.38.0"  # Redpanda for event-driven updates
+raft = { version = "0.7.0" }  # Raft consensus, updated to latest stable
+ring = "0.17.8"  # Encryption for HIPAA compliance, updated
 tokio = { version = "1.44.2", features = ["full"] } # Updated to latest stable
 tracing = "0.1.37" # Updated to latest stable
 tracing-subscriber = "0.3.18" # Updated to latest stable
@@ -22,6 +26,7 @@ tonic = "0.12.0" # Latest stable
 async-std = "1.13.0" # Consistent
 chrono = { version = "0.4.39", features = ["serde"] } # Consistent
 serde = { version = "1.0.219", features = ["derive"] } # Aligned with models and rest_api
+sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres"], optional = true }  # Optional Postgres for relational data
 dotenvy = "0.15.7" # Consistent
 diesel_json = "0.2.1" # Consistent
 open-cypher = "0.1.1" # Consistent
@@ -59,19 +64,28 @@ tempfile = "3.16.0" # Consistent
 byteorder = "1.5.0" # Consistent
 toml = "0.8.20" # Consistent
 postgres = "0.19.10" # Consistent
-redis = "0.28.2" # Consistent
+redis = { version = "0.32.4", optional = true} # Consistent
 log = "0.4.27" # Consistent
 password-hash = { version = "0.5", features = ["rand_core"] } # Consistent
 moka = { version = "0.12.10", features = ["sync", "future"] } # Consistent
 thiserror = "2.0.12" # Consistent
 models = { path = "../models", features = ["rocksdb-errors", "sled-errors", "bincode-errors"] } # Consistent, features enabled
+caching = { path = "../caching" }  # In-memory caching
 bcrypt = "0.15.1" # Aligned with models (highest version)
 regex = "1.11.1" # Consistent
+
+[dev-dependencies]
+tempfile = "3.20.0"  # Temporary storage for tests
+serde_json = "1.0.140"  # Test data
+tokio-test = "0.4.4"  # Async testing
+mockall = "0.13.1"  # Mocking
 
 [features]
 default = []
 sled-datastore = [] # No longer needs to list "sled" as sled is always active
 rocksdb-datastore = ["rocksdb"] # Still needs to list rocksdb if it's optional
+redis-datastore = ["redis"]
+postgres-datastore = ["sqlx"]
 test-suite = []
 bench-suite = []
 with-rocksdb = ["rocksdb"] # This feature enables the optional rocksdb crate
