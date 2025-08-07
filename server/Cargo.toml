@@ -81,6 +81,14 @@ daemon = { path = "../daemon", version = "0.1.0" }
 daemon_api = { path = "../daemon_api", version = "0.1.0" }
 proto = { path = "../proto", version = "0.1.0", features = ["server"] }
 models = { path = "../models", version = "0.1.0" }
+logging_service = { path = "../logging_service", version = "0.1.0" }
+indexing_service = { path = "../indexing_service", version = "0.1.0" }
+notifications_service = { path = "../notifications_service", version = "0.1.0" }
+analytics_service = { path = "../analytics_service", version = "0.1.0" }
+caching = { path = "../caching",  version = "0.1.0" }
+caching_service = { path = "../caching_service", version = "0.1.0" }
+observability_service = { path = "../observability_service",  version = "0.1.0" }
+compliance_service  = { path = "../compliance_service", version = "0.1.0" }
 reqwest = { version = "0.12.22", features = ["json", "blocking", "rustls-tls"] }
 shell-words="1.1.0"
 shlex="1.3.0"
