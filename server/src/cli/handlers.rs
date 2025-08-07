@@ -32,7 +32,7 @@ use serde_json::Value;
 use fs2;
 
 // Import command structs from commands.rs
-use crate::cli::commands::{Commands, DaemonCliCommand, RestCliCommand, StorageAction, StatusArgs, StopAction, StopArgs,
+use crate::cli::commands::{CommandType, Commands, DaemonCliCommand, RestCliCommand, StorageAction, StatusArgs, StopAction, StopArgs,
                            StartAction, ReloadArgs, CliArgs, StatusAction, ReloadAction, RestartArgs, RestartAction};
 use crate::cli::config::{load_storage_config_str as load_storage_config, DEFAULT_DAEMON_PORT, DEFAULT_REST_API_PORT, 
                          DEFAULT_STORAGE_PORT, DEFAULT_STORAGE_CONFIG_PATH_RELATIVE, DEFAULT_REST_CONFIG_PATH_RELATIVE,
@@ -918,6 +918,89 @@ pub async fn handle_start_command(
     }
 }
 
+// --- Command Handlers for direct CLI execution (non-interactive) ---
+/// Handles the top-level `start` command.
+pub async fn handle_start_command_interactive(
+    port: Option<u16>,
+    cluster: Option<String>,
+    listen_port: Option<u16>,
+    storage_port: Option<u16>,
+    storage_config_file: Option<PathBuf>,
+    _config: &crate::cli::config::CliConfig,
+    daemon_handles: Arc<TokioMutex<HashMap<u16, (JoinHandle<()>, oneshot::Sender<()>)>>>,
+    rest_api_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
+    rest_api_port_arc: Arc<TokioMutex<Option<u16>>>,
+    rest_api_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
+) -> Result<()> {
+    let mut daemon_status_msg = "Not requested".to_string();
+    let mut rest_api_status_msg = "Not requested".to_string();
+    let mut storage_status_msg = "Not requested".to_string();
+
+    let start_daemon_requested = port.is_some() || cluster.is_some();
+    let start_rest_requested = listen_port.is_some();
+    let start_storage_requested = storage_port.is_some() || storage_config_file.is_some();
+
+    let mut errors = Vec::new();
+
+    if start_daemon_requested {
+        let actual_port = port.unwrap_or(DEFAULT_DAEMON_PORT);
+        let daemon_result = start_daemon_instance_interactive(Some(actual_port), cluster.clone(), daemon_handles.clone()).await;
+        daemon_status_msg = match daemon_result {
+            Ok(()) => format!("Running on port: {}", actual_port),
+            Err(e) => {
+                errors.push(format!("Daemon on port {}: {}", actual_port, e));
+                format!("Failed to start ({:?})", e)
+            }
+        };
+    }
+
+    if start_rest_requested {
+        let actual_port = listen_port.unwrap_or(DEFAULT_REST_API_PORT);
+        let rest_result = start_rest_api_interactive(Some(actual_port), None, rest_api_shutdown_tx_opt.clone(), rest_api_port_arc.clone(), rest_api_handle.clone()).await;
+        rest_api_status_msg = match rest_result {
+            Ok(()) => format!("Running on port: {}", actual_port),
+            Err(e) => {
+                errors.push(format!("REST API on port {}: {}", actual_port, e));
+                format!("Failed to start ({:?})", e)
+            }
+        };
+    }
+
+    if start_storage_requested {
+        let actual_port = storage_port.unwrap_or(DEFAULT_STORAGE_PORT);
+        let actual_config_file = storage_config_file.unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_ROOT_DIRECTORY_STR).join(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE));
+        let storage_result = start_storage_interactive(
+            Some(actual_port),
+            Some(actual_config_file),
+            None,
+            rest_api_shutdown_tx_opt.clone(), // Reuse existing mutex to avoid registry conflicts
+            rest_api_handle.clone(), // Reuse existing handle
+            rest_api_port_arc.clone(), // Reuse existing port arc
+        ).await;
+        storage_status_msg = match storage_result {
+            Ok(()) => format!("Running on port: {}", actual_port),
+            Err(e) => {
+                errors.push(format!("Storage Daemon on port {}: {}", actual_port, e));
+                format!("Failed to start ({:?})", e)
+            }
+        };
+    }
+
+    println!("\n--- Component Startup Summary ---");
+    println!("{:<15} {:<50}", "Component", "Status");
+    println!("{:-<15} {:-<50}", "", "");
+    println!("{:<15} {:<50}", "GraphDB", daemon_status_msg);
+    println!("{:<15} {:<50}", "REST API", rest_api_status_msg);
+    println!("{:<15} {:<50}", "Storage", storage_status_msg);
+    println!("---------------------------------\n");
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!("Failed to start one or more components: {:?}", errors))
+    }
+}
+
 /// Handles `stop` subcommand for direct CLI execution.
 pub async fn handle_stop_command(args: StopArgs) -> Result<()> {
     info!("Processing stop command with args: {:?}", args);
@@ -1440,11 +1523,13 @@ pub async fn stop_rest_api_interactive(
     Ok(())
 }
 
-/// Starts the Storage Daemon in interactive mode.
+// This version of the function adds detailed debug logging to pinpoint
+// the exact line where the program is failing. The issue is likely
+// related to loading configuration files.
 pub async fn start_storage_interactive(
     port: Option<u16>,
     config_file: Option<PathBuf>,
-    _cluster_opt: Option<String>, // Ignored, as cluster_range validation is removed
+    _cluster_opt: Option<String>,
     storage_daemon_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
     storage_daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
     storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
@@ -1452,35 +1537,45 @@ pub async fn start_storage_interactive(
     use fs2::FileExt;
     use std::fs::OpenOptions;
     use std::os::unix::fs::OpenOptionsExt;
+    use anyhow::Context;
 
-    // Load CLI config
-    let cli_config = CliConfig::load().map_err(|e| anyhow!("Failed to load CLI config: {}", e))?;
+    println!("EVEN CAME HERE !!!!");
 
-    // Determine the config file path
+    // --- STEP 1: LOAD CLI CONFIGURATION ---
+    // Construct CommandType for interactive mode
+    let command = CommandType::StartStorage {
+        port,
+        config_file: config_file.clone(),
+        cluster: _cluster_opt.clone(),
+        storage_port: port,
+        storage_cluster: _cluster_opt,
+    };
+    let cli_config = CliConfig::load(Some(command))
+        .with_context(|| "Failed to load CLI configuration. Check file permissions or path.")?;
+    println!("SUCCESS: CLI config loaded.");
+
+    // --- STEP 2: DETERMINE CONFIG FILE PATH ---
+    let get_config_path = |cli_config_file: Option<PathBuf>| {
+        cli_config_file.or(config_file.clone()).unwrap_or_else(|| {
+            PathBuf::from(DEFAULT_CONFIG_ROOT_DIRECTORY_STR).join("storage_config.yaml")
+        })
+    };
+    
     let config_path = match &cli_config.command {
-        Commands::Start { action: Some(StartAction::All { storage_config, .. }), .. } => {
-            storage_config.clone()
-                .or(config_file)
-                .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_ROOT_DIRECTORY_STR).join("storage_config.yaml"))
-        }
-        Commands::Start { action: Some(StartAction::Storage { config_file: action_config_file, .. }), .. } => {
-            action_config_file.clone()
-                .or(config_file)
-                .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_ROOT_DIRECTORY_STR).join("storage_config.yaml"))
-        }
-        Commands::Storage(StorageAction::Start { config_file: action_config_file, .. }) => {
-            action_config_file.clone()
-                .or(config_file)
-                .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_ROOT_DIRECTORY_STR).join("storage_config.yaml"))
-        }
-        _ => config_file.unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_ROOT_DIRECTORY_STR).join("storage_config.yaml")),
+        Commands::Start { action: Some(StartAction::All { storage_config, .. }), .. } => get_config_path(storage_config.clone()),
+        Commands::Start { action: Some(StartAction::Storage { config_file, .. }), .. } => get_config_path(config_file.clone()),
+        Commands::Storage(StorageAction::Start { config_file, .. }) => get_config_path(config_file.clone()),
+        _ => get_config_path(None),
     };
     info!("=======> I WILL BE TRYING TO LOAD IT FROM {:?}", config_path);
+    println!("SUCCESS: Determined config path: {:?}", config_path);
 
-    // Load storage configuration
-    let storage_config = load_storage_config_from_yaml(Some(config_path.clone()))
-        .map_err(|e| {
-            error!("Failed to load storage config from {:?}: {}. Using default.", config_path, e);
+    // --- STEP 3: LOAD STORAGE CONFIGURATION ---
+    // This is the next potential point of failure.
+    let storage_config = match load_storage_config_from_yaml(Some(config_path.clone())) {
+        Ok(config) => config,
+        Err(e) => {
+            error!("Failed to load storage config from {:?}: {}.", config_path, e);
             if config_path.exists() {
                 if let Ok(content) = std::fs::read_to_string(&config_path) {
                     error!("Config file content: {}", content);
@@ -1490,27 +1585,21 @@ pub async fn start_storage_interactive(
             } else {
                 error!("Config file does not exist at {:?}", config_path);
             }
-            e
-        })?;
+            return Err(e).context("Failed to load storage configuration");
+        }
+    };
     info!("Loaded Storage Config: {:?}", storage_config);
+    println!("SUCCESS: Storage config loaded.");
 
-    // Select port: CLI --storage-port > CLI --port > YAML default_port > DEFAULT_STORAGE_PORT
-    let selected_port = port
-        .or_else(|| {
-            match &cli_config.command {
-                Commands::Start { action: Some(StartAction::All { storage_port, port: cmd_port, .. }), .. } => {
-                    storage_port.or(*cmd_port)
-                }
-                Commands::Start { action: Some(StartAction::Storage { storage_port, port: cmd_port, .. }), .. } => {
-                    storage_port.or(*cmd_port)
-                }
-                Commands::Storage(StorageAction::Start { storage_port, port: cmd_port, .. }) => {
-                    storage_port.or(*cmd_port)
-                }
-                _ => None,
-            }
-        })
-        .unwrap_or(storage_config.default_port); // Use YAML default_port directly (u16)
+    // --- THE REST OF THE FUNCTION (PREVIOUSLY PROVIDED) ---
+    let selected_port = port.or_else(|| {
+        match &cli_config.command {
+            Commands::Start { action: Some(StartAction::All { storage_port, port: cmd_port, .. }), .. } => storage_port.or(*cmd_port),
+            Commands::Start { action: Some(StartAction::Storage { storage_port, port: cmd_port, .. }), .. } => storage_port.or(*cmd_port),
+            Commands::Storage(StorageAction::Start { storage_port, port: cmd_port, .. }) => storage_port.or(*cmd_port),
+            _ => None,
+        }
+    }).unwrap_or(storage_config.default_port);
 
     info!("===> SELECTED PORT {}", selected_port);
     println!("===> SELECTED PORT {}", selected_port);
@@ -1520,253 +1609,123 @@ pub async fn start_storage_interactive(
     let addr = SocketAddr::new(ip_addr, selected_port);
     info!("Starting storage daemon on {}", addr);
 
-    // Check if the port is used by a registered GraphDB component
     let all_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
-    let is_graphdb_process = all_daemons.iter().any(|d| d.port == selected_port && (d.service_type == "main" || d.service_type == "rest" || d.service_type == "storage"));
+    let is_graphdb_process = all_daemons.iter().any(|d| d.port == selected_port && d.service_type == "storage");
 
-    if check_process_status_by_port("Storage Daemon", selected_port).await {
-        info!("Storage Daemon already running on port {}. Allowing multiple instances.", selected_port);
-        // Skip stopping to allow multiple Storage Daemons
-    } else if !is_port_free(selected_port).await && !is_graphdb_process {
-        info!("Port {} is in use by a non-GraphDB process. Attempting to stop.", selected_port);
-        stop_process_by_port("Storage Daemon", selected_port)
-            .await
-            .map_err(|e| anyhow!("Failed to stop existing process on port {}: {}", selected_port, e))?;
-    } else if is_graphdb_process {
-        info!("Port {} is in use by a GraphDB component (main, rest, or storage). Allowing multiple instances.", selected_port);
+    if is_graphdb_process {
+        info!("Port {} is in use by an existing GraphDB storage daemon. Removing stale registry entry.", selected_port);
+        if let Err(e) = GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("storage", selected_port).await {
+            warn!("Failed to remove stale storage daemon from registry: {}", e);
+        }
+    } else if check_process_status_by_port("Storage Daemon", selected_port).await {
+        info!("Port {} is in use by a process. Attempting to stop it.", selected_port);
+        stop_process_by_port("Storage Daemon", selected_port).await
+            .with_context(|| format!("Failed to stop existing process on port {}", selected_port))?;
     } else {
         info!("No process found running on port {}", selected_port);
     }
-
-    // Clean up any stale registry entries
-    if is_graphdb_process {
-        if let Err(e) = GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("storage", selected_port).await {
-            warn!("Failed to remove stale storage daemon on port {} from registry: {}", selected_port, e);
-        } else {
-            info!("Removed stale storage daemon on port {} from registry", selected_port);
-        }
+    
+    if !is_port_free(selected_port).await {
+        warn!("Port {} is still in use after cleanup attempt. This may cause issues.", selected_port);
     }
 
-    // Verify port is free only if not allowing multiple instances
-    if !is_port_free(selected_port).await && !is_graphdb_process {
-        warn!("Port {} is still in use by a non-GraphDB process after attempting to stop. Proceeding to start additional Storage Daemon.", selected_port);
-    }
-
-    // Use config values directly
     let data_dir = storage_config.data_directory;
     let engine_type = daemon_api_storage_engine_type_to_string(&storage_config.storage_engine_type);
 
-    // Log registry state before starting daemon
-    debug!("Registry state before starting storage daemon: {:?}", all_daemons);
-
-    // Start the daemon with explicit port logging
     debug!("Calling start_daemon with port: {:?}", Some(selected_port));
-    start_daemon(Some(selected_port), None, vec![], "storage")
-        .await
-        .map_err(|e| {
-            error!("Failed to start storage daemon on port {}: {}", selected_port, e);
-            anyhow!("Failed to start storage daemon on port {}: {}", selected_port, e)
-        })?;
+    start_daemon(Some(selected_port), None, vec![], "storage").await
+        .with_context(|| format!("Failed to start storage daemon on port {}", selected_port))?;
 
-    // Find PID with proper Option handling
     let pid = match find_pid_by_port(selected_port).await {
-        Some(0) | None => {
-            log::warn!("No valid PID found via lsof for Storage Daemon on port {}. Checking registry.", selected_port);
+        Some(p) if p > 0 => p,
+        _ => {
+            log::warn!("No valid PID found via lsof for port {}. Checking registry.", selected_port);
             match GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(selected_port).await {
-                Ok(Some(metadata)) if metadata.service_type == "storage" => {
-                    debug!("Found PID {} for port {} in registry", metadata.pid, selected_port);
-                    metadata.pid
-                }
-                Ok(Some(metadata)) => {
-                    log::error!("Port {} is registered to a non-storage service: {}", selected_port, metadata.service_type);
-                    return Err(anyhow!("Port {} is registered to a non-storage service: {}. Cannot start Storage Daemon.", selected_port, metadata.service_type));
-                }
-                Ok(None) => {
-                    log::error!("No registry metadata found for port {}.", selected_port);
+                Ok(Some(metadata)) if metadata.service_type == "storage" => metadata.pid,
+                _ => {
+                    log::error!("Failed to find PID for Storage Daemon on port {}.", selected_port);
                     return Err(anyhow!("Failed to find PID for Storage Daemon on port {}. Ensure the process is binding to the port.", selected_port));
-                }
-                Err(e) => {
-                    log::error!("Error accessing registry for port {}: {}", selected_port, e);
-                    return Err(anyhow!("Failed to access registry for port {}: {}.", selected_port, e));
                 }
             }
         }
-        Some(pid) => {
-            debug!("Found PID {} for port {} via lsof", pid, selected_port);
-            pid
-        }
     };
-
-    // Register daemon with retry
+    
     let metadata = DaemonMetadata {
         service_type: "storage".to_string(),
         port: selected_port,
         pid,
         ip_address: ip.to_string(),
-        data_dir: Some(data_dir.clone()), // Wrap in Some to match Option<PathBuf>
+        data_dir: Some(data_dir.clone()),
         config_path: Some(config_path),
         engine_type: Some(engine_type.clone()),
         last_seen_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
     };
 
-    // Ensure directory exists for fallback file with retry
-    let fallback_path = PathBuf::from("/tmp/graphdb/daemon_registry_fallback.json");
-    let fallback_dir = fallback_path.parent().ok_or_else(|| anyhow!("Invalid fallback path: {:?}", fallback_path))?;
-    let lock_path = PathBuf::from("/tmp/graphdb/daemon_registry_fallback.lock");
-    let mut dir_attempts = 0;
-    let max_dir_attempts = 3;
-    while dir_attempts < max_dir_attempts {
-        match tokio::fs::create_dir_all(fallback_dir).await {
-            Ok(_) => {
-                debug!("Successfully created directory {:?}", fallback_dir);
-                break;
-            }
-            Err(e) => {
-                dir_attempts += 1;
-                let os_err_code = e.raw_os_error().unwrap_or(-1);
-                error!("Failed to create directory {:?} (attempt {}/{}): {} (os error {})", 
-                    fallback_dir, dir_attempts, max_dir_attempts, e, os_err_code);
-                if dir_attempts >= max_dir_attempts {
-                    return Err(anyhow!("Failed to create directory {:?} after {} attempts: {}", fallback_dir, max_dir_attempts, e));
+    async fn retry_operation<F, Fut, T>(operation: F, max_attempts: u8, desc: &str) -> Result<T, anyhow::Error>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<T, anyhow::Error>>,
+    {
+        for attempt in 0..max_attempts {
+            match operation().await {
+                Ok(result) => {
+                    debug!("Successfully completed {} on attempt {}", desc, attempt + 1);
+                    return Ok(result);
                 }
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                Err(e) => {
+                    error!("Failed to {} (attempt {}/{}): {}", desc, attempt + 1, max_attempts, e);
+                    if attempt + 1 >= max_attempts {
+                        return Err(e).context(format!("Failed to {} after {} attempts", desc, max_attempts));
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                }
             }
         }
+        unreachable!()
     }
+    
+    let fallback_path = PathBuf::from("/tmp/graphdb/daemon_registry_fallback.json");
+    let fallback_dir = fallback_path.parent().ok_or_else(|| anyhow!("Invalid fallback path: {:?}", fallback_path))?;
+    
+    retry_operation(|| async {
+        tokio::fs::create_dir_all(fallback_dir).await.map_err(anyhow::Error::from)
+    }, 3, "create fallback directory").await?;
+    
+    retry_operation(|| async {
+        GLOBAL_DAEMON_REGISTRY.register_daemon(metadata.clone()).await.map_err(anyhow::Error::from)
+    }, 3, "register daemon").await?;
+    
+    info!("Successfully registered storage daemon with PID {} on port {}", pid, selected_port);
+    println!("==> Successfully registered storage daemon with PID {} on port {}", pid, selected_port);
 
-    // Now, open or create the fallback file.
-    // The previous checks and redundant file creations have been replaced with this
-    // single, robust approach.
+    let lock_path = PathBuf::from("/tmp/graphdb/daemon_registry_fallback.lock");
+    let new_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
+    debug!("Registry state after registering storage daemon: {:?}", new_daemons);
+
     let lock_file = OpenOptions::new()
         .create(true)
         .write(true)
-        .mode(0o666) // Set permissions for the lock file
+        .mode(0o666)
         .open(&lock_path)
-        .map_err(|e| {
-            let os_err_code = e.raw_os_error().unwrap_or(-1);
-            anyhow!("Failed to open lock file {:?}: {} (os error {})", lock_path, e, os_err_code)
-        })?;
+        .with_context(|| format!("Failed to open lock file {:?}", lock_path))?;
+        
+    retry_operation(|| async {
+        lock_file.try_lock_exclusive().map_err(anyhow::Error::from).map(|_| ())
+    }, 3, "acquire exclusive lock").await?;
+    
+    retry_operation(|| async {
+        write_registry_fallback(&new_daemons, &fallback_path).await
+    }, 3, "write registry fallback").await?;
+    
+    fs2::FileExt::unlock(&lock_file).with_context(|| format!("Failed to release lock on {:?}", lock_path))?;
+    let _ = std::fs::remove_file(&lock_path);
 
-    // Log file system state before registration
-    debug!("File system state before registration: dir_exists={:?}, dir_permissions={:?}, file_exists={:?}, file_permissions={:?}, file_size={:?}, file_modified={:?}",
-        fallback_dir.exists(),
-        tokio::fs::metadata(fallback_dir).await.map(|m| m.permissions()).ok(),
-        fallback_path.exists(),
-        tokio::fs::metadata(&fallback_path).await.map(|m| m.permissions()).ok(),
-        tokio::fs::metadata(&fallback_path).await.map(|m| m.len()).ok(),
-        tokio::fs::metadata(&fallback_path).await.map(|m| m.modified().ok()).ok()
-    );
-
-    let mut reg_attempts = 0;
-    let max_reg_attempts = 3;
-    while reg_attempts < max_reg_attempts {
-        match GLOBAL_DAEMON_REGISTRY.register_daemon(metadata.clone()).await {
-            Ok(_) => {
-                info!("Successfully registered storage daemon with PID {} on port {}", pid, selected_port);
-                println!("==> Successfully registered storage daemon with PID {} on port {}", pid, selected_port);
-                // Write registry state to fallback file with fs2 lock
-                let new_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
-                debug!("Registry state after registering storage daemon: {:?}", new_daemons);
-
-                // Attempt to acquire exclusive lock
-                let mut lock_attempts = 0;
-                let max_lock_attempts = 3;
-                while lock_attempts < max_lock_attempts {
-                    match lock_file.try_lock_exclusive() {
-                        Ok(_) => {
-                            debug!("Acquired exclusive lock on {:?}", lock_path);
-                            let mut write_attempts = 0;
-                            let max_write_attempts = 3;
-                            while write_attempts < max_write_attempts {
-                                match write_registry_fallback(&new_daemons, &fallback_path).await {
-                                    Ok(_) => {
-                                        debug!("Successfully wrote registry fallback to {:?}", fallback_path);
-                                        break;
-                                    }
-                                    Err(write_err) => {
-                                        let os_err_code = if let Some(io_err) = write_err.downcast_ref::<std::io::Error>() {
-                                            io_err.raw_os_error().unwrap_or(-1)
-                                        } else {
-                                            -1
-                                        };
-                                        error!("Failed to write registry fallback to {:?} (attempt {}/{}): {} (os error {})", 
-                                            fallback_path, write_attempts + 1, max_write_attempts, write_err, os_err_code);
-                                        write_attempts += 1;
-                                        if write_attempts >= max_write_attempts {
-                                            warn!("Failed to write registry fallback after {} attempts, proceeding", max_write_attempts);
-                                            break;
-                                        }
-                                        std::thread::sleep(std::time::Duration::from_millis(500));
-                                    }
-                                }
-                            }
-                            // Release lock
-                            if let Err(e) = fs2::FileExt::unlock(&lock_file) {
-                                let os_err_code = e.raw_os_error().unwrap_or(-1);
-                                error!("Failed to release lock on {:?}: {} (os error {})", lock_path, e, os_err_code);
-                            } else {
-                                debug!("Released lock on {:?}", lock_path);
-                            }
-                            break;
-                        }
-                        Err(lock_err) => {
-                            lock_attempts += 1;
-                            let os_err_code = lock_err.raw_os_error().unwrap_or(-1);
-                            error!("Failed to acquire lock on {:?} (attempt {}/{}): {} (os error {})", 
-                                lock_path, lock_attempts + 1, max_lock_attempts, lock_err, os_err_code);
-                            if lock_attempts >= max_lock_attempts {
-                                return Err(anyhow!("Failed to acquire lock on {:?} after {} attempts: {}", lock_path, max_lock_attempts, lock_err));
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(500));
-                        }
-                    }
-                }
-                // Remove lock file
-                let _ = std::fs::remove_file(&lock_path);
-                break;
-            }
-            Err(reg_err) => {
-                reg_attempts += 1;
-                let os_err_code = if let Some(io_err) = reg_err.downcast_ref::<std::io::Error>() {
-                    io_err.raw_os_error().unwrap_or(-1)
-                } else {
-                    -1
-                };
-                error!("Failed to register storage daemon on port {} (attempt {}/{}): {} (os error {})", 
-                    selected_port, reg_attempts, max_reg_attempts, reg_err, os_err_code);
-                if reg_attempts >= max_reg_attempts {
-                    // Attempt to restore registry from fallback file
-                    if let Ok(daemons) = read_registry_fallback(&fallback_path).await {
-                        warn!("Restoring registry from fallback file: {:?}", daemons);
-                        for daemon in daemons {
-                            let _ = GLOBAL_DAEMON_REGISTRY.register_daemon(daemon).await;
-                        }
-                    }
-                    return Err(reg_err).context(format!("Failed to register storage daemon on port {} after multiple attempts", selected_port));
-                }
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-        }
-    }
-
-    // Log file system state after registration
-    debug!("File system state after registration: dir_exists={:?}, dir_permissions={:?}, file_exists={:?}, file_permissions={:?}, file_size={:?}, file_modified={:?}",
-        fallback_dir.exists(),
-        tokio::fs::metadata(fallback_dir).await.map(|m| m.permissions()).ok(),
-        fallback_path.exists(),
-        tokio::fs::metadata(&fallback_path).await.map(|m| m.permissions()).ok(),
-        tokio::fs::metadata(&fallback_path).await.map(|m| m.len()).ok(),
-        tokio::fs::metadata(&fallback_path).await.map(|m| m.modified().ok()).ok()
-    );
-
-    // Health check
-    let addr_check = format!("{}:{}", ip, selected_port);
     let health_check_timeout = Duration::from_secs(15);
     let poll_interval = Duration::from_millis(500);
     let start_time = tokio::time::Instant::now();
 
     while start_time.elapsed() < health_check_timeout {
-        if tokio::net::TcpStream::connect(&addr_check).await.is_ok() {
+        if tokio::net::TcpStream::connect(&addr).await.is_ok() {
             info!("Storage daemon started on port {} (PID {}) with engine type {:?}", selected_port, pid, engine_type);
             *storage_daemon_port_arc.lock().await = Some(selected_port);
             let (tx, rx) = oneshot::channel();
@@ -2054,6 +2013,7 @@ pub async fn stop_storage_interactive(
     storage_daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
     storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
 ) -> Result<()> {
+    println!("IT IS TIME TO STOP STORAGE");
     let ports_to_stop = if let Some(p) = port {
         vec![p]
     } else {

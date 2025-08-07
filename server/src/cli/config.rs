@@ -15,7 +15,10 @@ use dirs;
 use toml;
 use serde_yaml2 as serde_yaml;
 // Import types from commands.rs
-use crate::cli::commands::{Commands, RestCliCommand, StatusAction, StorageAction, StartAction, StopAction, StopArgs, DaemonCliCommand};
+use crate::cli::commands::{Commands, CommandType, StatusArgs, RestartArgs, ReloadArgs, RestartAction, 
+                           ReloadAction, RestCliCommand, StatusAction, StorageAction, 
+                           StartAction, StopAction, 
+                           StopArgs, DaemonCliCommand};
 pub use lib::storage_engine::config::StorageEngineType;
 
 // --- Custom PathBuf Serialization Module ---
@@ -349,21 +352,73 @@ pub struct CliConfig {
 
 // --- CLI Config Loading ---
 impl CliConfig {
-    pub fn load() -> Result<Self> {
-        let mut args = <Self as clap::Parser>::parse();
+    pub fn load(interactive_command: Option<CommandType>) -> Result<Self> {
+        println!("Loading Config ==> STEP 0");
+        let mut args = if let Some(cmd) = interactive_command {
+            // Construct CliConfig from CommandType in interactive mode
+            let mut config = CliConfig {
+                command: Commands::Exit, // Placeholder, will be overridden
+                http_timeout_seconds: DEFAULT_HTTP_TIMEOUT_SECONDS,
+                http_retries: DEFAULT_HTTP_RETRIES,
+                grpc_timeout_seconds: DEFAULT_GRPC_TIMEOUT_SECONDS,
+                grpc_retries: DEFAULT_GRPC_RETRIES,
+                daemon_port: None,
+                daemon_cluster: None,
+                rest_port: None,
+                rest_cluster: None,
+                storage_port: None,
+                storage_cluster: None,
+                storage_config_path: None,
+                rest_api_config_path: None,
+                main_daemon_config_path: None,
+                config_root_directory: None,
+            };
+            match cmd {
+                CommandType::StartStorage { port, config_file, cluster, storage_port, storage_cluster } => {
+                    config.command = Commands::Storage(StorageAction::Start {
+                        port: storage_port.or(port),
+                        config_file: config_file.clone(),
+                        cluster: storage_cluster.clone().or(cluster.clone()),
+                        storage_port,
+                        storage_cluster: storage_cluster.clone(),
+                    });
+                    config.storage_port = storage_port.or(port);
+                    config.storage_cluster = storage_cluster.or(cluster);
+                    config.storage_config_path = config_file;
+                }
+                CommandType::Exit => {
+                    config.command = Commands::Exit;
+                }
+                // Add other CommandType variants as needed
+                _ => {
+                    return Err(anyhow!("Unsupported interactive command: {:?}", cmd));
+                }
+            }
+            config
+        } else {
+            // Non-interactive mode: parse from std::env::args_os()
+            match <Self as clap::Parser>::try_parse() {
+                Ok(args) => args,
+                Err(e) => {
+                    error!("Failed to parse CLI arguments: {:?}", e);
+                    return Err(anyhow!("CLI parsing error: {}", e));
+                }
+            }
+        };
+        println!("Loading Config ==> STEP 1");
         let config_root = args
             .config_root_directory
             .clone()
             .unwrap_or_else(|| default_config_root_directory());
 
         debug!("Resolved config root directory: {:?}", config_root);
-
+        println!("Loading Config ==> STEP 2");
         let global_config_path = config_root.join("graphdb_config.yaml");
         let mut global_yaml_config: Option<GlobalYamlConfig> = None;
         if global_config_path.exists() {
             debug!("Attempting to load global config from: {:?}", global_config_path);
             match fs::read_to_string(&global_config_path) {
-                Ok(content) => match serde_yaml2::from_str(&content) {
+                Ok(content) => match serde_yaml::from_str(&content) {
                     Ok(config) => {
                         global_yaml_config = Some(config);
                         debug!("Successfully loaded global config.");
@@ -373,21 +428,21 @@ impl CliConfig {
                 Err(e) => warn!("Failed to read global config file {:?}: {}", global_config_path, e),
             }
         }
-
+        println!("Loading Config ==> STEP 3");
         let storage_yaml_config = Self::load_specific_yaml(
             args.storage_config_path.as_ref(),
             global_yaml_config.as_ref().and_then(|g| g.storage.clone()),
             &PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH),
             "storage_config.yaml",
         );
-
+        
         let rest_api_yaml_config = Self::load_specific_yaml(
             args.rest_api_config_path.as_ref(),
             global_yaml_config.as_ref().and_then(|g| g.rest_api.clone()),
             &PathBuf::from(DEFAULT_REST_CONFIG_PATH_RELATIVE),
             "rest_api_config.yaml",
         );
-
+        
         let main_daemon_yaml_config = Self::load_specific_yaml(
             args.main_daemon_config_path.as_ref(),
             global_yaml_config.as_ref().and_then(|g| g.main_daemon.clone()),
@@ -395,75 +450,104 @@ impl CliConfig {
             "main_app_config.yaml",
         );
 
-        // Prioritize CLI arguments over config defaults
+        // Resolve Daemon Port
         if args.daemon_port.is_none() {
             args.daemon_port = match &args.command {
-                Commands::Start { action: Some(start_action), .. } => match start_action {
-                    StartAction::Daemon { port, daemon_port, .. } => port.or(*daemon_port),
-                    _ => None,
-                },
+                Commands::Start { action: Some(StartAction::Daemon { port, daemon_port, .. }), .. } => daemon_port.or(*port),
+                Commands::Start { action: Some(StartAction::All { daemon_port, port, .. }), .. } => daemon_port.or(*port),
+                Commands::Daemon(DaemonCliCommand::Start { port, daemon_port, .. }) => daemon_port.or(*port),
                 Commands::Stop(StopArgs { action: Some(StopAction::Daemon { port }), .. }) => *port,
-                Commands::Daemon(DaemonCliCommand::Start { port, daemon_port, .. }) => port.or(*daemon_port),
+                Commands::Daemon(DaemonCliCommand::Stop { port, .. }) => *port,
+                Commands::Status(StatusArgs { action: Some(StatusAction::Daemon { port, .. }), .. }) => *port,
+                Commands::Daemon(DaemonCliCommand::Status { port, .. }) => *port,
+                Commands::Reload(ReloadArgs { action: Some(ReloadAction::Daemon { port }), .. }) => *port,
+                Commands::Restart(RestartArgs { action: RestartAction::Daemon { port, daemon_port, .. } }) => daemon_port.or(*port),
+                Commands::Restart(RestartArgs { action: RestartAction::All { port, daemon_port, .. } }) => daemon_port.or(*port),
                 _ => main_daemon_yaml_config.as_ref().map(|c| c.default_port),
             };
         }
+
+        // Resolve Daemon Cluster
         if args.daemon_cluster.is_none() {
             args.daemon_cluster = match &args.command {
-                Commands::Start { action: Some(start_action), .. } => match start_action {
-                    StartAction::Daemon { cluster, daemon_cluster, .. } => cluster.clone().or_else(|| daemon_cluster.clone()),
-                    _ => None,
-                },
-                Commands::Daemon(DaemonCliCommand::Start { cluster, daemon_cluster, .. }) => cluster.clone().or_else(|| daemon_cluster.clone()),
+                Commands::Start { action: Some(StartAction::Daemon { cluster, daemon_cluster, .. }), .. } => daemon_cluster.clone().or_else(|| cluster.clone()),
+                Commands::Start { action: Some(StartAction::All { daemon_cluster, cluster, .. }), .. } => daemon_cluster.clone().or_else(|| cluster.clone()),
+                Commands::Daemon(DaemonCliCommand::Start { cluster, daemon_cluster, .. }) => daemon_cluster.clone().or_else(|| cluster.clone()),
+                Commands::Status(StatusArgs { action: Some(StatusAction::Daemon { cluster, .. }), .. }) => cluster.clone(),
+                Commands::Daemon(DaemonCliCommand::Status { cluster, .. }) => cluster.clone(),
+                Commands::Restart(RestartArgs { action: RestartAction::Daemon { cluster, daemon_cluster, .. } }) => daemon_cluster.clone().or_else(|| cluster.clone()),
+                Commands::Restart(RestartArgs { action: RestartAction::All { cluster, daemon_cluster, .. } }) => daemon_cluster.clone().or_else(|| cluster.clone()),
                 _ => main_daemon_yaml_config.as_ref().map(|c| c.cluster_range.clone()),
             };
         }
 
+        // Resolve REST Port
         if args.rest_port.is_none() {
             args.rest_port = match &args.command {
-                Commands::Rest(RestCliCommand::Start { port, .. }) => *port,
-                Commands::Rest(RestCliCommand::Stop { port }) => *port,
+                Commands::Start { action: Some(StartAction::Rest { port, rest_port, .. }), .. } => rest_port.or(*port),
+                Commands::Start { action: Some(StartAction::All { rest_port, listen_port, .. }), .. } => rest_port.or(*listen_port),
+                Commands::Rest(RestCliCommand::Start { port, rest_port, .. }) => rest_port.or(*port),
+                Commands::Stop(StopArgs { action: Some(StopAction::Rest { port, .. }), .. }) => *port,
+                Commands::Rest(RestCliCommand::Stop { port, .. }) => *port,
+                Commands::Status(StatusArgs { action: Some(StatusAction::Rest { port, .. }), .. }) => *port,
+                Commands::Rest(RestCliCommand::Status { port, .. }) => *port,
+                Commands::Restart(RestartArgs { action: RestartAction::Rest { port, rest_port, .. } }) => rest_port.or(*port),
+                Commands::Restart(RestartArgs { action: RestartAction::All { listen_port, rest_port, .. } }) => rest_port.or(*listen_port),
                 _ => rest_api_yaml_config.as_ref().map(|c| c.default_port),
             };
         }
+
+        // Resolve REST Cluster
         if args.rest_cluster.is_none() {
             args.rest_cluster = match &args.command {
-                Commands::Rest(RestCliCommand::Start { cluster, .. }) => cluster.clone(),
+                Commands::Start { action: Some(StartAction::Rest { cluster, rest_cluster, .. }), .. } => rest_cluster.clone().or_else(|| cluster.clone()),
+                Commands::Start { action: Some(StartAction::All { rest_cluster, .. }), .. } => rest_cluster.clone(),
+                Commands::Rest(RestCliCommand::Start { cluster, rest_cluster, .. }) => rest_cluster.clone().or_else(|| cluster.clone()),
+                Commands::Status(StatusArgs { action: Some(StatusAction::Rest { cluster, .. }), .. }) => cluster.clone(),
+                Commands::Rest(RestCliCommand::Status { cluster, .. }) => cluster.clone(),
+                Commands::Restart(RestartArgs { action: RestartAction::Rest { cluster, rest_cluster, .. } }) => rest_cluster.clone().or_else(|| cluster.clone()),
+                Commands::Restart(RestartArgs { action: RestartAction::All { rest_cluster, .. } }) => rest_cluster.clone(),
                 _ => Some(args.rest_port.unwrap_or(DEFAULT_REST_API_PORT).to_string()),
             };
         }
 
-        // Handle storage port: --port and --storage-port are synonyms for Storage commands
+        // Resolve Storage Port
         if args.storage_port.is_none() {
             args.storage_port = match &args.command {
-                Commands::Storage(StorageAction::Start { port, storage_port, .. }) => port.or(*storage_port),
-                Commands::Storage(StorageAction::Stop { port }) => *port,
+                Commands::Start { action: Some(StartAction::Storage { port, storage_port, .. }), .. } => storage_port.or(*port),
+                Commands::Start { action: Some(StartAction::All { storage_port, .. }), .. } => *storage_port,
+                Commands::Storage(StorageAction::Start { port, storage_port, .. }) => storage_port.or(*port),
+                Commands::Stop(StopArgs { action: Some(StopAction::Storage { port }), .. }) => *port,
+                Commands::Storage(StorageAction::Stop { port, .. }) => *port,
+                Commands::Status(StatusArgs { action: Some(StatusAction::Storage { port, .. }), .. }) => *port,
+                Commands::Storage(StorageAction::Status { port, .. }) => *port,
+                Commands::Restart(RestartArgs { action: RestartAction::Storage { port, storage_port, .. } }) => storage_port.or(*port),
+                Commands::Restart(RestartArgs { action: RestartAction::All { storage_port, .. } }) => *storage_port,
                 _ => storage_yaml_config
                     .as_ref()
-                    .map(|c| c.default_port)
-                    .or_else(|| {
-                        debug!("No storage YAML config found, checking CLI --storage-port");
-                        args.storage_port
-                    })
-                    .or(Some(DEFAULT_STORAGE_PORT)),
+                    .map(|c| c.default_port),
             };
         }
 
-        // Handle storage cluster: --cluster and --storage-cluster are synonyms for Storage commands
+        // Resolve Storage Cluster
         if args.storage_cluster.is_none() {
             args.storage_cluster = match &args.command {
-                Commands::Storage(StorageAction::Start { cluster, storage_cluster, .. }) => cluster.clone().or_else(|| storage_cluster.clone()),
+                Commands::Start { action: Some(StartAction::Storage { cluster, storage_cluster, .. }), .. } => storage_cluster.clone().or_else(|| cluster.clone()),
+                Commands::Start { action: Some(StartAction::All { storage_cluster, .. }), .. } => storage_cluster.clone(),
+                Commands::Storage(StorageAction::Start { cluster, storage_cluster, .. }) => storage_cluster.clone().or_else(|| cluster.clone()),
+                Commands::Status(StatusArgs { action: Some(StatusAction::Storage { cluster, .. }), .. }) => cluster.clone(),
+                Commands::Storage(StorageAction::Status { cluster, .. }) => cluster.clone(),
+                Commands::Restart(RestartArgs { action: RestartAction::Storage { cluster, storage_cluster, .. } }) => storage_cluster.clone().or_else(|| cluster.clone()),
+                Commands::Restart(RestartArgs { action: RestartAction::All { storage_cluster, .. } }) => storage_cluster.clone(),
                 _ => storage_yaml_config.as_ref().map(|c| c.cluster_range.clone()),
             };
         }
-
-        // No data_directory, log_directory, etc., fields exist in StartAction variants, so skip those updates
-        // Storage-specific fields like max_disk_space_gb are handled in YAML config only
 
         Ok(args)
     }
 
     pub fn load_cli_config() -> Result<Self> {
-        Self::load()
+        Self::load(None)
     }
 
     fn load_specific_yaml<T>(
@@ -479,7 +563,7 @@ impl CliConfig {
             debug!("Attempting to load {} from CLI specified path: {:?}", config_name_for_log, path);
             match fs::canonicalize(path) {
                 Ok(canonical_path) => match fs::read_to_string(&canonical_path) {
-                    Ok(content) => match serde_yaml2::from_str(&content) {
+                    Ok(content) => match serde_yaml::from_str(&content) {
                         Ok(config) => {
                             info!("Successfully loaded {} from CLI path: {:?}", config_name_for_log, canonical_path);
                             return Some(config);
@@ -504,7 +588,7 @@ impl CliConfig {
             debug!("Attempting to load {} from default path: {:?}", config_name_for_log, default_path);
             match fs::canonicalize(default_path) {
                 Ok(canonical_path) => match fs::read_to_string(&canonical_path) {
-                    Ok(content) => match serde_yaml2::from_str(&content) {
+                    Ok(content) => match serde_yaml::from_str(&content) {
                         Ok(config) => {
                             info!("Successfully loaded {} from default path: {:?}", config_name_for_log, canonical_path);
                             return Some(config);
@@ -532,76 +616,25 @@ impl CliConfig {
     }
 
     pub fn get_daemon_port(&self) -> Result<u16> {
-        match &self.command {
-            Commands::Start { action: Some(start_action), .. } => match start_action {
-                StartAction::Daemon { port, daemon_port, .. } => port.or(*daemon_port)
-                    .with_context(|| "Daemon port not specified and no default found."),
-                _ => self.daemon_port
-                    .with_context(|| "Daemon port not specified and no default found for this command."),
-            },
-            Commands::Stop(StopArgs { action: Some(StopAction::Daemon { port }), .. }) => {
-                port.or(self.daemon_port)
-                    .with_context(|| "Daemon port not specified and no default found.")
-            }
-            Commands::Daemon(DaemonCliCommand::Start { port, daemon_port, .. }) => {
-                port.or(*daemon_port)
-                    .with_context(|| "Daemon port not specified and no default found.")
-            }
-            _ => self.daemon_port
-                .with_context(|| "Daemon port not specified and no default found for this command."),
-        }
+        self.daemon_port
+            .with_context(|| "Daemon port not specified and no default found.")
     }
 
     pub fn get_daemon_cluster_range(&self) -> Result<String> {
-        match &self.command {
-            Commands::Start { action: Some(start_action), .. } => match start_action {
-                StartAction::Daemon { cluster, daemon_cluster, .. } => cluster.clone()
-                    .or_else(|| daemon_cluster.clone())
-                    .with_context(|| "Daemon cluster range not specified and no default found."),
-                _ => self.daemon_cluster.clone().with_context(|| {
-                    "Daemon cluster range not specified and no default found for this command."
-                }),
-            },
-            Commands::Daemon(DaemonCliCommand::Start { cluster, daemon_cluster, .. }) => {
-                cluster.clone()
-                    .or_else(|| daemon_cluster.clone())
-                    .with_context(|| "Daemon cluster range not specified and no default found.")
-            }
-            _ => self.daemon_cluster.clone().with_context(|| {
-                "Daemon cluster range not specified and no default found for this command."
-            }),
-        }
+        self.daemon_cluster
+            .clone()
+            .with_context(|| "Daemon cluster range not specified and no default found.")
     }
 
-
-
     pub fn get_rest_api_port(&self) -> Result<u16> {
-        match &self.command {
-            Commands::Rest(RestCliCommand::Start { port, .. }) => {
-                port.or(self.rest_port)
-                    .with_context(|| "REST API port not specified and no default found.")
-            }
-            Commands::Rest(RestCliCommand::Stop { port }) => {
-                port.or(self.rest_port)
-                    .with_context(|| "REST API port not specified and no default found.")
-            }
-            _ => self.rest_port
-                .with_context(|| "REST API port not specified and no default found for this command."),
-        }
+        self.rest_port
+            .with_context(|| "REST API port not specified and no default found.")
     }
 
     pub fn get_rest_api_cluster_range(&self) -> Result<String> {
-        match &self.command {
-            Commands::Rest(RestCliCommand::Start { cluster, .. }) => {
-                cluster
-                    .clone()
-                    .or(self.rest_cluster.clone())
-                    .with_context(|| "REST API cluster range not specified and no default found.")
-            }
-            _ => self.rest_cluster.clone().with_context(|| {
-                "REST API cluster range not specified and no default found for this command."
-            }),
-        }
+        self.rest_cluster
+            .clone()
+            .with_context(|| "REST API cluster range not specified and no default found.")
     }
 
     pub fn get_storage_daemon_address(&self) -> Result<SocketAddr> {
@@ -612,31 +645,14 @@ impl CliConfig {
     }
 
     pub fn get_storage_daemon_port(&self) -> Result<u16> {
-        match &self.command {
-            Commands::Storage(StorageAction::Start { port, storage_port, .. }) => {
-                port.or(*storage_port)
-                    .with_context(|| "Storage Daemon port not specified and no default found.")
-            }
-            Commands::Storage(StorageAction::Stop { port }) => {
-                port.or(self.storage_port)
-                    .with_context(|| "Storage Daemon port not specified and no default found.")
-            }
-            _ => self.storage_port
-                .with_context(|| "Storage Daemon port not specified and no default found for this command."),
-        }
+        self.storage_port
+            .with_context(|| "Storage Daemon port not specified and no default found.")
     }
 
     pub fn get_storage_daemon_cluster_range(&self) -> Result<String> {
-        match &self.command {
-            Commands::Storage(StorageAction::Start { cluster, storage_cluster, .. }) => {
-                cluster.clone()
-                    .or_else(|| storage_cluster.clone())
-                    .with_context(|| "Storage Daemon cluster range not specified and no default found.")
-            }
-            _ => self.storage_cluster.clone().with_context(|| {
-                "Storage Daemon cluster range not specified and no default found for this command."
-            }),
-        }
+        self.storage_cluster
+            .clone()
+            .with_context(|| "Storage Daemon cluster range not specified and no default found.")
     }
 
     pub fn get_rest_api_address(&self) -> Result<SocketAddr> {
@@ -655,7 +671,7 @@ impl CliConfig {
                 _ => Err(anyhow!("Not in a start context to retrieve data directory.")),
             },
             Commands::Rest(RestCliCommand::Start { .. }) => {
-                Ok(RestApiConfig::default().data_directory) // Use default since data_directory is not in RestCliCommand::Start
+                Ok(RestApiConfig::default().data_directory)
             }
             Commands::Storage(StorageAction::Start { .. }) => {
                 Ok(StorageConfig::default().data_directory.to_string_lossy().into_owned())
@@ -676,7 +692,7 @@ impl CliConfig {
                 _ => Err(anyhow!("Not in a start context to retrieve log directory.")),
             },
             Commands::Rest(RestCliCommand::Start { .. }) => {
-                Ok(RestApiConfig::default().log_directory) // Use default since log_directory is not in RestCliCommand::Start
+                Ok(RestApiConfig::default().log_directory)
             }
             Commands::Storage(StorageAction::Start { .. }) => {
                 Ok(StorageConfig::default().log_directory)
@@ -689,22 +705,18 @@ impl CliConfig {
     }
 
     pub fn get_storage_max_disk_space_gb(&self) -> Result<u64> {
-        // Since max_disk_space_gb is not in StorageAction::Start, rely on YAML config
         Ok(StorageConfig::default().max_disk_space_gb)
     }
 
     pub fn get_storage_min_disk_space_gb(&self) -> Result<u64> {
-        // Since min_disk_space_gb is not in StorageAction::Start, rely on YAML config
         Ok(StorageConfig::default().min_disk_space_gb)
     }
 
     pub fn get_storage_use_raft_for_scale(&self) -> Result<bool> {
-        // Since use_raft_for_scale is not in StorageAction::Start, rely on YAML config
         Ok(StorageConfig::default().use_raft_for_scale)
     }
 
     pub fn get_storage_engine_type(&self) -> Result<String> {
-        // Since storage_engine_type is not in StorageAction::Start, rely on YAML config
         Ok(daemon_api_storage_engine_type_to_string(&StorageConfig::default().storage_engine_type))
     }
 
@@ -725,12 +737,10 @@ impl CliConfig {
     }
 
     pub fn get_cli_internal_storage_engine(&self) -> Result<StorageEngineType> {
-        // Since internal_storage_engine is not in DaemonCliCommand::Start, return default
         Ok(StorageConfig::default().storage_engine_type)
     }
 
     pub fn get_cli_daemon_storage_engine(&self) -> Result<StorageEngineType> {
-        // Since daemon_storage_engine is not in DaemonCliCommand::Start, return default
         Ok(StorageConfig::default().storage_engine_type)
     }
 }
@@ -859,7 +869,6 @@ pub fn get_rest_cluster_range() -> String {
 pub fn load_storage_config_from_yaml(config_file_path: Option<PathBuf>) -> Result<StorageConfig> {
     let default_config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH);
     let project_config_path = PathBuf::from("storage_daemon_server/storage_config.yaml");
-
     let path_to_use = config_file_path
         .or_else(|| project_config_path.exists().then(|| project_config_path))
         .unwrap_or(default_config_path);
