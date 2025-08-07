@@ -14,7 +14,8 @@ use sysinfo::{System, Pid as SysinfoPid, ProcessesToUpdate};
 use lazy_static::lazy_static;
 use tokio::process::Command;
 use tokio::time::{sleep, Duration};
-use serde_json; // Added for serializing configuration
+use serde_json;
+use std::collections::HashSet; // Use a HashSet to manage unique ports efficiently
 
 pub mod cli_schema;
 pub mod help_generator;
@@ -490,111 +491,112 @@ pub async fn stop_port_daemon(port: u16, daemon_type: &str) -> Result<(), Daemon
     Ok(())
 }
 
+// A new helper function to stop all daemons found in the registry.
+async fn stop_all_registered_daemons() -> Result<(), DaemonError> {
+    info!("Attempting to stop daemons from registry...");
+    let daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await?;
+    let mut successfully_stopped_ports = Vec::new();
+
+    for metadata in daemons {
+        info!("Found registered daemon: {} on port {} with PID {}", metadata.service_type, metadata.port, metadata.pid);
+        match stop_port_daemon(metadata.port, &metadata.service_type).await {
+            Ok(_) => {
+                info!("Successfully stopped {} daemon on port {}", metadata.service_type, metadata.port);
+                successfully_stopped_ports.push(metadata.port);
+            },
+            Err(e) => error!("Failed to stop registered daemon on port {}: {}", metadata.port, e),
+        }
+    }
+
+    // Only unregister daemons that were successfully stopped.
+    for port in successfully_stopped_ports {
+        if let Err(e) = GLOBAL_DAEMON_REGISTRY.unregister_daemon(port).await {
+            error!("Failed to unregister daemon on port {}: {}", port, e);
+        }
+    }
+    
+    Ok(())
+}
+
 pub async fn stop_daemon() -> Result<(), DaemonError> {
     info!("Attempting to stop all 'graphdb' related daemon instances...");
 
+    // First, try to stop daemons based on the registry. This is the most reliable method.
+    if let Err(e) = stop_all_registered_daemons().await {
+        error!("Error during registry-based daemon stop: {}", e);
+    }
+    
+    // Read configuration to determine potential ports for a fallback check.
     let config_path_toml = "server/src/cli/config.toml";
     let main_config_yaml = "server/main_app_config.yaml";
     let rest_config_yaml = "rest_api/rest_api_config.yaml";
     let storage_config_yaml = "storage_daemon_server/storage_config.yaml";
-
-    let mut storage_port = CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS;
-    let mut rest_port = DEFAULT_REST_API_PORT;
-    let mut default_port = DEFAULT_DAEMON_PORT;
-    let mut known_ports = vec![DEFAULT_DAEMON_PORT, DEFAULT_REST_API_PORT, CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS];
-    let mut config_cluster_range = None;
+    let mut known_ports = std::collections::HashSet::new();
 
     let mut config_builder = Config::builder();
     if Path::new(config_path_toml).exists() {
         config_builder = config_builder.add_source(ConfigFile::with_name(config_path_toml));
-        info!("Loaded TOML config from {}", config_path_toml);
     }
     if Path::new(main_config_yaml).exists() {
         config_builder = config_builder.add_source(ConfigFile::with_name(main_config_yaml));
-        info!("Loaded main daemon YAML config from {}", main_config_yaml);
     }
     if Path::new(rest_config_yaml).exists() {
         config_builder = config_builder.add_source(ConfigFile::with_name(rest_config_yaml));
-        info!("Loaded REST API YAML config from {}", rest_config_yaml);
     }
     if Path::new(storage_config_yaml).exists() {
         config_builder = config_builder.add_source(ConfigFile::with_name(storage_config_yaml));
-        info!("Loaded storage YAML config from {}", storage_config_yaml);
     }
 
     if let Ok(config) = config_builder.build() {
-        if let Ok(st_port) = config.get_int("storage.default_port") {
-            storage_port = st_port as u16;
-            info!("Using storage port: {}", storage_port);
-        }
-        if let Ok(r_port) = config.get_int("rest_api.default_port") {
-            rest_port = r_port as u16;
-            info!("Using REST API port: {}", rest_port);
-        }
-        if let Ok(cfg_port) = config.get_int("main_daemon.default_port") {
-            default_port = cfg_port as u16;
-            info!("Using main daemon port: {}", default_port);
-        }
-        if let Ok(range) = config.get_string("main_daemon.cluster_range") {
-            config_cluster_range = Some(range);
-            info!("Using main daemon cluster range: {}", config_cluster_range.as_ref().unwrap());
-        }
-    }
-
-    if let Some(range_str) = config_cluster_range {
-        let parts: Vec<&str> = range_str.split('-').collect();
-        if parts.len() == 2 {
-            if let (Ok(start_port), Ok(end_port)) = (parts[0].parse::<u16>(), parts[1].parse::<u16>()) {
-                if start_port != 0 && end_port != 0 && start_port <= end_port {
-                    for p in start_port..=end_port {
-                        if !known_ports.contains(&p) {
-                            known_ports.push(p);
+        // Collect ports from config
+        if let Ok(st_port) = config.get_int("storage.default_port") { known_ports.insert(st_port as u16); }
+        if let Ok(r_port) = config.get_int("rest_api.default_port") { known_ports.insert(r_port as u16); }
+        if let Ok(cfg_port) = config.get_int("main_daemon.default_port") { known_ports.insert(cfg_port as u16); }
+        if let Ok(range_str) = config.get_string("main_daemon.cluster_range") {
+            let parts: Vec<&str> = range_str.split('-').collect();
+            if parts.len() == 2 {
+                if let (Ok(start_port), Ok(end_port)) = (parts[0].parse::<u16>(), parts[1].parse::<u16>()) {
+                    if start_port != 0 && end_port != 0 && start_port <= end_port {
+                        for p in start_port..=end_port {
+                            known_ports.insert(p);
                         }
                     }
                 }
             }
         }
     }
-    if !known_ports.contains(&storage_port) {
-        known_ports.push(storage_port);
-    }
-    if !known_ports.contains(&rest_port) {
-        known_ports.push(rest_port);
-    }
-    if !known_ports.contains(&default_port) {
-        known_ports.push(default_port);
-    }
-    info!("Known ports to stop: {:?}", known_ports);
+    
+    // Add default ports in case config files are missing or don't specify them.
+    known_ports.insert(DEFAULT_DAEMON_PORT);
+    known_ports.insert(DEFAULT_REST_API_PORT);
+    known_ports.insert(CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS);
 
-    // Try stopping via daemon registry first
-    let daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await?;
-    for metadata in daemons {
-        if let Err(e) = stop_port_daemon(metadata.port, &metadata.service_type).await {
-            error!("Failed to stop {} daemon on port {}: {}", metadata.service_type, metadata.port, e);
-        }
-    }
+    info!("Performing fallback stop on known ports: {:?}", known_ports);
 
-    // Fallback to stopping known ports
-    let daemon_types = vec!["main", "rest", "storage"];
+    // Now perform a fallback check using `lsof` on all known ports.
     for &port in &known_ports {
-        for daemon_type in &daemon_types {
-            if let Err(e) = stop_port_daemon(port, daemon_type).await {
-                error!("Failed to stop {} daemon on port {}: {}", daemon_type, port, e);
+        let pid = find_pid_by_port(port).await;
+        if let Some(pid) = pid {
+            info!("Found an unregistered process (PID: {}) on port {}. Attempting to stop...", pid, port);
+            if let Err(e) = kill(NixPid::from_raw(pid as i32), Signal::SIGTERM) {
+                error!("Failed to send SIGTERM to PID {}: {}", pid, e);
+            } else {
+                info!("Sent SIGTERM to PID {}. Port {} should be free soon.", pid, port);
             }
         }
     }
-
+    
     // Additional cleanup for legacy PID files
     for &port in &known_ports {
         let legacy_pid_file = format!("/tmp/graphdb-daemon-{}.pid", port);
         remove_pid_file(&legacy_pid_file);
     }
-
-    // Clear registry
+    
+    // Clear the registry completely at the end to ensure it's empty.
     if let Err(e) = GLOBAL_DAEMON_REGISTRY.clear_all_daemons().await {
         error!("Failed to clear daemon registry: {}", e);
     }
-
+    
     *SHUTDOWN_FLAG.lock().unwrap() = true;
     info!("All daemon instances stopped and registry cleared.");
     Ok(())

@@ -24,9 +24,10 @@
 // FIXED: 2025-07-31 - Added missing fields `daemon_port`, `daemon_cluster`, `rest_port`, `rest_cluster`, `storage_port`, `storage_cluster` to patterns and initializers for StartAction::Daemon, StartAction::Rest, StartAction::Storage (lines 325, 331, 339, 327, 333, 341).
 // FIXED: 2025-07-31 - Corrected `filter_command` to `command_filter` in Commands::Help block (line 404) to resolve E0425.
 // FIXED: 2025-08-05 - Modified effective_action logic to prioritize StartAction::All when non-storage-specific arguments (e.g., --cluster, --listen-port) are present alongside --storage-port, fixing incorrect `Cannot specify both --port and --storage-port` error.
+// FIXED: 2025-08-06 - Refactored to execute commands before entering interactive mode, addressing the request to not exit after `start` command.
 
 use clap::{Parser, Subcommand, CommandFactory};
-use anyhow::Result;
+use anyhow::{Result, Context};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -158,6 +159,211 @@ pub enum Commands {
     Quit,
 }
 
+// Re-usable function to handle all commands. This is called from both interactive and non-interactive modes.
+pub async fn run_single_command(
+    command: Commands,
+    daemon_handles: Arc<Mutex<HashMap<u16, (JoinHandle<()>, oneshot::Sender<()>)>>>,
+    rest_api_shutdown_tx_opt: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    rest_api_port_arc: Arc<Mutex<Option<u16>>>,
+    rest_api_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    storage_daemon_shutdown_tx_opt: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    storage_daemon_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    storage_daemon_port_arc: Arc<Mutex<Option<u16>>>,
+) -> Result<()> {
+    match command {
+        Commands::Start {
+            port: top_port,
+            cluster: top_cluster,
+            daemon_port: top_daemon_port,
+            daemon_cluster: top_daemon_cluster,
+            listen_port: top_listen_port,
+            rest_port: top_rest_port,
+            rest_cluster: top_rest_cluster,
+            storage_port: top_storage_port,
+            storage_cluster: top_storage_cluster,
+            storage_config: top_storage_config_str,
+            action,
+        } => {
+            let effective_action = match action {
+                Some(StartAction::All {
+                    port, cluster, daemon_port, daemon_cluster,
+                    listen_port, rest_port, rest_cluster,
+                    storage_port, storage_cluster, storage_config
+                }) => {
+                    StartAction::All {
+                        port, cluster, daemon_port, daemon_cluster,
+                        listen_port, rest_port, rest_cluster,
+                        storage_port, storage_cluster,
+                        storage_config,
+                    }
+                },
+                Some(other_action) => other_action,
+                None => {
+                    if top_port.is_some() || top_cluster.is_some() || top_daemon_port.is_some() || top_daemon_cluster.is_some() ||
+                        top_listen_port.is_some() || top_rest_port.is_some() || top_rest_cluster.is_some() {
+                        StartAction::All {
+                            port: top_port,
+                            cluster: top_cluster.clone(),
+                            daemon_port: top_daemon_port,
+                            daemon_cluster: top_daemon_cluster,
+                            listen_port: top_listen_port,
+                            rest_port: top_rest_port,
+                            rest_cluster: top_rest_cluster,
+                            storage_port: top_storage_port,
+                            storage_cluster: top_storage_cluster,
+                            storage_config: top_storage_config_str.clone().map(PathBuf::from),
+                        }
+                    } else if top_storage_port.is_some() || top_storage_cluster.is_some() || top_storage_config_str.is_some() {
+                        StartAction::Storage {
+                            port: top_storage_port,
+                            cluster: top_storage_cluster.clone(),
+                            config_file: top_storage_config_str.clone().map(PathBuf::from),
+                            storage_port: top_storage_port,
+                            storage_cluster: top_storage_cluster,
+                        }
+                    } else {
+                        StartAction::All {
+                            port: None, cluster: None, daemon_port: None, daemon_cluster: None,
+                            listen_port: None, rest_port: None, rest_cluster: None,
+                            storage_port: None, storage_cluster: None, storage_config: None,
+                        }
+                    }
+                }
+            };
+
+            match effective_action {
+                StartAction::All {
+                    port, cluster, daemon_port, daemon_cluster,
+                    listen_port, rest_port, rest_cluster,
+                    storage_port, storage_cluster, storage_config,
+                } => {
+                    handlers_mod::handle_start_all_interactive(
+                        port.or(daemon_port),
+                        cluster.or(daemon_cluster),
+                        listen_port.or(rest_port),
+                        rest_cluster,
+                        storage_port,
+                        storage_cluster,
+                        storage_config,
+                        daemon_handles.clone(),
+                        rest_api_shutdown_tx_opt.clone(),
+                        rest_api_port_arc.clone(),
+                        rest_api_handle.clone(),
+                        storage_daemon_shutdown_tx_opt.clone(),
+                        storage_daemon_handle.clone(),
+                        storage_daemon_port_arc.clone(),
+                    ).await?;
+                }
+                StartAction::Daemon { port, cluster, daemon_port, daemon_cluster } => {
+                    handlers_mod::handle_daemon_command_interactive(
+                        DaemonCliCommand::Start { port, cluster, daemon_port, daemon_cluster },
+                        daemon_handles.clone(),
+                    ).await?;
+                }
+                StartAction::Rest { port: rest_start_port, cluster: rest_start_cluster, rest_port, rest_cluster } => {
+                    handlers_mod::handle_rest_command_interactive(
+                        RestCliCommand::Start { port: rest_start_port, cluster: rest_start_cluster, rest_port, rest_cluster },
+                        rest_api_shutdown_tx_opt.clone(),
+                        rest_api_handle.clone(),
+                        rest_api_port_arc.clone(),
+                    ).await?;
+                }
+                StartAction::Storage { port, config_file, cluster, storage_port, storage_cluster } => {
+                    handlers_mod::handle_storage_command_interactive(
+                        StorageAction::Start { port, config_file, cluster, storage_port, storage_cluster },
+                        storage_daemon_shutdown_tx_opt.clone(),
+                        storage_daemon_handle.clone(),
+                        storage_daemon_port_arc.clone(),
+                    ).await?;
+                }
+            }
+        }
+        Commands::Stop(stop_args) => {
+            let updated_stop_args = StopArgs {
+                action: Some(stop_args.action.unwrap_or(StopAction::All))
+            };
+            handlers_mod::handle_stop_command(updated_stop_args).await?;
+        }
+        Commands::Status(status_args) => {
+            handlers_mod::handle_status_command(
+                status_args,
+                rest_api_port_arc.clone(),
+                storage_daemon_port_arc.clone(),
+            ).await?;
+        }
+        Commands::Reload(reload_args) => {
+            handlers_mod::handle_reload_command_interactive(
+                reload_args,
+            ).await?;
+        }
+        Commands::Restart(restart_args) => {
+            handlers_mod::handle_restart_command_interactive(
+                restart_args,
+                daemon_handles.clone(),
+                rest_api_shutdown_tx_opt.clone(),
+                rest_api_port_arc.clone(),
+                rest_api_handle.clone(),
+                storage_daemon_shutdown_tx_opt.clone(),
+                storage_daemon_handle.clone(),
+                storage_daemon_port_arc.clone(),
+            ).await?;
+        }
+        Commands::Storage(storage_action) => {
+            handlers_mod::handle_storage_command(storage_action).await?;
+        }
+        Commands::Daemon(daemon_cmd) => {
+            handlers_mod::handle_daemon_command_interactive(daemon_cmd, daemon_handles.clone()).await?;
+        }
+        Commands::Rest(rest_cmd) => {
+            handlers_mod::handle_rest_command_interactive(
+                rest_cmd,
+                rest_api_shutdown_tx_opt.clone(),
+                rest_api_handle.clone(),
+                rest_api_port_arc.clone(),
+            ).await?;
+        }
+        Commands::Interactive => {
+            // This is a specific command to enter interactive mode,
+            // which will be handled by the main flow of start_cli().
+        }
+        Commands::Help(help_args) => {
+            let mut cmd = CliArgs::command();
+            if let Some(command_filter) = help_args.filter_command {
+                help_display_mod::print_filtered_help_clap_generated(&mut cmd, &command_filter);
+            } else if !help_args.command_path.is_empty() {
+                let command_filter = help_args.command_path.join(" ");
+                help_display_mod::print_filtered_help_clap_generated(&mut cmd, &command_filter);
+            } else {
+                help_display_mod::print_help_clap_generated();
+            }
+        }
+        Commands::Auth { username, password } => {
+            handlers_mod::authenticate_user(username, password).await;
+        }
+        Commands::Authenticate { username, password } => {
+            handlers_mod::authenticate_user(username, password).await;
+        }
+        Commands::Register { username, password } => {
+            handlers_mod::register_user(username, password).await;
+        }
+        Commands::Version => {
+            handlers_mod::display_rest_api_version().await;
+        }
+        Commands::Health => {
+            handlers_mod::display_rest_api_health().await;
+        }
+        Commands::Clear => {
+            handlers_mod::clear_terminal_screen().await?;
+            handlers_mod::print_welcome_screen();
+        }
+        Commands::Exit | Commands::Quit => {
+            println!("Exiting CLI. Goodbye!");
+            process::exit(0);
+        }
+    }
+    Ok(())
+}
+
 /// Main entry point for CLI command handling.
 pub async fn start_cli() -> Result<()> {
     // --- Custom Help Command Handling ---
@@ -182,8 +388,6 @@ pub async fn start_cli() -> Result<()> {
         let converted_storage_engine = args.internal_storage_engine.map(|se_cli| {
             se_cli.into()
         });
-
-        // Call directly from daemon_management
         return daemon_management::handle_internal_daemon_run(
             args.internal_rest_api_run,
             args.internal_storage_daemon_run,
@@ -225,209 +429,21 @@ pub async fn start_cli() -> Result<()> {
         if args.enable_plugins {
             println!("Experimental plugins are enabled.");
         }
-        match command {
-            Commands::Start {
-                port: top_port,
-                cluster: top_cluster,
-                daemon_port: top_daemon_port,
-                daemon_cluster: top_daemon_cluster,
-                listen_port: top_listen_port,
-                rest_port: top_rest_port,
-                rest_cluster: top_rest_cluster,
-                storage_port: top_storage_port,
-                storage_cluster: top_storage_cluster,
-                storage_config: top_storage_config_str,
-                action,
-            } => {
-                let effective_action = match action {
-                    Some(StartAction::All {
-                        port, cluster, daemon_port, daemon_cluster,
-                        listen_port, rest_port, rest_cluster,
-                        storage_port, storage_cluster, storage_config
-                    }) => {
-                        // Explicit 'all' subcommand takes precedence for its own arguments.
-                        StartAction::All {
-                            port, cluster, daemon_port, daemon_cluster,
-                            listen_port, rest_port, rest_cluster,
-                            storage_port, storage_cluster,
-                            storage_config,
-                        }
-                    },
-                    Some(other_action) => other_action,
-                    None => {
-                        // Prioritize StartAction::All if non-storage-specific arguments are present
-                        if top_port.is_some() || top_cluster.is_some() || top_daemon_port.is_some() || top_daemon_cluster.is_some() ||
-                           top_listen_port.is_some() || top_rest_port.is_some() || top_rest_cluster.is_some() {
-                            StartAction::All {
-                                port: top_port,
-                                cluster: top_cluster.clone(),
-                                daemon_port: top_daemon_port,
-                                daemon_cluster: top_daemon_cluster,
-                                listen_port: top_listen_port,
-                                rest_port: top_rest_port,
-                                rest_cluster: top_rest_cluster,
-                                storage_port: top_storage_port,
-                                storage_cluster: top_storage_cluster,
-                                storage_config: top_storage_config_str.clone().map(PathBuf::from),
-                            }
-                        } else if top_storage_port.is_some() || top_storage_cluster.is_some() || top_storage_config_str.is_some() {
-                            // Only trigger StartAction::Storage if only storage-specific arguments are provided
-                            StartAction::Storage {
-                                port: top_storage_port,
-                                cluster: top_storage_cluster.clone(),
-                                config_file: top_storage_config_str.clone().map(PathBuf::from),
-                                storage_port: top_storage_port,
-                                storage_cluster: top_storage_cluster,
-                            }
-                        } else {
-                            // Default to 'start all' without any arguments if nothing specific is provided
-                            StartAction::All {
-                                port: None, cluster: None, daemon_port: None, daemon_cluster: None,
-                                listen_port: None, rest_port: None, rest_cluster: None,
-                                storage_port: None, storage_cluster: None, storage_config: None,
-                            }
-                        }
-                    }
-                };
+        run_single_command(
+            command,
+            daemon_handles.clone(),
+            rest_api_shutdown_tx_opt.clone(),
+            rest_api_port_arc.clone(),
+            rest_api_handle.clone(),
+            storage_daemon_shutdown_tx_opt.clone(),
+            storage_daemon_handle.clone(),
+            storage_daemon_port_arc.clone(),
+        ).await?;
 
-                match effective_action {
-                    StartAction::All {
-                        port, cluster, daemon_port, daemon_cluster,
-                        listen_port, rest_port, rest_cluster,
-                        storage_port, storage_cluster, storage_config,
-                    } => {
-                        handlers_mod::handle_start_all_interactive(
-                            port.or(daemon_port),
-                            cluster.or(daemon_cluster),
-                            listen_port.or(rest_port),
-                            rest_cluster,
-                            storage_port,
-                            storage_cluster,
-                            storage_config,
-                            daemon_handles.clone(),
-                            rest_api_shutdown_tx_opt.clone(),
-                            rest_api_port_arc.clone(),
-                            rest_api_handle.clone(),
-                            storage_daemon_shutdown_tx_opt.clone(),
-                            storage_daemon_handle.clone(),
-                            storage_daemon_port_arc.clone(),
-                        ).await?;
-                    }
-                    StartAction::Daemon { port, cluster, daemon_port, daemon_cluster } => {
-                        handlers_mod::handle_daemon_command_interactive(
-                            DaemonCliCommand::Start { port, cluster, daemon_port, daemon_cluster },
-                            daemon_handles.clone(),
-                        ).await?;
-                    }
-                    StartAction::Rest { port: rest_start_port, cluster: rest_start_cluster, rest_port, rest_cluster } => {
-                        handlers_mod::handle_rest_command_interactive(
-                            RestCliCommand::Start { port: rest_start_port, cluster: rest_start_cluster, rest_port, rest_cluster },
-                            rest_api_shutdown_tx_opt.clone(),
-                            rest_api_handle.clone(),
-                            rest_api_port_arc.clone(),
-                        ).await?;
-                    }
-                    StartAction::Storage { port, config_file, cluster, storage_port, storage_cluster } => {
-                        handlers_mod::handle_storage_command_interactive(
-                            StorageAction::Start { port, config_file, cluster, storage_port, storage_cluster },
-                            storage_daemon_shutdown_tx_opt.clone(),
-                            storage_daemon_handle.clone(),
-                            storage_daemon_port_arc.clone(),
-                        ).await?;
-                    }
-                }
-            }
-            Commands::Stop(stop_args) => {
-                let updated_stop_args = StopArgs {
-                    action: Some(stop_args.action.unwrap_or(StopAction::All))
-                };
-                handlers_mod::handle_stop_command(updated_stop_args).await?;
-            }
-            Commands::Status(status_args) => {
-                handlers_mod::handle_status_command(
-                    status_args,
-                    rest_api_port_arc.clone(),
-                    storage_daemon_port_arc.clone(),
-                ).await?;
-            }
-            Commands::Reload(reload_args) => {
-                handlers_mod::handle_reload_command_interactive(
-                    reload_args,
-                ).await?;
-            }
-            Commands::Restart(restart_args) => {
-                handlers_mod::handle_restart_command_interactive(
-                    restart_args,
-                    daemon_handles.clone(),
-                    rest_api_shutdown_tx_opt.clone(),
-                    rest_api_port_arc.clone(),
-                    rest_api_handle.clone(),
-                    storage_daemon_shutdown_tx_opt.clone(),
-                    storage_daemon_handle.clone(),
-                    storage_daemon_port_arc.clone(),
-                ).await?;
-            }
-            Commands::Storage(storage_action) => {
-                handlers_mod::handle_storage_command(storage_action).await?;
-            }
-            Commands::Daemon(daemon_cmd) => {
-                handlers_mod::handle_daemon_command_interactive(daemon_cmd, daemon_handles.clone()).await?;
-            }
-            Commands::Rest(rest_cmd) => {
-                handlers_mod::handle_rest_command_interactive(
-                    rest_cmd,
-                    rest_api_shutdown_tx_opt.clone(),
-                    rest_api_handle.clone(),
-                    rest_api_port_arc.clone(),
-                ).await?;
-            }
-            Commands::Interactive => {
-                interactive_mod::run_cli_interactive(
-                    daemon_handles,
-                    rest_api_shutdown_tx_opt,
-                    rest_api_port_arc,
-                    rest_api_handle,
-                    storage_daemon_shutdown_tx_opt,
-                    storage_daemon_handle,
-                    storage_daemon_port_arc,
-                ).await?;
-            }
-            Commands::Help(help_args) => {
-                let mut cmd = CliArgs::command();
-                if let Some(command_filter) = help_args.filter_command {
-                    help_display_mod::print_filtered_help_clap_generated(&mut cmd, &command_filter);
-                } else if !help_args.command_path.is_empty() {
-                    let command_filter = help_args.command_path.join(" ");
-                    help_display_mod::print_filtered_help_clap_generated(&mut cmd, &command_filter);
-                } else {
-                    help_display_mod::print_help_clap_generated();
-                }
-            }
-            Commands::Auth { username, password } => {
-                handlers_mod::authenticate_user(username, password).await;
-            }
-            Commands::Authenticate { username, password } => {
-                handlers_mod::authenticate_user(username, password).await;
-            }
-            Commands::Register { username, password } => {
-                handlers_mod::register_user(username, password).await;
-            }
-            Commands::Version => {
-                handlers_mod::display_rest_api_version().await;
-            }
-            Commands::Health => {
-                handlers_mod::display_rest_api_health().await;
-            }
-            Commands::Clear => {
-                handlers_mod::clear_terminal_screen().await?;
-                handlers_mod::print_welcome_screen();
-            }
-            Commands::Exit | Commands::Quit => {
-                println!("Exiting CLI. Goodbye!");
-                process::exit(0);
-            }
+        if !should_enter_interactive_mode {
+            // Exit if a command was run and interactive mode was not requested
+            return Ok(());
         }
-        return Ok(());
     }
 
     if should_enter_interactive_mode {
