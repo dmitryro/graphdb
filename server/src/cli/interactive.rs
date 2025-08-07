@@ -16,7 +16,7 @@ use std::path::PathBuf; // Added PathBuf import
 use clap::CommandFactory; // Added CommandFactory import
 use std::collections::HashSet; // Added for HashSet
 use shlex; // Import shlex for robust argument splitting
-
+use log::{info, error, warn, debug};
 // Import necessary items from sibling modules
 use crate::cli::cli::CliArgs; // Import CliArgs from cli.rs
 use crate::cli::commands::{
@@ -30,6 +30,19 @@ use crate::cli::help_display::{
     print_interactive_help, print_interactive_filtered_help, collect_all_cli_elements_for_suggestions,
     print_help_clap_generated, print_filtered_help_clap_generated
 };
+
+use crate::cli::config::{load_storage_config_from_yaml};
+
+// New struct to hold all the shared state, addressing the too_many_arguments lint.
+struct SharedState {
+    daemon_handles: Arc<TokioMutex<HashMap<u16, (JoinHandle<()>, oneshot::Sender<()>)>>>,
+    rest_api_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
+    rest_api_port_arc: Arc<TokioMutex<Option<u16>>>,
+    rest_api_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
+    storage_daemon_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
+        storage_daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
+    storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
+}
 
 // --- Levenshtein Distance Calculation ---
 // Helper function to calculate Levenshtein distance between two strings
@@ -1114,43 +1127,38 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_interactive_command(
     command: CommandType,
-    daemon_handles: Arc<TokioMutex<HashMap<u16, (tokio::task::JoinHandle<()>, oneshot::Sender<()>)>>>,
-    rest_api_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
-    rest_api_port_arc: Arc<TokioMutex<Option<u16>>>,
-    rest_api_handle: Arc<TokioMutex<Option<tokio::task::JoinHandle<()>>>>,
-    storage_daemon_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
-    storage_daemon_handle: Arc<TokioMutex<Option<tokio::task::JoinHandle<()>>>>,
-    storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
+    // The previous arguments are now grouped into a single struct.
+    state: &SharedState,
 ) -> Result<()> {
     match command {
         CommandType::Daemon(daemon_cmd) => {
-            handlers::handle_daemon_command_interactive(daemon_cmd, daemon_handles).await
+            handlers::handle_daemon_command_interactive(daemon_cmd, state.daemon_handles.clone()).await
         }
         CommandType::Rest(rest_cmd) => {
             match rest_cmd {
                 RestCliCommand::Status { port, cluster: _ } => {
-                    handlers::display_rest_api_status(port, rest_api_port_arc.clone()).await;
+                    handlers::display_rest_api_status(port, state.rest_api_port_arc.clone()).await;
                     Ok(())
                 },
                 _ => handlers::handle_rest_command_interactive(
                     rest_cmd,
-                    rest_api_shutdown_tx_opt,
-                    rest_api_handle,
-                    rest_api_port_arc,
+                    state.rest_api_shutdown_tx_opt.clone(),
+                    state.rest_api_handle.clone(),
+                    state.rest_api_port_arc.clone(),
                 ).await,
             }
         }
         CommandType::Storage(storage_action) => {
             match storage_action {
                 StorageAction::Status { port, cluster: _ } => {
-                    handlers::display_storage_daemon_status(port, storage_daemon_port_arc.clone()).await;
+                    handlers::display_storage_daemon_status(port, state.storage_daemon_port_arc.clone()).await;
                     Ok(())
                 },
                 _ => handlers::handle_storage_command_interactive(
                     storage_action,
-                    storage_daemon_shutdown_tx_opt.clone(),
-                    storage_daemon_handle.clone(),
-                    storage_daemon_port_arc.clone(),
+                    state.storage_daemon_shutdown_tx_opt.clone(),
+                    state.storage_daemon_handle.clone(),
+                    state.storage_daemon_port_arc.clone(),
                 ).await,
             }
         }
@@ -1158,9 +1166,9 @@ pub async fn handle_interactive_command(
             handlers::start_rest_api_interactive(
                 port,
                 cluster,
-                rest_api_shutdown_tx_opt,
-                rest_api_port_arc,
-                rest_api_handle,
+                state.rest_api_shutdown_tx_opt.clone(),
+                state.rest_api_port_arc.clone(),
+                state.rest_api_handle.clone(),
             )
             .await
         }
@@ -1174,14 +1182,14 @@ pub async fn handle_interactive_command(
                 port,
                 config_file,
                 cluster,
-                storage_daemon_shutdown_tx_opt,
-                storage_daemon_handle,
-                storage_daemon_port_arc,
+                state.storage_daemon_shutdown_tx_opt.clone(),
+                state.storage_daemon_handle.clone(),
+                state.storage_daemon_port_arc.clone(),
             )
             .await
         }
         CommandType::StartDaemon { port, cluster, .. } => {
-            handlers::start_daemon_instance_interactive(port, cluster, daemon_handles).await
+            handlers::start_daemon_instance_interactive(port, cluster, state.daemon_handles.clone()).await
         }
         CommandType::StartAll {
             port,
@@ -1203,53 +1211,53 @@ pub async fn handle_interactive_command(
                 storage_port,
                 storage_cluster,
                 storage_config_file,
-                daemon_handles,
-                rest_api_shutdown_tx_opt,
-                rest_api_port_arc,
-                rest_api_handle,
-                storage_daemon_shutdown_tx_opt,
-                storage_daemon_handle,
-                storage_daemon_port_arc,
+                state.daemon_handles.clone(),
+                state.rest_api_shutdown_tx_opt.clone(),
+                state.rest_api_port_arc.clone(),
+                state.rest_api_handle.clone(),
+                state.storage_daemon_shutdown_tx_opt.clone(),
+                state.storage_daemon_handle.clone(),
+                state.storage_daemon_port_arc.clone(),
             )
             .await
         }
         CommandType::StopAll => {
             handlers::stop_all_interactive(
-                daemon_handles,
-                rest_api_shutdown_tx_opt,
-                rest_api_port_arc,
-                rest_api_handle,
-                storage_daemon_shutdown_tx_opt.clone(),
-                storage_daemon_handle.clone(),
-                storage_daemon_port_arc.clone(),
+                state.daemon_handles.clone(),
+                state.rest_api_shutdown_tx_opt.clone(),
+                state.rest_api_port_arc.clone(),
+                state.rest_api_handle.clone(),
+                state.storage_daemon_shutdown_tx_opt.clone(),
+                state.storage_daemon_handle.clone(),
+                state.storage_daemon_port_arc.clone(),
             )
             .await
         }
         CommandType::StopRest(port) => {
             handlers::stop_rest_api_interactive(
                 port,
-                rest_api_shutdown_tx_opt,
-                rest_api_port_arc,
-                rest_api_handle,
+                state.rest_api_shutdown_tx_opt.clone(),
+                state.rest_api_port_arc.clone(),
+                state.rest_api_handle.clone(),
             )
             .await
         }
         CommandType::StopDaemon(port) => {
-            handlers::stop_daemon_instance_interactive(port, daemon_handles).await
+            handlers::stop_daemon_instance_interactive(port, state.daemon_handles.clone()).await
         }
         CommandType::StopStorage(port) => {
             handlers::stop_storage_interactive(
                 port,
-                storage_daemon_shutdown_tx_opt.clone(),
-                storage_daemon_handle.clone(),
-                storage_daemon_port_arc.clone(),
+                state.storage_daemon_shutdown_tx_opt.clone(),
+                state.storage_daemon_handle.clone(),
+                state.storage_daemon_port_arc.clone(),
             )
             .await
         }
         CommandType::StatusSummary => {
             handlers::display_full_status_summary(
-                rest_api_port_arc.clone(),
-                storage_daemon_port_arc.clone(),
+                state.rest_api_port_arc.clone(),
+                state.storage_daemon_port_arc.clone(),
             )
             .await;
             Ok(())
@@ -1259,7 +1267,7 @@ pub async fn handle_interactive_command(
             Ok(())
         }
         CommandType::StatusStorage(port) => {
-            handlers::display_storage_daemon_status(port, storage_daemon_port_arc.clone()).await;
+            handlers::display_storage_daemon_status(port, state.storage_daemon_port_arc.clone()).await;
             Ok(())
         }
         CommandType::StatusCluster => {
@@ -1288,29 +1296,29 @@ pub async fn handle_interactive_command(
         }
         CommandType::ReloadAll => {
             handlers::reload_all_interactive(
-                daemon_handles,
-                rest_api_shutdown_tx_opt,
-                rest_api_port_arc,
-                rest_api_handle,
-                storage_daemon_shutdown_tx_opt.clone(),
-                storage_daemon_handle.clone(),
-                storage_daemon_port_arc.clone(),
+                state.daemon_handles.clone(),
+                state.rest_api_shutdown_tx_opt.clone(),
+                state.rest_api_port_arc.clone(),
+                state.rest_api_handle.clone(),
+                state.storage_daemon_shutdown_tx_opt.clone(),
+                state.storage_daemon_handle.clone(),
+                state.storage_daemon_port_arc.clone(),
             )
             .await
         }
         CommandType::ReloadRest => {
             handlers::reload_rest_interactive(
-                rest_api_shutdown_tx_opt,
-                rest_api_port_arc,
-                rest_api_handle,
+                state.rest_api_shutdown_tx_opt.clone(),
+                state.rest_api_port_arc.clone(),
+                state.rest_api_handle.clone(),
             )
             .await
         }
         CommandType::ReloadStorage => {
             handlers::reload_storage_interactive(
-                storage_daemon_shutdown_tx_opt.clone(),
-                storage_daemon_handle.clone(),
-                storage_daemon_port_arc.clone(),
+                state.storage_daemon_shutdown_tx_opt.clone(),
+                state.storage_daemon_handle.clone(),
+                state.storage_daemon_port_arc.clone(),
             )
             .await
         }
@@ -1348,13 +1356,13 @@ pub async fn handle_interactive_command(
             };
             handlers::handle_restart_command_interactive(
                 restart_args,
-                daemon_handles,
-                rest_api_shutdown_tx_opt,
-                rest_api_port_arc,
-                rest_api_handle,
-                storage_daemon_shutdown_tx_opt,
-                storage_daemon_handle,
-                storage_daemon_port_arc,
+                state.daemon_handles.clone(),
+                state.rest_api_shutdown_tx_opt.clone(),
+                state.rest_api_port_arc.clone(),
+                state.rest_api_handle.clone(),
+                state.storage_daemon_shutdown_tx_opt.clone(),
+                state.storage_daemon_handle.clone(),
+                state.storage_daemon_port_arc.clone(),
             )
             .await
         }
@@ -1364,13 +1372,13 @@ pub async fn handle_interactive_command(
             };
             handlers::handle_restart_command_interactive(
                 restart_args,
-                daemon_handles,
-                rest_api_shutdown_tx_opt,
-                rest_api_port_arc,
-                rest_api_handle,
-                storage_daemon_shutdown_tx_opt,
-                storage_daemon_handle,
-                storage_daemon_port_arc,
+                state.daemon_handles.clone(),
+                state.rest_api_shutdown_tx_opt.clone(),
+                state.rest_api_port_arc.clone(),
+                state.rest_api_handle.clone(),
+                state.storage_daemon_shutdown_tx_opt.clone(),
+                state.storage_daemon_handle.clone(),
+                state.storage_daemon_port_arc.clone(),
             )
             .await
         }
@@ -1392,13 +1400,13 @@ pub async fn handle_interactive_command(
             };
             handlers::handle_restart_command_interactive(
                 restart_args,
-                daemon_handles,
-                rest_api_shutdown_tx_opt,
-                rest_api_port_arc,
-                rest_api_handle,
-                storage_daemon_shutdown_tx_opt,
-                storage_daemon_handle,
-                storage_daemon_port_arc,
+                state.daemon_handles.clone(),
+                state.rest_api_shutdown_tx_opt.clone(),
+                state.rest_api_port_arc.clone(),
+                state.rest_api_handle.clone(),
+                state.storage_daemon_shutdown_tx_opt.clone(),
+                state.storage_daemon_handle.clone(),
+                state.storage_daemon_port_arc.clone(),
             )
             .await
         }
@@ -1408,13 +1416,13 @@ pub async fn handle_interactive_command(
             };
             handlers::handle_restart_command_interactive(
                 restart_args,
-                daemon_handles,
-                rest_api_shutdown_tx_opt,
-                rest_api_port_arc,
-                rest_api_handle,
-                storage_daemon_shutdown_tx_opt,
-                storage_daemon_handle,
-                storage_daemon_port_arc,
+                state.daemon_handles.clone(),
+                state.rest_api_shutdown_tx_opt.clone(),
+                state.rest_api_port_arc.clone(),
+                state.rest_api_handle.clone(),
+                state.storage_daemon_shutdown_tx_opt.clone(),
+                state.storage_daemon_handle.clone(),
+                state.storage_daemon_port_arc.clone(),
             )
             .await
         }
@@ -1424,13 +1432,13 @@ pub async fn handle_interactive_command(
             };
             handlers::handle_restart_command_interactive(
                 restart_args,
-                daemon_handles,
-                rest_api_shutdown_tx_opt,
-                rest_api_port_arc,
-                rest_api_handle,
-                storage_daemon_shutdown_tx_opt,
-                storage_daemon_handle,
-                storage_daemon_port_arc,
+                state.daemon_handles.clone(),
+                state.rest_api_shutdown_tx_opt.clone(),
+                state.rest_api_port_arc.clone(),
+                state.rest_api_handle.clone(),
+                state.storage_daemon_shutdown_tx_opt.clone(),
+                state.storage_daemon_handle.clone(),
+                state.storage_daemon_port_arc.clone(),
             )
             .await
         }
@@ -1442,12 +1450,12 @@ pub async fn handle_interactive_command(
         CommandType::Help(help_args) => {
             let mut cmd = CliArgs::command();
             if let Some(command_filter) = help_args.filter_command {
-                print_filtered_help_clap_generated(&mut cmd, &command_filter);
+                crate::cli::help_display::print_filtered_help_clap_generated(&mut cmd, &command_filter);
             } else if !help_args.command_path.is_empty() {
                 let command_filter = help_args.command_path.join(" ");
-                print_filtered_help_clap_generated(&mut cmd, &command_filter);
+                crate::cli::help_display::print_filtered_help_clap_generated(&mut cmd, &command_filter);
             } else {
-                print_help_clap_generated();
+                crate::cli::help_display::print_help_clap_generated();
             }
             Ok(())
         }
@@ -1478,6 +1486,16 @@ pub async fn run_cli_interactive(
 
     handlers::print_welcome_screen();
 
+    let state = SharedState {
+        daemon_handles,
+        rest_api_shutdown_tx_opt,
+        rest_api_port_arc,
+        rest_api_handle,
+        storage_daemon_shutdown_tx_opt,
+        storage_daemon_handle,
+        storage_daemon_port_arc,
+    };
+
     loop {
         let readline = rl.readline("GraphDB> ");
         match readline {
@@ -1502,39 +1520,19 @@ pub async fn run_cli_interactive(
                 }
 
                 let (command, _parsed_args) = parse_command(&args);
+                debug!("Parsed command: {:?}", command); // Log parsed command
 
                 if command == CommandType::Exit {
-                    handle_interactive_command(
-                        command,
-                        daemon_handles.clone(),
-                        rest_api_shutdown_tx_opt.clone(),
-                        rest_api_port_arc.clone(),
-                        rest_api_handle.clone(),
-                        storage_daemon_shutdown_tx_opt.clone(),
-                        storage_daemon_handle.clone(),
-                        storage_daemon_port_arc.clone(),
-                    ).await?;
+                    handle_interactive_command(command, &state).await?;
                     break;
                 }
 
-                let daemon_handles_clone = Arc::clone(&daemon_handles);
-                let rest_api_shutdown_tx_opt_clone = Arc::clone(&rest_api_shutdown_tx_opt);
-                let rest_api_port_arc_clone = Arc::clone(&rest_api_port_arc);
-                let rest_api_handle_clone = Arc::clone(&rest_api_handle);
-                let storage_daemon_shutdown_tx_opt_clone = Arc::clone(&storage_daemon_shutdown_tx_opt);
-                let storage_daemon_handle_clone = Arc::clone(&storage_daemon_handle);
-                let storage_daemon_port_arc_clone = Arc::clone(&storage_daemon_port_arc);
-
-                handle_interactive_command(
-                    command,
-                    daemon_handles_clone,
-                    rest_api_shutdown_tx_opt_clone,
-                    rest_api_port_arc_clone,
-                    rest_api_handle_clone,
-                    storage_daemon_shutdown_tx_opt_clone,
-                    storage_daemon_handle_clone,
-                    storage_daemon_port_arc_clone,
-                ).await?;
+                // Catch errors to prevent CLI exit
+                if let Err(e) = handle_interactive_command(command, &state).await {
+                    eprintln!("Error executing command: {:?}", e);
+                    debug!("Detailed error: {:#}", e);
+                    continue; // Keep CLI loop running
+                }
             }
             Err(ReadlineError::Interrupted) => {
                 println!("Ctrl-C received. Type 'exit' to quit or Ctrl-D to terminate.");
@@ -1551,6 +1549,5 @@ pub async fn run_cli_interactive(
     }
 
     rl.save_history(&history_path).context("Failed to save history")?;
-
     Ok(())
 }

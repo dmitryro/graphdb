@@ -59,6 +59,7 @@ pub use handlers::{
     handle_start_command,
     handle_reload_command,
     handle_restart_command_interactive, // FIX: Changed to handle_restart_command_interactive
+    handle_start_command_interactive,
 };
 pub use interactive::{
     run_cli_interactive,
