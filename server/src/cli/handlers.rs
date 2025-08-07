@@ -229,47 +229,6 @@ pub async fn display_rest_api_status(port_arg: Option<u16>, rest_api_port_arc: A
     println!("--------------------------------------------------");
 }
 
-/*
-pub async fn display_storage_daemon_status(port_arg: Option<u16>, storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>) {
-    use crate::cli::daemon_registry::GLOBAL_DAEMON_REGISTRY;
-    use std::path::PathBuf;
-
-    println!("\n--- Storage Daemon Status ---");
-    println!("{:<15} {:<10} {:<40}", "Status", "Port", "Details");
-    println!("{:-<15} {:-<10} {:-<40}", "", "", "");
-
-    // Storage Daemon Status
-    let storage_config = StorageConfig::default();
-    let storage_ports = find_running_storage_daemon_port().await;
-
-    if storage_ports.is_empty() {
-        println!("{:<20} {:<15} {:<10} {:<40}", "Storage Daemon", "Down", "N/A", "No storage daemons found in registry.");
-    } else {
-   
-
-
-        match port_arg {
-            Some(p) =>  {
-                       println!("PORT ARG WAS {}", p);
-            },
-            None => println!("PORT ARG WAS None"),
-        }
-
-        for &port in &storage_ports {
-            let storage_daemon_status = if check_process_status_by_port("Storage Daemon", port).await {
-                "Running".to_string()
-            } else {
-                "Down".to_string()
-            };
-            println!("{:<20} {:<15} {:<10} {:<40}", "Storage Daemon", storage_daemon_status, port, format!("Type: {:?}", storage_config.storage_engine_type));
-            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Data Dir: {}", storage_config.data_directory.display()));
-            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Engine Config: {:?}", storage_config.engine_specific_config));
-            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Max Open Files: {:?}", storage_config.max_open_files));
-        }
-    }
-    println!("--------------------------------------------------");
-} */
-
 /// Displays status of storage daemons only.
 /// Displays status of storage daemons only.
 pub async fn display_storage_daemon_status(port_arg: Option<u16>, storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>) {
@@ -334,60 +293,6 @@ pub async fn display_storage_daemon_status(port_arg: Option<u16>, storage_daemon
     println!("--------------------------------------------------");
 }
 
-/*
-pub async fn display_storage_daemon_status(port_arg: Option<u16>, storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>) {
-    // 1. Find all currently running storage daemon ports.
-    let all_running_ports = find_running_storage_daemon_port().await;
-
-    // 2. Determine which ports to display based on the `port_arg`.
-    let ports_to_display = match port_arg {
-        Some(p) => {
-            // If a specific port is provided, check if it's in the list of running ports.
-            if all_running_ports.contains(&p) {
-                vec![p]
-            } else {
-                // If the specified port is not running, print a message and exit.
-                println!("\n--- Storage Daemon Status ---");
-                println!("{:<15} {:<10} {:<40}", "Status", "Port", "Details");
-                println!("{:-<15} {:-<10} {:-<40}", "", "", "");
-                println!("{:<15} {:<10} {:<40}", "Down", p, "No daemon found on this port.");
-                println!("--------------------------------------------------");
-                return;
-            }
-        },
-        None => {
-            // If no port is specified, display all running ports.
-            all_running_ports
-        }
-    };
-
-    // 3. Print the header.
-    println!("\n--- Storage Daemon Status ---");
-    println!("{:<15} {:<10} {:<40}", "Status", "Port", "Details");
-    println!("{:-<15} {:-<10} {:-<40}", "", "", "");
-
-    // 4. Iterate over the filtered or unfiltered list of ports to display the status.
-    if ports_to_display.is_empty() {
-        println!("{:<15} {:<10} {:<40}", "Down", "N/A", "No storage daemons found in registry.");
-    } else {
-        for port in ports_to_display {
-            // In a real implementation, we would load the config specific to this daemon instance,
-            // but for this example, we will use the default config.
-            let storage_config = StorageConfig::default();
-            let storage_daemon_status = if check_process_status_by_port("Storage Daemon", port).await {
-                "Running"
-            } else {
-                "Down"
-            };
-            println!("{:<15} {:<10} {:<40}", storage_daemon_status, port, format!("Type: {:?}", storage_config.storage_engine_type));
-            println!("{:<15} {:<10} {:<40}", "", "", format!("Data Dir: {}", storage_config.data_directory.display()));
-            println!("{:<15} {:<10} {:<40}", "", "", format!("Engine Config: {:?}", storage_config.engine_specific_config));
-            println!("{:<15} {:<10} {:<40}", "", "", format!("Max Open Files: {:?}", storage_config.max_open_files));
-        }
-    }
-    println!("--------------------------------------------------");
-}
-*/
 /// Displays detailed status for a specific GraphDB daemon or lists all running ones.
 pub async fn display_daemon_status(port_arg: Option<u16>) {
     let all_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
@@ -1010,6 +915,7 @@ pub async fn handle_stop_command(args: StopArgs) -> Result<()> {
             info!("Initiating stop for all components");
 
             let all_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
+            debug!("Initial daemon registry state: {:?}", all_daemons);
             if all_daemons.is_empty() {
                 println!("No running components found in registry.");
                 info!("No components registered in GLOBAL_DAEMON_REGISTRY");
@@ -1018,40 +924,6 @@ pub async fn handle_stop_command(args: StopArgs) -> Result<()> {
 
             let mut stopped_count = 0;
             let mut errors = Vec::new();
-
-            // Stop storage daemons
-            let storage_daemons: Vec<DaemonMetadata> = all_daemons
-                .iter()
-                .filter(|d| d.service_type == "storage")
-                .cloned()
-                .collect();
-            for daemon in storage_daemons {
-                println!("Stopping storage daemon on port {} (PID: {})...", daemon.port, daemon.pid);
-                info!("Attempting to stop storage daemon on port {} (PID: {})", daemon.port, daemon.pid);
-                match stop_storage_interactive(
-                    Some(daemon.port),
-                    Arc::new(TokioMutex::new(None)),
-                    Arc::new(TokioMutex::new(None)),
-                    Arc::new(TokioMutex::new(None)),
-                )
-                .await
-                {
-                    Ok(()) => {
-                        if is_port_free(daemon.port).await {
-                            info!("Storage daemon on port {} stopped successfully", daemon.port);
-                            stopped_count += 1;
-                        } else {
-                            warn!("Storage daemon on port {} stopped but port is still in use", daemon.port);
-                            errors.push(format!("Storage daemon on port {}: port still in use", daemon.port));
-                        }
-                    }
-                    Err(e) => {
-                        println!("Failed to stop storage daemon on port {}: {}", daemon.port, e);
-                        error!("Failed to stop storage daemon on port {}: {}", daemon.port, e);
-                        errors.push(format!("Storage daemon on port {}: {}", daemon.port, e));
-                    }
-                }
-            }
 
             // Stop REST API daemons
             let rest_daemons: Vec<DaemonMetadata> = all_daemons
@@ -1110,6 +982,54 @@ pub async fn handle_stop_command(args: StopArgs) -> Result<()> {
                         println!("Failed to stop main daemon on port {}: {}", daemon.port, e);
                         error!("Failed to stop main daemon on port {}: {}", daemon.port, e);
                         errors.push(format!("Main daemon on port {}: {}", daemon.port, e));
+                    }
+                }
+            }
+
+            // Stop storage daemons
+            let storage_daemons: Vec<DaemonMetadata> = all_daemons
+                .iter()
+                .filter(|d| d.service_type == "storage")
+                .cloned()
+                .collect();
+            for daemon in storage_daemons {
+                println!("Stopping storage daemon on port {} (PID: {})...", daemon.port, daemon.pid);
+                info!("Attempting to stop storage daemon on port {} (PID: {})", daemon.port, daemon.pid);
+                match stop_storage_interactive(
+                    Some(daemon.port),
+                    Arc::new(TokioMutex::new(None)),
+                    Arc::new(TokioMutex::new(None)),
+                    Arc::new(TokioMutex::new(None)),
+                )
+                .await
+                {
+                    Ok(()) => {
+                        if is_port_free(daemon.port).await {
+                            info!("Storage daemon on port {} stopped successfully", daemon.port);
+                            stopped_count += 1;
+                        } else {
+                            warn!("Storage daemon on port {} stopped but port is still in use", daemon.port);
+                            errors.push(format!("Storage daemon on port {}: port still in use", daemon.port));
+                        }
+                    }
+                    Err(e) => {
+                        println!("Failed to stop storage daemon on port {}: {}", daemon.port, e);
+                        error!("Failed to stop storage daemon on port {}: {}", daemon.port, e);
+                        errors.push(format!("Storage daemon on port {}: {}", daemon.port, e));
+                    }
+                }
+            }
+
+            // Clear any remaining registry entries
+            let remaining_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
+            if !remaining_daemons.is_empty() {
+                warn!("Found stale registry entries after stopping components: {:?}", remaining_daemons);
+                for daemon in remaining_daemons {
+                    if let Err(e) = GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type(&daemon.service_type, daemon.port).await {
+                        warn!("Failed to remove stale {} daemon on port {} from registry: {}", daemon.service_type, daemon.port, e);
+                        errors.push(format!("Failed to remove stale {} daemon on port {}: {}", daemon.service_type, daemon.port, e));
+                    } else {
+                        info!("Removed stale {} daemon on port {} from registry", daemon.service_type, daemon.port);
                     }
                 }
             }
@@ -1375,37 +1295,76 @@ pub async fn execute_storage_query() {
     println!("Storage query executed (placeholder).");
 }
 
-/// Stops the main daemon on the specified port.
+/// Stops the main daemon on the specified port or all main daemons if no port is specified.
 pub async fn stop_main_interactive(
     port: Option<u16>,
     shutdown_tx: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
 ) -> Result<(), anyhow::Error> {
-    let actual_port = port.unwrap_or(DEFAULT_DAEMON_PORT);
-    log::info!("Attempting to stop main daemon on port {}", actual_port);
+    let ports_to_stop = if let Some(p) = port {
+        vec![p]
+    } else {
+        GLOBAL_DAEMON_REGISTRY
+            .get_all_daemon_metadata()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|d| d.service_type == "main")
+            .map(|d| d.port)
+            .collect()
+    };
 
-    if !check_process_status_by_port("Main Daemon", actual_port).await {
-        log::info!("No main daemon running on port {}", actual_port);
-        return Ok(());
-    }
+    let mut errors = Vec::new();
+    for actual_port in ports_to_stop {
+        log::info!("Attempting to stop main daemon on port {}", actual_port);
 
-    // This is the correct way to call the robust stop function.
-    // The stop_process_by_port function handles all the necessary cleanup,
-    // including unregistering the daemon and removing the PID file.
-    stop_process_by_port("Main Daemon", actual_port)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to stop main daemon on port {}: {}", actual_port, e))?;
+        if !check_process_status_by_port("Main Daemon", actual_port).await {
+            log::info!("No main daemon running on port {}", actual_port);
+            if let Ok(Some(_)) = GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("main", actual_port).await {
+                log::info!("Removed stale main daemon registry entry for port {}", actual_port);
+            }
+            println!("Main daemon on port {} stopped.", actual_port);
+            continue;
+        }
 
-    let mut shutdown_tx_guard = shutdown_tx.lock().await;
-    if let Some(tx) = shutdown_tx_guard.take() {
-        if tx.send(()).is_ok() {
-            log::info!("Sent shutdown signal to main daemon on port {}", actual_port);
+        // Stop the process
+        if let Err(e) = stop_process_by_port("Main Daemon", actual_port).await {
+            log::error!("Failed to stop main daemon process on port {}: {}", actual_port, e);
+            errors.push(anyhow!("Failed to stop main daemon on port {}: {}", actual_port, e));
+        }
+
+        // Attempt to deregister the daemon
+        if let Err(e) = GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("main", actual_port).await {
+            log::warn!("Failed to remove main daemon (port: {}) from registry: {}", actual_port, e);
         } else {
-            log::warn!("Failed to send shutdown signal to main daemon on port {}", actual_port);
+            log::info!("Successfully removed main daemon on port {} from registry", actual_port);
+        }
+
+        // Verify port is free with retries
+        let mut attempts = 0;
+        let max_attempts = 7;
+        let mut port_free = false;
+        while attempts < max_attempts {
+            if is_port_free(actual_port).await {
+                port_free = true;
+                log::info!("Main daemon on port {} stopped successfully", actual_port);
+                println!("Main daemon on port {} stopped.", actual_port);
+                break;
+            }
+            debug!("Port {} still in use after attempt {}", actual_port, attempts + 1);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            attempts += 1;
+        }
+
+        if !port_free {
+            errors.push(anyhow!("Port {} is still in use after attempting to stop main daemon", actual_port));
         }
     }
 
-    log::info!("Main daemon on port {} stopped successfully", actual_port);
-    Ok(())
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!("Failed to stop main daemon: {:?}", errors))
+    }
 }
 
 /// Stops a REST API instance in interactive mode.
@@ -1538,8 +1497,6 @@ pub async fn start_storage_interactive(
     use std::fs::OpenOptions;
     use std::os::unix::fs::OpenOptionsExt;
     use anyhow::Context;
-
-    println!("EVEN CAME HERE !!!!");
 
     // --- STEP 1: LOAD CLI CONFIGURATION ---
     // Construct CommandType for interactive mode
@@ -2269,6 +2226,10 @@ pub async fn stop_all_interactive(
     let mut stopped_count = 0;
     let mut failed_count = 0;
 
+    // Log initial registry state
+    let all_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
+    debug!("Initial daemon registry state: {:?}", all_daemons);
+
     // Stop REST API instances
     log::info!("Stopping all REST API instances...");
     match stop_rest_api_interactive(
@@ -2288,19 +2249,53 @@ pub async fn stop_all_interactive(
         }
     }
 
-    // Stop main daemons
-    log::info!("Stopping all main daemon instances...");
+    // Stop main daemons using daemon_handles
+    log::info!("Stopping all main daemon instances from handles...");
+    {
+        let mut handles = daemon_handles.lock().await;
+        let ports: Vec<u16> = handles.keys().copied().collect();
+        for port in ports {
+            if let Some((handle, tx)) = handles.remove(&port) {
+                log::info!("Sending stop signal to main daemon on port {}", port);
+                if let Err(_) = tx.send(()) {
+                    println!("Failed to send stop signal to main daemon on port {}: channel closed or receiver dropped", port);
+                    log::error!("Failed to send stop signal to main daemon on port {}: channel closed or receiver dropped", port);
+                    failed_count += 1;
+                } else {
+                    match tokio::time::timeout(Duration::from_secs(5), handle).await {
+                        Ok(Ok(_)) => {
+                            log::info!("Main daemon on port {} stopped successfully", port);
+                            stopped_count += 1;
+                        }
+                        Ok(Err(e)) => {
+                            println!("Main daemon on port {} failed to stop: {}", port, e);
+                            log::error!("Main daemon on port {} failed to stop: {}", port, e);
+                            failed_count += 1;
+                        }
+                        Err(_) => {
+                            println!("Main daemon on port {} timed out after 5 seconds", port);
+                            log::error!("Main daemon on port {} timed out after 5 seconds", port);
+                            failed_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback to stop_main_interactive for any remaining daemons
+    log::info!("Checking for remaining main daemon instances...");
     match stop_main_interactive(
         None,
         Arc::new(TokioMutex::new(None)),
     ).await {
         Ok(()) => {
-            log::info!("Main daemon instances stopped successfully");
+            log::info!("Remaining main daemon instances stopped successfully");
             stopped_count += 1;
         }
         Err(e) => {
-            println!("Failed to stop main daemon instances: {}", e);
-            log::error!("Failed to stop main daemon instances: {}", e);
+            println!("Failed to stop remaining main daemon instances: {}", e);
+            log::error!("Failed to stop remaining main daemon instances: {}", e);
             failed_count += 1;
         }
     }
@@ -2324,23 +2319,26 @@ pub async fn stop_all_interactive(
         }
     }
 
-    // Stop external daemon processes
-    log::info!("Sending global stop signal to all external daemon processes...");
-    match tokio::time::timeout(Duration::from_secs(10), stop_daemon_api_call()).await {
-        Ok(Ok(_)) => {
-            log::info!("Global stop signal sent successfully to all external daemon processes");
-            stopped_count += 1;
+    // Clear any remaining registry entries
+    let remaining_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
+    if !remaining_daemons.is_empty() {
+        warn!("Found stale registry entries after stopping components: {:?}", remaining_daemons);
+        for daemon in remaining_daemons {
+            if let Err(e) = GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type(&daemon.service_type, daemon.port).await {
+                warn!("Failed to remove stale {} daemon on port {} from registry: {}", daemon.service_type, daemon.port, e);
+                failed_count += 1;
+            } else {
+                info!("Removed stale {} daemon on port {} from registry", daemon.service_type, daemon.port);
+            }
         }
-        Ok(Err(e)) => {
-            println!("Failed to send global stop signal to daemons: {}", e);
-            log::error!("Failed to send global stop signal to daemons: {}", e);
-            failed_count += 1;
-        }
-        Err(_) => {
-            println!("Global stop signal timed out after 10 seconds");
-            log::error!("Global stop signal timed out after 10 seconds");
-            failed_count += 1;
-        }
+    }
+
+    // Log final registry state
+    let final_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
+    if !final_daemons.is_empty() {
+        println!("Warning: Some daemons still registered: {:?}", final_daemons);
+        log::warn!("Some daemons still registered after stop attempt: {:?}", final_daemons);
+        failed_count += 1;
     }
 
     if stopped_count == 0 && failed_count == 0 {
@@ -2350,7 +2348,12 @@ pub async fn stop_all_interactive(
         println!("Stop all completed: {} component groups stopped, {} failed.", stopped_count, failed_count);
         log::info!("Stop all completed: {} component groups stopped, {} failed", stopped_count, failed_count);
     }
-    Ok(())
+
+    if failed_count > 0 {
+        Err(anyhow!("Failed to stop one or more components: {} failures detected", failed_count))
+    } else {
+        Ok(())
+    }
 }
 
 pub async fn handle_daemon_command_interactive(
