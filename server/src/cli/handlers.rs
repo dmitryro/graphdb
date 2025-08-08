@@ -1,3 +1,4 @@
+
 // server/src/cli/handlers.rs
 
 // This file contains the handlers for various CLI commands, encapsulating
@@ -45,7 +46,8 @@ use crate::cli::daemon_management::{find_running_storage_daemon_port, clear_all_
                                     stop_daemon_api_call, handle_internal_daemon_run, load_storage_config_path_or_default,
                                     run_command_with_timeout, is_port_free, find_pid_by_port, is_rest_api_running,
                                     find_all_running_daemon_ports, check_process_status_by_port, parse_cluster_range,
-                                    find_all_running_rest_api_ports, start_daemon_with_pid, is_port_listening}; // Added handle_internal_daemon_run
+                                    find_all_running_rest_api_ports, start_daemon_with_pid, is_port_listening,
+                                    stop_process_by_port}; // Added handle_internal_daemon_run
 use daemon_api::{stop_daemon, start_daemon};
 use daemon_api::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
 use lib::storage_engine::config::{StorageEngineType};
@@ -115,47 +117,80 @@ pub fn get_current_exe_path() -> Result<PathBuf> {
         .context("Failed to get current executable path")
 }
 
-/// Helper to find and kill a process by port. This is used for all daemon processes.
-pub async fn stop_process_by_port(process_name: &str, port: u16) -> Result<(), anyhow::Error> {
-    println!("Attempting to find and kill process for {} on port {}...", process_name, port);
+/// Helper function to format engine-specific configuration details
+fn format_engine_config(storage_config: &StorageConfig) -> Vec<String> {
+    let mut config_lines = Vec::new();
     
-    let output = run_command_with_timeout(
-        "lsof",
-        &["-i", &format!(":{}", port), "-t"],
-        Duration::from_secs(3), // Short timeout for lsof
-    ).await?;
-
-    let pids = String::from_utf8_lossy(&output.stdout);
-    let pids: Vec<i32> = pids.trim().lines().filter_map(|s| s.parse::<i32>().ok()).collect();
-
-    if pids.is_empty() {
-        println!("No {} process found running on port {}.", process_name, port);
-        return Ok(());
-    }
-
-    for pid in pids {
-        println!("Killing process {} (for {} on port {})...", pid, process_name, port);
-        match TokioCommand::new("kill").arg("-9").arg(pid.to_string()).status().await {
-            Ok(status) if status.success() => println!("Process {} killed successfully.", pid),
-            Ok(_) => eprintln!("Failed to kill process {}.", pid),
-            Err(e) => eprintln!("Error killing process {}: {}", pid, e),
+    // Display the storage engine type prominently
+    config_lines.push(format!("Engine: {}", daemon_api_storage_engine_type_to_string(&storage_config.storage_engine_type)));
+    
+    // Display engine-specific configuration if available
+    if let Some(ref engine_config) = storage_config.engine_specific_config {
+        let storage_inner = &engine_config.storage;
+        
+        match storage_config.storage_engine_type {
+            StorageEngineType::RocksDB | StorageEngineType::Sled => {
+                // File-based storage engines
+                if let Some(ref path) = storage_inner.path {
+                    config_lines.push(format!("  Data Path: {}", path.display()));
+                }
+                if let Some(ref host) = storage_inner.host {
+                    config_lines.push(format!("  Host: {}", host));
+                }
+                if let Some(port) = storage_inner.port {
+                    config_lines.push(format!("  Port: {}", port));
+                }
+            },
+            StorageEngineType::PostgreSQL | StorageEngineType::MySQL => {
+                // Database storage engines
+                if let Some(ref host) = storage_inner.host {
+                    config_lines.push(format!("  Host: {}", host));
+                }
+                if let Some(port) = storage_inner.port {
+                    config_lines.push(format!("  Port: {}", port));
+                }
+                if let Some(ref database) = storage_inner.database {
+                    config_lines.push(format!("  Database: {}", database));
+                }
+                if let Some(ref username) = storage_inner.username {
+                    config_lines.push(format!("  Username: {}", username));
+                }
+                // Don't display password for security reasons
+                if storage_inner.password.is_some() {
+                    config_lines.push("  Password: [CONFIGURED]".to_string());
+                }
+            },
+            StorageEngineType::Redis => {
+                // Redis storage engine
+                if let Some(ref host) = storage_inner.host {
+                    config_lines.push(format!("  Host: {}", host));
+                }
+                if let Some(port) = storage_inner.port {
+                    config_lines.push(format!("  Port: {}", port));
+                }
+                if let Some(ref database) = storage_inner.database {
+                    config_lines.push(format!("  Database: {}", database));
+                }
+                if storage_inner.password.is_some() {
+                    config_lines.push("  Password: [CONFIGURED]".to_string());
+                }
+            },
+            StorageEngineType::InMemory => {
+                // In-memory storage doesn't need additional config
+                config_lines.push("  Config: In-memory storage (no additional configuration)".to_string());
+            }
         }
+    } else {
+        config_lines.push("  Config: Using default configuration".to_string());
     }
-
-    // Add a retry loop to ensure the port is actually freed
-    let start_time = Instant::now();
-    let wait_timeout = Duration::from_secs(5); // Increased timeout
-    let poll_interval = Duration::from_millis(200);
-
-    while start_time.elapsed() < wait_timeout {
-        if is_port_free(port).await {
-            println!("Port {} is now free.", port);
-            return Ok(());
-        }
-        tokio::time::sleep(poll_interval).await;
-    }
-
-    Err(anyhow::anyhow!("Port {} remained in use after killing processes within {:?}.", port, wait_timeout))
+    
+    // Add general storage configuration
+    config_lines.push(format!("  Max Open Files: {}", storage_config.max_open_files));
+    config_lines.push(format!("  Max Disk Space: {} GB", storage_config.max_disk_space_gb));
+    config_lines.push(format!("  Min Disk Space: {} GB", storage_config.min_disk_space_gb));
+    config_lines.push(format!("  Use Raft: {}", storage_config.use_raft_for_scale));
+    
+    config_lines
 }
 
 pub async fn display_rest_api_status(port_arg: Option<u16>, rest_api_port_arc: Arc<TokioMutex<Option<u16>>>) {
@@ -229,12 +264,22 @@ pub async fn display_rest_api_status(port_arg: Option<u16>, rest_api_port_arc: A
     println!("--------------------------------------------------");
 }
 
+
 /// Displays status of storage daemons only.
-/// Displays status of storage daemons only.
-pub async fn display_storage_daemon_status(port_arg: Option<u16>, storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>) {
+// Enhanced version of display_storage_daemon_status with detailed engine configuration
+pub async fn display_storage_daemon_status(
+    port_arg: Option<u16>, 
+    storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>
+) {
     let all_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
     debug!("Registry contents for storage status: {:?}", all_daemons);
-    let storage_config = StorageConfig::default();
+    
+    // Load actual storage configuration instead of using default
+    let storage_config = load_storage_config_from_yaml(None).unwrap_or_else(|e| {
+        warn!("Failed to load storage config: {}, using default", e);
+        StorageConfig::default()
+    });
+    
     let running_storage_ports: Vec<u16> = futures::stream::iter(all_daemons.iter().filter(|d| d.service_type == "storage"))
         .filter_map(|d| async move {
             let mut attempts = 0;
@@ -263,11 +308,11 @@ pub async fn display_storage_daemon_status(port_arg: Option<u16>, storage_daemon
     };
 
     println!("\n--- Storage Daemon Status ---");
-    println!("{:<15} {:<10} {:<40}", "Status", "Port", "Details");
-    println!("{:-<15} {:-<10} {:-<40}", "", "", "");
-
+    println!("{:<15} {:<10} {:<50}", "Status", "Port", "Configuration Details");
+    println!("{:-<15} {:-<10} {:-<50}", "", "", "");
+    
     if ports_to_display.is_empty() {
-        println!("{:<15} {:<10} {:<40}", "Down", "N/A", "No storage daemons found in registry.");
+        println!("{:<15} {:<10} {:<50}", "Down", "N/A", "No storage daemons found in registry.");
     } else {
         for &port in &ports_to_display {
             let storage_daemon_status = if check_process_status_by_port("Storage Daemon", port).await {
@@ -275,17 +320,43 @@ pub async fn display_storage_daemon_status(port_arg: Option<u16>, storage_daemon
             } else {
                 "Down".to_string()
             };
+            
             let metadata = all_daemons.iter().find(|d| d.port == port && d.service_type == "storage");
-            let details = if let Some(meta) = metadata {
-                format!("PID: {}, Type: {:?}", meta.pid, storage_config.storage_engine_type)
+            let pid_info = if let Some(meta) = metadata {
+                format!("PID: {} | Started: {:?}", meta.pid, meta.data_dir)
             } else {
-                format!("Type: {:?}", storage_config.storage_engine_type)
+                "PID: Unknown".to_string()
             };
-
-            println!("{:<15} {:<10} {:<40}", storage_daemon_status, port, details);
-            println!("{:<15} {:<10} {:<40}", "", "", format!("Data Dir: {}", storage_config.data_directory.display()));
-            println!("{:<15} {:<10} {:<40}", "", "", format!("Engine Config: {:?}", storage_config.engine_specific_config));
-            println!("{:<15} {:<10} {:<40}", "", "", format!("Max Open Files: {:?}", storage_config.max_open_files));
+            
+            println!("{:<15} {:<10} {:<50}", storage_daemon_status, port, pid_info);
+            println!("{:<15} {:<10} {:<50}", "", "", "");
+            
+            // Display comprehensive storage configuration
+            println!("{:<15} {:<10} {:<50}", "", "", "=== Storage Configuration ===");
+            
+            // Display engine configuration details
+            let engine_config_lines = format_engine_config(&storage_config);
+            for config_line in engine_config_lines {
+                println!("{:<15} {:<10} {:<50}", "", "", config_line);
+            }
+            
+            println!("{:<15} {:<10} {:<50}", "", "", "");
+            println!("{:<15} {:<10} {:<50}", "", "", "=== Directory Configuration ===");
+            println!("{:<15} {:<10} {:<50}", "", "", format!("Data Directory: {}", storage_config.data_directory.display()));
+            println!("{:<15} {:<10} {:<50}", "", "", format!("Log Directory: {}", storage_config.log_directory));
+            println!("{:<15} {:<10} {:<50}", "", "", format!("Config Root: {}", storage_config.config_root_directory.display()));
+            
+            println!("{:<15} {:<10} {:<50}", "", "", "");
+            println!("{:<15} {:<10} {:<50}", "", "", "=== Network & Scaling ===");
+            println!("{:<15} {:<10} {:<50}", "", "", format!("Default Port: {}", storage_config.default_port));
+            println!("{:<15} {:<10} {:<50}", "", "", format!("Cluster Range: {}", storage_config.cluster_range));
+            println!("{:<15} {:<10} {:<50}", "", "", format!("Use Raft for Scale: {}", storage_config.use_raft_for_scale));
+            
+            // Add separator between multiple storage daemons
+            if ports_to_display.len() > 1 && port != *ports_to_display.last().unwrap() {
+                println!("{:<15} {:<10} {:<50}", "", "", "");
+                println!("{:-<15} {:-<10} {:-<50}", "", "", "");
+            }
         }
     }
 
@@ -532,15 +603,19 @@ pub async fn display_cluster_status() {
 /// information for each component type, including health checks for the REST API
 /// and configuration details for the Storage daemons.
 /// Displays full status summary of all components.
-pub async fn display_full_status_summary(rest_api_port_arc: Arc<TokioMutex<Option<u16>>>, storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>) -> Result<()> {
+/// Enhanced version of display_full_status_summary with better storage formatting
+pub async fn display_full_status_summary(
+    rest_api_port_arc: Arc<TokioMutex<Option<u16>>>, 
+    storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>
+) -> Result<()> {
     println!("\n--- GraphDB System Status Summary ---");
-    println!("{:<20} {:<15} {:<10} {:<40}", "Component", "Status", "Port", "");
+    println!("{:<20} {:<15} {:<10} {:<40}", "Component", "Status", "Port", "Details");
     println!("{:-<20} {:-<15} {:-<10} {:-<40}", "", "", "", "");
 
     let all_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
     debug!("Registry contents: {:?}", all_daemons);
 
-    // Daemon status
+    // Daemon status (keeping existing logic)
     let daemon_ports: Vec<u16> = futures::stream::iter(all_daemons.iter().filter(|d| d.service_type == "main"))
         .filter_map(|d| async move {
             let mut attempts = 0;
@@ -558,6 +633,7 @@ pub async fn display_full_status_summary(rest_api_port_arc: Arc<TokioMutex<Optio
         })
         .collect::<Vec<u16>>()
         .await;
+    
     let daemon_status_msg = if daemon_ports.is_empty() {
         "Down".to_string()
     } else {
@@ -570,7 +646,7 @@ pub async fn display_full_status_summary(rest_api_port_arc: Arc<TokioMutex<Optio
     };
     println!("{:<20} {:<15} {:<10} {:<40}", "GraphDB Daemon", daemon_status_msg, daemon_ports_display, "Core Graph Processing");
 
-    // REST API status
+    // REST API status (keeping existing logic but shortened)
     let rest_ports: Vec<u16> = futures::stream::iter(all_daemons.iter().filter(|d| d.service_type == "rest"))
         .filter_map(|d| async move {
             let mut attempts = 0;
@@ -588,45 +664,32 @@ pub async fn display_full_status_summary(rest_api_port_arc: Arc<TokioMutex<Optio
         })
         .collect::<Vec<u16>>()
         .await;
-    let rest_api_status = if rest_ports.is_empty() {
-        "Down".to_string()
-    } else {
-        "Running".to_string()
-    };
+    
+    let rest_api_status = if rest_ports.is_empty() { "Down".to_string() } else { "Running".to_string() };
     let rest_ports_display = if rest_ports.is_empty() {
         DEFAULT_REST_API_PORT.to_string()
     } else {
         rest_ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
     };
+    
     let mut rest_api_details = String::new();
     if let Some(&port) = rest_ports.first() {
+        // Keep existing REST API health check logic...
         let client = Client::builder()
             .timeout(Duration::from_secs(2))
             .build()
             .context("Failed to build reqwest client")?;
         let health_url = format!("http://127.0.0.1:{}/api/v1/health", port);
-        let version_url = format!("http://127.0.0.1:{}/api/v1/version", port);
         if let Ok(resp) = client.get(&health_url).send().await {
             if resp.status().is_success() {
                 rest_api_details = "Health: OK".to_string();
-                if let Ok(v_resp) = client.get(&version_url).send().await {
-                    if v_resp.status().is_success() {
-                        let v_json: Value = v_resp.json().await.unwrap_or_default();
-                        let version = v_json["version"].as_str().unwrap_or("N/A");
-                        rest_api_details = format!("{}; Version: {}", rest_api_details, version);
-                    }
-                }
             }
-        }
-        let metadata = all_daemons.iter().find(|d| d.port == port && d.service_type == "rest");
-        if let Some(meta) = metadata {
-            rest_api_details = format!("{}; PID: {}, Data Dir: {:?}", rest_api_details, meta.pid, meta.data_dir);
         }
     }
     println!("{:<20} {:<15} {:<10} {:<40}", "REST API", rest_api_status, rest_ports_display, rest_api_details);
 
-    // Storage status
-    let storage_config = load_storage_config(None)?;
+    // Enhanced Storage status with detailed configuration
+    let storage_config = load_storage_config_from_yaml(None).unwrap_or_else(|_| StorageConfig::default());
     let storage_ports: Vec<u16> = futures::stream::iter(all_daemons.iter().filter(|d| d.service_type == "storage"))
         .filter_map(|d| async move {
             let mut attempts = 0;
@@ -644,6 +707,7 @@ pub async fn display_full_status_summary(rest_api_port_arc: Arc<TokioMutex<Optio
         })
         .collect::<Vec<u16>>()
         .await;
+
     if storage_ports.is_empty() {
         println!("{:<20} {:<15} {:<10} {:<40}", "Storage Daemon", "Down", "N/A", "No storage daemons found in registry.");
     } else {
@@ -653,16 +717,31 @@ pub async fn display_full_status_summary(rest_api_port_arc: Arc<TokioMutex<Optio
             } else {
                 "Down"
             };
+            
             let metadata = all_daemons.iter().find(|d| d.port == port && d.service_type == "storage");
-            let details = if let Some(meta) = metadata {
-                format!("PID: {}, Type: {:?}", meta.pid, storage_config.storage_engine_type)
+            let pid_info = if let Some(meta) = metadata {
+                format!("PID: {}", meta.pid)
             } else {
-                format!("Type: {:?}", storage_config.storage_engine_type)
+                "PID: Unknown".to_string()
             };
-            println!("{:<20} {:<15} {:<10} {:<40}", "Storage Daemon", storage_daemon_status, port, details);
-            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Data Dir: {}", storage_config.data_directory.display()));
-            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Engine Config: {:?}", storage_config.engine_specific_config));
-            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Max Open Files: {:?}", storage_config.max_open_files));
+            
+            println!("{:<20} {:<15} {:<10} {:<40}", "Storage Daemon", storage_daemon_status, port, pid_info);
+            
+            // Display detailed engine configuration
+            let engine_config_lines = format_engine_config(&storage_config);
+            for config_line in engine_config_lines {
+                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", config_line);
+            }
+            
+            // Display data directory
+            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Data Directory: {}", storage_config.data_directory.display()));
+            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Log Directory: {}", storage_config.log_directory));
+            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Cluster Range: {}", storage_config.cluster_range));
+            
+            // Add separator between multiple storage daemons
+            if storage_ports.len() > 1 && port != *storage_ports.last().unwrap() {
+                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", "");
+            }
         }
     }
 
@@ -671,7 +750,6 @@ pub async fn display_full_status_summary(rest_api_port_arc: Arc<TokioMutex<Optio
     println!("--------------------------------------------------");
     Ok(())
 }
-
 
 /// Prints a visually appealing welcome screen for the CLI.
 pub fn print_welcome_screen() {

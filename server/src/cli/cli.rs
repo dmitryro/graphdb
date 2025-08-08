@@ -65,7 +65,7 @@ use crate::cli::commands::{
 use crate::cli::config::{
     self, DEFAULT_STORAGE_CONFIG_PATH_ROCKSDB, DEFAULT_STORAGE_CONFIG_PATH_SLED,
     DEFAULT_STORAGE_CONFIG_PATH_POSTGRES, DEFAULT_STORAGE_CONFIG_PATH_MYSQL,
-    DEFAULT_STORAGE_CONFIG_PATH_REDIS
+    DEFAULT_STORAGE_CONFIG_PATH_REDIS, SelectedStorageConfig, StorageConfigInner
 };
 use crate::cli::config as config_mod;
 use crate::cli::handlers as handlers_mod;
@@ -75,52 +75,6 @@ use crate::cli::daemon_management;
 use lib::query_parser::{parse_query_from_string, QueryType};
 use lib::storage_engine::config::StorageEngineType;
 use storage_daemon_server::{StorageSettingsWrapper};
-
-// New struct for storage-specific configurations
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SelectedStorageConfig {
-    storage: StorageConfigInner,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct StorageConfigInner {
-    pub storage_engine_type: String,
-    #[serde(default)]
-    pub path: Option<PathBuf>,
-    #[serde(default)]
-    pub host: Option<String>,
-    #[serde(default)]
-    pub port: Option<u16>,
-    #[serde(default)]
-    pub username: Option<String>,
-    #[serde(default)]
-    pub password: Option<String>,
-    #[serde(default)]
-    pub database: Option<String>,
-}
-
-impl SelectedStorageConfig {
-    pub fn load_from_yaml<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
-        let content = fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read config file {:?}", path.as_ref()))?;
-        serde_yaml2::from_str(&content)
-            .with_context(|| format!("Failed to parse YAML from {:?}", path.as_ref()))
-    }
-
-    pub fn default() -> Self {
-        SelectedStorageConfig {
-            storage: StorageConfigInner {
-                storage_engine_type: String::new(),
-                path: None,
-                host: Some("127.0.0.1".to_string()), // Default for network-based engines
-                port: None,
-                username: Some("graphdb_user".to_string()), // Default for auth-based engines
-                password: None,
-                database: None,
-            }
-        }
-    }
-}
 
 /// GraphDB Command Line Interface
 #[derive(Parser, Debug)]
