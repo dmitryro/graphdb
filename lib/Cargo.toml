@@ -13,9 +13,10 @@ rand = "0.8.5" # Consistent
 actix-web = "4.11.0" # Crucial: Updated to match security crate's version
 actix-rt = "2.10.0" # Updated to match server crate's version
 dotenv = "0.15.0" # Aligned with server
-dashmap = "6.1.0"  # Concurrent hash map for Raft state
+dashmap = { version = "6.1.0", optional = true}  # Concurrent hash map for Raft state
 rdkafka = "0.38.0"  # Redpanda for event-driven updates
 raft = { version = "0.7.0" }  # Raft consensus, updated to latest stable
+openraft = { version = "0.9.21", features = ["serde"] }
 ring = "0.17.8"  # Encryption for HIPAA compliance, updated
 tokio = { version = "1.44.2", features = ["full"] } # Updated to latest stable
 tracing = "0.1.37" # Updated to latest stable
@@ -31,11 +32,12 @@ dotenvy = "0.15.7" # Consistent
 diesel_json = "0.2.1" # Consistent
 open-cypher = "0.1.1" # Consistent
 nom = "8.0.0" # Consistent
-sled = { version= "0.34.7" } # Consistent, no longer optional
+sled = { version= "0.34.7", optional = true } # Consistent, no longer optional
 bytes = "1.10.0" # Consistent
 clap = { version = "4.5.29", features = ["derive"] } # Consistent
 hashbrown = "0.15.2" # Consistent
 pest = "2.7.15" # Consistent
+petgraph = "0.8.2" # Graph algorithms
 lalrpop = "0.22.1" # Consistent
 sqlparser = "0.54.0" # Consistent
 async-trait = "0.1.86" # Consistent with server
@@ -48,7 +50,6 @@ r2d2 = "0.8.10" # Consistent
 anyhow = "1.0.98" # Aligned with server, rest_api, storage_daemon_server
 crossterm = "0.28.1" # Consistent
 tokio-stream = "0.1.17" # Consistent
-petgraph = "0.7.1" # Consistent
 tokio-test = "0.4.4" # Consistent
 mockall = "0.13.1" # Consistent
 graphql-parser = "0.4.1" # Consistent
@@ -82,10 +83,11 @@ mockall = "0.13.1"  # Mocking
 
 [features]
 default = []
-sled-datastore = [] # No longer needs to list "sled" as sled is always active
+sled-datastore = ["sled"] # No longer needs to list "sled" as sled is always active
 rocksdb-datastore = ["rocksdb"] # Still needs to list rocksdb if it's optional
 redis-datastore = ["redis"]
 postgres-datastore = ["sqlx"]
+in-memory-datastore = ["dashmap"]
 test-suite = []
 bench-suite = []
 with-rocksdb = ["rocksdb"] # This feature enables the optional rocksdb crate

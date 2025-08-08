@@ -23,6 +23,7 @@ thiserror = "2.0.12" # Consistent
 bincode = "2.0.1"
 tokio = { version = "1.44.2", features = ["net", "time"] } # Updated to latest stable, retaining specific features
 lib = { path = "../lib" }
+storage_daemon_server = { path = "../storage_daemon_server" }
 log = "0.4.27"
 chrono = { version = "0.4.39", features = ["serde"] }
 serde_with = "3.14.0"
