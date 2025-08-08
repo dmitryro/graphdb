@@ -40,7 +40,7 @@ use crate::cli::config::{load_storage_config_str as load_storage_config, DEFAULT
                          CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS, DAEMON_REGISTRY_DB_PATH, StorageConfig, 
                          get_default_rest_port_from_config, load_main_daemon_config, load_storage_config_from_yaml, 
                          daemon_api_storage_engine_type_to_string, RestApiConfig, MainDaemonConfig, load_rest_config, 
-                         CliConfig, default_config_root_directory};
+                         CliConfig, default_config_root_directory, CliTomlStorageConfig, load_cli_config};
 use crate::cli::daemon_management::{find_running_storage_daemon_port, clear_all_daemon_processes, start_daemon_process, 
                                     stop_daemon_api_call, handle_internal_daemon_run, load_storage_config_path_or_default,
                                     run_command_with_timeout, is_port_free, find_pid_by_port, is_rest_api_running,
@@ -352,6 +352,17 @@ async fn ensure_daemon_registry_paths_exist() -> Result<()> {
             .context(format!("Failed to create daemon registry directory: {:?}", db_path))?;
     }
 
+    Ok(())
+}
+
+/// Displays the Raft status for a storage daemon running on the specified port.
+pub async fn display_raft_status(port: Option<u16>) -> Result<()> {
+    let port = port.unwrap_or(8081); // Default port for storage daemon
+    // Placeholder: Implement actual Raft status checking logic here
+    // For example, query the storage daemon's Raft node status via an API or internal call
+    println!("Checking Raft status for storage daemon on port {}...", port);
+    println!("Raft status: Not implemented yet (placeholder).");
+    // TODO: Add actual Raft status checking logic, e.g., querying a Raft node's state
     Ok(())
 }
 
@@ -1222,6 +1233,9 @@ pub async fn handle_status_command(
         }
         Some(StatusAction::Summary) => {
             display_full_status_summary(rest_api_port_arc, storage_daemon_port_arc).await?;
+        }
+        Some(StatusAction::Raft { port }) => {
+            display_raft_status(port).await?;
         }
     }
     Ok(())
@@ -3272,3 +3286,46 @@ pub async fn stop_daemon_instance_interactive(
     Ok(())
 }
 
+/// Updates the storage engine configuration and persists it to the config file.
+pub async fn use_storage_engine(engine: StorageEngineType) -> Result<()> {
+    // Load the current configuration from server/src/cli/config.toml
+    let config_path = PathBuf::from("server/src/cli/config.toml");
+    let mut config = load_cli_config()
+        .map_err(|e| anyhow!("Failed to load config from {}: {}", config_path.display(), e))?;
+
+    // Store engine string for display before move
+    let engine_str = engine.to_string();
+
+    // Update the storage engine type in the storage section
+    config.storage = Some(CliTomlStorageConfig {
+        storage_engine_type: Some(engine),
+        ..config.storage.unwrap_or_default()
+    });
+
+    // Save the updated configuration to /opt/graphdb/config.toml
+    let save_path = PathBuf::from("/opt/graphdb/config.toml");
+    config.save()
+        .map_err(|e| anyhow!("Failed to save config to {}: {}", save_path.display(), e))?;
+
+    println!("Storage engine configured to {}", engine_str);
+    Ok(())
+}
+
+/// Enables or disables plugins and persists the setting to the config file.
+pub async fn use_plugin(enable: bool) -> Result<()> {
+    // Load the current configuration from server/src/cli/config.toml
+    let config_path = PathBuf::from("server/src/cli/config.toml");
+    let mut config = load_cli_config()
+        .map_err(|e| anyhow!("Failed to load config from {}: {}", config_path.display(), e))?;
+
+    // Update the plugins_enabled field
+    config.enable_plugins = enable;
+
+    // Save the updated configuration to /opt/graphdb/config.toml
+    let save_path = PathBuf::from("/opt/graphdb/config.toml");
+    config.save()
+        .map_err(|e| anyhow!("Failed to save config to {}: {}", save_path.display(), e))?;
+
+    println!("Plugins set to enabled: {}", enable);
+    Ok(())
+}

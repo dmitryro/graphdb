@@ -14,6 +14,9 @@ pub enum StorageEngineType {
     Sled,
     RocksDB,
     InMemory, // Added InMemory option
+    Redis,
+    PostgreSQL,
+    MySQL,
     // Add other storage types like PostgreSQL, Redis, etc., as needed
 }
 
@@ -25,6 +28,9 @@ impl FromStr for StorageEngineType {
             "sled" => Ok(StorageEngineType::Sled),
             "rocksdb" => Ok(StorageEngineType::RocksDB),
             "inmemory" => Ok(StorageEngineType::InMemory),
+            "postgresql" => Ok(StorageEngineType::PostgreSQL),
+            "mysql" => Ok(StorageEngineType::MySQL),
+            "redis" => Ok(StorageEngineType::Redis),
             _ => Err(anyhow!("Unknown storage engine type: {}", s)),
         }
     }
@@ -36,6 +42,9 @@ impl ToString for StorageEngineType {
             StorageEngineType::Sled => "sled".to_string(),
             StorageEngineType::RocksDB => "rocksdb".to_string(),
             StorageEngineType::InMemory => "inmemory".to_string(),
+            StorageEngineType::PostgreSQL => "postgresql".to_string(),
+            StorageEngineType::MySQL => "mysql".to_string(),
+            StorageEngineType::Redis => "redis".to_string(),
         }
     }
 }

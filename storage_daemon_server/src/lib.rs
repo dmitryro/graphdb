@@ -141,8 +141,8 @@ impl StorageSettings {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct StorageSettingsWrapper {
-    storage: StorageSettings,
+pub struct StorageSettingsWrapper {
+    pub storage: StorageSettings,
 }
 
 pub struct StorageDaemon {
