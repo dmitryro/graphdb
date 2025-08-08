@@ -1,7 +1,8 @@
+// daemon_api/src/lib.rs
 use serde::{Serialize, Deserialize};
 use std::fs::{self, File};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::path::Path;
+use std::path::{PathBuf, Path};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use anyhow::Result;
@@ -15,7 +16,8 @@ use lazy_static::lazy_static;
 use tokio::process::Command;
 use tokio::time::{sleep, Duration};
 use serde_json;
-use std::collections::HashSet; // Use a HashSet to manage unique ports efficiently
+use std::collections::HashSet;
+use storage_daemon_server::{StorageSettings, start_storage_daemon_server_real};
 
 pub mod cli_schema;
 pub mod help_generator;
@@ -44,9 +46,9 @@ pub struct DaemonData {
     pub pid: u32,
 }
 
-// New struct to hold configuration for the daemonized child process
 #[derive(Serialize, Deserialize, Debug)]
 pub struct DaemonStartConfig {
+    pub config_path: String,
     pub daemon_type: String,
     pub port: u16,
     pub skip_ports: Vec<u16>,
@@ -194,9 +196,16 @@ pub async fn start_daemon(
         }
     }
 
+    // Load StorageSettings for storage daemon in the parent process
+    let settings = if daemon_type == "storage" {
+        Some(StorageSettings::load_from_yaml(&PathBuf::from(storage_config_yaml))
+            .map_err(|e| DaemonError::Anyhow(e))?)
+    } else {
+        None
+    };
+
     let mut ports_to_start: Vec<u16> = Vec::new();
     if let Some(range_str) = cluster_range {
-        // Explicitly handle cluster range for the "main" daemon
         if daemon_type == "main" {
             let parts: Vec<&str> = range_str.split('-').collect();
             if parts.len() != 2 {
@@ -221,12 +230,9 @@ pub async fn start_daemon(
             for p in start_port..=end_port {
                 ports_to_start.push(p);
             }
-        // Handle rest and storage daemons for a single port when a range is specified
         } else if daemon_type == "rest" || daemon_type == "storage" {
             ports_to_start.push(port.unwrap_or(default_port));
         } else {
-            // This case should be unreachable due to the initial daemon_type check,
-            // but is a good practice as a fallback.
             return Err(DaemonError::GeneralError("Invalid daemon type for cluster range".to_string()));
         }
     } else {
@@ -270,7 +276,7 @@ pub async fn start_daemon(
 
         let mut daemonize = DaemonizeBuilder::new()
             .working_directory("/tmp")
-            .umask(0o027)
+            .umask(0o022) // Relaxed permissions for debugging
             .stdout(stdout)
             .stderr(stderr)
             .process_name(&specific_process_name)
@@ -288,29 +294,50 @@ pub async fn start_daemon(
                         port: current_port,
                         skip_ports: skip_ports.clone(),
                         host: host_to_use.clone(),
+                        config_path: storage_config_yaml.to_string(),
                     };
                     let config_json = serde_json::to_string(&config)?;
-                    
-                    let args = vec![
-                        format!("--internal-run"),
-                        format!("--config-json"),
-                        config_json,
-                    ];
-                    let mut cmd = Command::new(std::env::current_exe()?);
-                    cmd.args(&args).stdout(Stdio::null()).stderr(Stdio::null());
-                    cmd.spawn()?.wait().await?;
-                    std::process::exit(0);
-                }
-                // --- Parent process logic starts here ---
 
-                // Wait for the daemon to start and listen on the port.
+                    if daemon_type == "storage" {
+                        info!("[Child Process] Starting storage daemon on port {}", current_port);
+                        let settings = StorageSettings::load_from_yaml(&PathBuf::from(storage_config_yaml))
+                            .map_err(|e| DaemonError::Anyhow(e))?;
+                        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+                        match start_storage_daemon_server_real(current_port, settings, shutdown_rx).await {
+                            Ok(daemon) => {
+                                info!("[Child Process] Storage daemon started successfully on port {}", current_port);
+                                // Keep the process alive with a shutdown handler
+                                tokio::spawn(async move {
+                                    tokio::signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
+                                    info!("[Child Process] Ctrl-C received, shutting down storage daemon on port {}", current_port);
+                                    let _ = shutdown_tx.send(());
+                                });
+                                // Block to keep the Tokio runtime alive
+                                tokio::time::sleep(Duration::from_secs(3600)).await;
+                            }
+                            Err(e) => {
+                                error!("[Child Process] Storage daemon failed on port {}: {}", current_port, e);
+                                std::process::exit(1);
+                            }
+                        }
+                    } else {
+                        let args = vec![
+                            "--internal-run".to_string(),
+                            "--config-json".to_string(),
+                            config_json,
+                        ];
+                        let mut cmd = Command::new(std::env::current_exe()?);
+                        cmd.args(&args).stdout(Stdio::null()).stderr(Stdio::null());
+                        cmd.spawn()?.wait().await?;
+                        std::process::exit(0);
+                    }
+                }
+                // Parent process logic
                 let mut confirmed_pid = 0;
                 for attempt in 0..max_port_check_attempts {
                     sleep(Duration::from_millis(port_check_interval_ms)).await;
                     if TcpStream::connect(&socket_addr).is_ok() {
                         info!("{} daemon successfully started on port {} with PID {}", daemon_type, current_port, child_pid);
-                        
-                        // After confirming the port is open, find the correct PID.
                         confirmed_pid = find_pid_by_port(current_port).await.unwrap_or(0);
                         if confirmed_pid != 0 {
                             break;
@@ -324,8 +351,7 @@ pub async fn start_daemon(
                         )));
                     }
                 }
-                
-                // If we couldn't find the PID, it's a failure.
+
                 if confirmed_pid == 0 {
                     return Err(DaemonError::GeneralError(format!(
                         "Failed to find PID for daemon on port {} after it started.",
@@ -333,21 +359,19 @@ pub async fn start_daemon(
                     )));
                 }
 
-                // Write PID file with the confirmed PID.
                 fs::write(&pid_file_path, confirmed_pid.to_string())?;
 
-                // Register in daemon registry with the confirmed PID.
                 let metadata = DaemonMetadata {
                     service_type: daemon_type.to_string(),
                     port: current_port,
                     pid: confirmed_pid,
                     ip_address: host_to_use.clone(),
                     data_dir: if daemon_type == "storage" { Some(std::path::PathBuf::from("/opt/graphdb/storage_data")) } else { None },
-                    config_path: None,
-                    engine_type: if daemon_type == "storage" { Some("sled".to_string()) } else { None },
+                    config_path: if daemon_type == "storage" { Some(std::path::PathBuf::from(storage_config_yaml)) } else { None },
+                    engine_type: if daemon_type == "storage" { settings.as_ref().map(|s| s.storage_engine_type.clone()) } else { None },
                     last_seen_nanos: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
                 };
-                
+
                 if let Err(e) = GLOBAL_DAEMON_REGISTRY.register_daemon(metadata).await {
                     error!("Failed to register daemon {} on port {}: {}", daemon_type, current_port, e);
                 }
@@ -491,7 +515,6 @@ pub async fn stop_port_daemon(port: u16, daemon_type: &str) -> Result<(), Daemon
     Ok(())
 }
 
-// A new helper function to stop all daemons found in the registry.
 async fn stop_all_registered_daemons() -> Result<(), DaemonError> {
     info!("Attempting to stop daemons from registry...");
     let daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await?;
@@ -508,7 +531,6 @@ async fn stop_all_registered_daemons() -> Result<(), DaemonError> {
         }
     }
 
-    // Only unregister daemons that were successfully stopped.
     for port in successfully_stopped_ports {
         if let Err(e) = GLOBAL_DAEMON_REGISTRY.unregister_daemon(port).await {
             error!("Failed to unregister daemon on port {}: {}", port, e);
@@ -521,12 +543,10 @@ async fn stop_all_registered_daemons() -> Result<(), DaemonError> {
 pub async fn stop_daemon() -> Result<(), DaemonError> {
     info!("Attempting to stop all 'graphdb' related daemon instances...");
 
-    // First, try to stop daemons based on the registry. This is the most reliable method.
     if let Err(e) = stop_all_registered_daemons().await {
         error!("Error during registry-based daemon stop: {}", e);
     }
     
-    // Read configuration to determine potential ports for a fallback check.
     let config_path_toml = "server/src/cli/config.toml";
     let main_config_yaml = "server/main_app_config.yaml";
     let rest_config_yaml = "rest_api/rest_api_config.yaml";
@@ -548,7 +568,6 @@ pub async fn stop_daemon() -> Result<(), DaemonError> {
     }
 
     if let Ok(config) = config_builder.build() {
-        // Collect ports from config
         if let Ok(st_port) = config.get_int("storage.default_port") { known_ports.insert(st_port as u16); }
         if let Ok(r_port) = config.get_int("rest_api.default_port") { known_ports.insert(r_port as u16); }
         if let Ok(cfg_port) = config.get_int("main_daemon.default_port") { known_ports.insert(cfg_port as u16); }
@@ -566,14 +585,12 @@ pub async fn stop_daemon() -> Result<(), DaemonError> {
         }
     }
     
-    // Add default ports in case config files are missing or don't specify them.
     known_ports.insert(DEFAULT_DAEMON_PORT);
     known_ports.insert(DEFAULT_REST_API_PORT);
     known_ports.insert(CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS);
 
     info!("Performing fallback stop on known ports: {:?}", known_ports);
 
-    // Now perform a fallback check using `lsof` on all known ports.
     for &port in &known_ports {
         let pid = find_pid_by_port(port).await;
         if let Some(pid) = pid {
@@ -586,13 +603,11 @@ pub async fn stop_daemon() -> Result<(), DaemonError> {
         }
     }
     
-    // Additional cleanup for legacy PID files
     for &port in &known_ports {
         let legacy_pid_file = format!("/tmp/graphdb-daemon-{}.pid", port);
         remove_pid_file(&legacy_pid_file);
     }
     
-    // Clear the registry completely at the end to ensure it's empty.
     if let Err(e) = GLOBAL_DAEMON_REGISTRY.clear_all_daemons().await {
         error!("Failed to clear daemon registry: {}", e);
     }

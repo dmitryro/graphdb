@@ -1,11 +1,11 @@
 // storage_daemon_server/src/storage_client.rs
 
-// Import StorageRequest and StorageResponse from the parent crate's root
-use crate::{StorageRequest, StorageResponse};
+// Import StorageRequest, StorageResponse, and Command from the parent crate's root
+use crate::{StorageRequest, StorageResponse, Command};
 use anyhow::{Result, Context}; // Import Context for .context()
 use tokio::time::Duration; // For simulating async operations
 use serde_json; // ADD THIS LINE
-use models::medical::{User, NewUser}; // Make sure this is correctly imported for the mock methods
+use models::medical::User; // Make sure this is correctly imported for the mock methods
 
 #[derive(Debug, Clone)]
 pub struct StorageClient {
@@ -34,17 +34,17 @@ impl StorageClient {
         // Simulate network call and response
         tokio::time::sleep(Duration::from_millis(30)).await;
 
-        match request.operation.as_str() {
-            "GET" => {
-                // Mock behavior for get_user_by_username
-                if request.key.starts_with("user_role:") {
-                    if request.key == "user_role:admin" {
+        match &request.command {
+            Command::Set { key, value: _ } => {
+                // Mock behavior for different key patterns
+                if key.starts_with("user_role:") {
+                    if key == "user_role:admin" {
                         Ok(StorageResponse {
                             success: true,
                             message: "Data retrieved successfully".to_string(),
                             data: Some("admin_role_data".to_string()),
                         })
-                    } else if request.key == "user_role:testuser" {
+                    } else if key == "user_role:testuser" {
                         Ok(StorageResponse {
                             success: true,
                             message: "Data retrieved successfully".to_string(),
@@ -57,9 +57,9 @@ impl StorageClient {
                             data: None, // User not found
                         })
                     }
-                } else if request.key.starts_with("user_data:") {
+                } else if key.starts_with("user_data:") {
                     // Mock for get_user_by_username
-                    if request.key == "user_data:existing_user" {
+                    if key == "user_data:existing_user" {
                         // Mock a serialized User object
                         let mock_user_json = serde_json::to_string(&serde_json::json!({
                             "id": "some-uuid",
@@ -90,48 +90,42 @@ impl StorageClient {
                      Ok(StorageResponse {
                         success: true,
                         message: "Data retrieved successfully".to_string(),
-                        data: Some(format!("mock_data_for_{}", request.key)),
+                        data: Some(format!("mock_data_for_{}", key)),
                     })
                 }
-            },
-            "PUT" => {
-                // Mock for create_user
-                if request.key.starts_with("user_data:") {
-                    println!("StorageClient: Mocking user creation for key: {}", request.key);
-                    Ok(StorageResponse {
-                        success: true,
-                        message: "User created successfully (mock)".to_string(),
-                        data: None,
-                    })
-                } else {
-                    Ok(StorageResponse {
-                        success: true,
-                        message: format!("Data '{}' put for key '{}'", request.value.unwrap_or_default(), request.key),
-                        data: None,
-                    })
-                }
-            },
-            _ => {
-                Ok(StorageResponse {
-                    success: false,
-                    message: format!("Unsupported operation: {}", request.operation),
-                    data: None,
-                })
             }
         }
+    }
+
+    // Helper method to create a GET-like request using the Set command structure
+    async fn send_get_request(&self, key: &str) -> Result<StorageResponse> {
+        let request = StorageRequest {
+            command: Command::Set {
+                key: key.to_string(),
+                value: String::new(), // Empty value for GET-like operations
+            },
+        };
+        self.send_request(request).await
+    }
+
+    // Helper method to create a PUT-like request using the Set command structure
+    async fn send_put_request(&self, key: &str, value: &str) -> Result<StorageResponse> {
+        let request = StorageRequest {
+            command: Command::Set {
+                key: key.to_string(),
+                value: value.to_string(),
+            },
+        };
+        self.send_request(request).await
     }
 
     // --- Mock methods to satisfy `security/src/lib.rs`'s expectations ---
     // These methods wrap `send_request` to provide the specific API expected by the security crate.
 
     // Mock for `get_user_by_username`
-    pub async fn get_user_by_username(&self, username: &str) -> Result<Option<User>> { // Changed from models::medical::User to User (from models::medical import)
-        let request = StorageRequest {
-            key: format!("user_data:{}", username), // Assuming users are stored by "user_data:<username>"
-            value: None,
-            operation: "GET".to_string(),
-        };
-        let response = self.send_request(request).await?;
+    pub async fn get_user_by_username(&self, username: &str) -> Result<Option<User>> {
+        let response = self.send_get_request(&format!("user_data:{}", username)).await?;
+        
         if response.success {
             if let Some(data_str) = response.data {
                 // Attempt to deserialize the User object
@@ -147,16 +141,14 @@ impl StorageClient {
     }
 
     // Mock for `create_user`
-    pub async fn create_user(&self, user: User) -> Result<()> { // Changed from models::medical::User to User
+    pub async fn create_user(&self, user: User) -> Result<()> {
         let user_json = serde_json::to_string(&user)
             .context("Failed to serialize User for storage")?;
-        let request = StorageRequest {
-            key: format!("user_data:{}", user.username), // Store by username
-            value: Some(user_json),
-            operation: "PUT".to_string(),
-        };
-        let response = self.send_request(request).await?;
+        
+        let response = self.send_put_request(&format!("user_data:{}", user.username), &user_json).await?;
+        
         if response.success {
+            println!("StorageClient: User created successfully: {}", user.username);
             Ok(())
         } else {
             anyhow::bail!("Failed to create user in storage: {}", response.message)
