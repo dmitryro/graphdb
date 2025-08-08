@@ -1,21 +1,53 @@
 // lib/src/storage_engine/mod.rs
-// Corrected: 2025-07-02 - Fixed module re-exports to resolve import errors.
-// Refactored: 2025-07-02 - Added storage_utils module for common helper functions.
+// Fixed: 2025-08-07 - Resolved import conflicts and missing dependencies
+// Fixed: 2025-08-07 - Coerced GraphError to anyhow::Error in create_storage
 
-pub mod storage_engine; // Declares the module defined in storage_engine.rs (now trait-only)
-pub mod sled_storage; // Declares the module for Sled implementation
+// Module declarations
+pub mod storage_engine;
+pub mod sled_storage;
 #[cfg(feature = "with-rocksdb")]
-pub mod rocksdb_storage; // Declares the module for RocksDB implementation
+pub mod rocksdb_storage;
+pub mod inmemory_storage;
 pub mod config;
-pub mod storage_utils; // Declare the new utility module
+pub mod storage_utils;
 
-// Re-export key traits and structs for easier access from `crate::storage_engine::*`
-pub use self::storage_engine::{StorageEngine, GraphStorageEngine};
-// Corrected: Re-export SledStorage (not SledGraphStorage)
-pub use self::sled_storage::{SledStorage, open_sled_db};
+// Re-export key types and traits for external use
+pub use storage_engine::{GraphStorageEngine, StorageEngine};
+pub use sled_storage::{SledStorage, open_sled_db};
 #[cfg(feature = "with-rocksdb")]
-pub use self::rocksdb_storage::RocksDBStorage;
-pub use self::config::{StorageConfig, StorageEngineType};
-// No need to re-export individual functions from storage_utils here unless they are meant for direct top-level use.
-// They will be imported directly by sled_storage and rocksdb_storage.
+pub use rocksdb_storage::RocksDBStorage;
+pub use inmemory_storage::InMemoryStorage;
+pub use config::{StorageConfig, StorageEngineType};
 
+// Required imports for the create_storage function
+use anyhow::Result;
+use std::sync::Arc;
+
+/// Creates a storage engine instance based on the provided configuration.
+/// 
+/// Uses Sled as the default storage engine (as per StorageConfig::default).
+/// Supports RocksDB (if the "with-rocksdb" feature is enabled) and InMemory storage.
+pub fn create_storage(config: StorageConfig) -> Result<Arc<dyn GraphStorageEngine>> {
+    match config.engine_type {
+        StorageEngineType::Sled => {
+            // Sled is the default storage engine, as defined in StorageConfig::default
+            // Use the open_sled_db function and then create SledStorage
+            let db = open_sled_db(&config.data_path)?;
+            Ok(SledStorage::new(db).map(|storage| Arc::new(storage) as Arc<dyn GraphStorageEngine>)?)
+        }
+        StorageEngineType::RocksDB => {
+            #[cfg(feature = "with-rocksdb")]
+            {
+                Ok(RocksDBStorage::new(config).map(|storage| Arc::new(storage) as Arc<dyn GraphStorageEngine>)?)
+            }
+            #[cfg(not(feature = "with-rocksdb"))]
+            {
+                Err(anyhow::anyhow!("RocksDB support is not enabled. Use Sled (default) or InMemory."))
+            }
+        }
+        StorageEngineType::InMemory => {
+            // InMemory storage for lightweight or testing scenarios
+            Ok(InMemoryStorage::new(config).map(|storage| Arc::new(storage) as Arc<dyn GraphStorageEngine>)?)
+        }
+    }
+}
