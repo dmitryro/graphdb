@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::cli::config::StorageEngineType;
 
 /// Custom parser for storage engine to accept many aliases (rocksdb, rocks-db, postgres, postgresql, postgre-sql, mysql, my-sql, inmemory, in-memory).
-fn parse_storage_engine(engine: &str) -> Result<StorageEngineType, String> {
+pub fn parse_storage_engine(engine: &str) -> Result<StorageEngineType, String> {
     match engine.to_lowercase().as_str() {
         "sled" => Ok(StorageEngineType::Sled),
         "rocksdb" | "rocks-db" => Ok(StorageEngineType::RocksDB),

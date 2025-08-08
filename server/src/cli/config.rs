@@ -1,8 +1,16 @@
 // server/src/cli/config.rs
-// Existing changelog entries from cli.rs and interactive.rs are not repeated here as they pertain to different files.
-// ADDED: 2025-08-08 - Added `enable_plugins` field to `CliConfigToml`. Implemented `save` method for `CliConfigToml` to serialize to TOML file. Replaced `std::fs` with `fs` and ensured consistent use of `serde_yaml2` to align with cli.rs.
-// UPDATED: 2025-08-08 - Changed `load_cli_config` to use `/opt/graphdb/config.toml` instead of `config.toml` in `CARGO_MANIFEST_DIR` to align with `save` method and system config paths.
-// UPDATED: 2025-08-08 - Updated `load_cli_config` to load from `server/src/cli/config.toml` using `CARGO_MANIFEST_DIR` and save to `/opt/graphdb/config.toml` as per user clarification.
+// ADDED: 2025-08-08 - Added `enable_plugins` field to `CliConfigToml`. Implemented `save` method for `CliConfigToml` to serialize to TOML file. Replaced `std::fs` with `fs` and ensured consistent use of `serde_yaml2`.
+// UPDATED: 2025-08-08 - Changed `load_cli_config` to use `/opt/graphdb/config.toml` instead of `config.toml` in `CARGO_MANIFEST_DIR`.
+// UPDATED: 2025-08-08 - Updated `load_cli_config` to load from `server/src/cli/config.toml` using `CARGO_MANIFEST_DIR` and save to `/opt/graphdb/config.toml`.
+// FIXED: 2025-08-08 - Corrected typo in `DEFAULT_STORAGE_CONFIG_PATH_POSTGRES` from `posgres` to `postgres`.
+// ADDED: 2025-08-08 - Added `get_engine_config_path` to map `StorageEngineType` to YAML file paths.
+// ADDED: 2025-08-08 - Added `load_engine_specific_config` to load engine-specific configurations using `SelectedStorageConfig`.
+// UPDATED: 2025-08-09 - Restored `engine_specific_config: Option<SelectedStorageConfig>` in `StorageConfig` as a structured sub-object.
+// FIXED: 2025-08-09 - Replaced `StorageConfigInner` with `StorageEngineConfig` for clarity and removed redundant `storage_engine_type`.
+// FIXED: 2025-08-09 - Updated `SelectedStorageConfig::default` to align with `StorageConfig::default`.
+// FIXED: 2025-08-09 - Ensured `load_engine_specific_config` loads engine-specific YAML files correctly.
+// FIXED: 2025-08-09 - Added `Redis` branch to `get_engine_config_path` to handle `StorageEngineType::Redis`.
+// UPDATED: 2025-08-08 - Reverted `StorageEngineConfig` back to `StorageConfigInner` per user request, maintaining same fields and serialization.
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -18,11 +26,9 @@ use std::time::Duration;
 use dirs;
 use toml;
 use serde_yaml2 as serde_yaml;
-// Import types from commands.rs
 use crate::cli::commands::{Commands, CommandType, StatusArgs, RestartArgs, ReloadArgs, RestartAction, 
                            ReloadAction, RestCliCommand, StatusAction, StorageAction, 
-                           StartAction, StopAction, 
-                           StopArgs, DaemonCliCommand};
+                           StartAction, StopAction, StopArgs, DaemonCliCommand};
 pub use lib::storage_engine::config::StorageEngineType;
 
 // --- Custom PathBuf Serialization Module ---
@@ -121,7 +127,7 @@ pub const DEFAULT_STORAGE_CONFIG_PATH: &str = "/opt/graphdb/storage_config.yaml"
 pub const DEFAULT_STORAGE_CONFIG_PATH_RELATIVE: &str = "./storage_daemon_server/storage_config.yaml";
 pub const DEFAULT_STORAGE_CONFIG_PATH_ROCKSDB: &str = "storage_daemon_server/storage_config_rocksdb.yaml";
 pub const DEFAULT_STORAGE_CONFIG_PATH_SLED: &str = "storage_daemon_server/storage_config_sled.yaml";
-pub const DEFAULT_STORAGE_CONFIG_PATH_POSTGRES: &str = "storage_daemon_server/storage_config_posgres.yaml";
+pub const DEFAULT_STORAGE_CONFIG_PATH_POSTGRES: &str = "storage_daemon_server/storage_config_postgres.yaml";
 pub const DEFAULT_STORAGE_CONFIG_PATH_MYSQL: &str = "storage_daemon_server/storage_config_mysql.yaml";
 pub const DEFAULT_STORAGE_CONFIG_PATH_REDIS: &str = "storage_daemon_server/storage_config_redis.yaml";
 pub const DEFAULT_REST_CONFIG_PATH_RELATIVE: &str = "/opt/graphdb/rest_api_config.yaml";
@@ -144,6 +150,52 @@ pub fn default_config_root_directory() -> PathBuf {
 
 fn default_config_root_directory_option() -> Option<PathBuf> {
     Some(default_config_root_directory())
+}
+
+// --- Storage Engine Config Structs ---
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct StorageConfigInner {
+    #[serde(default, with = "option_path_buf_serde")]
+    pub path: Option<PathBuf>,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub database: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct SelectedStorageConfig {
+    pub storage: StorageConfigInner,
+}
+
+impl SelectedStorageConfig {
+    pub fn load_from_yaml<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
+        let content = fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read config file {:?}", path.as_ref()))?;
+        serde_yaml::from_str(&content)
+            .with_context(|| format!("Failed to parse YAML from {:?}", path.as_ref()))
+    }
+}
+
+impl Default for SelectedStorageConfig {
+    fn default() -> Self {
+        SelectedStorageConfig {
+            storage: StorageConfigInner {
+                path: Some(PathBuf::from("/opt/graphdb/storage_data")),
+                host: Some("127.0.0.1".to_string()),
+                port: Some(DEFAULT_STORAGE_PORT),
+                username: None,
+                password: None,
+                database: None,
+            },
+        }
+    }
 }
 
 // --- YAML Configuration Structs ---
@@ -240,7 +292,7 @@ pub struct StorageConfig {
     pub use_raft_for_scale: bool,
     #[serde(with = "storage_engine_type_serde")]
     pub storage_engine_type: StorageEngineType,
-    pub engine_specific_config: Option<String>,
+    pub engine_specific_config: Option<SelectedStorageConfig>,
     pub max_open_files: u64,
 }
 
@@ -259,6 +311,18 @@ impl StorageConfig {
             Ok(vec![port])
         }
     }
+
+    pub fn save(&self) -> Result<()> {
+        let config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH);
+        let wrapper = StorageConfigWrapper { storage: self.clone() };
+        let yaml_string = serde_yaml::to_string(&wrapper)
+            .context("Failed to serialize StorageConfig to YAML")?;
+        fs::create_dir_all(config_path.parent().unwrap())
+            .context(format!("Failed to create parent directories for {}", config_path.display()))?;
+        fs::write(&config_path, yaml_string)
+            .context(format!("Failed to write StorageConfig to file: {}", config_path.display()))?;
+        Ok(())
+    }
 }
 
 impl Default for StorageConfig {
@@ -273,13 +337,13 @@ impl Default for StorageConfig {
             min_disk_space_gb: 10,
             use_raft_for_scale: true,
             storage_engine_type: StorageEngineType::Sled,
-            engine_specific_config: None,
+            engine_specific_config: Some(SelectedStorageConfig::default()),
             max_open_files: 1024,
         }
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct StorageConfigWrapper {
     pub storage: StorageConfig,
 }
@@ -287,6 +351,33 @@ pub struct StorageConfigWrapper {
 // Helper function to convert StorageEngineType to String
 pub fn daemon_api_storage_engine_type_to_string(engine_type: &StorageEngineType) -> String {
     engine_type.to_string()
+}
+
+// Helper function to map StorageEngineType to YAML file path
+pub fn get_engine_config_path(engine_type: &StorageEngineType) -> PathBuf {
+    match engine_type {
+        StorageEngineType::RocksDB => PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_ROCKSDB),
+        StorageEngineType::Sled => PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_SLED),
+        StorageEngineType::PostgreSQL => PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_POSTGRES),
+        StorageEngineType::MySQL => PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_MYSQL),
+        StorageEngineType::Redis => PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_REDIS),
+        StorageEngineType::InMemory => PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH),
+    }
+}
+
+// Helper function to load engine-specific configuration
+pub fn load_engine_specific_config(engine_type: &StorageEngineType) -> Result<SelectedStorageConfig> {
+    let config_path = get_engine_config_path(engine_type);
+    info!("Loading engine-specific config from {:?}", config_path);
+
+    if config_path.exists() {
+        let config = SelectedStorageConfig::load_from_yaml(&config_path)?;
+        info!("Loaded engine-specific config: {:?}", config);
+        Ok(config)
+    } else {
+        info!("Engine-specific config file not found at {}. Using default.", config_path.display());
+        Ok(SelectedStorageConfig::default())
+    }
 }
 
 // --- CLI Configuration ---
@@ -533,7 +624,7 @@ impl CliConfig {
                 Commands::Storage(StorageAction::Status { port, .. }) => *port,
                 Commands::Restart(RestartArgs { action: RestartAction::Storage { port, storage_port, .. } }) => storage_port.or(*port),
                 Commands::Restart(RestartArgs { action: RestartAction::All { storage_port, .. } }) => *storage_port,
-                _ => Some(storage_yaml_config.default_port),
+                _ => Some(load_storage_config_from_yaml(None).map(|c| c.default_port).unwrap_or(DEFAULT_STORAGE_PORT)),
             };
         }
 
@@ -547,13 +638,13 @@ impl CliConfig {
                 Commands::Storage(StorageAction::Status { cluster, .. }) => cluster.clone(),
                 Commands::Restart(RestartArgs { action: RestartAction::Storage { cluster, storage_cluster, .. } }) => storage_cluster.clone().or_else(|| cluster.clone()),
                 Commands::Restart(RestartArgs { action: RestartAction::All { storage_cluster, .. } }) => storage_cluster.clone(),
-                _ => Some(storage_yaml_config.cluster_range.clone()),
+                _ => Some(load_storage_config_from_yaml(None).map(|c| c.cluster_range).unwrap_or_else(|_| StorageConfig::default().cluster_range)),
             };
         }
 
         println!("SUCCESS: CLI config loaded.");
         info!("SUCCESS: Determined config path: {:?}", args.storage_config_path);
-        info!("SUCCESS: Storage config loaded: {:?}", storage_yaml_config);
+        info!("SUCCESS: Storage config loaded: {:?}", load_storage_config_from_yaml(None));
         Ok(args)
     }
 
@@ -752,7 +843,7 @@ impl CliConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 struct GlobalYamlConfig {
     #[serde(default = "default_config_root_directory_option")]
     #[serde(with = "option_path_buf_serde")]
@@ -778,10 +869,10 @@ pub fn load_main_daemon_config(config_file_path: Option<&str>) -> Result<MainDae
                 let config_content = fs::read_to_string(&canonical_path)
                     .context(format!("Failed to read main daemon config file: {}", canonical_path.display()))?;
                 debug!("Main Daemon config content: {}", config_content);
-                let wrapper: MainConfigWrapper = serde_yaml2::from_str(&config_content)
+                let wrapper: MainConfigWrapper = serde_yaml::from_str(&config_content)
                     .map_err(|e| {
                         error!("YAML parsing error for Main Daemon at {:?}: {:?}", canonical_path, e);
-                        if let Ok(partial) = serde_yaml2::from_str::<Value>(&config_content) {
+                        if let Ok(partial) = serde_yaml::from_str::<Value>(&config_content) {
                             error!("Partial YAML parse: {:?}", partial);
                         }
                         anyhow!("Failed to parse main daemon config YAML: {}", canonical_path.display())
@@ -816,10 +907,10 @@ pub fn load_rest_config(config_file_path: Option<&str>) -> Result<RestApiConfig>
                 let config_content = fs::read_to_string(&canonical_path)
                     .context(format!("Failed to read REST API config file: {}", canonical_path.display()))?;
                 debug!("REST API config content: {}", config_content);
-                let wrapper: RestApiConfigWrapper = serde_yaml2::from_str(&config_content)
+                let wrapper: RestApiConfigWrapper = serde_yaml::from_str(&config_content)
                     .map_err(|e| {
                         error!("YAML parsing error for REST API at {:?}: {:?}", canonical_path, e);
-                        if let Ok(partial) = serde_yaml2::from_str::<Value>(&config_content) {
+                        if let Ok(partial) = serde_yaml::from_str::<Value>(&config_content) {
                             error!("Partial YAML parse: {:?}", partial);
                         }
                         anyhow!("Failed to parse REST API config YAML: {}", canonical_path.display())
@@ -847,7 +938,7 @@ pub fn save_rest_config(config: &RestApiConfig) -> Result<()> {
         rest_api: config.clone(),
     };
 
-    let yaml_string = serde_yaml2::to_string(&wrapper)
+    let yaml_string = serde_yaml::to_string(&wrapper)
         .context("Failed to serialize RestApiConfig to YAML")?;
 
     fs::create_dir_all(config_path.parent().unwrap())
@@ -872,7 +963,6 @@ pub fn get_rest_cluster_range() -> String {
 }
 
 /// Loads the storage configuration from a YAML file or returns a default configuration.
-/// Prints the loaded configuration to the terminal.
 pub fn load_storage_config_from_yaml(config_file_path: Option<PathBuf>) -> Result<StorageConfig> {
     let default_config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH);
     let project_config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
@@ -901,11 +991,12 @@ pub fn load_storage_config_from_yaml(config_file_path: Option<PathBuf>) -> Resul
 
     // Log the loaded configuration
     info!(
-        "Loaded storage config: default_port={}, cluster_range={}, data_directory={:?}, storage_engine_type={:?}, log_directory={}, max_disk_space_gb={}, min_disk_space_gb={}, use_raft_for_scale={}",
+        "Loaded storage config: default_port={}, cluster_range={}, data_directory={:?}, storage_engine_type={:?}, engine_specific_config={:?}, log_directory={}, max_disk_space_gb={}, min_disk_space_gb={}, use_raft_for_scale={}",
         config.default_port,
         config.cluster_range,
         config.data_directory,
         config.storage_engine_type,
+        config.engine_specific_config,
         config.log_directory,
         config.max_disk_space_gb,
         config.min_disk_space_gb,
@@ -953,10 +1044,10 @@ pub fn load_daemon_config(config_file_path: Option<&str>) -> Result<DaemonYamlCo
                 let config_content = fs::read_to_string(&canonical_path)
                     .context(format!("Failed to read daemon config file: {}", canonical_path.display()))?;
                 debug!("Daemon config content: {}", config_content);
-                let config: DaemonYamlConfig = serde_yaml2::from_str(&config_content)
+                let config: DaemonYamlConfig = serde_yaml::from_str(&config_content)
                     .map_err(|e| {
                         error!("YAML parsing error for Daemon at {:?}: {:?}", canonical_path, e);
-                        if let Ok(partial) = serde_yaml2::from_str::<Value>(&config_content) {
+                        if let Ok(partial) = serde_yaml::from_str::<Value>(&config_content) {
                             error!("Partial YAML parse: {:?}", partial);
                         }
                         anyhow!("Failed to parse daemon config YAML: {}", canonical_path.display())
@@ -979,7 +1070,7 @@ pub fn load_daemon_config(config_file_path: Option<&str>) -> Result<DaemonYamlCo
 pub fn save_daemon_config(config: &DaemonYamlConfig) -> Result<()> {
     let config_path = PathBuf::from(DEFAULT_DAEMON_CONFIG_PATH_RELATIVE);
 
-    let yaml_string = serde_yaml2::to_string(config)
+    let yaml_string = serde_yaml::to_string(config)
         .context("Failed to serialize DaemonYamlConfig to YAML")?;
 
     fs::create_dir_all(config_path.parent().unwrap())
