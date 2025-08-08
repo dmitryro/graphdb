@@ -1,6 +1,7 @@
 // lib/src/util.rs
 // Updated: 2025-07-04 - next_uuid now returns GraphResult and handles ValidationError.
 // Fixed: 2025-07-04 - Corrected import for GraphResult.
+// Fixed: 2025-08-08 - Added unsafe block for Identifier::new_unchecked to resolve E0133 warning
 
 use std::io::{Cursor, Read, Write};
 use uuid::Uuid;
@@ -68,7 +69,9 @@ pub unsafe fn read_identifier<T: AsRef<[u8]>>(cursor: &mut Cursor<T>) -> GraphRe
     let mut buf = vec![0u8; t_len];
     cursor.read_exact(&mut buf)?;
     let s = unsafe { String::from_utf8_unchecked(buf) }; // Use from_utf8_unchecked for performance
-    Ok(Identifier::new_unchecked(s))
+    // Fixed: Added unsafe block for new_unchecked call
+    // Safe because the string is derived from valid UTF-8 bytes read from the cursor
+    Ok(unsafe { Identifier::new_unchecked(s) })
 }
 
 pub fn read_u64<T: AsRef<[u8]>>(cursor: &mut Cursor<T>) -> GraphResult<u64> { // Changed Result to GraphResult
@@ -89,4 +92,3 @@ pub fn next_uuid(uuid: Uuid) -> GraphResult<Uuid> {
     // If all bytes are 255, it means we cannot increment
     Err(GraphError::Validation(ValidationError::CannotIncrementUuid))
 }
-

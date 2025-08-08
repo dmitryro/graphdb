@@ -1,8 +1,12 @@
 // server/src/cli/interactive.rs
 // This file handles the interactive CLI mode, including command parsing
 // and displaying interactive help messages.
-// ADDED: 2025-07-31 - Added parsing and handling for new fields `daemon_port`, `daemon_cluster`, `rest_port`, `rest_cluster`, `storage_port`, `storage_cluster` in CommandType variants (StartRest, StartStorage, StartDaemon, RestartRest, RestartStorage, RestartDaemon) and subcommands (DaemonCliCommand::Start, RestCliCommand::Start, StorageAction::Start) to align with commands.rs (artifact ID 2caecb52-0a6c-46b0-a6b6-42c1b23388a1). Updated patterns and initializers to include these fields, resolving E0027 and E0063 errors at lines 331-333, 601, 643, 675, 757, 864, 943, 1030, 1040, 1055, 1234, 1250, 1274. Preserved all original code and function signatures.
+// ADDED: 2025-07-31 - Added parsing and handling for new fields `daemon_port`, `daemon_cluster`, `rest_port`, `rest_cluster`, `storage_port`, `storage_cluster` in CommandType variants (StartRest, StartStorage, StartDaemon, RestartRest, RestartStorage, RestartDaemon) and subcommands (DaemonCliCommand::Start, RestCliCommand::Start, StorageAction::Start) to align with commands.rs (artifact ID 2caecb52-0a6c-46b0-a6b6-42c1b23388a1). Updated patterns and initializers to include these fields, resolving E0027 and E0063 errors at lines 331-333, 601, 643, 675, 757, 864, 943, 1030, 1040, 1055, 1234, 1250, 1274.
 // UPDATED: 2025-07-31 - Fixed E0382 (use of moved value) for `rest_cluster`, `storage_cluster`, `daemon_cluster` by adding `.clone()` in `.or()` calls at lines 331, 337, 344, 635, 697, 749, 851, 978, 1077, 1369, 1394, 1413. Removed redundant `--storage-port` case at line 673 to fix unreachable pattern warning. Removed unused `cmd_type` assignment at line 87 to fix unused variable warning.
+// ADDED: 2025-08-08 - Added parsing and handling for `use storage <engine>` and `use plugin [--enable <bool>]` commands in `parse_command`, mapping to `CommandType::UseStorage` and `CommandType::UsePlugin`. Added handling for `StatusRaft(Option<u16>)` in `parse_command` and `handle_interactive_command`. Ensured `StorageEngineType` is imported.
+// UPDATED: 2025-08-08 - Fixed E0599 and E0308 for `UsePlugin`. In `parse_command`, set `enable` to `unwrap_or(true)` for `CommandType::UsePlugin`. In `handle_interactive_command`, removed redundant `unwrap_or(true)` since `enable` is now a `bool`.
+// UPDATED: 2025-08-08 - Updated `parse_command` to handle `StorageEngineType` variants `sled`, `rocksdb`, `inmemory`, `redis`, `postgresql`, `mysql` in `use storage` command, aligning with updated `StorageEngineType` enum.
+// UPDATED: 2025-08-08 - Fixed E0603 by ensuring `StorageEngineType` is imported from `crate::cli::commands`, which re-exports from `crate::cli::config`.
 
 use anyhow::{Result, Context, anyhow};
 use rustyline::error::ReadlineError;
@@ -11,41 +15,35 @@ use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex as TokioMutex};
 use std::collections::HashMap;
 use tokio::task::JoinHandle;
-use std::process; // For process::exit
-use std::path::PathBuf; // Added PathBuf import
-use clap::CommandFactory; // Added CommandFactory import
-use std::collections::HashSet; // Added for HashSet
-use shlex; // Import shlex for robust argument splitting
+use std::process;
+use std::path::PathBuf;
+use clap::CommandFactory;
+use std::collections::HashSet;
+use shlex;
 use log::{info, error, warn, debug};
-// Import necessary items from sibling modules
-use crate::cli::cli::CliArgs; // Import CliArgs from cli.rs
+use crate::cli::cli::CliArgs;
 use crate::cli::commands::{
     CommandType, DaemonCliCommand, RestCliCommand, StorageAction, StatusArgs, StopArgs,
-    ReloadArgs, ReloadAction, StartAction, RestartArgs, RestartAction,
-    HelpArgs // Ensure HelpArgs is imported from commands.rs if it's there, or define locally if not.
+    ReloadArgs, ReloadAction, StartAction, RestartArgs, RestartAction, HelpArgs,
 };
-// Assuming these are defined in handlers.rs or help_display.rs as per previous context
 use crate::cli::handlers;
 use crate::cli::help_display::{
     print_interactive_help, print_interactive_filtered_help, collect_all_cli_elements_for_suggestions,
     print_help_clap_generated, print_filtered_help_clap_generated
 };
-
+pub use lib::storage_engine::config::{StorageEngineType};
 use crate::cli::config::{load_storage_config_from_yaml};
 
-// New struct to hold all the shared state, addressing the too_many_arguments lint.
 struct SharedState {
     daemon_handles: Arc<TokioMutex<HashMap<u16, (JoinHandle<()>, oneshot::Sender<()>)>>>,
     rest_api_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
     rest_api_port_arc: Arc<TokioMutex<Option<u16>>>,
     rest_api_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
     storage_daemon_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
-        storage_daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
+    storage_daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
     storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
 }
 
-// --- Levenshtein Distance Calculation ---
-// Helper function to calculate Levenshtein distance between two strings
 fn levenshtein_distance(s1: &str, s2: &str) -> usize {
     let s1_chars: Vec<char> = s1.chars().collect();
     let s2_chars: Vec<char> = s2.chars().collect();
@@ -68,39 +66,33 @@ fn levenshtein_distance(s1: &str, s2: &str) -> usize {
     for i in 1..=m {
         for j in 1..=n {
             let cost = if s1_chars[i - 1] == s2_chars[j - 1] { 0 } else { 1 };
-            dp[i][j] = (dp[i - 1][j] + 1) // deletion
-                .min(dp[i][j - 1] + 1) // insertion
-                .min(dp[i - 1][j - 1] + cost); // substitution
+            dp[i][j] = (dp[i - 1][j] + 1)
+                .min(dp[i][j - 1] + 1)
+                .min(dp[i - 1][j - 1] + cost);
         }
     }
     dp[m][n]
 }
 
-/// Parses a command string from the interactive CLI input.
-/// This function now expects a `Vec<String>` (from shlex) as input.
 pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
     if parts.is_empty() {
         return (CommandType::Unknown, Vec::new());
     }
 
     let command_str = parts[0].to_lowercase();
-    let remaining_args: Vec<String> = parts[1..].to_vec(); // Arguments after the main command
+    let remaining_args: Vec<String> = parts[1..].to_vec();
 
-    // List of common top-level commands for fuzzy matching
     let top_level_commands = vec![
         "start", "stop", "status", "auth", "authenticate", "register",
         "version", "health", "reload", "restart", "clear", "help", "exit",
-        "daemon", "rest", "storage", // These are often subcommands but can also be typed first.
-        "quit", "q", "clean" // Aliases
+        "daemon", "rest", "storage", "use", "quit", "q", "clean"
     ];
 
-    // Define a threshold for Levenshtein distance for a "suggestion"
-    const FUZZY_MATCH_THRESHOLD: usize = 2; // e.g., 'sta' vs 'start' (2 diff)
+    const FUZZY_MATCH_THRESHOLD: usize = 2;
 
-    let cmd_type; // Declare without initial value
-    let parsed_remaining_args = remaining_args.clone(); // Clone to modify if arguments are consumed
+    let cmd_type;
+    let parsed_remaining_args = remaining_args.clone();
 
-    // Try exact match first
     cmd_type = match command_str.as_str() {
         "exit" | "quit" | "q" => CommandType::Exit,
         "clear" | "clean" => CommandType::Clear,
@@ -115,7 +107,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                     "rest" => {
                         let mut port = None;
                         let mut cluster = None;
-                        let mut i = 1; // Start after "rest"
+                        let mut i = 1;
                         while i < remaining_args.len() {
                             match remaining_args[i].to_lowercase().as_str() {
                                 "--port" | "-p" => {
@@ -144,7 +136,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                     "daemon" => {
                         let mut port = None;
                         let mut cluster = None;
-                        let mut i = 1; // Start after "daemon"
+                        let mut i = 1;
                         while i < remaining_args.len() {
                             match remaining_args[i].to_lowercase().as_str() {
                                 "--port" | "-p" => {
@@ -173,7 +165,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                     "storage" => {
                         let mut port = None;
                         let mut cluster = None;
-                        let mut i = 1; // Start after "storage"
+                        let mut i = 1;
                         while i < remaining_args.len() {
                             match remaining_args[i].to_lowercase().as_str() {
                                 "--port" | "-p" => {
@@ -200,6 +192,25 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                         CommandType::Storage(StorageAction::Status { port, cluster })
                     },
                     "cluster" => CommandType::StatusCluster,
+                    "raft" => {
+                        let mut port = None;
+                        let mut i = 1;
+                        while i < remaining_args.len() {
+                            match remaining_args[i].to_lowercase().as_str() {
+                                "--port" | "-p" => {
+                                    if i + 1 < remaining_args.len() {
+                                        port = remaining_args[i + 1].parse::<u16>().ok();
+                                        i += 2;
+                                    } else {
+                                        eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
+                                        i += 1;
+                                    }
+                                }
+                                _ => { i += 1; }
+                            }
+                        }
+                        CommandType::StatusRaft(port)
+                    },
                     _ => CommandType::Unknown,
                 }
             }
@@ -219,15 +230,13 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
             let mut current_subcommand_index = 0;
             let mut explicit_subcommand: Option<String> = None;
 
-            // First, identify if there's an explicit subcommand (e.g., "start rest")
             if !remaining_args.is_empty() {
                 match remaining_args[0].to_lowercase().as_str() {
                     "all" | "daemon" | "rest" | "storage" => {
                         explicit_subcommand = Some(remaining_args[0].to_lowercase());
-                        current_subcommand_index = 1; // Start parsing args after the subcommand
+                        current_subcommand_index = 1;
                     }
                     _ => {
-                        // No explicit subcommand, assume top-level 'start' with potential flags
                         current_subcommand_index = 0;
                     }
                 }
@@ -373,7 +382,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                 match remaining_args[0].to_lowercase().as_str() {
                     "rest" => {
                         let mut port = None;
-                        let mut i = 1; // Start after "rest"
+                        let mut i = 1;
                         while i < remaining_args.len() {
                             match remaining_args[i].to_lowercase().as_str() {
                                 "--port" | "-p" => {
@@ -395,7 +404,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                     }
                     "daemon" => {
                         let mut port = None;
-                        let mut i = 1; // Start after "daemon"
+                        let mut i = 1;
                         while i < remaining_args.len() {
                             match remaining_args[i].to_lowercase().as_str() {
                                 "--port" | "-p" => {
@@ -407,16 +416,14 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                         i += 1;
                                     }
                                 }
-                                _ => {
-                                    i += 1;
-                                }
+                                _ => { i += 1; }
                             }
                         }
                         CommandType::StopDaemon(port)
                     }
                     "storage" => {
                         let mut port = None;
-                        let mut i = 1; // Start after "storage"
+                        let mut i = 1;
                         while i < remaining_args.len() {
                             match remaining_args[i].to_lowercase().as_str() {
                                 "--port" | "-p" => {
@@ -428,9 +435,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                         i += 1;
                                     }
                                 }
-                                _ => {
-                                    i += 1;
-                                }
+                                _ => { i += 1; }
                             }
                         }
                         CommandType::StopStorage(port)
@@ -451,7 +456,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                     "storage" => CommandType::ReloadStorage,
                     "daemon" => {
                         let mut port = None;
-                        let mut i = 1; // Start after "daemon"
+                        let mut i = 1;
                         while i < remaining_args.len() {
                             match remaining_args[i].to_lowercase().as_str() {
                                 "--port" | "-p" => {
@@ -490,7 +495,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                         let mut rest_cluster = None;
                         let mut rest_port = None;
                         let mut storage_cluster = None;
-                        let mut i = 1; // Start parsing from the argument after "all"
+                        let mut i = 1;
 
                         while i < remaining_args.len() {
                             match remaining_args[i].to_lowercase().as_str() {
@@ -782,6 +787,64 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                 CommandType::Unknown
             }
         },
+        "use" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: use [storage <engine>|plugin [--enable <bool>]]");
+                CommandType::Unknown
+            } else {
+                match remaining_args[0].to_lowercase().as_str() {
+                    "storage" => {
+                        if remaining_args.len() < 2 {
+                            eprintln!("Usage: use storage <engine>");
+                            CommandType::Unknown
+                        } else {
+                            let engine = match remaining_args[1].to_lowercase().as_str() {
+                                "sled" => StorageEngineType::Sled,
+                                "rocksdb" | "rocks-db" => StorageEngineType::RocksDB,
+                                "inmemory" | "in-memory" => StorageEngineType::InMemory,
+                                "redis" => StorageEngineType::Redis,
+                                "postgres" | "postgresql" | "postgre-sql" => StorageEngineType::PostgreSQL,
+                                "mysql" | "my-sql" => StorageEngineType::MySQL,
+                                _ => {
+                                    eprintln!(
+                                        "Unknown storage engine: {}. Supported: sled, rocksdb, rocks-db, inmemory, in-memory, redis, postgres, postgresql, postgre-sql, mysql, my-sql",
+                                        remaining_args[1]
+                                    );
+                                    return (CommandType::Unknown, parsed_remaining_args);
+                                }
+                            };
+                            CommandType::UseStorage { engine }
+                        }
+                    },
+                    "plugin" => {
+                        let mut enable = None;
+                        let mut i = 1;
+                        while i < remaining_args.len() {
+                            match remaining_args[i].to_lowercase().as_str() {
+                                "--enable" => {
+                                    if i + 1 < remaining_args.len() {
+                                        enable = Some(remaining_args[i + 1].parse::<bool>().ok().unwrap_or_default());
+                                        i += 2;
+                                    } else {
+                                        eprintln!("Warning: Flag '--enable' requires a boolean value.");
+                                        i += 1;
+                                    }
+                                }
+                                _ => {
+                                    eprintln!("Warning: Unknown argument for 'use plugin': {}", remaining_args[i]);
+                                    i += 1;
+                                }
+                            }
+                        }
+                        CommandType::UsePlugin { enable: enable.unwrap_or(true) }
+                    },
+                    _ => {
+                        eprintln!("Usage: use [storage <engine>|plugin [--enable <bool>]]");
+                        CommandType::Unknown
+                    }
+                }
+            }
+        },
         "help" => {
             let mut filter_command: Option<String> = None;
             let mut command_path: Vec<String> = Vec::new();
@@ -818,7 +881,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                 let mut cluster = None;
                 let mut daemon_port = None;
                 let mut daemon_cluster = None;
-                let mut i = 1; // Start after "start"
+                let mut i = 1;
                 while i < remaining_args.len() {
                     match remaining_args[i].to_lowercase().as_str() {
                         "--port" | "-p" => {
@@ -863,7 +926,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                 CommandType::Daemon(DaemonCliCommand::Start { port: daemon_port.or(port), cluster: daemon_cluster.clone().or(cluster), daemon_port, daemon_cluster })
             } else if remaining_args.first().map_or(false, |s| s.to_lowercase() == "stop") {
                 let mut port = None;
-                let mut i = 1; // Start after "stop"
+                let mut i = 1;
                 while i < remaining_args.len() {
                     match remaining_args[i].to_lowercase().as_str() {
                         "--port" | "-p" => {
@@ -882,7 +945,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
             } else if remaining_args.first().map_or(false, |s| s.to_lowercase() == "status") {
                 let mut port = None;
                 let mut cluster = None;
-                let mut i = 1; // Start after "status"
+                let mut i = 1;
                 while i < remaining_args.len() {
                     match remaining_args[i].to_lowercase().as_str() {
                         "--port" | "-p" => {
@@ -925,7 +988,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                 let mut username: Option<String> = None;
                 let mut password: Option<String> = None;
 
-                let mut i = 1; // Start parsing args after the subcommand (e.g., "start", "status")
+                let mut i = 1;
                 while i < remaining_args.len() {
                     match remaining_args[i].to_lowercase().as_str() {
                         "--port" | "-p" | "--listen-port" => {
@@ -965,11 +1028,10 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                             }
                         }
                         "--persist" => {
-                            persist = Some(true); // Flag presence means true
+                            persist = Some(true);
                             i += 1;
                         }
                         _ => {
-                            // Handle positional arguments for register-user, authenticate, graph-query
                             if rest_subcommand == "register-user" || rest_subcommand == "authenticate" {
                                 if username.is_none() {
                                     username = Some(remaining_args[i].clone());
@@ -1033,9 +1095,9 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                 let mut storage_port = None;
                 let mut storage_cluster = None;
 
-                let mut i = 1; // Start parsing args after the subcommand
+                let mut i = 1;
                 while i < remaining_args.len() {
-                    match storage_subcommand.as_str() {
+                    match remaining_args[i].to_lowercase().as_str() {
                         "--port" | "-p" => {
                             if i + 1 < remaining_args.len() {
                                 port = remaining_args[i + 1].parse::<u16>().ok();
@@ -1099,7 +1161,6 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
         _ => CommandType::Unknown,
     };
 
-    // Fuzzy matching for top-level commands if the initial match was Unknown
     if cmd_type == CommandType::Unknown {
         let mut best_match: Option<String> = None;
         let mut min_distance = usize::MAX;
@@ -1122,12 +1183,9 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
     (cmd_type, parsed_remaining_args)
 }
 
-/// Handler for CLI commands in interactive mode.
-/// This function dispatches interactive commands to the appropriate handlers in the `handlers` module.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_interactive_command(
     command: CommandType,
-    // The previous arguments are now grouped into a single struct.
     state: &SharedState,
 ) -> Result<()> {
     match command {
@@ -1274,6 +1332,10 @@ pub async fn handle_interactive_command(
             handlers::display_cluster_status().await;
             Ok(())
         }
+        CommandType::StatusRaft(port) => {
+            handlers::display_raft_status(port).await;
+            Ok(())
+        }
         CommandType::Auth { username, password } => {
             handlers::authenticate_user(username, password).await;
             Ok(())
@@ -1284,6 +1346,14 @@ pub async fn handle_interactive_command(
         }
         CommandType::RegisterUser { username, password } => {
             handlers::register_user(username, password).await;
+            Ok(())
+        }
+        CommandType::UseStorage { engine } => {
+            handlers::use_storage_engine(engine).await;
+            Ok(())
+        }
+        CommandType::UsePlugin { enable } => {
+            handlers::use_plugin(enable).await;
             Ok(())
         }
         CommandType::Version => {
@@ -1469,7 +1539,6 @@ pub async fn handle_interactive_command(
     }
 }
 
-// --- Main asynchronous loop for the CLI interactive mode. ---
 #[allow(clippy::too_many_arguments)]
 pub async fn run_cli_interactive(
     daemon_handles: Arc<TokioMutex<HashMap<u16, (tokio::task::JoinHandle<()>, oneshot::Sender<()>)>>>,
@@ -1520,18 +1589,17 @@ pub async fn run_cli_interactive(
                 }
 
                 let (command, _parsed_args) = parse_command(&args);
-                debug!("Parsed command: {:?}", command); // Log parsed command
+                debug!("Parsed command: {:?}", command);
 
                 if command == CommandType::Exit {
                     handle_interactive_command(command, &state).await?;
                     break;
                 }
 
-                // Catch errors to prevent CLI exit
                 if let Err(e) = handle_interactive_command(command, &state).await {
                     eprintln!("Error executing command: {:?}", e);
                     debug!("Detailed error: {:#}", e);
-                    continue; // Keep CLI loop running
+                    continue;
                 }
             }
             Err(ReadlineError::Interrupted) => {

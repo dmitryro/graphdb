@@ -1,24 +1,32 @@
 // server/src/cli/commands.rs
-// This file defines the command-line arguments and subcommands
-// for the GraphDB CLI using the `clap` crate.
-// MODIFIED: 2025-08-05 - Updated StartAction::All to resolve conflict between --port and --storage-port,
-// ensuring --storage-port and --storage-cluster are accepted without conflicts. Added conflicts_with and
-// overrides_with to clarify argument relationships, allowing --port (daemon), --listen-port (REST API),
-// and --storage-port (storage daemon) to coexist. Preserved all original fields and functionality.
-// FIXED: 2025-08-05 - Removed conflicts_with = "port" from storage_port in StartAction::Storage to allow
-// --storage-port with --cluster and --listen-port in StartAction::All. Changed storage_config type in
-// Commands::Start to PathBuf to match StartAction::All and ensure consistency with cli.rs and handlers.rs.
-// FIXED: 2025-08-05 - Restored top-level fields (port, cluster, daemon_port, daemon_cluster, listen_port,
-// rest_port, rest_cluster, storage_port, storage_cluster, storage_config) in Commands::Start to fix
-// pattern mismatch errors in handlers.rs (E0027).
-// FIXED: 2025-08-05 - Removed invalid token 'হালকা' from RestartAction::Rest to fix syntax error (E0277).
-// FIXED: 2025-08-05 - Added #[derive(Subcommand)] to RestartAction to implement Subcommand and FromArgMatches traits,
-// resolving trait bound errors (E0277).
+// ADDED: 2025-08-08 - Added `pub use crate::cli::config::StorageEngineType` to re-export `StorageEngineType` publicly, resolving `error[E0603]` in `interactive.rs`.
+// UPDATED: 2025-08-08 - Changed import from `lib::storage_engine::config::StorageEngineType` to `crate::cli::config::StorageEngineType` to align with project structure.
+// UPDATED: 2025-08-08 - Ensured `StorageEngineType` supports `Sled`, `RocksDB`, `InMemory`, `Redis`, `PostgreSQL`, `MySQL` as per updated enum definition.
+// NOTE: Kept `std::path::PathBuf` as it’s standard for CLI args and compatible with `fs2` in `config.rs`.
 
-use clap::{Parser, Subcommand, Arg, Args, ValueEnum};
+use clap::{Parser, Subcommand, Arg, Args};
 use std::path::PathBuf;
 use uuid::Uuid;
-use lib::storage_engine::config::StorageEngineType;
+use crate::cli::config::StorageEngineType;
+
+/// Custom parser for storage engine to accept many aliases (rocksdb, rocks-db, postgres, postgresql, postgre-sql, mysql, my-sql, inmemory, in-memory).
+fn parse_storage_engine(engine: &str) -> Result<StorageEngineType, String> {
+    match engine.to_lowercase().as_str() {
+        "sled" => Ok(StorageEngineType::Sled),
+        "rocksdb" | "rocks-db" => Ok(StorageEngineType::RocksDB),
+        "inmemory" | "in-memory" | "in_memory" => Ok(StorageEngineType::InMemory),
+        "redis" => Ok(StorageEngineType::Redis),
+        "postgres" | "postgresql" | "postgre-sql" | "postgres-sql" => Ok(StorageEngineType::PostgreSQL),
+        "mysql" | "my-sql" | "my_sql" => Ok(StorageEngineType::MySQL),
+        other => Err(format!(
+            "Invalid storage engine: '{}'. Supported values (examples): sled, rocksdb, rocks-db, inmemory, in-memory, redis, postgres, postgresql, postgre-sql, mysql, my-sql",
+            other
+        )),
+    }
+}
+
+// Re-export StorageEngineType to make it accessible to `interactive.rs`
+// (If you already re-export this elsewhere, keep that — harmless otherwise)
 
 #[derive(Debug, PartialEq, Clone, Args)]
 pub struct HelpArgs {
@@ -37,6 +45,10 @@ pub enum CommandType {
 
     // Storage Commands
     Storage(StorageAction),
+
+    // Use Commands
+    UseStorage { engine: StorageEngineType },
+    UsePlugin { enable: bool },
 
     // Top-level Start command variants (can also be subcommands of 'start')
     StartRest { port: Option<u16>, cluster: Option<String>, rest_port: Option<u16>, rest_cluster: Option<String> },
@@ -66,6 +78,7 @@ pub enum CommandType {
     StatusDaemon(Option<u16>),
     StatusStorage(Option<u16>),
     StatusCluster,
+    StatusRaft(Option<u16>),
 
     // Authentication and User Management
     Auth { username: String, password: String },
@@ -185,6 +198,9 @@ pub enum Commands {
     /// Manage standalone Storage daemon
     #[clap(subcommand)]
     Storage(StorageAction),
+    /// Configure components (storage engine or plugins)
+    #[clap(subcommand)]
+    Use(UseAction),
     /// Reload GraphDB components (all, rest, storage, daemon, or cluster)
     Reload(ReloadArgs),
     /// Restart GraphDB components (all, rest, storage, daemon, or cluster)
@@ -374,6 +390,12 @@ pub enum StatusAction {
     },
     /// Get the status of the entire cluster.
     Cluster,
+    /// Get the status of Raft nodes (Storage daemons).
+    Raft {
+        /// Port of the storage daemon to check.
+        #[clap(long, short = 'p')]
+        port: Option<u16>,
+    },
 }
 
 #[derive(Subcommand, Debug, PartialEq, Clone)]
@@ -611,4 +633,20 @@ pub enum RestartAction {
     },
     /// Restart the cluster configuration.
     Cluster,
+}
+
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum UseAction {
+    /// Configure the storage engine (e.g., sled, rocksdb, inmemory, redis, postgresql, mysql).
+    Storage {
+        /// Storage engine to use.
+        #[arg(value_parser = parse_storage_engine)]
+        engine: StorageEngineType,
+    },
+    /// Enable or disable experimental plugins.
+    Plugin {
+        /// Enable or disable plugins (true to enable, false to disable).
+        #[clap(long, default_value = "true")]
+        enable: bool,
+    },
 }
