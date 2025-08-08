@@ -39,7 +39,7 @@ use crate::cli::config::{load_storage_config_str as load_storage_config, DEFAULT
                          DEFAULT_STORAGE_PORT, DEFAULT_STORAGE_CONFIG_PATH_RELATIVE, DEFAULT_REST_CONFIG_PATH_RELATIVE,
                          DEFAULT_CONFIG_ROOT_DIRECTORY_STR, DEFAULT_DAEMON_CONFIG_PATH_RELATIVE, DEFAULT_MAIN_APP_CONFIG_PATH_RELATIVE,
                          CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS, DAEMON_REGISTRY_DB_PATH, StorageConfig, 
-                         get_default_rest_port_from_config, load_main_daemon_config, load_storage_config_from_yaml, 
+                         get_default_rest_port_from_config, load_main_daemon_config, load_daemon_config, load_storage_config_from_yaml, 
                          daemon_api_storage_engine_type_to_string, RestApiConfig, MainDaemonConfig, load_rest_config, 
                          CliConfig, default_config_root_directory, CliTomlStorageConfig, load_cli_config};
 use crate::cli::daemon_management::{find_running_storage_daemon_port, clear_all_daemon_processes, start_daemon_process, 
@@ -205,7 +205,7 @@ pub async fn display_rest_api_status(port_arg: Option<u16>, rest_api_port_arc: A
         })
         .collect::<Vec<u16>>()
         .await;
-
+        
     let ports_to_display = match port_arg {
         Some(p) if running_rest_ports.contains(&p) => vec![p],
         Some(p) => {
@@ -214,34 +214,38 @@ pub async fn display_rest_api_status(port_arg: Option<u16>, rest_api_port_arc: A
         }
         None => running_rest_ports,
     };
-
+    
     println!("\n--- REST API Status ---");
-    println!("{:<15} {:<10} {:<40}", "Status", "Port", "Details");
-    println!("{:-<15} {:-<10} {:-<40}", "", "", "");
-
+    println!("{:<20} {:<15} {:<10} {:<50}", "Component", "Status", "Port", "Details");
+    println!("{:-<20} {:-<15} {:-<10} {:-<50}", "", "", "", "");
+    
     if ports_to_display.is_empty() {
-        println!("{:<15} {:<10} {:<40}", "Down", "N/A", "No REST API servers found in registry.");
+        println!("{:<20} {:<15} {:<10} {:<50}", "REST API", "Down", "N/A", "No REST API servers found in registry.");
     } else {
-        for &port in &ports_to_display {
+        for (i, &port) in ports_to_display.iter().enumerate() {
             let client = reqwest::Client::builder()
                 .timeout(Duration::from_secs(2))
-                .build().expect("Failed to build reqwest client");
-
-            let mut rest_api_status = "Down".to_string();
+                .build()
+                .expect("Failed to build reqwest client");
+                
+            let mut rest_api_status = "Down";
             let mut rest_api_details = String::new();
-
+            
+            // Health check
             let health_url = format!("http://127.0.0.1:{}/api/v1/health", port);
             match client.get(&health_url).send().await {
                 Ok(resp) if resp.status().is_success() => {
-                    rest_api_status = "Running".to_string();
+                    rest_api_status = "Running";
                     rest_api_details = "Health: OK".to_string();
-
+                    
+                    // Version check
                     let version_url = format!("http://127.0.0.1:{}/api/v1/version", port);
                     match client.get(&version_url).send().await {
                         Ok(v_resp) if v_resp.status().is_success() => {
-                            let v_json: serde_json::Value = v_resp.json().await.unwrap_or_default();
-                            let version = v_json["version"].as_str().unwrap_or("N/A");
-                            rest_api_details = format!("{}; Version: {}", rest_api_details, version);
+                            if let Ok(v_json) = v_resp.json::<serde_json::Value>().await {
+                                let version = v_json["version"].as_str().unwrap_or("N/A");
+                                rest_api_details = format!("{}; Version: {}", rest_api_details, version);
+                            }
                         },
                         _ => rest_api_details = format!("{}; Version: N/A", rest_api_details),
                     }
@@ -250,20 +254,35 @@ pub async fn display_rest_api_status(port_arg: Option<u16>, rest_api_port_arc: A
                     rest_api_details = "Health: Down (Failed to connect or unhealthy)".to_string();
                 },
             }
-
+            
             let metadata = all_daemons.iter().find(|d| d.port == port && d.service_type == "rest");
+            
+            // Show "REST API" only for the first instance, empty for others
+            let component_name = if i == 0 { "REST API" } else { "" };
+            
             if let Some(meta) = metadata {
-                rest_api_details = format!("{}; PID: {}, Data Dir: {:?}", rest_api_details, meta.pid, meta.data_dir);
+                println!("{:<20} {:<15} {:<10} {:<50}", component_name, rest_api_status, port, format!("PID: {}", meta.pid));
+                println!("{:<20} {:<15} {:<10} {:<50}", "", "", "", format!("Data Directory: {:?}", meta.data_dir));
+                println!("{:<20} {:<15} {:<10} {:<50}", "", "", "", format!("Service Type: HTTP REST API"));
+                println!("{:<20} {:<15} {:<10} {:<50}", "", "", "", rest_api_details);
+            } else {
+                println!("{:<20} {:<15} {:<10} {:<50}", component_name, rest_api_status, port, rest_api_details);
             }
-
-            println!("{:<15} {:<10} {:<40}", rest_api_status, port, rest_api_details);
+            
+            // Add separator between multiple REST APIs
+            if ports_to_display.len() > 1 && i < ports_to_display.len() - 1 {
+                println!("{:<20} {:<15} {:<10} {:<50}", "", "", "", "");
+            }
         }
     }
-
+    
+    if port_arg.is_none() && !ports_to_display.is_empty() {
+        println!("\nTo check a specific REST API, use 'status rest --port <port>'.");
+    }
+    
     *rest_api_port_arc.lock().await = ports_to_display.first().copied();
     println!("--------------------------------------------------");
 }
-
 
 /// Displays status of storage daemons only.
 // Enhanced version of display_storage_daemon_status with detailed engine configuration
@@ -360,13 +379,20 @@ pub async fn display_storage_daemon_status(
         }
     }
 
+    if port_arg.is_none() && !ports_to_display.is_empty() {
+        println!("\nTo check a specific Storage, use 'status storage --port <port>'.");
+    }
+    
     *storage_daemon_port_arc.lock().await = ports_to_display.first().copied();
     println!("--------------------------------------------------");
 }
 
 /// Displays detailed status for a specific GraphDB daemon or lists all running ones.
+/// Enhanced version of display_daemon_status with better formatting and deduplication
 pub async fn display_daemon_status(port_arg: Option<u16>) {
     let all_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
+    debug!("Registry contents for daemon status: {:?}", all_daemons);
+    
     let running_daemon_ports: Vec<u16> = futures::stream::iter(all_daemons.iter())
         .filter_map(|d| async move {
             if d.service_type == "main" && check_process_status_by_port("GraphDB Daemon", d.port).await {
@@ -377,7 +403,7 @@ pub async fn display_daemon_status(port_arg: Option<u16>) {
         })
         .collect::<Vec<u16>>()
         .await;
-
+    
     let ports_to_display = match port_arg {
         Some(p) if running_daemon_ports.contains(&p) => vec![p],
         Some(p) => {
@@ -388,28 +414,48 @@ pub async fn display_daemon_status(port_arg: Option<u16>) {
     };
 
     println!("\n--- GraphDB Daemon Status ---");
-    println!("{:<20} {:<15} {:<10} {:<40}", "Component", "Status", "Port", "Details");
-    println!("{:-<20} {:-<15} {:-<10} {:-<40}", "", "", "", "");
-
+    println!("{:<20} {:<15} {:<10} {:<50}", "Component", "Status", "Port", "Details");
+    println!("{:-<20} {:-<15} {:-<10} {:-<50}", "", "", "", "");
+    
     if ports_to_display.is_empty() {
-        println!("{:<20} {:<15} {:<10} {:<40}", "GraphDB Daemon", "Down", "N/A", "No running daemons found in registry.");
+        println!("{:<20} {:<15} {:<10} {:<50}", "GraphDB Daemon", "Down", "N/A", "No running daemons found in registry.");
     } else {
-        for &port in &ports_to_display {
+        for (i, &port) in ports_to_display.iter().enumerate() {
             let metadata = all_daemons.iter().find(|d| d.port == port && d.service_type == "main");
-            let details = if let Some(meta) = metadata {
-                format!("PID: {}", meta.pid)
+            
+            // Show "GraphDB Daemon" only for the first daemon, empty for others
+            let component_name = if i == 0 { "GraphDB Daemon" } else { "" };
+            
+            if let Some(meta) = metadata {
+                println!("{:<20} {:<15} {:<10} {:<50}", component_name, "Running", port, format!("PID: {}", meta.pid));
+                println!("{:<20} {:<15} {:<10} {:<50}", "", "", "", format!("Data Directory: {:?}", meta.data_dir));
+                println!("{:<20} {:<15} {:<10} {:<50}", "", "", "", "Service Type: Core Graph Processing");
+                
+                // Add configuration details from daemon config if available
+                if let Ok(daemon_config) = load_daemon_config(None) {
+                    println!("{:<20} {:<15} {:<10} {:<50}", "", "", "", format!("Max Connections: {}", daemon_config.max_connections));
+                    println!("{:<20} {:<15} {:<10} {:<50}", "", "", "", format!("Max Open Files: {}", daemon_config.max_open_files));
+                    println!("{:<20} {:<15} {:<10} {:<50}", "", "", "", format!("Use Raft: {}", daemon_config.use_raft_for_scale));
+                    println!("{:<20} {:<15} {:<10} {:<50}", "", "", "", format!("Log Level: {}", daemon_config.log_level));
+                    println!("{:<20} {:<15} {:<10} {:<50}", "", "", "", format!("Log Directory: {}", daemon_config.log_directory));
+                }
             } else {
-                "Core Graph Processing".to_string()
-            };
-            println!("{:<20} {:<15} {:<10} {:<40}", "GraphDB Daemon", "Running", port, details);
+                println!("{:<20} {:<15} {:<10} {:<50}", component_name, "Running", port, "Core Graph Processing (No metadata)");
+            }
+            
+            // Add separator between multiple daemons
+            if ports_to_display.len() > 1 && i < ports_to_display.len() - 1 {
+                println!("{:<20} {:<15} {:<10} {:<50}", "", "", "", "");
+            }
         }
     }
-
-    if port_arg.is_none() {
-        println!("\nTo check a specific daemon, use 'status daemon --port <port>'.");
+    
+    if port_arg.is_none() && !ports_to_display.is_empty() {
+        println!("\nTo check a specific main daemon, use 'status daemon --port <port>'.");
     }
     println!("--------------------------------------------------");
 }
+
 
 // A utility function to ensure the necessary parent directories for the daemon registry exist.
 /// This prevents "No such file or directory" errors when creating PID files or the database.
@@ -615,7 +661,7 @@ pub async fn display_full_status_summary(
     let all_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
     debug!("Registry contents: {:?}", all_daemons);
 
-    // Daemon status (keeping existing logic)
+    // Enhanced Daemon status with individual daemon display
     let daemon_ports: Vec<u16> = futures::stream::iter(all_daemons.iter().filter(|d| d.service_type == "main"))
         .filter_map(|d| async move {
             let mut attempts = 0;
@@ -634,19 +680,25 @@ pub async fn display_full_status_summary(
         .collect::<Vec<u16>>()
         .await;
     
-    let daemon_status_msg = if daemon_ports.is_empty() {
-        "Down".to_string()
+    if daemon_ports.is_empty() {
+        println!("{:<20} {:<15} {:<10} {:<40}", "GraphDB Daemon", "Down", "N/A", "No daemons found in registry.");
     } else {
-        format!("Running on: {}", daemon_ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", "))
-    };
-    let daemon_ports_display = if daemon_ports.is_empty() {
-        "N/A".to_string()
-    } else {
-        daemon_ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
-    };
-    println!("{:<20} {:<15} {:<10} {:<40}", "GraphDB Daemon", daemon_status_msg, daemon_ports_display, "Core Graph Processing");
+        for (i, &port) in daemon_ports.iter().enumerate() {
+            let metadata = all_daemons.iter().find(|d| d.port == port && d.service_type == "main");
+            let details = if let Some(meta) = metadata {
+                format!("PID: {} | Core Graph Processing", meta.pid)
+            } else {
+                "Core Graph Processing".to_string()
+            };
+            
+            // Show "GraphDB Daemon" only for the first daemon, empty for others
+            let component_name = if i == 0 { "GraphDB Daemon" } else { "" };
+            println!("{:<20} {:<15} {:<10} {:<40}", component_name, "Running", port, details);
+        }
+    }
+    println!("\n");
 
-    // REST API status (keeping existing logic but shortened)
+    // REST API status - Enhanced with individual API display like daemons
     let rest_ports: Vec<u16> = futures::stream::iter(all_daemons.iter().filter(|d| d.service_type == "rest"))
         .filter_map(|d| async move {
             let mut attempts = 0;
@@ -664,29 +716,64 @@ pub async fn display_full_status_summary(
         })
         .collect::<Vec<u16>>()
         .await;
-    
-    let rest_api_status = if rest_ports.is_empty() { "Down".to_string() } else { "Running".to_string() };
-    let rest_ports_display = if rest_ports.is_empty() {
-        DEFAULT_REST_API_PORT.to_string()
+
+    if rest_ports.is_empty() {
+        println!("{:<20} {:<15} {:<10} {:<40}", "REST API", "Down", "N/A", "No REST API servers found in registry.");
     } else {
-        rest_ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
-    };
-    
-    let mut rest_api_details = String::new();
-    if let Some(&port) = rest_ports.first() {
-        // Keep existing REST API health check logic...
         let client = Client::builder()
             .timeout(Duration::from_secs(2))
             .build()
             .context("Failed to build reqwest client")?;
-        let health_url = format!("http://127.0.0.1:{}/api/v1/health", port);
-        if let Ok(resp) = client.get(&health_url).send().await {
-            if resp.status().is_success() {
-                rest_api_details = "Health: OK".to_string();
+            
+        for (i, &port) in rest_ports.iter().enumerate() {
+            let mut rest_api_status = "Running";
+            let mut rest_api_details = String::new();
+            
+            // Health check
+            let health_url = format!("http://127.0.0.1:{}/api/v1/health", port);
+            match client.get(&health_url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    rest_api_details = "Health: OK".to_string();
+                    
+                    // Version check
+                    let version_url = format!("http://127.0.0.1:{}/api/v1/version", port);
+                    if let Ok(v_resp) = client.get(&version_url).send().await {
+                        if v_resp.status().is_success() {
+                            if let Ok(v_json) = v_resp.json::<serde_json::Value>().await {
+                                let version = v_json["version"].as_str().unwrap_or("N/A");
+                                rest_api_details = format!("{}; Version: {}", rest_api_details, version);
+                            }
+                        }
+                    }
+                },
+                _ => {
+                    rest_api_status = "Down";
+                    rest_api_details = "Health check failed".to_string();
+                }
+            }
+            
+            let metadata = all_daemons.iter().find(|d| d.port == port && d.service_type == "rest");
+            if let Some(meta) = metadata {
+                rest_api_details = format!("PID: {} | {}", meta.pid, rest_api_details);
+            }
+            
+            // Show "REST API" only for the first instance, empty for others
+            let component_name = if i == 0 { "REST API" } else { "" };
+            println!("{:<20} {:<15} {:<10} {:<40}", component_name, rest_api_status, port, rest_api_details);
+            
+            // Add metadata details on separate lines like other services
+            if let Some(meta) = metadata {
+                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Data Directory: {:?}", meta.data_dir));
+                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", "Service Type: HTTP REST API");
+            }
+            
+            // Add separator between multiple REST APIs
+            if rest_ports.len() > 1 && i < rest_ports.len() - 1 {
+                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", "");
             }
         }
     }
-    println!("{:<20} {:<15} {:<10} {:<40}", "REST API", rest_api_status, rest_ports_display, rest_api_details);
+    println!("\n");
 
     // Enhanced Storage status with detailed configuration
     let storage_config = load_storage_config_from_yaml(None).unwrap_or_else(|_| StorageConfig::default());
@@ -711,7 +798,7 @@ pub async fn display_full_status_summary(
     if storage_ports.is_empty() {
         println!("{:<20} {:<15} {:<10} {:<40}", "Storage Daemon", "Down", "N/A", "No storage daemons found in registry.");
     } else {
-        for &port in &storage_ports {
+        for (i, &port) in storage_ports.iter().enumerate() {
             let storage_daemon_status = if check_process_status_by_port("Storage Daemon", port).await {
                 "Running"
             } else {
@@ -725,7 +812,9 @@ pub async fn display_full_status_summary(
                 "PID: Unknown".to_string()
             };
             
-            println!("{:<20} {:<15} {:<10} {:<40}", "Storage Daemon", storage_daemon_status, port, pid_info);
+            // Show "Storage Daemon" only for the first instance, empty for others
+            let component_name = if i == 0 { "Storage Daemon" } else { "" };
+            println!("{:<20} {:<15} {:<10} {:<40}", component_name, storage_daemon_status, port, pid_info);
             
             // Display detailed engine configuration
             let engine_config_lines = format_engine_config(&storage_config);
@@ -739,7 +828,7 @@ pub async fn display_full_status_summary(
             println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Cluster Range: {}", storage_config.cluster_range));
             
             // Add separator between multiple storage daemons
-            if storage_ports.len() > 1 && port != *storage_ports.last().unwrap() {
+            if storage_ports.len() > 1 && i < storage_ports.len() - 1 {
                 println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", "");
             }
         }
