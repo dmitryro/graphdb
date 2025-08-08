@@ -1,0 +1,15 @@
+# storage_daemon_server/sorage_config_mysql.yaml
+# Configuration for MySQL storage engine.
+# Requires connection parameters for local or remote MySQL server.
+storage:
+  storage_engine_type: mysql
+  # Host address of the MySQL server.
+  host: 127.0.0.1
+  # Port for MySQL server (default: 3306).
+  port: 3306
+  # Username for authentication.
+  username: graphdb_user
+  # Password for authentication.
+  password: secure_password
+  # Database name to connect to.
+  database: graphdb
