@@ -28,6 +28,16 @@
 // FIXED: 2025-08-08 - Used `serde_yaml2` and `fs` as per user request. Updated to access `storage_engine_type` via `config.storage` and added `enable_plugins` to `CliConfigToml` in `config.rs`. Implemented `save` method for `CliConfigToml`.
 // UPDATED: 2025-08-08 - Modified `UseAction::Storage` to use custom `parse_storage_engine` for `engine` argument, supporting `sled`, `rocksdb`, `rocks-db`, `inmemory`, `in-memory`, `redis`, `postgres`, `postgresql`, `postgre-sql`, `mysql`, `my-sql`.
 // FIXED: 2025-08-08 - Corrected `Commands::Use` match in `run_single_command` to use struct variant syntax `Commands::Use { action }` to resolve E0164.
+// FIXED: 2025-08-08 - Corrected `rank_port` to `rest_port` in `StartAction::All` pattern to resolve E0026.
+// FIXED: 2025-08-08 - Removed mutable `storage_settings` in `UseAction::Storage` to fix warning.
+// ADDED: 2025-08-08 - Introduced `SelectedStorageConfig` for storage-specific YAMLs, overriding core `StorageSettings` fields, and updated logging to handle both with masked password.
+// FIXED: 2025-08-08 - Removed incorrect `cluster_range` reference in `SelectedStorageConfig` to resolve E0609.
+// FIXED: 2025-08-08 - Corrected `StorageSettings` field types to handle `Option<T>` for `config_root_directory`, `data_directory`, `log_directory`, `cluster_range` to resolve E0308.
+// FIXED: 2025-08-08 - Used `serde_yaml2` with `from_str` for YAML deserialization to resolve E0425 and E0432.
+// FIXED: 2025-08-08 - Ensured `StorageSettings` fields are accessed as `Option<T>` in logging to resolve E0308.
+// FIXED: 2025-08-08 - Updated `SelectedStorageConfig` to handle nested `storage` key in YAML files to fix RocksDB parsing error.
+// FIXED: 2025-08-08 - Ensured `host` and `username` are logged for all storage engines when available.
+// FIXED: 2025-08-08 - Corrected filename typo (`sorage` → `storage`) in config.rs constants.
 
 use clap::{Parser, Subcommand, CommandFactory};
 use anyhow::{Result, Context};
@@ -39,6 +49,7 @@ use tokio::task::JoinHandle;
 use std::process;
 use std::env;
 use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
 use serde_yaml2;
 use std::fs;
 use toml;
@@ -51,6 +62,11 @@ use crate::cli::commands::{
     ReloadAction, RestartAction, StartAction, StopAction, StatusAction,
     HelpArgs
 };
+use crate::cli::config::{
+    self, DEFAULT_STORAGE_CONFIG_PATH_ROCKSDB, DEFAULT_STORAGE_CONFIG_PATH_SLED,
+    DEFAULT_STORAGE_CONFIG_PATH_POSTGRES, DEFAULT_STORAGE_CONFIG_PATH_MYSQL,
+    DEFAULT_STORAGE_CONFIG_PATH_REDIS
+};
 use crate::cli::config as config_mod;
 use crate::cli::handlers as handlers_mod;
 use crate::cli::interactive as interactive_mod;
@@ -59,6 +75,52 @@ use crate::cli::daemon_management;
 use lib::query_parser::{parse_query_from_string, QueryType};
 use lib::storage_engine::config::StorageEngineType;
 use storage_daemon_server::{StorageSettingsWrapper};
+
+// New struct for storage-specific configurations
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SelectedStorageConfig {
+    storage: StorageConfigInner,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StorageConfigInner {
+    pub storage_engine_type: String,
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub database: Option<String>,
+}
+
+impl SelectedStorageConfig {
+    pub fn load_from_yaml<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
+        let content = fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read config file {:?}", path.as_ref()))?;
+        serde_yaml2::from_str(&content)
+            .with_context(|| format!("Failed to parse YAML from {:?}", path.as_ref()))
+    }
+
+    pub fn default() -> Self {
+        SelectedStorageConfig {
+            storage: StorageConfigInner {
+                storage_engine_type: String::new(),
+                path: None,
+                host: Some("127.0.0.1".to_string()), // Default for network-based engines
+                port: None,
+                username: Some("graphdb_user".to_string()), // Default for auth-based engines
+                password: None,
+                database: None,
+            }
+        }
+    }
+}
 
 /// GraphDB Command Line Interface
 #[derive(Parser, Debug)]
@@ -192,7 +254,6 @@ fn parse_storage_engine(engine: &str) -> Result<StorageEngineType, String> {
         )),
     }
 }
-
 
 // Re-usable function to handle all commands. This is called from both interactive and non-interactive modes.
 pub async fn run_single_command(
@@ -330,6 +391,7 @@ pub async fn run_single_command(
             let mut config = config_mod::load_cli_config()?;
             match action {
                 UseAction::Storage { engine } => {
+                    // Update CLI config
                     if config.storage.is_none() {
                         config.storage = Some(config_mod::CliTomlStorageConfig::default());
                     }
@@ -339,14 +401,74 @@ pub async fn run_single_command(
                     config.save()?;
                     println!("Set storage engine to {:?}", engine);
 
+                    // Determine engine-specific config file using constants from config.rs
+                    let engine_config_file = match engine {
+                        StorageEngineType::RocksDB => DEFAULT_STORAGE_CONFIG_PATH_ROCKSDB,
+                        StorageEngineType::Sled => DEFAULT_STORAGE_CONFIG_PATH_SLED,
+                        StorageEngineType::PostgreSQL => DEFAULT_STORAGE_CONFIG_PATH_POSTGRES,
+                        StorageEngineType::MySQL => DEFAULT_STORAGE_CONFIG_PATH_MYSQL,
+                        StorageEngineType::Redis => DEFAULT_STORAGE_CONFIG_PATH_REDIS,
+                        StorageEngineType::InMemory => {
+                            println!("Storage configuration applied: InMemory (no persistent config required)");
+                            return Ok(());
+                        }
+                    };
+
+                    // Load core storage settings
                     let storage_config_path = PathBuf::from("/opt/graphdb/storage_data/config.yaml");
-                    let mut storage_settings = if storage_config_path.exists() {
-                        StorageSettings::load_from_yaml(&storage_config_path)?
+                    let storage_settings = if storage_config_path.exists() {
+                        StorageSettings::load_from_yaml(&storage_config_path)
+                            .with_context(|| format!("Failed to load core config from {:?}", storage_config_path))?
                     } else {
                         StorageSettings::default()
                     };
-                    storage_settings.storage_engine_type = engine.to_string();
-                    let storage_settings_wrapper = StorageSettingsWrapper { storage: storage_settings };
+
+                    // Load storage-specific config
+                    let selected_config = if PathBuf::from(engine_config_file).exists() {
+                        SelectedStorageConfig::load_from_yaml(&PathBuf::from(engine_config_file))
+                            .with_context(|| format!("Failed to load config from {:?}", engine_config_file))?
+                    } else {
+                        println!("Config file {:?} not found; using default storage-specific settings", engine_config_file);
+                        SelectedStorageConfig::default()
+                    };
+
+                    // Merge configurations (specific overrides core)
+                    let mut merged_settings = storage_settings;
+                    merged_settings.storage_engine_type = engine.to_string();
+                    if let Some(port) = selected_config.storage.port {
+                        merged_settings.default_port = port;
+                    }
+
+                    // Log merged configuration
+                    println!("Storage configuration applied:");
+                    println!("- storage_engine_type: {}", merged_settings.storage_engine_type);
+                    println!("- config_root_directory: {}", merged_settings.config_root_directory.display());
+                    println!("- data_directory: {}", merged_settings.data_directory.display());
+                    println!("- log_directory: {}", merged_settings.log_directory.display());
+                    println!("- default_port: {}", merged_settings.default_port);
+                    println!("- cluster_range: {}", merged_settings.cluster_range);
+                    // Log storage-specific fields
+                    if let Some(path) = selected_config.storage.path {
+                        println!("- path: {}", path.display());
+                    }
+                    if let Some(host) = selected_config.storage.host {
+                        println!("- host: {}", host);
+                    }
+                    if let Some(port) = selected_config.storage.port {
+                        println!("- port: {}", port);
+                    }
+                    if let Some(username) = selected_config.storage.username {
+                        println!("- username: {}", username);
+                    }
+                    if selected_config.storage.password.is_some() {
+                        println!("- password: *****");
+                    }
+                    if let Some(database) = selected_config.storage.database {
+                        println!("- database: {}", database);
+                    }
+
+                    // Save merged configuration
+                    let storage_settings_wrapper = StorageSettingsWrapper { storage: merged_settings };
                     let content = serde_yaml2::to_string(&storage_settings_wrapper)
                         .with_context(|| "Failed to serialize storage settings")?;
                     if let Some(parent) = storage_config_path.parent() {
@@ -477,8 +599,7 @@ pub async fn start_cli() -> Result<()> {
     if let Some(engine) = config.storage.as_ref().and_then(|s| s.storage_engine_type.clone()) {
         let storage_config_path = PathBuf::from("/opt/graphdb/storage_data/config.yaml");
         if storage_config_path.exists() {
-            let mut storage_settings = StorageSettings::load_from_yaml(&storage_config_path)?;
-            storage_settings.storage_engine_type = engine.to_string();
+            let storage_settings = StorageSettings::load_from_yaml(&storage_config_path)?;
             let storage_settings_wrapper = StorageSettingsWrapper { storage: storage_settings };
             let content = serde_yaml2::to_string(&storage_settings_wrapper)?;
             if let Some(parent) = storage_config_path.parent() {

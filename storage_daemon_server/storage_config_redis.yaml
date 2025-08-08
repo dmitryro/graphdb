@@ -1,0 +1,13 @@
+# storage_daemon_server/sorage_config_redis.yaml
+# Configuration for Redis storage engine.
+# Supports local or remote Redis server with optional authentication.
+storage:
+  storage_engine_type: redis
+  # Host address of the Redis server.
+  host: 127.0.0.1
+  # Port for Redis server (default: 6379).
+  port: 6379
+  # Optional password for authentication (uncomment if required).
+  # password: secure_password
+  # Optional database number or name (default: 0).
+  database: 0
