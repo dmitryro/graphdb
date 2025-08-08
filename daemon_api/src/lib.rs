@@ -6,6 +6,7 @@ use std::path::{PathBuf, Path};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use anyhow::Result;
+use chrono::Utc;
 use config::{Config, File as ConfigFile};
 use daemon::{DaemonizeBuilder, DaemonizeError};
 use log::{error, info};
@@ -18,7 +19,15 @@ use tokio::time::{sleep, Duration};
 use serde_json;
 use std::collections::HashSet;
 use storage_daemon_server::{StorageSettings, start_storage_daemon_server_real};
-
+use simplelog::{
+    CombinedLogger,
+    TermLogger,
+    TerminalMode,
+    WriteLogger,
+    ConfigBuilder,
+    ColorChoice,
+};
+use log::LevelFilter;
 pub mod cli_schema;
 pub mod help_generator;
 pub mod daemon_config;
@@ -153,13 +162,20 @@ pub async fn start_daemon(
     let main_config_yaml = "server/main_app_config.yaml";
     let rest_config_yaml = "rest_api/rest_api_config.yaml";
     let storage_config_yaml = "storage_daemon_server/storage_config.yaml";
+
     let mut host_to_use = "127.0.0.1".to_string();
     let mut default_port = match daemon_type {
         "main" => DEFAULT_DAEMON_PORT,
         "rest" => DEFAULT_REST_API_PORT,
         "storage" => CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS,
-        _ => return Err(DaemonError::GeneralError(format!("Invalid daemon_type: {}", daemon_type))),
+        _ => {
+            return Err(DaemonError::GeneralError(format!(
+                "Invalid daemon_type: {}",
+                daemon_type
+            )))
+        }
     };
+
     let mut base_process_name = format!("graphdb-{}", daemon_type);
 
     let mut config_builder = Config::builder();
@@ -191,15 +207,18 @@ pub async fn start_daemon(
                 default_port = cfg_port as u16;
             }
         }
-        if let Ok(process_name) = config.get_string(format!("{}.process_name", daemon_type).as_str()) {
+        if let Ok(process_name) =
+            config.get_string(format!("{}.process_name", daemon_type).as_str())
+        {
             base_process_name = process_name;
         }
     }
 
-    // Load StorageSettings for storage daemon in the parent process
     let settings = if daemon_type == "storage" {
-        Some(StorageSettings::load_from_yaml(&PathBuf::from(storage_config_yaml))
-            .map_err(|e| DaemonError::Anyhow(e))?)
+        Some(
+            StorageSettings::load_from_yaml(&PathBuf::from(storage_config_yaml))
+                .map_err(DaemonError::Anyhow)?,
+        )
     } else {
         None
     };
@@ -227,13 +246,13 @@ pub async fn start_daemon(
                     end_port - start_port + 1
                 )));
             }
-            for p in start_port..=end_port {
-                ports_to_start.push(p);
-            }
+            ports_to_start.extend(start_port..=end_port);
         } else if daemon_type == "rest" || daemon_type == "storage" {
             ports_to_start.push(port.unwrap_or(default_port));
         } else {
-            return Err(DaemonError::GeneralError("Invalid daemon type for cluster range".to_string()));
+            return Err(DaemonError::GeneralError(
+                "Invalid daemon type for cluster range".to_string(),
+            ));
         }
     } else {
         ports_to_start.push(port.unwrap_or(default_port));
@@ -253,30 +272,40 @@ pub async fn start_daemon(
             .to_socket_addrs()
             .map_err(DaemonError::Io)?
             .next()
-            .ok_or_else(|| DaemonError::InvalidPortRange(format!("No socket for port {}", current_port)))?;
+            .ok_or_else(|| {
+                DaemonError::InvalidPortRange(format!("No socket for port {}", current_port))
+            })?;
 
         if TcpStream::connect(&socket_addr).is_ok() {
-            info!("Port {} is already in use for {}. Skipping start.", current_port, daemon_type);
+            info!(
+                "Port {} is already in use for {}. Skipping start.",
+                current_port, daemon_type
+            );
             any_started = true;
             continue;
         }
 
         let pid_file_path = format!("/tmp/graphdb-{}-{}.pid", daemon_type, current_port);
         if Path::new(&pid_file_path).exists() {
-            info!("Removing stale PID file for {} on port {}: {}", daemon_type, current_port, pid_file_path);
+            info!(
+                "Removing stale PID file for {} on port {}: {}",
+                daemon_type, current_port, pid_file_path
+            );
             remove_pid_file(&pid_file_path);
         }
 
         let specific_process_name = format!("graphdb-{}-{}", daemon_type, current_port);
-        let specific_stdout_file_path = format!("/tmp/graphdb-{}-{}.out", daemon_type, current_port);
-        let specific_stderr_file_path = format!("/tmp/graphdb-{}-{}.err", daemon_type, current_port);
+        let specific_stdout_file_path =
+            format!("/tmp/graphdb-{}-{}.out", daemon_type, current_port);
+        let specific_stderr_file_path =
+            format!("/tmp/graphdb-{}-{}.err", daemon_type, current_port);
 
         let stdout = File::create(&specific_stdout_file_path)?;
         let stderr = File::create(&specific_stderr_file_path)?;
 
         let mut daemonize = DaemonizeBuilder::new()
             .working_directory("/tmp")
-            .umask(0o022) // Relaxed permissions for debugging
+            .umask(0o022)
             .stdout(stdout)
             .stderr(stderr)
             .process_name(&specific_process_name)
@@ -288,63 +317,100 @@ pub async fn start_daemon(
         match daemonize.start() {
             Ok(child_pid) => {
                 if child_pid == 0 {
-                    // Child process
-                    let config = DaemonStartConfig {
-                        daemon_type: daemon_type.to_string(),
-                        port: current_port,
-                        skip_ports: skip_ports.clone(),
-                        host: host_to_use.clone(),
-                        config_path: storage_config_yaml.to_string(),
-                    };
-                    let config_json = serde_json::to_string(&config)?;
-
+                    // === CHILD PROCESS ===
                     if daemon_type == "storage" {
-                        info!("[Child Process] Starting storage daemon on port {}", current_port);
-                        let settings = StorageSettings::load_from_yaml(&PathBuf::from(storage_config_yaml))
-                            .map_err(|e| DaemonError::Anyhow(e))?;
-                        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-                        match start_storage_daemon_server_real(current_port, settings, shutdown_rx).await {
-                            Ok(daemon) => {
-                                info!("[Child Process] Storage daemon started successfully on port {}", current_port);
-                                // Keep the process alive with a shutdown handler
-                                tokio::spawn(async move {
-                                    tokio::signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
-                                    info!("[Child Process] Ctrl-C received, shutting down storage daemon on port {}", current_port);
-                                    let _ = shutdown_tx.send(());
-                                });
-                                // Block to keep the Tokio runtime alive
-                                tokio::time::sleep(Duration::from_secs(3600)).await;
-                            }
-                            Err(e) => {
-                                error!("[Child Process] Storage daemon failed on port {}: {}", current_port, e);
+                        let log_file_path =
+                            format!("/tmp/graphdb-storage-{}.out", current_port);
+                        let log_file = File::create(&log_file_path)
+                            .expect("Failed to create storage log file");
+
+                        let log_config = ConfigBuilder::new()
+                            .set_time_format_rfc3339()
+                            .set_thread_level(LevelFilter::Off)
+                            .build();
+
+                        CombinedLogger::init(vec![
+                            TermLogger::new(
+                                LevelFilter::Info,
+                                log_config.clone(),
+                                TerminalMode::Mixed,
+                                ColorChoice::Auto,
+                            ),
+                            WriteLogger::new(LevelFilter::Info, log_config, log_file),
+                        ])
+                        .expect("Failed to init logger in child");
+
+                        let rt = tokio::runtime::Runtime::new().unwrap();
+                        rt.block_on(async {
+                            let settings = StorageSettings::load_from_yaml(
+                                &PathBuf::from(storage_config_yaml),
+                            )
+                            .expect("Failed to load storage settings");
+                            let (shutdown_tx, shutdown_rx) =
+                                tokio::sync::oneshot::channel();
+
+                            tokio::spawn(async move {
+                                tokio::signal::ctrl_c()
+                                    .await
+                                    .expect("Failed to listen for Ctrl+C");
+                                let _ = shutdown_tx.send(());
+                            });
+
+                            if let Err(e) = start_storage_daemon_server_real(
+                                current_port,
+                                settings,
+                                shutdown_rx,
+                            )
+                            .await
+                            {
+                                error!("Storage daemon failed: {:?}", e);
                                 std::process::exit(1);
                             }
-                        }
+                        });
+                        std::process::exit(0);
                     } else {
+                        let config = DaemonStartConfig {
+                            daemon_type: daemon_type.to_string(),
+                            port: current_port,
+                            skip_ports: skip_ports.clone(),
+                            host: host_to_use.clone(),
+                            config_path: storage_config_yaml.to_string(),
+                        };
+                        let config_json = serde_json::to_string(&config)?;
                         let args = vec![
                             "--internal-run".to_string(),
                             "--config-json".to_string(),
                             config_json,
                         ];
                         let mut cmd = Command::new(std::env::current_exe()?);
-                        cmd.args(&args).stdout(Stdio::null()).stderr(Stdio::null());
+                        cmd.args(&args)
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null());
                         cmd.spawn()?.wait().await?;
                         std::process::exit(0);
                     }
                 }
-                // Parent process logic
+
+                // === PARENT PROCESS ===
                 let mut confirmed_pid = 0;
                 for attempt in 0..max_port_check_attempts {
                     sleep(Duration::from_millis(port_check_interval_ms)).await;
                     if TcpStream::connect(&socket_addr).is_ok() {
-                        info!("{} daemon successfully started on port {} with PID {}", daemon_type, current_port, child_pid);
-                        confirmed_pid = find_pid_by_port(current_port).await.unwrap_or(0);
+                        info!(
+                            "{} daemon successfully started on port {} with PID {}",
+                            daemon_type, current_port, child_pid
+                        );
+                        confirmed_pid =
+                            find_pid_by_port(current_port).await.unwrap_or(0);
                         if confirmed_pid != 0 {
                             break;
                         }
                     }
                     if attempt == max_port_check_attempts - 1 {
-                        error!("{} daemon (PID {}) failed to bind to port {} after {} attempts", daemon_type, child_pid, current_port, max_port_check_attempts);
+                        error!(
+                            "{} daemon (PID {}) failed to bind to port {} after {} attempts",
+                            daemon_type, child_pid, current_port, max_port_check_attempts
+                        );
                         return Err(DaemonError::GeneralError(format!(
                             "{} daemon (PID {}) failed to bind to port {} after {} attempts",
                             daemon_type, child_pid, current_port, max_port_check_attempts
@@ -366,20 +432,42 @@ pub async fn start_daemon(
                     port: current_port,
                     pid: confirmed_pid,
                     ip_address: host_to_use.clone(),
-                    data_dir: if daemon_type == "storage" { Some(std::path::PathBuf::from("/opt/graphdb/storage_data")) } else { None },
-                    config_path: if daemon_type == "storage" { Some(std::path::PathBuf::from(storage_config_yaml)) } else { None },
-                    engine_type: if daemon_type == "storage" { settings.as_ref().map(|s| s.storage_engine_type.clone()) } else { None },
-                    last_seen_nanos: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+                    data_dir: if daemon_type == "storage" {
+                        Some(PathBuf::from("/opt/graphdb/storage_data"))
+                    } else {
+                        None
+                    },
+                    config_path: if daemon_type == "storage" {
+                        Some(PathBuf::from(storage_config_yaml))
+                    } else {
+                        None
+                    },
+                    engine_type: if daemon_type == "storage" {
+                        settings
+                            .as_ref()
+                            .map(|s| s.storage_engine_type.clone())
+                    } else {
+                        None
+                    },
+                    last_seen_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
                 };
 
-                if let Err(e) = GLOBAL_DAEMON_REGISTRY.register_daemon(metadata).await {
-                    error!("Failed to register daemon {} on port {}: {}", daemon_type, current_port, e);
+                if let Err(e) =
+                    GLOBAL_DAEMON_REGISTRY.register_daemon(metadata).await
+                {
+                    error!(
+                        "Failed to register daemon {} on port {}: {}",
+                        daemon_type, current_port, e
+                    );
                 }
 
                 any_started = true;
             }
             Err(e) => {
-                error!("Failed to start {} daemon on port {}: {}", daemon_type, current_port, e);
+                error!(
+                    "Failed to start {} daemon on port {}: {}",
+                    daemon_type, current_port, e
+                );
                 continue;
             }
         }

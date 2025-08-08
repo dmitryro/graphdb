@@ -715,51 +715,36 @@ pub async fn start_daemon_process(
             .unwrap_or_else(|_| PathBuf::from(format!("{}/daemon_data", DEFAULT_CONFIG_ROOT_DIRECTORY_STR)))
     };
 
-    let pid = if is_rest {
-        let (tx_shutdown, rx_shutdown) = tokio::sync::oneshot::channel::<()>();
-        let rest_api_shutdown_tx_opt = Arc::new(TokioMutex::new(Some(tx_shutdown)));
-        let rest_api_port_arc = Arc::new(TokioMutex::new(None));
-        let rest_api_handle = Arc::new(TokioMutex::new(None));
+    // Spawn as TokioCommand so we can pipe stdout/stderr
+    let mut child = TokioCommand::new(std::env::current_exe()?)
+        .arg("--daemon")
+        .arg("--port").arg(actual_port.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("Failed to spawn {} process", process_name))?;
 
-        crate::cli::handlers::start_rest_api_interactive(
-            Some(actual_port),
-            None,
-            rest_api_shutdown_tx_opt.clone(),
-            rest_api_port_arc.clone(),
-            rest_api_handle.clone(),
-        )
-        .await
-        .map_err(|e| anyhow!("Failed to start REST API process on port {}: {}", actual_port, e))?;
+    let child_pid = child.id().ok_or_else(|| anyhow!("Failed to get PID of spawned {}", process_name))?;
 
-        let pid = find_pid_by_port(actual_port)
-            .await
-            .ok_or_else(|| anyhow!("Failed to find PID for REST API process on port {}", actual_port))?;
-        pid
-    } else if is_storage {
-        let storage_daemon_shutdown_tx_opt = Arc::new(TokioMutex::new(None));
-        let storage_daemon_port_arc = Arc::new(TokioMutex::new(None));
-        let storage_daemon_handle = Arc::new(TokioMutex::new(None));
+    // Capture stdout logs
+    if let Some(stdout) = child.stdout.take() {
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                info!("[{} stdout] {}", process_name, line);
+            }
+        });
+    }
 
-        crate::cli::handlers::start_storage_interactive(
-            Some(actual_port),
-            config_path.clone(), // Clone here to avoid move
-            None,
-            storage_daemon_shutdown_tx_opt,
-            storage_daemon_handle,
-            storage_daemon_port_arc,
-        )
-        .await
-        .map_err(|e| anyhow!("Failed to start Storage Daemon process on port {}: {}", actual_port, e))?;
-
-        let pid = find_pid_by_port(actual_port)
-            .await
-            .ok_or_else(|| anyhow!("Failed to find PID for Storage Daemon process on port {}", actual_port))?;
-        pid
-    } else {
-        spawn_daemon_process(Some(actual_port), None, false, false)
-            .await
-            .map_err(|e| anyhow!("Failed to spawn GraphDB Daemon process on port {}: {}", actual_port, e))?
-    };
+    // Capture stderr logs
+    if let Some(stderr) = child.stderr.take() {
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                error!("[{} stderr] {}", process_name, line);
+            }
+        });
+    }
 
     let addr = format!("127.0.0.1:{}", actual_port);
     let health_check_timeout = Duration::from_secs(5);
@@ -767,16 +752,16 @@ pub async fn start_daemon_process(
     let start_time = Instant::now();
 
     while start_time.elapsed() < health_check_timeout {
-        if tokio::net::TcpStream::connect(&addr).await.is_ok() {
-            info!("{} process started successfully with PID {} on port {}", process_name, pid, actual_port);
+        if TcpStream::connect(&addr).await.is_ok() {
+            info!("{} process started successfully with PID {} on port {}", process_name, child_pid, actual_port);
 
             let metadata = DaemonMetadata {
                 service_type: if is_rest { "rest" } else if is_storage { "storage" } else { "main" }.to_string(),
                 port: actual_port,
-                pid,
+                pid: child_pid,
                 ip_address: "127.0.0.1".to_string(),
                 data_dir: Some(data_dir),
-                config_path, // Now we can use config_path here since we cloned it above
+                config_path,
                 engine_type,
                 last_seen_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
             };
@@ -784,22 +769,15 @@ pub async fn start_daemon_process(
             GLOBAL_DAEMON_REGISTRY.register_daemon(metadata).await
                 .with_context(|| format!("Failed to register {} daemon on port {}", process_name, actual_port))?;
 
-            return Ok(pid);
+            return Ok(child_pid);
         }
-        tokio::time::sleep(poll_interval).await;
-    }
-
-    // Check stderr file for errors
-    let stderr_file = format!("/tmp/daemon-{}.err", actual_port);
-    if let Ok(stderr_content) = fs::read_to_string(&stderr_file) {
-        error!("{} process stderr: {}", process_name, stderr_content);
+        time::sleep(poll_interval).await;
     }
 
     error!("{} process on port {} failed to become reachable after {} seconds", process_name, actual_port, health_check_timeout.as_secs());
     Err(anyhow!("{} process on port {} failed to start", process_name, actual_port))
 }
 
-/// Wraps `start_daemon` from daemon_api to start a daemon process and return its PID.
 /// Wraps `start_daemon` from daemon_api to start a daemon process and return its PID.
 pub async fn start_daemon_with_pid(
     port: Option<u16>,
