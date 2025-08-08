@@ -25,6 +25,9 @@
 // FIXED: 2025-07-31 - Corrected `filter_command` to `command_filter` in Commands::Help block (line 404) to resolve E0425.
 // FIXED: 2025-08-05 - Modified effective_action logic to prioritize StartAction::All when non-storage-specific arguments (e.g., --cluster, --listen-port) are present alongside --storage-port, fixing incorrect `Cannot specify both --port and --storage-port` error.
 // FIXED: 2025-08-06 - Refactored to execute commands before entering interactive mode, addressing the request to not exit after `start` command.
+// FIXED: 2025-08-08 - Used `serde_yaml2` and `fs` as per user request. Updated to access `storage_engine_type` via `config.storage` and added `enable_plugins` to `CliConfigToml` in `config.rs`. Implemented `save` method for `CliConfigToml`.
+// UPDATED: 2025-08-08 - Modified `UseAction::Storage` to use custom `parse_storage_engine` for `engine` argument, supporting `sled`, `rocksdb`, `rocks-db`, `inmemory`, `in-memory`, `redis`, `postgres`, `postgresql`, `postgre-sql`, `mysql`, `my-sql`.
+// FIXED: 2025-08-08 - Corrected `Commands::Use` match in `run_single_command` to use struct variant syntax `Commands::Use { action }` to resolve E0164.
 
 use clap::{Parser, Subcommand, CommandFactory};
 use anyhow::{Result, Context};
@@ -36,10 +39,14 @@ use tokio::task::JoinHandle;
 use std::process;
 use std::env;
 use std::collections::HashMap;
+use serde_yaml2;
+use std::fs;
+use toml;
+use storage_daemon_server::StorageSettings;
 
 // Import modules
 use crate::cli::commands::{
-    DaemonCliCommand, RestCliCommand, StorageAction,
+    DaemonCliCommand, RestCliCommand, StorageAction, UseAction,
     StatusArgs, StopArgs, ReloadArgs, RestartArgs,
     ReloadAction, RestartAction, StartAction, StopAction, StatusAction,
     HelpArgs
@@ -50,6 +57,8 @@ use crate::cli::interactive as interactive_mod;
 use crate::cli::help_display as help_display_mod;
 use crate::cli::daemon_management;
 use lib::query_parser::{parse_query_from_string, QueryType};
+use lib::storage_engine::config::StorageEngineType;
+use storage_daemon_server::{StorageSettingsWrapper};
 
 /// GraphDB Command Line Interface
 #[derive(Parser, Debug)]
@@ -81,7 +90,11 @@ pub struct CliArgs {
     #[clap(long, hide = true)]
     pub internal_storage_config_path: Option<PathBuf>,
     #[clap(long, hide = true)]
-    pub internal_storage_engine: Option<config_mod::StorageEngineType>,
+    pub internal_storage_engine: Option<StorageEngineType>,
+    #[clap(long, hide = true)]
+    pub internal_data_directory: Option<PathBuf>,
+    #[clap(long, hide = true)]
+    pub internal_cluster_range: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -106,8 +119,8 @@ pub enum Commands {
         storage_port: Option<u16>,
         #[arg(long, value_parser = clap::value_parser!(String), help = "Cluster name for the Storage Daemon. Synonym for --cluster in `start storage`.")]
         storage_cluster: Option<String>,
-        #[arg(long, value_parser = clap::value_parser!(String), help = "Path to the Storage Daemon configuration file.")]
-        storage_config: Option<String>,
+        #[arg(long, value_parser = clap::value_parser!(PathBuf), help = "Path to the Storage Daemon configuration file.")]
+        storage_config: Option<PathBuf>,
         #[clap(subcommand)]
         action: Option<StartAction>,
     },
@@ -124,6 +137,11 @@ pub enum Commands {
     /// Manage standalone Storage daemon
     #[clap(subcommand)]
     Storage(StorageAction),
+    /// Configure components (storage engine or plugins)
+    Use {
+        #[clap(subcommand)]
+        action: UseAction,
+    },
     /// Reload GraphDB components (all, rest, storage, daemon, or cluster)
     Reload(ReloadArgs),
     /// Restart GraphDB components (all, rest, storage, daemon, or cluster)
@@ -159,6 +177,23 @@ pub enum Commands {
     Quit,
 }
 
+// Custom parser for storage engine to handle hyphenated and non-hyphenated aliases
+fn parse_storage_engine(engine: &str) -> Result<StorageEngineType, String> {
+    match engine.to_lowercase().as_str() {
+        "sled" => Ok(StorageEngineType::Sled),
+        "rocksdb" | "rocks-db" => Ok(StorageEngineType::RocksDB),
+        "inmemory" | "in-memory" => Ok(StorageEngineType::InMemory),
+        "redis" => Ok(StorageEngineType::Redis),
+        "postgres" | "postgresql" | "postgre-sql" => Ok(StorageEngineType::PostgreSQL),
+        "mysql" | "my-sql" => Ok(StorageEngineType::MySQL),
+        _ => Err(format!(
+            "Invalid storage engine: {}. Supported: sled, rocksdb, rocks-db, inmemory, in-memory, redis, postgres, postgresql, postgre-sql, mysql, my-sql",
+            engine
+        )),
+    }
+}
+
+
 // Re-usable function to handle all commands. This is called from both interactive and non-interactive modes.
 pub async fn run_single_command(
     command: Commands,
@@ -181,7 +216,7 @@ pub async fn run_single_command(
             rest_cluster: top_rest_cluster,
             storage_port: top_storage_port,
             storage_cluster: top_storage_cluster,
-            storage_config: top_storage_config_str,
+            storage_config: top_storage_config,
             action,
         } => {
             let effective_action = match action {
@@ -211,13 +246,13 @@ pub async fn run_single_command(
                             rest_cluster: top_rest_cluster,
                             storage_port: top_storage_port,
                             storage_cluster: top_storage_cluster,
-                            storage_config: top_storage_config_str.clone().map(PathBuf::from),
+                            storage_config: top_storage_config.clone(),
                         }
-                    } else if top_storage_port.is_some() || top_storage_cluster.is_some() || top_storage_config_str.is_some() {
+                    } else if top_storage_port.is_some() || top_storage_cluster.is_some() || top_storage_config.is_some() {
                         StartAction::Storage {
                             port: top_storage_port,
                             cluster: top_storage_cluster.clone(),
-                            config_file: top_storage_config_str.clone().map(PathBuf::from),
+                            config_file: top_storage_config.clone(),
                             storage_port: top_storage_port,
                             storage_cluster: top_storage_cluster,
                         }
@@ -290,6 +325,43 @@ pub async fn run_single_command(
                 rest_api_port_arc.clone(),
                 storage_daemon_port_arc.clone(),
             ).await?;
+        }
+        Commands::Use { action } => {
+            let mut config = config_mod::load_cli_config()?;
+            match action {
+                UseAction::Storage { engine } => {
+                    if config.storage.is_none() {
+                        config.storage = Some(config_mod::CliTomlStorageConfig::default());
+                    }
+                    if let Some(storage) = config.storage.as_mut() {
+                        storage.storage_engine_type = Some(engine.clone());
+                    }
+                    config.save()?;
+                    println!("Set storage engine to {:?}", engine);
+
+                    let storage_config_path = PathBuf::from("/opt/graphdb/storage_data/config.yaml");
+                    let mut storage_settings = if storage_config_path.exists() {
+                        StorageSettings::load_from_yaml(&storage_config_path)?
+                    } else {
+                        StorageSettings::default()
+                    };
+                    storage_settings.storage_engine_type = engine.to_string();
+                    let storage_settings_wrapper = StorageSettingsWrapper { storage: storage_settings };
+                    let content = serde_yaml2::to_string(&storage_settings_wrapper)
+                        .with_context(|| "Failed to serialize storage settings")?;
+                    if let Some(parent) = storage_config_path.parent() {
+                        fs::create_dir_all(parent)
+                            .with_context(|| format!("Failed to create config directory {:?}", parent))?;
+                    }
+                    fs::write(&storage_config_path, content)
+                        .with_context(|| format!("Failed to write storage config to {:?}", storage_config_path))?;
+                }
+                UseAction::Plugin { enable } => {
+                    config.enable_plugins = enable;
+                    config.save()?;
+                    println!("Experimental plugins {}", if enable { "enabled" } else { "disabled" });
+                }
+            }
         }
         Commands::Reload(reload_args) => {
             handlers_mod::handle_reload_command_interactive(
@@ -396,14 +468,39 @@ pub async fn start_cli() -> Result<()> {
             converted_storage_engine,
         ).await;
     }
-    let config = match config_mod::load_cli_config() {
+    let mut config = match config_mod::load_cli_config() {
         Ok(config) => config,
         Err(e) => return Err(e),
     };
 
+    // Apply saved storage engine and plugins setting
+    if let Some(engine) = config.storage.as_ref().and_then(|s| s.storage_engine_type.clone()) {
+        let storage_config_path = PathBuf::from("/opt/graphdb/storage_data/config.yaml");
+        if storage_config_path.exists() {
+            let mut storage_settings = StorageSettings::load_from_yaml(&storage_config_path)?;
+            storage_settings.storage_engine_type = engine.to_string();
+            let storage_settings_wrapper = StorageSettingsWrapper { storage: storage_settings };
+            let content = serde_yaml2::to_string(&storage_settings_wrapper)?;
+            if let Some(parent) = storage_config_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&storage_config_path, content)?;
+        }
+    }
+    if config.enable_plugins {
+        println!("Experimental plugins enabled from config.");
+    }
+
+    // Update CliArgs with saved settings
+    let args = CliArgs {
+        enable_plugins: config.enable_plugins,
+        internal_storage_engine: config.storage.as_ref().and_then(|s| s.storage_engine_type.clone()),
+        ..args
+    };
+
     if let Some(query_string) = args.query {
         println!("Executing direct query: {}", query_string);
-        match lib::query_parser::parse_query_from_string(&query_string) {
+        match parse_query_from_string(&query_string) {
             Ok(parsed_query) => match parsed_query {
                 QueryType::Cypher => println!("  -> Identified as Cypher query."),
                 QueryType::SQL => println!("  -> Identified as SQL query."),

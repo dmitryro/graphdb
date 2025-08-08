@@ -1,3 +1,9 @@
+// server/src/cli/config.rs
+// Existing changelog entries from cli.rs and interactive.rs are not repeated here as they pertain to different files.
+// ADDED: 2025-08-08 - Added `enable_plugins` field to `CliConfigToml`. Implemented `save` method for `CliConfigToml` to serialize to TOML file. Replaced `std::fs` with `fs` and ensured consistent use of `serde_yaml2` to align with cli.rs.
+// UPDATED: 2025-08-08 - Changed `load_cli_config` to use `/opt/graphdb/config.toml` instead of `config.toml` in `CARGO_MANIFEST_DIR` to align with `save` method and system config paths.
+// UPDATED: 2025-08-08 - Updated `load_cli_config` to load from `server/src/cli/config.toml` using `CARGO_MANIFEST_DIR` and save to `/opt/graphdb/config.toml` as per user clarification.
+
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use log::{debug, error, info, warn};
@@ -546,11 +552,7 @@ impl CliConfig {
         Ok(args)
     }
 
-    pub fn load_cli_config() -> Result<Self> {
-        Self::load(None)
-    }
-
-    fn load_specific_yaml<T>(
+    pub fn load_specific_yaml<T>(
         cli_path: Option<&PathBuf>,
         global_embed: Option<T>,
         default_path: &Path,
@@ -1051,7 +1053,7 @@ pub struct CliTomlStorageConfig {
     pub config_file: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct CliConfigToml {
     pub app: AppConfig,
     pub server: ServerConfig,
@@ -1062,6 +1064,25 @@ pub struct CliConfigToml {
     pub paths: Option<PathsConfig>,
     pub security: Option<SecurityConfig>,
     pub deployment: DeploymentConfig,
+    #[serde(default)]
+    pub enable_plugins: bool,
+}
+
+impl CliConfigToml {
+    pub fn save(&self) -> Result<()> {
+        let config_path = PathBuf::from("/opt/graphdb/config.toml");
+
+        let toml_string = toml::to_string(self)
+            .context("Failed to serialize CliConfigToml to TOML")?;
+
+        fs::create_dir_all(config_path.parent().unwrap())
+            .context(format!("Failed to create parent directories for {}", config_path.display()))?;
+
+        fs::write(&config_path, toml_string)
+            .context(format!("Failed to write CliConfigToml to file: {}", config_path.display()))?;
+
+        Ok(())
+    }
 }
 
 pub fn load_cli_config() -> Result<CliConfigToml> {
