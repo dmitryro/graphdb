@@ -285,42 +285,93 @@ pub async fn start_daemon(
             .skip_ports(skip_ports.clone())
             .build()?;
 
+        // In the daemon startup section of start_daemon function
         match daemonize.start() {
             Ok(child_pid) => {
                 if child_pid == 0 {
-                    // Child process
-                    let config = DaemonStartConfig {
-                        daemon_type: daemon_type.to_string(),
-                        port: current_port,
-                        skip_ports: skip_ports.clone(),
-                        host: host_to_use.clone(),
-                        config_path: storage_config_yaml.to_string(),
-                    };
-                    let config_json = serde_json::to_string(&config)?;
-
+                    // Child process - this is where the actual daemon runs
                     if daemon_type == "storage" {
-                        info!("[Child Process] Starting storage daemon on port {}", current_port);
-                        let settings = StorageSettings::load_from_yaml(&PathBuf::from(storage_config_yaml))
-                            .map_err(|e| DaemonError::Anyhow(e))?;
-                        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-                        match start_storage_daemon_server_real(current_port, settings, shutdown_rx).await {
-                            Ok(daemon) => {
-                                info!("[Child Process] Storage daemon started successfully on port {}", current_port);
-                                // Keep the process alive with a shutdown handler
-                                tokio::spawn(async move {
-                                    tokio::signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
-                                    info!("[Child Process] Ctrl-C received, shutting down storage daemon on port {}", current_port);
-                                    let _ = shutdown_tx.send(());
-                                });
-                                // Block to keep the Tokio runtime alive
-                                tokio::time::sleep(Duration::from_secs(3600)).await;
+                        // Set up a new Tokio runtime for the child process
+                        let rt = tokio::runtime::Runtime::new().unwrap();
+                        rt.block_on(async {
+                            // Write startup info directly to files for debugging
+                            let debug_file_path = format!("/tmp/graphdb-storage-{}-debug.log", current_port);
+                            let mut debug_file = std::fs::OpenOptions::new()
+                                .create(true)
+                                .write(true)
+                                .truncate(true)
+                                .open(&debug_file_path)
+                                .expect("Failed to create debug file");
+                            
+                            use std::io::Write;
+                            writeln!(debug_file, "=== STORAGE DAEMON CHILD PROCESS STARTED ===").unwrap();
+                            writeln!(debug_file, "Child PID: {}", std::process::id()).unwrap();
+                            writeln!(debug_file, "Port: {}", current_port).unwrap();
+                            writeln!(debug_file, "Config path: {}", storage_config_yaml).unwrap();
+                            debug_file.flush().unwrap();
+                            
+                            // Load settings in the child process
+                            let settings = match StorageSettings::load_from_yaml(&PathBuf::from(storage_config_yaml)) {
+                                Ok(s) => {
+                                    writeln!(debug_file, "Settings loaded successfully").unwrap();
+                                    debug_file.flush().unwrap();
+                                    s
+                                }
+                                Err(e) => {
+                                    writeln!(debug_file, "Failed to load settings: {}", e).unwrap();
+                                    debug_file.flush().unwrap();
+                                    std::process::exit(1);
+                                }
+                            };
+                            
+                            // Create shutdown channel
+                            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+                            
+                            // Set up signal handler
+                            let shutdown_tx_clone = std::sync::Arc::new(std::sync::Mutex::new(Some(shutdown_tx)));
+                            let shutdown_tx_for_signal = shutdown_tx_clone.clone();
+                            
+                            tokio::spawn(async move {
+                                tokio::signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
+                                if let Some(tx) = shutdown_tx_for_signal.lock().unwrap().take() {
+                                    let _ = tx.send(());
+                                }
+                            });
+                            
+                            writeln!(debug_file, "About to start storage daemon server...").unwrap();
+                            debug_file.flush().unwrap();
+                            
+                            // Start the storage daemon
+                            match start_storage_daemon_server_real(current_port, settings, shutdown_rx).await {
+                                Ok(_daemon) => {
+                                    writeln!(debug_file, "Storage daemon started successfully!").unwrap();
+                                    debug_file.flush().unwrap();
+                                    
+                                    // Keep the process alive
+                                    let mut interval = tokio::time::interval(Duration::from_secs(60));
+                                    loop {
+                                        interval.tick().await;
+                                        writeln!(debug_file, "Storage daemon heartbeat - {}", chrono::Utc::now()).unwrap();
+                                        debug_file.flush().unwrap();
+                                    }
+                                }
+                                Err(e) => {
+                                    writeln!(debug_file, "Storage daemon failed to start: {}", e).unwrap();
+                                    debug_file.flush().unwrap();
+                                    std::process::exit(1);
+                                }
                             }
-                            Err(e) => {
-                                error!("[Child Process] Storage daemon failed on port {}: {}", current_port, e);
-                                std::process::exit(1);
-                            }
-                        }
+                        });
                     } else {
+                        // Handle other daemon types
+                        let config = DaemonStartConfig {
+                            daemon_type: daemon_type.to_string(),
+                            port: current_port,
+                            skip_ports: skip_ports.clone(),
+                            host: host_to_use.clone(),
+                            config_path: storage_config_yaml.to_string(),
+                        };
+                        let config_json = serde_json::to_string(&config)?;
                         let args = vec![
                             "--internal-run".to_string(),
                             "--config-json".to_string(),
@@ -332,7 +383,8 @@ pub async fn start_daemon(
                         std::process::exit(0);
                     }
                 }
-                // Parent process logic
+                
+                // Parent process continues here...
                 let mut confirmed_pid = 0;
                 for attempt in 0..max_port_check_attempts {
                     sleep(Duration::from_millis(port_check_interval_ms)).await;
@@ -384,7 +436,6 @@ pub async fn start_daemon(
             }
         }
     }
-
     if !any_started {
         return Err(DaemonError::NoDaemonsStarted);
     }

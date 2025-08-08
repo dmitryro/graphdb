@@ -20,8 +20,8 @@ use std::str::FromStr;
 use serde_yaml2 as serde_yaml;
 use std::io::Cursor;
 use std::collections::{BTreeMap, BTreeSet};
-use log::{info, error, LevelFilter};
-use simplelog::{CombinedLogger, ConfigBuilder, WriteLogger, TermLogger, TerminalMode, ColorChoice};
+use log::{info, warn, error};
+use simplelog::{CombinedLogger, TermLogger, WriteLogger, LevelFilter, Config, ConfigBuilder, TerminalMode, ColorChoice};
 
 // Declare the storage_client module.
 pub mod storage_client;
@@ -477,9 +477,8 @@ pub async fn start_storage_daemon_server_real(
     settings: StorageSettings,
     shutdown_rx: oneshot::Receiver<()>,
 ) -> Result<StorageDaemon> {
-    println!("SEE IF WE GOT HERE");
     // Initialize logger
-    let log_file_path = format!("/tmp/graphdb-storage-{}.log", port);
+    let log_file_path = format!("/tmp/graphdb-storage-{}.out", port);
     let log_file = File::create(&log_file_path)
         .with_context(|| format!("Failed to create log file at {}", log_file_path))?;
     let log_config = ConfigBuilder::new()

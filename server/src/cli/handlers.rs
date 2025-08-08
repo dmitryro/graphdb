@@ -1970,7 +1970,6 @@ pub async fn stop_storage_interactive(
     storage_daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
     storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
 ) -> Result<()> {
-    println!("IT IS TIME TO STOP STORAGE");
     let ports_to_stop = if let Some(p) = port {
         vec![p]
     } else {
