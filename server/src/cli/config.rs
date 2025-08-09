@@ -14,6 +14,14 @@
 // ADDED: 2025-08-09 - Added `UseStorage` subcommand to `Commands` for switching storage engines via `StorageEngineManager`.
 // UPDATED: 2025-08-09 - Added `execute` method to `CliConfig` to handle `UseStorage` command with session-based or permanent engine switching.
 // FIXED: 2025-08-10 - Corrected `Commands::UseStorage` to `Commands::Use(UseAction::Storage)` in match arms to fix E0599 errors.
+// FIXED: 2025-08-09 - Added `permanent` boolean field to `UseAction::Storage` and `CommandType::UseStorage` to resolve `E0026` error.
+// UPDATED: 2025-08-09 - Modified `CliConfig::execute` to respect `--permanent` flag in both interactive and non-interactive modes, allowing non-permanent switches in non-interactive mode.
+// ADDED: 2025-08-09 - Added `Save` command handling in `execute` for `SaveAction::Storage` and `SaveAction::Configuration` to save storage and config changes.
+// UPDATED: 2025-08-09 - Modified `UseAction::Storage` to save engine changes when `--permanent` is true, equivalent to `use storage` followed by `save storage`.
+// FIXED: 2025-08-09 - Restored truncated portion of `config.rs` from `load_rest_config` to end of file.
+// FIXED: 2025-08-09 - Corrected file truncation and removed test module per user request, ensuring full file content from start.
+// FIXED: 2025-08-09 - Corrected `SaveConfiguration` to `SaveConfig` in `CliConfig::load` to fix E0599 error.
+// ADDED: 2025-08-09 - Implemented `Default` trait for `CliConfigToml` to fix E0599 errors related to missing `default` method.
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -31,7 +39,7 @@ use toml;
 use serde_yaml2 as serde_yaml;
 use crate::cli::commands::{Commands, CommandType, StatusArgs, RestartArgs, ReloadArgs, RestartAction, 
                            ReloadAction, RestCliCommand, StatusAction, StorageAction, 
-                           StartAction, StopAction, StopArgs, DaemonCliCommand, UseAction};
+                           StartAction, StopAction, StopArgs, DaemonCliCommand, UseAction, SaveAction};
 pub use lib::storage_engine::storage_engine::{StorageEngineManager};
 pub use models::errors::GraphError;
 pub use lib::storage_engine::config::StorageEngineType;
@@ -453,14 +461,44 @@ pub struct CliConfig {
 
     #[clap(long, help = "Root directory for configurations, if not using default paths")]
     pub config_root_directory: Option<PathBuf>,
+
+    #[clap(long, short = 'c', help = "Run CLI in interactive mode")]
+    pub cli: bool,
 }
 
 impl CliConfig {
     pub async fn execute(&self, manager: &mut StorageEngineManager) -> Result<(), GraphError> {
         match &self.command {
             Commands::Use(UseAction::Storage { engine, permanent }) => {
-                manager.use_storage(*engine, *permanent).await?;
-                println!("Switched to storage engine: {:?}", engine);
+                let is_permanent = *permanent;
+                info!(
+                    "Switching to storage engine: {:?}, permanent: {} (interactive mode: {})",
+                    engine, is_permanent, self.cli
+                );
+                manager.use_storage(*engine, is_permanent).await?;
+                if is_permanent {
+                    let mut storage_config = load_storage_config_from_yaml(None)?;
+                    storage_config.storage_engine_type = *engine;
+                    storage_config.save()?;
+                    info!("Saved storage engine change to {:?}", DEFAULT_STORAGE_CONFIG_PATH);
+                }
+                println!(
+                    "Switched to storage engine: {:?}{}",
+                    engine,
+                    if is_permanent { " (persisted)" } else { " (non-persisted)" }
+                );
+                Ok(())
+            }
+            Commands::Save(SaveAction::Storage) => {
+                let storage_config = load_storage_config_from_yaml(None)?;
+                storage_config.save()?;
+                println!("Saved storage configuration to {:?}", DEFAULT_STORAGE_CONFIG_PATH);
+                Ok(())
+            }
+            Commands::Save(SaveAction::Configuration) => {
+                let cli_config = load_cli_config()?;
+                cli_config.save()?;
+                println!("Saved CLI configuration to {:?}", PathBuf::from("/opt/graphdb/config.toml"));
                 Ok(())
             }
             _ => Ok(()), // Other commands handled elsewhere
@@ -486,6 +524,7 @@ impl CliConfig {
                 rest_api_config_path: None,
                 main_daemon_config_path: None,
                 config_root_directory: None,
+                cli: true, // Set to true for interactive mode
             };
             match cmd {
                 CommandType::StartStorage { port, config_file, cluster, storage_port, storage_cluster } => {
@@ -499,6 +538,15 @@ impl CliConfig {
                     config.storage_port = storage_port.or(port);
                     config.storage_cluster = storage_cluster.or(cluster);
                     config.storage_config_path = config_file;
+                }
+                CommandType::UseStorage { engine, permanent } => {
+                    config.command = Commands::Use(UseAction::Storage { engine, permanent });
+                }
+                CommandType::SaveStorage => {
+                    config.command = Commands::Save(SaveAction::Storage);
+                }
+                CommandType::SaveConfig => {
+                    config.command = Commands::Save(SaveAction::Configuration);
                 }
                 CommandType::Exit => {
                     config.command = Commands::Exit;
@@ -797,6 +845,12 @@ impl CliConfig {
             Commands::Use(UseAction::Storage { .. }) => {
                 Ok(StorageConfig::default().data_directory.to_string_lossy().into_owned())
             }
+            Commands::Save(SaveAction::Storage) => {
+                Ok(StorageConfig::default().data_directory.to_string_lossy().into_owned())
+            }
+            Commands::Save(SaveAction::Configuration) => {
+                Ok(default_config_root_directory().to_string_lossy().into_owned())
+            }
             _ => Err(anyhow!("Not in a start/cli context to retrieve data directory.")),
         }
     }
@@ -820,6 +874,12 @@ impl CliConfig {
             }
             Commands::Use(UseAction::Storage { .. }) => {
                 Ok(StorageConfig::default().log_directory)
+            }
+            Commands::Save(SaveAction::Storage) => {
+                Ok(StorageConfig::default().log_directory)
+            }
+            Commands::Save(SaveAction::Configuration) => {
+                Ok("/var/log/graphdb".to_string())
             }
             _ => Err(anyhow!("Not in a start/cli context to retrieve log directory.")),
         }
@@ -1118,14 +1178,30 @@ pub fn get_daemon_cluster_range() -> String {
 }
 
 // --- TOML CLI Config ---
-#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct AppConfig {
     pub version: String,
 }
 
-#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+impl Default for AppConfig {
+    fn default() -> Self {
+        AppConfig {
+            version: "0.1.0".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct DeploymentConfig {
     pub config_root_directory: PathBuf,
+}
+
+impl Default for DeploymentConfig {
+    fn default() -> Self {
+        DeploymentConfig {
+            config_root_directory: default_config_root_directory(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
@@ -1137,24 +1213,53 @@ pub struct PathsConfig {}
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct SecurityConfig {}
 
-#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ServerConfig {
     pub port: Option<u16>,
     pub host: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+impl Default for ServerConfig {
+    fn default() -> Self {
+        ServerConfig {
+            port: Some(DEFAULT_MAIN_PORT),
+            host: Some("127.0.0.1".to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct RestConfig {
     pub port: u16,
     pub host: String,
 }
 
-#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+impl Default for RestConfig {
+    fn default() -> Self {
+        RestConfig {
+            port: DEFAULT_REST_API_PORT,
+            host: "127.0.0.1".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct DaemonConfig {
     pub port: Option<u16>,
     pub process_name: String,
     pub user: String,
     pub group: String,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        DaemonConfig {
+            port: Some(DEFAULT_DAEMON_PORT),
+            process_name: EXECUTABLE_NAME.to_string(),
+            user: "graphdb".to_string(),
+            group: "graphdb".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
@@ -1172,7 +1277,7 @@ pub struct CliTomlStorageConfig {
     pub config_file: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct CliConfigToml {
     pub app: AppConfig,
     pub server: ServerConfig,
@@ -1185,6 +1290,23 @@ pub struct CliConfigToml {
     pub deployment: DeploymentConfig,
     #[serde(default)]
     pub enable_plugins: bool,
+}
+
+impl Default for CliConfigToml {
+    fn default() -> Self {
+        CliConfigToml {
+            app: AppConfig::default(),
+            server: ServerConfig::default(),
+            rest: RestConfig::default(),
+            daemon: DaemonConfig::default(),
+            storage: Some(CliTomlStorageConfig::default()),
+            log: Some(LogConfig::default()),
+            paths: Some(PathsConfig::default()),
+            security: Some(SecurityConfig::default()),
+            deployment: DeploymentConfig::default(),
+            enable_plugins: false,
+        }
+    }
 }
 
 impl CliConfigToml {
@@ -1205,18 +1327,41 @@ impl CliConfigToml {
 }
 
 pub fn load_cli_config() -> Result<CliConfigToml> {
-    let config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("src")
-        .join("cli")
-        .join("config.toml");
+    let config_path = if let Ok(manifest_dir) = env::var("CARGO_MANIFEST_DIR") {
+        PathBuf::from(manifest_dir).join("server/src/cli/config.toml")
+    } else {
+        PathBuf::from("/opt/graphdb/config.toml")
+    };
 
-    let config_content = fs::read_to_string(&config_path)
-        .context(format!("Failed to read CLI config file: {}", config_path.display()))?;
+    info!("Attempting to load CLI config from {:?}", config_path);
 
-    let config: CliConfigToml = toml::from_str(&config_content)
-        .context("Failed to parse CLI config file")?;
-
-    Ok(config)
+    if config_path.exists() {
+        match fs::canonicalize(&config_path) {
+            Ok(canonical_path) => {
+                let config_content = fs::read_to_string(&canonical_path)
+                    .context(format!("Failed to read CLI config file: {}", canonical_path.display()))?;
+                debug!("CLI config content: {}", config_content);
+                let config: CliConfigToml = toml::from_str(&config_content)
+                    .map_err(|e| {
+                        error!("TOML parsing error for CLI config at {:?}: {:?}", canonical_path, e);
+                        if let Ok(partial) = serde_json::from_str::<Value>(&config_content) {
+                            error!("Partial TOML parse: {:?}", partial);
+                        }
+                        anyhow!("Failed to parse CLI config TOML: {}", canonical_path.display())
+                    })?;
+                info!("Successfully loaded CLI config: {:?}", config);
+                Ok(config)
+            }
+            Err(e) => {
+                warn!("Failed to canonicalize CLI config path {:?}", config_path);
+                warn!("Config file not found at {}. Using default CLI config.", config_path.display());
+                Ok(CliConfigToml::default())
+            }
+        }
+    } else {
+        warn!("Config file not found at {}. Using default CLI config.", config_path.display());
+        Ok(CliConfigToml::default())
+    }
 }
 
 pub fn get_cli_storage_config(config_file_path: Option<PathBuf>) -> CliTomlStorageConfig {

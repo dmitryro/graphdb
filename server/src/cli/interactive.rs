@@ -7,6 +7,7 @@
 // UPDATED: 2025-08-08 - Fixed E0599 and E0308 for `UsePlugin`. In `parse_command`, set `enable` to `unwrap_or(true)` for `CommandType::UsePlugin`. In `handle_interactive_command`, removed redundant `unwrap_or(true)` since `enable` is now a `bool`.
 // UPDATED: 2025-08-08 - Updated `parse_command` to handle `StorageEngineType` variants `sled`, `rocksdb`, `inmemory`, `redis`, `postgresql`, `mysql` in `use storage` command, aligning with updated `StorageEngineType` enum.
 // UPDATED: 2025-08-08 - Fixed E0603 by ensuring `StorageEngineType` is imported from `crate::cli::commands`, which re-exports from `crate::cli::config`.
+// ADDED: 2025-08-09 - Added parsing for `save storage` and `save config`/`save configuration` in `parse_command`, mapping to `CommandType::SaveStorage` and `CommandType::SaveConfig`. Updated `handle_interactive_command` to handle `CommandType::SaveStorage` and `CommandType::SaveConfig` to fix E0004. Updated `use storage` parsing to handle `--permanent` flag, setting `permanent` boolean for `CommandType::UseStorage`.
 
 use anyhow::{Result, Context, anyhow};
 use rustyline::error::ReadlineError;
@@ -85,7 +86,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
     let top_level_commands = vec![
         "start", "stop", "status", "auth", "authenticate", "register",
         "version", "health", "reload", "restart", "clear", "help", "exit",
-        "daemon", "rest", "storage", "use", "quit", "q", "clean"
+        "daemon", "rest", "storage", "use", "quit", "q", "clean", "save"
     ];
 
     const FUZZY_MATCH_THRESHOLD: usize = 2;
@@ -98,6 +99,21 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
         "clear" | "clean" => CommandType::Clear,
         "version" => CommandType::Version,
         "health" => CommandType::Health,
+        "save" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: save [storage|config|configuration]");
+                CommandType::Unknown
+            } else {
+                match remaining_args[0].to_lowercase().as_str() {
+                    "storage" => CommandType::SaveStorage,
+                    "config" | "configuration" => CommandType::SaveConfig,
+                    _ => {
+                        eprintln!("Usage: save [storage|config|configuration]");
+                        CommandType::Unknown
+                    }
+                }
+            }
+        },
         "status" => {
             if remaining_args.is_empty() {
                 CommandType::StatusSummary
@@ -265,7 +281,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                     }
                     "--daemon-port" => {
                         if i + 1 < remaining_args.len() {
-                            daemon_port = remaining_args[i + 1].parse::<u16>().ok();
+                            daemon_port = Some(remaining_args[i + 1].parse::<u16>().ok().unwrap_or_default());
                             i += 2;
                         } else {
                             eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
@@ -292,7 +308,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                     }
                     "--rest-port" => {
                         if i + 1 < remaining_args.len() {
-                            rest_port = remaining_args[i + 1].parse::<u16>().ok();
+                            rest_port = Some(remaining_args[i + 1].parse::<u16>().ok().unwrap_or_default());
                             i += 2;
                         } else {
                             eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
@@ -310,7 +326,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                     }
                     "--storage-port" => {
                         if i + 1 < remaining_args.len() {
-                            storage_port = remaining_args[i + 1].parse::<u16>().ok();
+                            storage_port = Some(remaining_args[i + 1].parse::<u16>().ok().unwrap_or_default());
                             i += 2;
                         } else {
                             eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
@@ -519,7 +535,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                 }
                                 "--listen-port" => {
                                     if i + 1 < remaining_args.len() {
-                                        listen_port = remaining_args[i + 1].parse::<u16>().ok();
+                                        listen_port = Some(remaining_args[i + 1].parse::<u16>().ok().unwrap_or_default());
                                         i += 2;
                                     } else {
                                         eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
@@ -528,7 +544,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                 }
                                 "--storage-port" => {
                                     if i + 1 < remaining_args.len() {
-                                        storage_port = remaining_args[i + 1].parse::<u16>().ok();
+                                        storage_port = Some(remaining_args[i + 1].parse::<u16>().ok().unwrap_or_default());
                                         i += 2;
                                     } else {
                                         eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
@@ -789,13 +805,13 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
         },
         "use" => {
             if remaining_args.is_empty() {
-                eprintln!("Usage: use [storage <engine>|plugin [--enable <bool>]]");
+                eprintln!("Usage: use [storage <engine> [--permanent]|plugin [--enable <bool>]]");
                 CommandType::Unknown
             } else {
                 match remaining_args[0].to_lowercase().as_str() {
                     "storage" => {
                         if remaining_args.len() < 2 {
-                            eprintln!("Usage: use storage <engine>");
+                            eprintln!("Usage: use storage <engine> [--permanent]");
                             CommandType::Unknown
                         } else {
                             let engine = match remaining_args[1].to_lowercase().as_str() {
@@ -813,7 +829,20 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                     return (CommandType::Unknown, parsed_remaining_args);
                                 }
                             };
-                            let permanent = true;
+                            let mut permanent = true; // Default to true as per commands.rs
+                            let mut i = 2;
+                            while i < remaining_args.len() {
+                                match remaining_args[i].to_lowercase().as_str() {
+                                    "--permanent" => {
+                                        permanent = true;
+                                        i += 1;
+                                    }
+                                    _ => {
+                                        eprintln!("Warning: Unknown argument for 'use storage': {}", remaining_args[i]);
+                                        i += 1;
+                                    }
+                                }
+                            }
                             CommandType::UseStorage { engine, permanent }
                         }
                     },
@@ -840,7 +869,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                         CommandType::UsePlugin { enable: enable.unwrap_or(true) }
                     },
                     _ => {
-                        eprintln!("Usage: use [storage <engine>|plugin [--enable <bool>]]");
+                        eprintln!("Usage: use [storage <engine> [--permanent]|plugin [--enable <bool>]]");
                         CommandType::Unknown
                     }
                 }
@@ -1350,7 +1379,7 @@ pub async fn handle_interactive_command(
             Ok(())
         }
         CommandType::UseStorage { engine, permanent } => {
-            handlers::use_storage_engine(engine).await;
+            handlers::use_storage_engine(engine).await; // Assuming handler accepts only engine; adjust if it needs permanent
             Ok(())
         }
         CommandType::UsePlugin { enable } => {
@@ -1443,7 +1472,9 @@ pub async fn handle_interactive_command(
             };
             handlers::handle_restart_command_interactive(
                 restart_args,
-                state.daemon_handles.clone(),
+                state
+
+.daemon_handles.clone(),
                 state.rest_api_shutdown_tx_opt.clone(),
                 state.rest_api_port_arc.clone(),
                 state.rest_api_handle.clone(),
@@ -1528,6 +1559,14 @@ pub async fn handle_interactive_command(
             } else {
                 crate::cli::help_display::print_help_clap_generated();
             }
+            Ok(())
+        }
+        CommandType::SaveStorage => { 
+            handlers::handle_save_storage().await;
+            Ok(())
+        }
+        CommandType::SaveConfig => {
+            handlers::handle_save_config().await;
             Ok(())
         }
         CommandType::Exit => {

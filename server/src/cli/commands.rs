@@ -4,11 +4,13 @@
 // UPDATED: 2025-08-08 - Ensured `StorageEngineType` supports `Sled`, `RocksDB`, `InMemory`, `Redis`, `PostgreSQL`, `MySQL` as per updated enum definition.
 // NOTE: Kept `std::path::PathBuf` as it’s standard for CLI args and compatible with `fs2` in `config.rs`.
 // FIXED: 2025-08-08 - Added `permanent` boolean field to `UseAction::Storage` and `CommandType::UseStorage` to resolve `E0026` error in `config.rs`.
+// ADDED: 2025-08-09 - Added `Save` command with `Storage` and `Config` subcommands to save storage engine and configuration changes.
 
 use clap::{Parser, Subcommand, Arg, Args};
 use std::path::PathBuf;
 use uuid::Uuid;
-use crate::cli::config::StorageEngineType;
+// Re-export StorageEngineType to make it accessible to `interactive.rs`
+pub use crate::cli::config::StorageEngineType;
 
 /// Custom parser for storage engine to accept many aliases (rocksdb, rocks-db, postgres, postgresql, postgre-sql, mysql, my-sql, inmemory, in-memory).
 pub fn parse_storage_engine(engine: &str) -> Result<StorageEngineType, String> {
@@ -25,15 +27,6 @@ pub fn parse_storage_engine(engine: &str) -> Result<StorageEngineType, String> {
         )),
     }
 }
-
-// Re-export StorageEngineType to make it accessible to `interactive.rs`
-
-#[derive(Debug, PartialEq, Clone, Args)]
-pub struct HelpArgs {
-    pub filter_command: Option<String>,
-    pub command_path: Vec<String>,
-}
-
 /// Enum representing the parsed command type in interactive mode.
 #[derive(Debug, PartialEq, Clone)]
 pub enum CommandType {
@@ -49,6 +42,10 @@ pub enum CommandType {
     // Use Commands
     UseStorage { engine: StorageEngineType, permanent: bool },
     UsePlugin { enable: bool },
+
+    // Save Commands
+    SaveStorage,
+    SaveConfig,
 
     // Top-level Start command variants (can also be subcommands of 'start')
     StartRest { port: Option<u16>, cluster: Option<String>, rest_port: Option<u16>, rest_cluster: Option<String> },
@@ -119,6 +116,12 @@ pub enum CommandType {
     Help(HelpArgs),
     Exit,
     Unknown,
+}
+
+#[derive(Debug, PartialEq, Clone, Args)]
+pub struct HelpArgs {
+    pub filter_command: Option<String>,
+    pub command_path: Vec<String>,
 }
 
 /// GraphDB Command Line Interface
@@ -201,6 +204,9 @@ pub enum Commands {
     /// Configure components (storage engine or plugins)
     #[clap(subcommand)]
     Use(UseAction),
+    /// Save changes to storage or configuration
+    #[clap(subcommand)]
+    Save(SaveAction),
     /// Reload GraphDB components (all, rest, storage, daemon, or cluster)
     Reload(ReloadArgs),
     /// Restart GraphDB components (all, rest, storage, daemon, or cluster)
@@ -234,6 +240,15 @@ pub enum Commands {
     Exit,
     /// Quit the CLI (alias for 'exit')
     Quit,
+}
+
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum SaveAction {
+    /// Save changes to the storage engine configuration
+    Storage,
+    /// Save changes to the general configuration (alias: save config)
+    #[clap(name = "config")]
+    Configuration,
 }
 
 #[derive(Subcommand, Debug, PartialEq, Clone)]
