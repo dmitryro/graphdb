@@ -38,6 +38,8 @@
 // FIXED: 2025-08-08 - Updated `SelectedStorageConfig` to handle nested `storage` key in YAML files to fix RocksDB parsing error.
 // FIXED: 2025-08-08 - Ensured `host` and `username` are logged for all storage engines when available.
 // FIXED: 2025-08-08 - Corrected filename typo (`sorage` → `storage`) in config.rs constants.
+// ADDED: 2025-08-09 - Added `Save` subcommand with `Configuration` and `Storage` variants to support `save configuration` and `save storage` commands.
+// FIXED: 2025-08-09 - Removed `permanent` field from `Commands::Save` and `UseAction::Plugin` to fix `E0027` at `cli.rs:459`. Kept `config`/`configuration` aliases in `parse_storage_engine`.
 
 use clap::{Parser, Subcommand, CommandFactory};
 use anyhow::{Result, Context};
@@ -57,7 +59,7 @@ use storage_daemon_server::StorageSettings;
 
 // Import modules
 use crate::cli::commands::{
-    DaemonCliCommand, RestCliCommand, StorageAction, UseAction,
+    DaemonCliCommand, RestCliCommand, StorageAction, UseAction, SaveAction,
     StatusArgs, StopArgs, ReloadArgs, RestartArgs,
     ReloadAction, RestartAction, StartAction, StopAction, StatusAction,
     HelpArgs
@@ -83,18 +85,12 @@ use storage_daemon_server::{StorageSettingsWrapper};
 pub struct CliArgs {
     #[clap(subcommand)]
     pub command: Option<Commands>,
-
-    /// Run CLI in interactive mode
     #[clap(long, short = 'c')]
     pub cli: bool,
-    /// Enable experimental plugins
     #[clap(long)]
     pub enable_plugins: bool,
-    /// Execute a direct query string
     #[clap(long, short = 'q')]
     pub query: Option<String>,
-
-    // Internal flags for daemonized processes (hidden from help)
     #[clap(long, hide = true)]
     pub internal_rest_api_run: bool,
     #[clap(long, hide = true)]
@@ -115,7 +111,6 @@ pub struct CliArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Start GraphDB components (daemon, rest, storage, or all)
     Start {
         #[arg(long, value_parser = clap::value_parser!(u16), help = "Port for the daemon. Conflicts with --daemon-port if both specified.")]
         port: Option<u16>,
@@ -140,56 +135,29 @@ pub enum Commands {
         #[clap(subcommand)]
         action: Option<StartAction>,
     },
-    /// Stop GraphDB components (daemon, rest, storage, or all)
     Stop(StopArgs),
-    /// Get status of GraphDB components (daemon, rest, storage, cluster, or all)
     Status(StatusArgs),
-    /// Manage GraphDB daemon instances
     #[clap(subcommand)]
     Daemon(DaemonCliCommand),
-    /// Manage REST API server
     #[clap(subcommand)]
     Rest(RestCliCommand),
-    /// Manage standalone Storage daemon
     #[clap(subcommand)]
     Storage(StorageAction),
-    /// Configure components (storage engine or plugins)
-    Use {
-        #[clap(subcommand)]
-        action: UseAction,
-    },
-    /// Reload GraphDB components (all, rest, storage, daemon, or cluster)
+    #[clap(subcommand)]
+    Use(UseAction),
+    #[clap(subcommand)]
+    Save(SaveAction),
     Reload(ReloadArgs),
-    /// Restart GraphDB components (all, rest, storage, daemon, or cluster)
     Restart(RestartArgs),
-    /// Run CLI in interactive mode
     Interactive,
-    /// Authenticate a user and get a token
-    Auth {
-        username: String,
-        password: String,
-    },
-    /// Authenticate a user and get a token (alias for 'auth')
-    Authenticate {
-        username: String,
-        password: String,
-    },
-    /// Register a new user
-    Register {
-        username: String,
-        password: String,
-    },
-    /// Get the version of the REST API server
+    Auth { username: String, password: String },
+    Authenticate { username: String, password: String },
+    Register { username: String, password: String },
     Version,
-    /// Perform a health check on the REST API server
     Health,
-    /// Display help message
     Help(HelpArgs),
-    /// Clear the terminal screen
     Clear,
-    /// Exit the CLI
     Exit,
-    /// Quit the CLI (alias for 'exit')
     Quit,
 }
 
@@ -202,6 +170,7 @@ fn parse_storage_engine(engine: &str) -> Result<StorageEngineType, String> {
         "redis" => Ok(StorageEngineType::Redis),
         "postgres" | "postgresql" | "postgre-sql" => Ok(StorageEngineType::PostgreSQL),
         "mysql" | "my-sql" => Ok(StorageEngineType::MySQL),
+        "config" | "configuration" => Err("Use 'save configuration' or 'save config' for configuration saving".to_string()),
         _ => Err(format!(
             "Invalid storage engine: {}. Supported: sled, rocksdb, rocks-db, inmemory, in-memory, redis, postgres, postgresql, postgre-sql, mysql, my-sql",
             engine
@@ -341,21 +310,23 @@ pub async fn run_single_command(
                 storage_daemon_port_arc.clone(),
             ).await?;
         }
-        Commands::Use { action } => {
+        Commands::Use(action) => {
             let mut config = config_mod::load_cli_config()?;
             match action {
                 UseAction::Storage { engine, permanent } => {
-                    // Update CLI config
                     if config.storage.is_none() {
                         config.storage = Some(config_mod::CliTomlStorageConfig::default());
                     }
                     if let Some(storage) = config.storage.as_mut() {
                         storage.storage_engine_type = Some(engine.clone());
                     }
-                    config.save()?;
-                    println!("Set storage engine to {:?}", engine);
+                    if permanent {
+                        config.save()?;
+                        println!("Set storage engine to {:?} (persisted)", engine);
+                    } else {
+                        println!("Set storage engine to {:?} (non-persisted)", engine);
+                    }
 
-                    // Determine engine-specific config file using constants from config.rs
                     let engine_config_file = match engine {
                         StorageEngineType::RocksDB => DEFAULT_STORAGE_CONFIG_PATH_ROCKSDB,
                         StorageEngineType::Sled => DEFAULT_STORAGE_CONFIG_PATH_SLED,
@@ -368,7 +339,6 @@ pub async fn run_single_command(
                         }
                     };
 
-                    // Load core storage settings
                     let storage_config_path = PathBuf::from("/opt/graphdb/storage_data/config.yaml");
                     let storage_settings = if storage_config_path.exists() {
                         StorageSettings::load_from_yaml(&storage_config_path)
@@ -377,7 +347,6 @@ pub async fn run_single_command(
                         StorageSettings::default()
                     };
 
-                    // Load storage-specific config
                     let selected_config = if PathBuf::from(engine_config_file).exists() {
                         SelectedStorageConfig::load_from_yaml(&PathBuf::from(engine_config_file))
                             .with_context(|| format!("Failed to load config from {:?}", engine_config_file))?
@@ -386,14 +355,12 @@ pub async fn run_single_command(
                         SelectedStorageConfig::default()
                     };
 
-                    // Merge configurations (specific overrides core)
                     let mut merged_settings = storage_settings;
                     merged_settings.storage_engine_type = engine.to_string();
                     if let Some(port) = selected_config.storage.port {
                         merged_settings.default_port = port;
                     }
 
-                    // Log merged configuration
                     println!("Storage configuration applied:");
                     println!("- storage_engine_type: {}", merged_settings.storage_engine_type);
                     println!("- config_root_directory: {}", merged_settings.config_root_directory.display());
@@ -401,7 +368,6 @@ pub async fn run_single_command(
                     println!("- log_directory: {}", merged_settings.log_directory.display());
                     println!("- default_port: {}", merged_settings.default_port);
                     println!("- cluster_range: {}", merged_settings.cluster_range);
-                    // Log storage-specific fields
                     if let Some(path) = selected_config.storage.path {
                         println!("- path: {}", path.display());
                     }
@@ -421,21 +387,81 @@ pub async fn run_single_command(
                         println!("- database: {}", database);
                     }
 
-                    // Save merged configuration
-                    let storage_settings_wrapper = StorageSettingsWrapper { storage: merged_settings };
-                    let content = serde_yaml2::to_string(&storage_settings_wrapper)
-                        .with_context(|| "Failed to serialize storage settings")?;
-                    if let Some(parent) = storage_config_path.parent() {
-                        fs::create_dir_all(parent)
-                            .with_context(|| format!("Failed to create config directory {:?}", parent))?;
+                    if permanent {
+                        let storage_settings_wrapper = StorageSettingsWrapper { storage: merged_settings };
+                        let content = serde_yaml2::to_string(&storage_settings_wrapper)
+                            .with_context(|| "Failed to serialize storage settings")?;
+                        if let Some(parent) = storage_config_path.parent() {
+                            fs::create_dir_all(parent)
+                                .with_context(|| format!("Failed to create config directory {:?}", parent))?;
+                        }
+                        fs::write(&storage_config_path, content)
+                            .with_context(|| format!("Failed to write storage config to {:?}", storage_config_path))?;
                     }
-                    fs::write(&storage_config_path, content)
-                        .with_context(|| format!("Failed to write storage config to {:?}", storage_config_path))?;
                 }
                 UseAction::Plugin { enable } => {
                     config.enable_plugins = enable;
                     config.save()?;
-                    println!("Experimental plugins {}", if enable { "enabled" } else { "disabled" });
+                    println!("Plugins {}", if enable { "enabled" } else { "disabled" });
+                }
+            }
+        }
+        Commands::Save(action) => {
+            let mut config = config_mod::load_cli_config()?;
+            match action {
+                SaveAction::Configuration => {
+                    config.save()?;
+                    println!("CLI configuration saved persistently");
+                }
+                SaveAction::Storage => {
+                    if let Some(engine) = config.storage.as_ref().and_then(|s| s.storage_engine_type.clone()) {
+                        let engine_config_file = match engine {
+                            StorageEngineType::RocksDB => DEFAULT_STORAGE_CONFIG_PATH_ROCKSDB,
+                            StorageEngineType::Sled => DEFAULT_STORAGE_CONFIG_PATH_SLED,
+                            StorageEngineType::PostgreSQL => DEFAULT_STORAGE_CONFIG_PATH_POSTGRES,
+                            StorageEngineType::MySQL => DEFAULT_STORAGE_CONFIG_PATH_MYSQL,
+                            StorageEngineType::Redis => DEFAULT_STORAGE_CONFIG_PATH_REDIS,
+                            StorageEngineType::InMemory => {
+                                println!("Storage configuration not saved: InMemory (no persistent config required)");
+                                return Ok(());
+                            }
+                        };
+
+                        let storage_config_path = PathBuf::from("/opt/graphdb/storage_data/config.yaml");
+                        let storage_settings = if storage_config_path.exists() {
+                            StorageSettings::load_from_yaml(&storage_config_path)
+                                .with_context(|| format!("Failed to load core config from {:?}", storage_config_path))?
+                        } else {
+                            StorageSettings::default()
+                        };
+
+                        let selected_config = if PathBuf::from(engine_config_file).exists() {
+                            SelectedStorageConfig::load_from_yaml(&PathBuf::from(engine_config_file))
+                                .with_context(|| format!("Failed to load config from {:?}", engine_config_file))?
+                        } else {
+                            println!("Config file {:?} not found; using default storage-specific settings", engine_config_file);
+                            SelectedStorageConfig::default()
+                        };
+
+                        let mut merged_settings = storage_settings;
+                        merged_settings.storage_engine_type = engine.to_string();
+                        if let Some(port) = selected_config.storage.port {
+                            merged_settings.default_port = port;
+                        }
+
+                        let storage_settings_wrapper = StorageSettingsWrapper { storage: merged_settings };
+                        let content = serde_yaml2::to_string(&storage_settings_wrapper)
+                            .with_context(|| "Failed to serialize storage settings")?;
+                        if let Some(parent) = storage_config_path.parent() {
+                            fs::create_dir_all(parent)
+                                .with_context(|| format!("Failed to create config directory {:?}", parent))?;
+                        }
+                        fs::write(&storage_config_path, content)
+                            .with_context(|| format!("Failed to write storage config to {:?}", storage_config_path))?;
+                        println!("Storage configuration saved persistently");
+                    } else {
+                        println!("No storage engine configured; nothing to save");
+                    }
                 }
             }
         }
@@ -471,8 +497,7 @@ pub async fn run_single_command(
             ).await?;
         }
         Commands::Interactive => {
-            // This is a specific command to enter interactive mode,
-            // which will be handled by the main flow of start_cli().
+            // Handled by the main flow of start_cli()
         }
         Commands::Help(help_args) => {
             let mut cmd = CliArgs::command();
@@ -514,7 +539,6 @@ pub async fn run_single_command(
 
 /// Main entry point for CLI command handling.
 pub async fn start_cli() -> Result<()> {
-    // --- Custom Help Command Handling ---
     let args_vec: Vec<String> = env::args().collect();
     if args_vec.len() > 1 && args_vec[1].to_lowercase() == "help" {
         let help_command_args: Vec<String> = args_vec.into_iter().skip(2).collect();
@@ -527,11 +551,9 @@ pub async fn start_cli() -> Result<()> {
         help_display_mod::print_filtered_help_clap_generated(&mut cmd, &command_filter);
         process::exit(0);
     }
-    // --- End Custom Help Command Handling ---
 
     let args = CliArgs::parse();
 
-    // If any internal daemon run flag is set, handle it and exit
     if args.internal_rest_api_run || args.internal_storage_daemon_run || args.internal_daemon_run {
         let converted_storage_engine = args.internal_storage_engine.map(|se_cli| {
             se_cli.into()
@@ -549,7 +571,6 @@ pub async fn start_cli() -> Result<()> {
         Err(e) => return Err(e),
     };
 
-    // Apply saved storage engine and plugins setting
     if let Some(engine) = config.storage.as_ref().and_then(|s| s.storage_engine_type.clone()) {
         let storage_config_path = PathBuf::from("/opt/graphdb/storage_data/config.yaml");
         if storage_config_path.exists() {
@@ -566,7 +587,6 @@ pub async fn start_cli() -> Result<()> {
         println!("Experimental plugins enabled from config.");
     }
 
-    // Update CliArgs with saved settings
     let args = CliArgs {
         enable_plugins: config.enable_plugins,
         internal_storage_engine: config.storage.as_ref().and_then(|s| s.storage_engine_type.clone()),
@@ -586,7 +606,6 @@ pub async fn start_cli() -> Result<()> {
         return Ok(());
     }
 
-    // Shared state for interactive mode to manage daemon processes
     let daemon_handles: Arc<Mutex<HashMap<u16, (JoinHandle<()>, oneshot::Sender<()>)>>> = Arc::new(Mutex::new(HashMap::new()));
     let rest_api_shutdown_tx_opt: Arc<Mutex<Option<oneshot::Sender<()>>>> = Arc::new(Mutex::new(None));
     let rest_api_port_arc: Arc<Mutex<Option<u16>>> = Arc::new(Mutex::new(None));
@@ -613,7 +632,6 @@ pub async fn start_cli() -> Result<()> {
         ).await?;
 
         if !should_enter_interactive_mode {
-            // Exit if a command was run and interactive mode was not requested
             return Ok(());
         }
     }
