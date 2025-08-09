@@ -2,6 +2,7 @@
 // Refactored: 2025-07-04 - Updated to use new InMemoryGraphStorage and RocksdbGraphStorage.
 
 use std::sync::Arc;
+use std::path::{Path, PathBuf};
 
 // Import the refactored storage engines
 use crate::storage_engine::{GraphStorageEngine, StorageConfig, StorageEngineType, open_sled_db};
@@ -36,9 +37,13 @@ impl Database {
     /// # Returns
     /// A `GraphResult` indicating success or a `GraphError` if initialization fails.
     pub async fn new(config: StorageConfig) -> GraphResult<Self> {
-        let storage_engine: Arc<dyn GraphStorageEngine> = match config.engine_type {
+        let storage_engine: Arc<dyn GraphStorageEngine> = match config.storage_engine_type {
             StorageEngineType::Sled => {
-                let db = open_sled_db(&config.data_path)?;
+                let db_path = match &config.data_directory {
+                    Some(path) => path.as_path(),
+                    None => return Err(GraphError::ConfigError("Sled storage requires a data directory path.".to_string())),
+                };
+                let db = open_sled_db(db_path)?;
                 Arc::new(SledStorage::new(db)?)
             },
             StorageEngineType::RocksDB => {
@@ -55,11 +60,15 @@ impl Database {
                 }
             },
             StorageEngineType::InMemory => { // Added InMemory option
-                Arc::new(InMemoryGraphStorage::new_with_path(&config.data_path))
+                let db_path = match &config.data_directory {
+                    Some(path) => path.clone(),
+                    None => return Err(GraphError::ConfigError("In-memory storage requires a data directory path.".to_string())),
+                };
+                Arc::new(InMemoryGraphStorage::new_with_path(db_path))
             }
             // Add other storage types here as they are implemented (e.g., PostgreSQL, Redis)
             _ => return Err(GraphError::ConfigError(
-                format!("Unsupported storage engine type: {:?}", config.engine_type)
+                format!("Unsupported storage engine type: {:?}", config.storage_engine_type)
             )),
         };
 
@@ -147,4 +156,3 @@ impl Database {
         self.storage_engine.as_ref().stop().await
     }
 }
-

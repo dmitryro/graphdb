@@ -813,7 +813,8 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                     return (CommandType::Unknown, parsed_remaining_args);
                                 }
                             };
-                            CommandType::UseStorage { engine }
+                            let permanent = true;
+                            CommandType::UseStorage { engine, permanent }
                         }
                     },
                     "plugin" => {
@@ -1348,7 +1349,7 @@ pub async fn handle_interactive_command(
             handlers::register_user(username, password).await;
             Ok(())
         }
-        CommandType::UseStorage { engine } => {
+        CommandType::UseStorage { engine, permanent } => {
             handlers::use_storage_engine(engine).await;
             Ok(())
         }

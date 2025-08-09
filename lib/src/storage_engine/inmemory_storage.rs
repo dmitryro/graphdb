@@ -1,4 +1,7 @@
 // lib/src/storage_engine/inmemory_storage.rs
+// ADDED: 2025-08-08 - Enhanced InMemoryStorage to support generic key-value operations for hybrid storage.
+// UPDATED: 2025-08-08 - Improved thread safety and performance with RwLock.
+
 use super::config::StorageConfig;
 use super::storage_engine::{GraphStorageEngine, StorageEngine};
 use async_trait::async_trait;
@@ -14,6 +17,7 @@ use uuid::Uuid;
 pub struct InMemoryStorage {
     vertices: Arc<RwLock<HashMap<Uuid, Vertex>>>,
     edges: Arc<RwLock<HashMap<(Uuid, Identifier, Uuid), Edge>>>,
+    kv_store: Arc<RwLock<HashMap<Vec<u8>, Vec<u8>>>>, // Added for generic K/V operations
     config: StorageConfig,
     running: Arc<RwLock<bool>>,
 }
@@ -23,6 +27,7 @@ impl InMemoryStorage {
         Ok(InMemoryStorage {
             vertices: Arc::new(RwLock::new(HashMap::new())),
             edges: Arc::new(RwLock::new(HashMap::new())),
+            kv_store: Arc::new(RwLock::new(HashMap::new())),
             config,
             running: Arc::new(RwLock::new(false)),
         })
@@ -32,18 +37,25 @@ impl InMemoryStorage {
 #[async_trait]
 impl StorageEngine for InMemoryStorage {
     async fn connect(&self) -> Result<(), GraphError> {
+        let mut running = self.running.write().await;
+        *running = true;
         Ok(())
     }
 
-    async fn insert(&self, _key: &[u8], _value: &[u8]) -> Result<(), GraphError> {
+    async fn insert(&self, key: &[u8], value: &[u8]) -> Result<(), GraphError> {
+        let mut kv_store = self.kv_store.write().await;
+        kv_store.insert(key.to_vec(), value.to_vec());
         Ok(())
     }
 
-    async fn retrieve(&self, _key: &[u8]) -> Result<Option<Vec<u8>>, GraphError> {
-        Ok(None)
+    async fn retrieve(&self, key: &[u8]) -> Result<Option<Vec<u8>>, GraphError> {
+        let kv_store = self.kv_store.read().await;
+        Ok(kv_store.get(key).cloned())
     }
 
-    async fn delete(&self, _key: &[u8]) -> Result<(), GraphError> {
+    async fn delete(&self, key: &[u8]) -> Result<(), GraphError> {
+        let mut kv_store = self.kv_store.write().await;
+        kv_store.remove(key);
         Ok(())
     }
 
@@ -74,13 +86,17 @@ impl GraphStorageEngine for InMemoryStorage {
         *self.running.blocking_read()
     }
 
-    async fn query(&self, _query_string: &str) -> Result<Value, GraphError> {
-        Ok(Value::Null)
+    async fn query(&self, query_string: &str) -> Result<Value, GraphError> {
+        Ok(serde_json::json!({
+            "status": "success",
+            "query": query_string,
+            "result": "InMemory query execution placeholder"
+        }))
     }
 
     async fn create_vertex(&self, vertex: Vertex) -> Result<(), GraphError> {
         let mut vertices = self.vertices.write().await;
-        vertices.insert(vertex.id.into(), vertex); // Convert SerializableUuid to Uuid
+        vertices.insert(vertex.id.0, vertex);
         Ok(())
     }
 
@@ -91,13 +107,16 @@ impl GraphStorageEngine for InMemoryStorage {
 
     async fn update_vertex(&self, vertex: Vertex) -> Result<(), GraphError> {
         let mut vertices = self.vertices.write().await;
-        vertices.insert(vertex.id.into(), vertex); // Convert SerializableUuid to Uuid
+        vertices.insert(vertex.id.0, vertex);
         Ok(())
     }
 
     async fn delete_vertex(&self, id: &Uuid) -> Result<(), GraphError> {
         let mut vertices = self.vertices.write().await;
         vertices.remove(id);
+        // Also remove associated edges
+        let mut edges = self.edges.write().await;
+        edges.retain(|(out_id, _, in_id), _| *out_id != *id && *in_id != *id);
         Ok(())
     }
 
@@ -108,38 +127,22 @@ impl GraphStorageEngine for InMemoryStorage {
 
     async fn create_edge(&self, edge: Edge) -> Result<(), GraphError> {
         let mut edges = self.edges.write().await;
-        edges.insert(
-            (edge.outbound_id.into(), edge.t.clone(), edge.inbound_id.into()), // Convert SerializableUuid to Uuid
-            edge,
-        );
+        edges.insert((edge.outbound_id.0, edge.t.clone(), edge.inbound_id.0), edge);
         Ok(())
     }
 
-    async fn get_edge(
-        &self,
-        outbound_id: &Uuid,
-        edge_type: &Identifier,
-        inbound_id: &Uuid,
-    ) -> Result<Option<Edge>, GraphError> {
+    async fn get_edge(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> Result<Option<Edge>, GraphError> {
         let edges = self.edges.read().await;
         Ok(edges.get(&(*outbound_id, edge_type.clone(), *inbound_id)).cloned())
     }
 
     async fn update_edge(&self, edge: Edge) -> Result<(), GraphError> {
         let mut edges = self.edges.write().await;
-        edges.insert(
-            (edge.outbound_id.into(), edge.t.clone(), edge.inbound_id.into()), // Convert SerializableUuid to Uuid
-            edge,
-        );
+        edges.insert((edge.outbound_id.0, edge.t.clone(), edge.inbound_id.0), edge);
         Ok(())
     }
 
-    async fn delete_edge(
-        &self,
-        outbound_id: &Uuid,
-        edge_type: &Identifier,
-        inbound_id: &Uuid,
-    ) -> Result<(), GraphError> {
+    async fn delete_edge(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> Result<(), GraphError> {
         let mut edges = self.edges.write().await;
         edges.remove(&(*outbound_id, edge_type.clone(), *inbound_id));
         Ok(())

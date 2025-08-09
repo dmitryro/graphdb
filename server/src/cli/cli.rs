@@ -344,7 +344,7 @@ pub async fn run_single_command(
         Commands::Use { action } => {
             let mut config = config_mod::load_cli_config()?;
             match action {
-                UseAction::Storage { engine } => {
+                UseAction::Storage { engine, permanent } => {
                     // Update CLI config
                     if config.storage.is_none() {
                         config.storage = Some(config_mod::CliTomlStorageConfig::default());

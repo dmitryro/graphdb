@@ -1,4 +1,7 @@
 // storage_daemon_server/src/lib.rs
+// Fixed: 2025-08-10 - Corrected StorageConfig initialization to match expected fields and types
+// Fixed: 2025-08-10 - Converted Map<String, Value> to HashMap<String, Value> for engine_specific_config
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
@@ -19,9 +22,10 @@ use openraft::storage::SnapshotMeta;
 use std::str::FromStr;
 use serde_yaml2 as serde_yaml;
 use std::io::Cursor;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use log::{info, warn, error};
 use simplelog::{CombinedLogger, TermLogger, WriteLogger, LevelFilter, Config, ConfigBuilder, TerminalMode, ColorChoice};
+use serde_json::{Value, Map};
 
 // Declare the storage_client module.
 pub mod storage_client;
@@ -503,11 +507,20 @@ pub async fn start_storage_daemon_server_real(
 
     // Initialize the storage engine
     let storage_config = StorageConfig {
-        engine_type: StorageEngineType::from_str(&settings.storage_engine_type)
+        storage_engine_type: StorageEngineType::from_str(&settings.storage_engine_type)
             .map_err(|e| anyhow::anyhow!("Invalid storage engine type: {}", e))?,
-        data_path: settings.data_directory.to_string_lossy().to_string(),
-        engine_specific_config: settings.engine_specific_config.map(|config| serde_json::to_string(&config).unwrap_or_default()),
-        max_open_files: Some(settings.max_open_files as i32),
+        data_directory: Some(settings.data_directory),
+        engine_specific_config: settings.engine_specific_config.map(|config| {
+            serde_json::to_value(&config)
+                .map(|value| value.as_object().unwrap().clone().into_iter().collect::<HashMap<String, Value>>())
+                .map_err(|e| anyhow::anyhow!("Failed to serialize engine_specific_config: {}", e))
+                .unwrap()
+        }),
+        max_open_files: Some(settings.max_open_files as usize),
+        connection_string: match settings.storage_engine_type.as_str() {
+            "redis" | "postgresql" | "mysql" => Some(format!("{}:{}", settings.cluster_range, port)),
+            _ => None,
+        },
     };
     let storage = create_storage(storage_config)?;
     info!("[Storage Daemon] Initialized storage backend: {}", settings.storage_engine_type);
