@@ -1,49 +1,41 @@
-
 // server/src/cli/handlers.rs
 
-// This file contains the handlers for various CLI commands, encapsulating
-// the logic for interacting with daemon, REST API, and storage components.
+// This file contains the handlers for top-level CLI commands, encapsulating
+// logic for starting, stopping, reloading, and managing the status of GraphDB components,
+// as well as cluster and plugin operations.
 
-use anyhow::{Result, Context, anyhow}; // Added `anyhow` macro import
+use anyhow::{Result, Context, anyhow};
 use std::collections::HashMap;
 use std::path::{PathBuf, Path};
 use tokio::sync::{oneshot, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
-use rand;
 use std::sync::Arc;
-use std::net::{IpAddr, SocketAddr};
-use tokio::process::Command as TokioCommand;
-use std::process::Stdio;
-use std::time::{Duration, Instant};
-use std::ops::RangeInclusive;
-use std::io::{self, Write};
-use futures::future; // Added for parallel execution
+use std::time::Duration;
 use futures::stream::StreamExt;
-use sysinfo::Pid;
-use chrono::Utc;
-use config::Config;
 use log::{info, error, warn, debug};
+use config::Config;
 use std::fs;
-use reqwest::Client;
-use serde_json::Value;
-use fs2;
 
 // Import command structs from commands.rs
-use crate::cli::commands::{CommandType, Commands, DaemonCliCommand, RestCliCommand, StorageAction, StatusArgs, StopAction, StopArgs,
-                           StartAction, ReloadArgs, CliArgs, StatusAction, ReloadAction, RestartArgs, RestartAction};
-use crate::cli::config::{load_storage_config_str as load_storage_config, DEFAULT_DAEMON_PORT, DEFAULT_REST_API_PORT, 
-                         DEFAULT_STORAGE_PORT, DEFAULT_STORAGE_CONFIG_PATH_RELATIVE, DEFAULT_REST_CONFIG_PATH_RELATIVE,
-                         DEFAULT_CONFIG_ROOT_DIRECTORY_STR, DEFAULT_DAEMON_CONFIG_PATH_RELATIVE, DEFAULT_MAIN_APP_CONFIG_PATH_RELATIVE,
-                         CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS, DAEMON_REGISTRY_DB_PATH, StorageConfig, 
-                         get_default_rest_port_from_config, load_main_daemon_config, load_daemon_config, load_storage_config_from_yaml, 
-                         daemon_api_storage_engine_type_to_string, RestApiConfig, MainDaemonConfig, load_rest_config, 
-                         CliConfig, default_config_root_directory, CliTomlStorageConfig, load_cli_config};
-use crate::cli::daemon_management::{find_running_storage_daemon_port, clear_all_daemon_processes, start_daemon_process, 
-                                    stop_daemon_api_call, handle_internal_daemon_run, load_storage_config_path_or_default,
-                                    run_command_with_timeout, is_port_free, find_pid_by_port, is_rest_api_running,
-                                    find_all_running_daemon_ports, check_process_status_by_port, parse_cluster_range,
-                                    find_all_running_rest_api_ports, start_daemon_with_pid, is_port_listening,
-                                    stop_process_by_port}; // Added handle_internal_daemon_run
+use crate::cli::commands::{
+    Commands, StatusArgs, StopArgs, StopAction, StatusAction, ReloadArgs, ReloadAction,
+    RestartArgs, RestartAction
+};
+
+// Import configuration-related items
+use crate::cli::config::{
+    DEFAULT_DAEMON_PORT, DEFAULT_REST_API_PORT, DEFAULT_STORAGE_PORT,
+    DEFAULT_CONFIG_ROOT_DIRECTORY_STR, DEFAULT_STORAGE_CONFIG_PATH_RELATIVE,
+    CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS, load_storage_config_str as load_storage_config, 
+    load_cli_config, CliConfig
+};
+
+// Import daemon management utilities
+use crate::cli::daemon_management::{
+    is_port_free, parse_cluster_range, stop_process_by_port, find_all_running_rest_api_ports,
+    find_running_storage_daemon_port
+};
+
 pub use crate::cli::handlers_utils::{get_current_exe_path, format_engine_config, print_welcome_screen, write_registry_fallback, 
                                      read_registry_fallback, clear_terminal_screen, ensure_daemon_registry_paths_exist,
                                      execute_storage_query};
@@ -58,18 +50,9 @@ pub use crate::cli::handlers_all::{stop_all_interactive, reload_all_interactive,
                                    display_full_status_summary};     
 pub use crate::cli::handlers_main::{display_daemon_status, handle_daemon_command, handle_daemon_command_interactive, 
                                     start_daemon_instance_interactive, stop_main_interactive, reload_daemon_interactive,
-                                    stop_daemon_instance_interactive};                                                  
+                                    stop_daemon_instance_interactive};   
 use daemon_api::{stop_daemon, start_daemon};
-use daemon_api::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
-use lib::storage_engine::config::{StorageEngineType};
-use serde_yaml2 as serde_yaml; // Use serde_yaml2 for YAML parsing
-
-// Placeholder imports for daemon and rest args, assuming they exist in your project structure
-#[derive(Debug, Clone)]
-pub struct DaemonArgs {
-    pub port: Option<u16>,
-    pub cluster: Option<String>,
-}
+use daemon_api::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};                                    
 
 /// Displays the Raft status for a storage daemon running on the specified port.
 pub async fn display_raft_status(port: Option<u16>) -> Result<()> {

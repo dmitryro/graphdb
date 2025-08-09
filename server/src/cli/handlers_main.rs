@@ -12,6 +12,13 @@ use log::{info, error, warn, debug};
 use std::fs;
 use chrono::Utc;
 
+// Placeholder struct for daemon args
+#[derive(Debug, Clone)]
+pub struct DaemonArgs {
+    pub port: Option<u16>,
+    pub cluster: Option<String>,
+}
+
 // Import command structs from commands.rs
 use crate::cli::commands::DaemonCliCommand;
 
