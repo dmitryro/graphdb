@@ -10,6 +10,11 @@ pub mod daemon_management;
 pub mod handlers;
 pub mod help_display;
 pub mod interactive;
+pub mod handlers_utils;
+pub mod handlers_main;
+pub mod handlers_storage;
+pub mod handlers_rest;
+pub mod handlers_all;
 
 // Re-export the main CLI entry point from cli.rs
 pub use cli::{start_cli, CliArgs, Commands}; // Corrected: Changed run_cli to start_cli
@@ -50,10 +55,61 @@ pub use commands::{
     RestartAction,
     StatusAction,
 };
-pub use handlers::{
+pub use handlers_utils::{
+    get_current_exe_path,
+    format_engine_config,
+    write_registry_fallback,
+    read_registry_fallback,
+    print_welcome_screen,
+    clear_terminal_screen,
+    ensure_daemon_registry_paths_exist,
+    execute_storage_query,
+};
+pub use handlers_main::{
+    display_daemon_status,
     handle_daemon_command,
-    handle_rest_command,
+    handle_daemon_command_interactive,
+    start_daemon_instance_interactive, 
+    stop_main_interactive,
+    stop_daemon_instance_interactive,
+    reload_daemon_interactive,
+};  
+pub use handlers_storage::{
+    storage,
+    display_storage_daemon_status,
     handle_storage_command,
+    handle_storage_command_interactive,
+    start_storage_interactive,
+    stop_storage,
+    stop_storage_interactive,
+    use_storage_engine,
+    handle_save_storage,
+    reload_storage_interactive,
+};
+pub use handlers_rest::{
+    RestArgs,
+    rest,
+    register_user,
+    authenticate_user,
+    display_rest_api_status,
+    handle_rest_command,
+    handle_rest_command_interactive,
+    start_rest_api_interactive,
+    stop_rest_api_interactive,
+    display_rest_api_health,
+    display_rest_api_version,
+    execute_graph_query,
+    reload_rest_interactive,
+};
+
+pub use handlers_all::{
+    stop_all_interactive,
+    reload_all_interactive,
+    handle_start_all_interactive,
+    display_full_status_summary,
+};
+  
+pub use handlers::{
     handle_status_command,
     handle_stop_command,
     handle_start_command,
@@ -71,7 +127,6 @@ pub use help_display::{
     print_interactive_help,
     print_interactive_filtered_help,
 };
-
 pub use daemon_management::{
     start_daemon_process,
     stop_daemon_api_call,
