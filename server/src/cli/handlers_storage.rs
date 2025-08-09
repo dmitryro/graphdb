@@ -44,11 +44,18 @@ use crate::cli::daemon_management::{
     stop_process_by_port,
     parse_cluster_range,
 };
-use crate::cli::handlers_utils::{format_engine_config, write_registry_fallback};
+use crate::cli::handlers_utils::{format_engine_config, write_registry_fallback, execute_storage_query};
 
 use daemon_api::start_daemon;
 use daemon_api::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
 use lib::storage_engine::config::{StorageEngineType};
+
+pub mod storage {
+    pub mod api {
+        use anyhow::Result;
+        pub async fn check_storage_daemon_status(_port: u16) -> Result<String> { Ok("Running".to_string()) }
+    }
+}
 
 // This version of the function adds detailed debug logging to pinpoint
 // the exact line where the program is failing. The issue is likely
@@ -370,11 +377,6 @@ pub async fn stop_storage_interactive(
     } else {
         Err(anyhow!("Failed to stop storage daemon: {:?}", errors))
     }
-}
-
-pub async fn execute_storage_query() {
-    println!("Executing storage query...");
-    println!("Storage query executed (placeholder).");
 }
 
 /// Displays status of storage daemons only.

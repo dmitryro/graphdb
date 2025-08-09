@@ -12,6 +12,7 @@ pub mod help_display;
 pub mod interactive;
 pub mod handlers_utils;
 pub mod handlers_storage;
+pub mod handlers_rest;
 
 // Re-export the main CLI entry point from cli.rs
 pub use cli::{start_cli, CliArgs, Commands}; // Corrected: Changed run_cli to start_cli
@@ -60,10 +61,11 @@ pub use handlers_utils::{
     print_welcome_screen,
     clear_terminal_screen,
     ensure_daemon_registry_paths_exist,
+    execute_storage_query,
 };
 pub use handlers_storage::{
+    storage,
     display_storage_daemon_status,
-    execute_storage_query,
     handle_storage_command,
     handle_storage_command_interactive,
     start_storage_interactive,
@@ -73,9 +75,23 @@ pub use handlers_storage::{
     handle_save_storage,
     reload_storage_interactive,
 };
+pub use handlers_rest::{
+    RestArgs,
+    rest,
+    register_user,
+    authenticate_user,
+    display_rest_api_status,
+    handle_rest_command,
+    handle_rest_command_interactive,
+    start_rest_api_interactive,
+    stop_rest_api_interactive,
+    display_rest_api_health,
+    display_rest_api_version,
+    execute_graph_query,
+};
+  
 pub use handlers::{
     handle_daemon_command,
-    handle_rest_command,
     handle_status_command,
     handle_stop_command,
     handle_start_command,
