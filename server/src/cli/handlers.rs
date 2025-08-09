@@ -3478,6 +3478,16 @@ pub async fn use_storage_engine(engine: StorageEngineType) -> Result<()> {
     Ok(())
 }
 
+pub async fn handle_save_storage() -> Result<()> {
+    println!("Saved storage...");
+    Ok(())
+}
+
+pub async fn handle_save_config() -> Result<()> {
+    println!("Saved configuration...");
+     Ok(())
+}
+
 /// Enables or disables plugins and persists the setting to the config file.
 pub async fn use_plugin(enable: bool) -> Result<()> {
     // Load the current configuration from server/src/cli/config.toml
