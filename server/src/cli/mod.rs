@@ -66,6 +66,7 @@ pub use handlers_utils::{
     execute_storage_query,
 };
 pub use handlers_main::{
+    DaemonArgs,
     display_daemon_status,
     handle_daemon_command,
     handle_daemon_command_interactive,
