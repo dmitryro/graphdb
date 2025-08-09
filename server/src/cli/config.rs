@@ -11,6 +11,9 @@
 // FIXED: 2025-08-09 - Ensured `load_engine_specific_config` loads engine-specific YAML files correctly.
 // FIXED: 2025-08-09 - Added `Redis` branch to `get_engine_config_path` to handle `StorageEngineType::Redis`.
 // UPDATED: 2025-08-08 - Reverted `StorageEngineConfig` back to `StorageConfigInner` per user request, maintaining same fields and serialization.
+// ADDED: 2025-08-09 - Added `UseStorage` subcommand to `Commands` for switching storage engines via `StorageEngineManager`.
+// UPDATED: 2025-08-09 - Added `execute` method to `CliConfig` to handle `UseStorage` command with session-based or permanent engine switching.
+// FIXED: 2025-08-10 - Corrected `Commands::UseStorage` to `Commands::Use(UseAction::Storage)` in match arms to fix E0599 errors.
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -28,7 +31,9 @@ use toml;
 use serde_yaml2 as serde_yaml;
 use crate::cli::commands::{Commands, CommandType, StatusArgs, RestartArgs, ReloadArgs, RestartAction, 
                            ReloadAction, RestCliCommand, StatusAction, StorageAction, 
-                           StartAction, StopAction, StopArgs, DaemonCliCommand};
+                           StartAction, StopAction, StopArgs, DaemonCliCommand, UseAction};
+pub use lib::storage_engine::storage_engine::{StorageEngineManager};
+pub use models::errors::GraphError;
 pub use lib::storage_engine::config::StorageEngineType;
 
 // --- Custom PathBuf Serialization Module ---
@@ -336,7 +341,7 @@ impl Default for StorageConfig {
             max_disk_space_gb: 1000,
             min_disk_space_gb: 10,
             use_raft_for_scale: true,
-            storage_engine_type: StorageEngineType::Sled,
+            storage_engine_type: StorageEngineType::RocksDB, // Default to RocksDB for hybrid storage
             engine_specific_config: Some(SelectedStorageConfig::default()),
             max_open_files: 1024,
         }
@@ -450,8 +455,18 @@ pub struct CliConfig {
     pub config_root_directory: Option<PathBuf>,
 }
 
-// --- CLI Config Loading ---
 impl CliConfig {
+    pub async fn execute(&self, manager: &mut StorageEngineManager) -> Result<(), GraphError> {
+        match &self.command {
+            Commands::Use(UseAction::Storage { engine, permanent }) => {
+                manager.use_storage(*engine, *permanent).await?;
+                println!("Switched to storage engine: {:?}", engine);
+                Ok(())
+            }
+            _ => Ok(()), // Other commands handled elsewhere
+        }
+    }
+
     pub fn load(interactive_command: Option<CommandType>) -> Result<Self> {
         let mut args = if let Some(cmd) = interactive_command {
             // Construct CliConfig from CommandType in interactive mode
@@ -624,6 +639,7 @@ impl CliConfig {
                 Commands::Storage(StorageAction::Status { port, .. }) => *port,
                 Commands::Restart(RestartArgs { action: RestartAction::Storage { port, storage_port, .. } }) => storage_port.or(*port),
                 Commands::Restart(RestartArgs { action: RestartAction::All { storage_port, .. } }) => *storage_port,
+                Commands::Use(UseAction::Storage { .. }) => Some(DEFAULT_STORAGE_PORT),
                 _ => Some(load_storage_config_from_yaml(None).map(|c| c.default_port).unwrap_or(DEFAULT_STORAGE_PORT)),
             };
         }
@@ -638,6 +654,7 @@ impl CliConfig {
                 Commands::Storage(StorageAction::Status { cluster, .. }) => cluster.clone(),
                 Commands::Restart(RestartArgs { action: RestartAction::Storage { cluster, storage_cluster, .. } }) => storage_cluster.clone().or_else(|| cluster.clone()),
                 Commands::Restart(RestartArgs { action: RestartAction::All { storage_cluster, .. } }) => storage_cluster.clone(),
+                Commands::Use(UseAction::Storage { .. }) => Some(DEFAULT_STORAGE_PORT.to_string()),
                 _ => Some(load_storage_config_from_yaml(None).map(|c| c.cluster_range).unwrap_or_else(|_| StorageConfig::default().cluster_range)),
             };
         }
@@ -777,6 +794,9 @@ impl CliConfig {
             Commands::Daemon(DaemonCliCommand::Start { .. }) => {
                 Ok(MainDaemonConfig::default().data_directory)
             }
+            Commands::Use(UseAction::Storage { .. }) => {
+                Ok(StorageConfig::default().data_directory.to_string_lossy().into_owned())
+            }
             _ => Err(anyhow!("Not in a start/cli context to retrieve data directory.")),
         }
     }
@@ -797,6 +817,9 @@ impl CliConfig {
             }
             Commands::Daemon(DaemonCliCommand::Start { .. }) => {
                 Ok(MainDaemonConfig::default().log_directory)
+            }
+            Commands::Use(UseAction::Storage { .. }) => {
+                Ok(StorageConfig::default().log_directory)
             }
             _ => Err(anyhow!("Not in a start/cli context to retrieve log directory.")),
         }

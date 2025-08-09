@@ -74,7 +74,8 @@ models = { path = "../models", features = ["rocksdb-errors", "sled-errors", "bin
 caching = { path = "../caching" }  # In-memory caching
 bcrypt = "0.15.1" # Aligned with models (highest version)
 regex = "1.11.1" # Consistent
-mysql = "26.0.1"
+mysql = { version="26.0.1", optional = true}
+serde_yaml2 = "0.1.3"
 
 [dev-dependencies]
 tempfile = "3.20.0"  # Temporary storage for tests
@@ -88,6 +89,7 @@ sled-datastore = ["sled"] # No longer needs to list "sled" as sled is always act
 rocksdb-datastore = ["rocksdb"] # Still needs to list rocksdb if it's optional
 redis-datastore = ["redis"]
 postgres-datastore = ["sqlx"]
+mysql-datastore = ["mysql"]
 in-memory-datastore = ["dashmap"]
 test-suite = []
 bench-suite = []
