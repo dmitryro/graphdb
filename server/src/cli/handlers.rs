@@ -41,16 +41,18 @@ pub use crate::cli::handlers_utils::{get_current_exe_path, format_engine_config,
                                      execute_storage_query};
 pub use crate::cli::handlers_storage::{storage, start_storage_interactive, stop_storage_interactive, show_storage,
                                        display_storage_daemon_status, handle_storage_command, handle_storage_command_interactive, 
-                                       stop_storage, use_storage_engine, handle_save_storage, reload_storage_interactive};
+                                       stop_storage, use_storage_engine, handle_save_storage, reload_storage_interactive,
+                                       handle_use_storage_interactive, handle_use_storage_command, handle_show_storage_command,
+                                       handle_show_storage_command_interactive, handle_show_storage_config_command};
 pub use crate::cli::handlers_rest::{RestArgs, rest, display_rest_api_status, handle_rest_command, handle_rest_command_interactive, 
                                     start_rest_api_interactive, stop_rest_api_interactive,  display_rest_api_health,
                                     display_rest_api_version, register_user, authenticate_user, execute_graph_query,
-                                    reload_rest_interactive};     
+                                    reload_rest_interactive, handle_show_rest_config_command};     
 pub use crate::cli::handlers_all::{stop_all_interactive, reload_all_interactive, handle_start_all_interactive, 
-                                   display_full_status_summary};     
+                                   display_full_status_summary, handle_show_all_config_command};     
 pub use crate::cli::handlers_main::{display_daemon_status, handle_daemon_command, handle_daemon_command_interactive, 
                                     start_daemon_instance_interactive, stop_main_interactive, reload_daemon_interactive,
-                                    stop_daemon_instance_interactive};   
+                                    stop_daemon_instance_interactive, handle_show_main_config_command};   
 use daemon_api::{stop_daemon, start_daemon};
 use daemon_api::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};                                    
 
@@ -893,6 +895,21 @@ pub async fn handle_reload_command_interactive(
     // assuming the "interactive use case" means it's callable in an interactive shell.
     handle_reload_command(reload_args).await
 }
+
+pub async fn handle_show_plugins_command() -> Result<()> {
+     let config = load_cli_config()?;
+     println!("Plugins Enabled: {}", config.enable_plugins);
+     println!("Plugins will be shown here...");
+     Ok(())
+}
+
+pub async fn handle_show_plugins_command_interactive() -> Result<()> {
+     let config = load_cli_config()?;
+     println!("Plugins Enabled: {}", config.enable_plugins);
+     println!("Plugins will be shown here...");
+     Ok(())
+}
+
 
 pub async fn handle_save_config() -> Result<()> {
     println!("Saved configuration...");

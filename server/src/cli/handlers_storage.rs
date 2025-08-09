@@ -779,3 +779,80 @@ pub async fn reload_storage_interactive(
     println!("Standalone Storage daemon reloaded.");
     Ok(())
 }
+
+/// Handles the 'use storage' command.
+/// This function is responsible for both updating the configuration file and
+/// setting the in-memory state for the running CLI session.
+pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bool) -> Result<()> {
+    // Load the current CLI configuration
+    let mut config = load_cli_config()
+        .map_err(|e| anyhow!("Failed to load CLI config: {}", e))?;
+
+    // Ensure the storage section exists in the config
+    if config.storage.is_none() {
+        config.storage = Some(CliTomlStorageConfig::default());
+    }
+
+    // Get a mutable reference to the storage config
+    if let Some(storage_config) = config.storage.as_mut() {
+        // Update the storage engine type
+        storage_config.storage_engine_type = Some(engine.clone());
+    }
+
+    // If the 'permanent' flag is set, save the updated configuration to disk
+    if permanent {
+        config.save()
+            .map_err(|e| anyhow!("Failed to save CLI config: {}", e))?;
+        println!("Set storage engine to {:?} (persisted)", engine);
+    } else {
+        println!("Set storage engine to {:?} (non-persisted)", engine);
+    }
+
+    Ok(())
+}
+
+/// Handles the 'show storage' command.
+pub async fn handle_show_storage_command() -> Result<()> {
+    let config = load_cli_config()
+        .map_err(|e| anyhow!("Failed to load CLI config: {}", e))?;
+    let engine_type = config.storage.and_then(|s| s.storage_engine_type);
+    println!("Current Storage Engine: {:?}", engine_type);
+    Ok(())
+}
+
+pub async fn handle_show_storage_command_interactive() -> Result<()> {
+    let config = load_cli_config()
+        .map_err(|e| anyhow!("Failed to load CLI config: {}", e))?;
+    let engine_type = config.storage.and_then(|s| s.storage_engine_type);
+    println!("Current Storage Engine: {:?}", engine_type);
+    Ok(())
+}
+
+/// Handles the interactive 'use storage' command.
+/// This function first calls the core handler to save the config, then
+/// reloads the storage daemon to apply the new settings.
+pub async fn handle_use_storage_interactive(
+    engine: StorageEngineType,
+    permanent: bool,
+    storage_daemon_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
+    storage_daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
+    storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
+) -> Result<()> {
+    // 1. First, save the configuration to disk
+    handle_use_storage_command(engine, permanent).await?;
+
+    // 2. Then, reload the storage daemon to apply the new configuration
+    reload_storage_interactive(
+        storage_daemon_shutdown_tx_opt,
+        storage_daemon_handle,
+        storage_daemon_port_arc,
+    ).await?;
+
+    Ok(())
+}
+
+pub async fn handle_show_storage_config_command() -> Result<()> {
+    println!("'show config storage' command is not yet fully implemented.");
+    Ok(())
+}
+

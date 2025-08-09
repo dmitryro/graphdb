@@ -62,7 +62,7 @@ use crate::cli::commands::{
     DaemonCliCommand, RestCliCommand, StorageAction, UseAction, SaveAction,
     StatusArgs, StopArgs, ReloadArgs, RestartArgs,
     ReloadAction, RestartAction, StartAction, StopAction, StatusAction,
-    HelpArgs, ShowAction,
+    HelpArgs, ShowAction, ConfigAction,
 };
 use crate::cli::config::{
     self, DEFAULT_STORAGE_CONFIG_PATH_ROCKSDB, DEFAULT_STORAGE_CONFIG_PATH_SLED,
@@ -313,98 +313,18 @@ pub async fn run_single_command(
             ).await?;
         }
         Commands::Use(action) => {
-            let mut config = config_mod::load_cli_config()?;
             match action {
                 UseAction::Storage { engine, permanent } => {
-                    if config.storage.is_none() {
-                        config.storage = Some(config_mod::CliTomlStorageConfig::default());
-                    }
-                    if let Some(storage) = config.storage.as_mut() {
-                        storage.storage_engine_type = Some(engine.clone());
-                    }
-                    if permanent {
-                        config.save()?;
-                        println!("Set storage engine to {:?} (persisted)", engine);
-                    } else {
-                        println!("Set storage engine to {:?} (non-persisted)", engine);
-                    }
-
-                    let engine_config_file = match engine {
-                        StorageEngineType::RocksDB => DEFAULT_STORAGE_CONFIG_PATH_ROCKSDB,
-                        StorageEngineType::Sled => DEFAULT_STORAGE_CONFIG_PATH_SLED,
-                        StorageEngineType::PostgreSQL => DEFAULT_STORAGE_CONFIG_PATH_POSTGRES,
-                        StorageEngineType::MySQL => DEFAULT_STORAGE_CONFIG_PATH_MYSQL,
-                        StorageEngineType::Redis => DEFAULT_STORAGE_CONFIG_PATH_REDIS,
-                        StorageEngineType::InMemory => {
-                            println!("Storage configuration applied: InMemory (no persistent config required)");
-                            return Ok(());
-                        }
-                    };
-
-                    let storage_config_path = PathBuf::from("/opt/graphdb/storage_data/config.yaml");
-                    let storage_settings = if storage_config_path.exists() {
-                        StorageSettings::load_from_yaml(&storage_config_path)
-                            .with_context(|| format!("Failed to load core config from {:?}", storage_config_path))?
-                    } else {
-                        StorageSettings::default()
-                    };
-
-                    let selected_config = if PathBuf::from(engine_config_file).exists() {
-                        SelectedStorageConfig::load_from_yaml(&PathBuf::from(engine_config_file))
-                            .with_context(|| format!("Failed to load config from {:?}", engine_config_file))?
-                    } else {
-                        println!("Config file {:?} not found; using default storage-specific settings", engine_config_file);
-                        SelectedStorageConfig::default()
-                    };
-
-                    let mut merged_settings = storage_settings;
-                    merged_settings.storage_engine_type = engine.to_string();
-                    if let Some(port) = selected_config.storage.port {
-                        merged_settings.default_port = port;
-                    }
-
-                    println!("Storage configuration applied:");
-                    println!("- storage_engine_type: {}", merged_settings.storage_engine_type);
-                    println!("- config_root_directory: {}", merged_settings.config_root_directory.display());
-                    println!("- data_directory: {}", merged_settings.data_directory.display());
-                    println!("- log_directory: {}", merged_settings.log_directory.display());
-                    println!("- default_port: {}", merged_settings.default_port);
-                    println!("- cluster_range: {}", merged_settings.cluster_range);
-                    if let Some(path) = selected_config.storage.path {
-                        println!("- path: {}", path.display());
-                    }
-                    if let Some(host) = selected_config.storage.host {
-                        println!("- host: {}", host);
-                    }
-                    if let Some(port) = selected_config.storage.port {
-                        println!("- port: {}", port);
-                    }
-                    if let Some(username) = selected_config.storage.username {
-                        println!("- username: {}", username);
-                    }
-                    if selected_config.storage.password.is_some() {
-                        println!("- password: *****");
-                    }
-                    if let Some(database) = selected_config.storage.database {
-                        println!("- database: {}", database);
-                    }
-
-                    if permanent {
-                        let storage_settings_wrapper = StorageSettingsWrapper { storage: merged_settings };
-                        let content = serde_yaml2::to_string(&storage_settings_wrapper)
-                            .with_context(|| "Failed to serialize storage settings")?;
-                        if let Some(parent) = storage_config_path.parent() {
-                            fs::create_dir_all(parent)
-                                .with_context(|| format!("Failed to create config directory {:?}", parent))?;
-                        }
-                        fs::write(&storage_config_path, content)
-                            .with_context(|| format!("Failed to write storage config to {:?}", storage_config_path))?;
-                    }
+                    // Delegate all logic to the new handler function.
+                    // This replaces the entire block of code that was here before.
+                    handlers_mod::handle_use_storage_command(engine, permanent).await?;
                 }
                 UseAction::Plugin { enable } => {
+                    let mut config = config_mod::load_cli_config()?;
                     config.enable_plugins = enable;
                     config.save()?;
                     println!("Plugins {}", if enable { "enabled" } else { "disabled" });
+                    handlers_mod::handle_show_plugins_command().await?;
                 }
             }
         }
@@ -535,16 +455,32 @@ pub async fn run_single_command(
         Commands::Show { action } => {
             match action {
                 ShowAction::Storage => {
-                    let config = config_mod::load_cli_config()?;
-                    let storage_config = config.storage.unwrap_or_default();
-                    println!("Current Storage Engine: {:?}", storage_config.storage_engine_type);
+                   //  let config = config_mod::load_cli_config()?;
+                   // let storage_config = config.storage.unwrap_or_default();
+
+                    // println!("Current Storage Engine: {:?}", storage_config.storage_engine_type);
+                    handlers_mod::handle_show_storage_command().await?;
                 }
                 ShowAction::Plugins => {
-                    let config = config_mod::load_cli_config()?;
-                    println!("Plugins Enabled: {}", config.enable_plugins);
+                    handlers_mod::handle_show_plugins_command().await?;
                 }
-                ShowAction::Config { action } => {
-                    println!("'show config' command is not yet fully implemented. Action: {:?}", action);
+                ShowAction::Config { config_type } => {
+                    match config_type {
+                        ConfigAction::All => {
+                            handlers_mod::handle_show_all_config_command().await?;
+                        }
+                        ConfigAction::Rest => {
+                            handlers_mod::handle_show_rest_config_command().await?;
+                        }
+                        ConfigAction::Storage => {
+                            //let config = config_mod::load_cli_config()?;
+                            //let storage_config = config.storage.unwrap_or_default();
+                            handlers_mod::handle_show_storage_config_command().await?;
+                        }
+                        ConfigAction::Main => {
+                            handlers_mod::handle_show_main_config_command().await?;
+                        }
+                    }
                 }
             }
         }

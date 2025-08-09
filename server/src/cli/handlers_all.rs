@@ -553,3 +553,9 @@ pub async fn display_full_status_summary(
     println!("--------------------------------------------------");
     Ok(())
 }
+
+pub async fn handle_show_all_config_command() -> Result<()> {
+    println!("'show config all' command is not yet fully implemented.");
+    Ok(())
+}
+
