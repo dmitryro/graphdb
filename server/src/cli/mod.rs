@@ -11,8 +11,10 @@ pub mod handlers;
 pub mod help_display;
 pub mod interactive;
 pub mod handlers_utils;
+pub mod handlers_main;
 pub mod handlers_storage;
 pub mod handlers_rest;
+pub mod handlers_all;
 
 // Re-export the main CLI entry point from cli.rs
 pub use cli::{start_cli, CliArgs, Commands}; // Corrected: Changed run_cli to start_cli
@@ -63,6 +65,15 @@ pub use handlers_utils::{
     ensure_daemon_registry_paths_exist,
     execute_storage_query,
 };
+pub use handlers_main::{
+    display_daemon_status,
+    handle_daemon_command,
+    handle_daemon_command_interactive,
+    start_daemon_instance_interactive, 
+    stop_main_interactive,
+    stop_daemon_instance_interactive,
+    reload_daemon_interactive,
+};  
 pub use handlers_storage::{
     storage,
     display_storage_daemon_status,
@@ -88,10 +99,17 @@ pub use handlers_rest::{
     display_rest_api_health,
     display_rest_api_version,
     execute_graph_query,
+    reload_rest_interactive,
+};
+
+pub use handlers_all::{
+    stop_all_interactive,
+    reload_all_interactive,
+    handle_start_all_interactive,
+    display_full_status_summary,
 };
   
 pub use handlers::{
-    handle_daemon_command,
     handle_status_command,
     handle_stop_command,
     handle_start_command,

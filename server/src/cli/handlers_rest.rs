@@ -753,3 +753,49 @@ pub async fn display_rest_api_version() {
         }
     }
 }
+
+/// Handles the interactive 'reload rest' command.
+pub async fn reload_rest_interactive(
+    rest_api_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
+    rest_api_port_arc: Arc<TokioMutex<Option<u16>>>,
+    rest_api_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
+) -> Result<()> {
+    println!("Reloading REST API server...");
+
+    let running_ports = find_all_running_rest_api_ports().await;
+
+    // Stop all found REST API instances
+    stop_rest_api_interactive(
+        None, // Stop all REST API instances
+        rest_api_shutdown_tx_opt.clone(),
+        rest_api_port_arc.clone(),
+        rest_api_handle.clone(),
+    ).await?;
+
+    // Start new instances
+    if running_ports.is_empty() {
+        println!("No REST API servers found running to reload. Starting one on default port {}.", DEFAULT_REST_API_PORT);
+        start_rest_api_interactive(
+            Some(DEFAULT_REST_API_PORT),
+            None,
+            rest_api_shutdown_tx_opt,
+            rest_api_port_arc,
+            rest_api_handle,
+        ).await?;
+    } else {
+        for &port in &running_ports {
+            start_rest_api_interactive(
+                Some(port),
+                None,
+                rest_api_shutdown_tx_opt.clone(),
+                rest_api_port_arc.clone(),
+                rest_api_handle.clone(),
+            ).await?;
+            println!("REST API server restarted on port {}.", port);
+        }
+    }
+
+    println!("REST API server reloaded.");
+    Ok(())
+}
+
