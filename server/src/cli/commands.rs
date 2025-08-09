@@ -3,6 +3,7 @@
 // UPDATED: 2025-08-08 - Changed import from `lib::storage_engine::config::StorageEngineType` to `crate::cli::config::StorageEngineType` to align with project structure.
 // UPDATED: 2025-08-08 - Ensured `StorageEngineType` supports `Sled`, `RocksDB`, `InMemory`, `Redis`, `PostgreSQL`, `MySQL` as per updated enum definition.
 // NOTE: Kept `std::path::PathBuf` as it’s standard for CLI args and compatible with `fs2` in `config.rs`.
+// FIXED: 2025-08-08 - Added `permanent` boolean field to `UseAction::Storage` and `CommandType::UseStorage` to resolve `E0026` error in `config.rs`.
 
 use clap::{Parser, Subcommand, Arg, Args};
 use std::path::PathBuf;
@@ -26,7 +27,6 @@ pub fn parse_storage_engine(engine: &str) -> Result<StorageEngineType, String> {
 }
 
 // Re-export StorageEngineType to make it accessible to `interactive.rs`
-// (If you already re-export this elsewhere, keep that — harmless otherwise)
 
 #[derive(Debug, PartialEq, Clone, Args)]
 pub struct HelpArgs {
@@ -47,7 +47,7 @@ pub enum CommandType {
     Storage(StorageAction),
 
     // Use Commands
-    UseStorage { engine: StorageEngineType },
+    UseStorage { engine: StorageEngineType, permanent: bool },
     UsePlugin { enable: bool },
 
     // Top-level Start command variants (can also be subcommands of 'start')
@@ -642,6 +642,9 @@ pub enum UseAction {
         /// Storage engine to use.
         #[arg(value_parser = parse_storage_engine)]
         engine: StorageEngineType,
+        /// Persist the storage engine choice across sessions.
+        #[clap(long, default_value = "false")]
+        permanent: bool,
     },
     /// Enable or disable experimental plugins.
     Plugin {

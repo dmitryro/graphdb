@@ -5,6 +5,8 @@
 // Fixed: 2025-08-08 - Implemented all required GraphStorageEngine methods
 // Fixed: 2025-08-08 - Used GraphError::StorageError for errors
 // Fixed: 2025-08-08 - Fixed connection string access and type issues
+// Fixed: 2025-08-08 - Corrected error handling and result collection in get_vertex and get_all_vertices
+// Fixed: 2025-08-08 - Added missing .collect() calls
 // NOTE: Assumes `store` table (key BLOB, value BLOB), `vertices` table (id VARCHAR(36), label TEXT, data JSON),
 // and `edges` table (outbound_id VARCHAR(36), edge_type VARCHAR(255), inbound_id VARCHAR(36))
 
@@ -29,11 +31,18 @@ pub struct MySQLStorage {
 impl MySQLStorage {
     pub fn new(config: &StorageConfig) -> mysql::Result<Self> {
         // Get connection string from engine_specific_config
-        let connection_string = config.engine_specific_config
+        let connection_string_value = config.engine_specific_config
             .as_ref()
             .ok_or_else(|| mysql::Error::UrlError(mysql::UrlError::InvalidValue(
                 "connection_string".to_string(),
                 "Connection string is required in engine_specific_config".to_string()
+            )))?;
+        
+        // Ensure the value is a string before attempting to convert it
+        let connection_string = connection_string_value.as_str()
+            .ok_or_else(|| mysql::Error::UrlError(mysql::UrlError::InvalidValue(
+                "connection_string".to_string(),
+                "Connection string must be a string".to_string()
             )))?;
             
         let opts = Opts::from_url(connection_string)?;
@@ -47,6 +56,7 @@ impl MySQLStorage {
 #[async_trait]
 impl StorageEngine for MySQLStorage {
     async fn connect(&self) -> Result<(), GraphError> {
+        // A connection is established in `new`, so this method can be a no-op
         Ok(())
     }
 
@@ -76,6 +86,7 @@ impl StorageEngine for MySQLStorage {
     }
 
     async fn flush(&self) -> Result<(), GraphError> {
+        // A no-op for now, as there's no clear way to flush in this implementation
         Ok(())
     }
 }
@@ -83,10 +94,12 @@ impl StorageEngine for MySQLStorage {
 #[async_trait]
 impl GraphStorageEngine for MySQLStorage {
     async fn start(&self) -> Result<(), GraphError> {
+        // A no-op as the connection is already managed
         Ok(())
     }
 
     async fn stop(&self) -> Result<(), GraphError> {
+        // A no-op as the connection will be dropped with the struct
         Ok(())
     }
 
@@ -126,11 +139,12 @@ impl GraphStorageEngine for MySQLStorage {
         let rows: Vec<(String, String)> = conn
             .exec("SELECT label, data FROM vertices WHERE id = ?", (id.to_string(),))
             .map_err(|e| GraphError::StorageError(e.to_string()))?;
+
+        // The .map closure now returns a Result, which is then handled by transpose()
         rows.into_iter().next().map(|(label, data)| {
             let props_json: Value = serde_json::from_str(&data)
                 .map_err(|e| GraphError::StorageError(e.to_string()))?;
             
-            // Convert JSON Value to HashMap<String, PropertyValue>
             let properties = if let Value::Object(map) = props_json {
                 map.into_iter().map(|(k, v)| {
                     let prop_value = match v {
@@ -190,13 +204,14 @@ impl GraphStorageEngine for MySQLStorage {
         let rows: Vec<(String, String, String)> = conn
             .query("SELECT id, label, data FROM vertices")
             .map_err(|e| GraphError::StorageError(e.to_string()))?;
+
+        // The .map closure now returns a Result, and we use .collect() to collect into a Result<Vec, Error>
         rows.into_iter().map(|(id, label, data)| {
             let uuid = Uuid::parse_str(&id)
                 .map_err(|e| GraphError::StorageError(e.to_string()))?;
             let props_json: Value = serde_json::from_str(&data)
                 .map_err(|e| GraphError::StorageError(e.to_string()))?;
                 
-            // Convert JSON Value to HashMap<String, PropertyValue>
             let properties = if let Value::Object(map) = props_json {
                 map.into_iter().map(|(k, v)| {
                     let prop_value = match v {
@@ -283,6 +298,8 @@ impl GraphStorageEngine for MySQLStorage {
         let rows: Vec<(String, String, String)> = conn
             .query("SELECT outbound_id, edge_type, inbound_id FROM edges")
             .map_err(|e| GraphError::StorageError(e.to_string()))?;
+
+        // The .map closure now returns a Result, and we use .collect() to collect into a Result<Vec, Error>
         rows.into_iter().map(|(outbound_id, edge_type, inbound_id)| {
             let outbound_uuid = Uuid::parse_str(&outbound_id)
                 .map_err(|e| GraphError::StorageError(e.to_string()))?;
