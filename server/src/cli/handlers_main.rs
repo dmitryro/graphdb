@@ -484,3 +484,8 @@ pub async fn stop_daemon_instance_interactive(
 
     Ok(())
 }
+
+pub async fn handle_show_main_config_command() -> Result<()> {
+    println!("'show config main' command is not yet fully implemented.");
+    Ok(())
+}

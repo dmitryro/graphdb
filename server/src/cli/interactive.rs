@@ -25,13 +25,15 @@ use log::{info, error, warn, debug};
 use crate::cli::cli::CliArgs;
 use crate::cli::commands::{
     CommandType, DaemonCliCommand, RestCliCommand, StorageAction, StatusArgs, StopArgs,
-    ReloadArgs, ReloadAction, StartAction, RestartArgs, RestartAction, HelpArgs,
+    ReloadArgs, ReloadAction, StartAction, RestartArgs, RestartAction, HelpArgs, ShowAction,
+    ConfigAction,
 };
 use crate::cli::handlers;
 use crate::cli::help_display::{
     print_interactive_help, print_interactive_filtered_help, collect_all_cli_elements_for_suggestions,
     print_help_clap_generated, print_filtered_help_clap_generated
 };
+use crate::cli::handlers_utils::{storage_engine_type_to_str, parse_show_command};
 pub use lib::storage_engine::config::{StorageEngineType};
 use crate::cli::config::{load_storage_config_from_yaml};
 
@@ -86,7 +88,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
     let top_level_commands = vec![
         "start", "stop", "status", "auth", "authenticate", "register",
         "version", "health", "reload", "restart", "clear", "help", "exit",
-        "daemon", "rest", "storage", "use", "quit", "q", "clean", "save"
+        "daemon", "rest", "storage", "use", "quit", "q", "clean", "save", "show",
     ];
 
     const FUZZY_MATCH_THRESHOLD: usize = 2;
@@ -1113,6 +1115,15 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                 }
             }
         },
+        "show" => {
+            match parse_show_command(parts) {
+                Ok(command) => command,
+                Err(e) => {
+                    eprintln!("Error parsing show command: {}", e);
+                    return (CommandType::Unknown, vec![]);
+                }
+            }
+        },
         "storage" => {
             if remaining_args.is_empty() {
                 eprintln!("Usage: storage <start|stop|status|health|version|storage-query>");
@@ -1260,6 +1271,11 @@ pub async fn handle_interactive_command(
             )
             .await
         }
+        /*
+        CommandType::ShowStorage => {
+            handlers::show_storage().await;
+            Ok(())
+        }*/
         CommandType::StartStorage {
             port,
             config_file,
@@ -1379,11 +1395,46 @@ pub async fn handle_interactive_command(
             Ok(())
         }
         CommandType::UseStorage { engine, permanent } => {
-            handlers::use_storage_engine(engine).await; // Assuming handler accepts only engine; adjust if it needs permanent
+            handlers::handle_use_storage_interactive(
+                engine,
+                permanent,
+                state.storage_daemon_shutdown_tx_opt.clone(),
+                state.storage_daemon_handle.clone(),
+                state.storage_daemon_port_arc.clone(),
+            ).await?;
+            // The compiler expects this arm to return a Result, but the '?' returns '()'.
+            // Explicitly returning Ok(()) fixes the type mismatch.
             Ok(())
         }
         CommandType::UsePlugin { enable } => {
             handlers::use_plugin(enable).await;
+            Ok(())
+        }
+        CommandType::Show(action) => {
+            match action {
+                ShowAction::Storage => {
+                    handlers::handle_show_storage_command().await?;
+                }
+                ShowAction::Plugins => {
+                    handlers::handle_show_plugins_command().await?;
+                }
+                ShowAction::Config { config_type } => {
+                    match config_type {
+                        ConfigAction::All => {
+                            println!("'show config all' command is not yet fully implemented.");
+                        }
+                        ConfigAction::Rest => {
+                            println!("'show config rest' command is not yet fully implemented.");
+                        }
+                        ConfigAction::Storage => {
+                            println!("'show config storage' command is not yet fully implemented.");
+                        }
+                        ConfigAction::Main => {
+                            println!("'show config main' command is not yet fully implemented.");
+                        }
+                    }
+                }
+            }
             Ok(())
         }
         CommandType::Version => {

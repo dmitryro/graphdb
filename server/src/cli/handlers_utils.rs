@@ -3,6 +3,7 @@ use std::path::{PathBuf, Path};
 use std::io::{self, Write};
 use std::fs;
 use log::{info, error, warn, debug};
+use crate::cli::commands::{CommandType, ShowAction,  ConfigAction};
 use crate::cli::config::{StorageConfig, daemon_api_storage_engine_type_to_string, DAEMON_REGISTRY_DB_PATH};
 use lib::storage_engine::config::{StorageEngineType};
 use crossterm::style::{self, Stylize};
@@ -207,4 +208,41 @@ pub async fn ensure_daemon_registry_paths_exist() -> Result<()> {
 pub async fn execute_storage_query() {
     println!("Executing storage query...");
     println!("Storage query executed (placeholder).");
+}
+
+// Helper function to convert StorageEngineType to string
+pub fn storage_engine_type_to_str(engine: StorageEngineType) -> &'static str {
+    match engine {
+        StorageEngineType::Sled => "sled",
+        StorageEngineType::RocksDB => "rocksdb",
+        StorageEngineType::InMemory => "inmemory",
+        StorageEngineType::Redis => "redis",
+        StorageEngineType::PostgreSQL => "postgresql",
+        StorageEngineType::MySQL => "mysql",
+    }
+}
+
+/// Parses the 'show' command and its subcommands.
+pub fn parse_show_command(args: &[String]) -> Result<CommandType, anyhow::Error> {
+    if args.len() < 2 {
+        return Err(anyhow!("Missing subcommand for 'show'. Available: storage, config, plugins"));
+    }
+    match args[1].as_str() {
+        "storage" => Ok(CommandType::Show(ShowAction::Storage)),
+        "config" => {
+            if args.len() < 3 {
+                return Err(anyhow!("Missing subcommand for 'show config'. Available: all, rest, storage, main"));
+            }
+            let config_type = match args[2].as_str() {
+                "all" => ConfigAction::All,
+                "rest" => ConfigAction::Rest,
+                "storage" => ConfigAction::Storage,
+                "main" => ConfigAction::Main,
+                _ => return Err(anyhow!("Unknown subcommand for 'show config': {}", args[2])),
+            };
+            Ok(CommandType::Show(ShowAction::Config { config_type }))
+        }
+        "plugins" => Ok(CommandType::Show(ShowAction::Plugins)),
+        _ => Err(anyhow!("Unknown subcommand for 'show': {}", args[1])),
+    }
 }

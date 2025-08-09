@@ -2,6 +2,9 @@
 // Updated: 2025-08-08 - Added StorageEngineType enum and serialization/deserialization logic
 // Fixed: 2025-08-09 - Replaced serde_yaml with serde_yaml2
 // Fixed: 2025-08-09 - Imported GraphError directly from models::errors
+// ADDED: 2025-08-10 - Implemented the `std::fmt::Display` trait for `StorageEngineType` to allow it to be formatted with `{}` in `println!` macros.
+// FIXED: 2025-08-10 - Removed the conflicting `ToString` implementation, as `Display` provides the same functionality.
+// FIXED: 2025-08-10 - Removed `fmt::Display` from the derive macro as it is not a standard attribute.
 
 use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
@@ -11,6 +14,7 @@ use models::errors::GraphError;
 use serde_yaml2 as serde_yaml;
 use serde_json::Value; // Import Value from serde_json
 use std::fs;
+use std::fmt; // New import for the Display trait
 
 /// An enum representing the supported storage engine types.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -39,15 +43,16 @@ impl FromStr for StorageEngineType {
     }
 }
 
-impl ToString for StorageEngineType {
-    fn to_string(&self) -> String {
+// Implemented the `Display` trait to allow formatting with `{}`
+impl fmt::Display for StorageEngineType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            StorageEngineType::Sled => "sled".to_string(),
-            StorageEngineType::RocksDB => "rocksdb".to_string(),
-            StorageEngineType::InMemory => "inmemory".to_string(),
-            StorageEngineType::Redis => "redis".to_string(),
-            StorageEngineType::PostgreSQL => "postgresql".to_string(),
-            StorageEngineType::MySQL => "mysql".to_string(),
+            StorageEngineType::Sled => write!(f, "Sled"),
+            StorageEngineType::RocksDB => write!(f, "RocksDB"),
+            StorageEngineType::InMemory => write!(f, "InMemory"),
+            StorageEngineType::Redis => write!(f, "Redis"),
+            StorageEngineType::PostgreSQL => write!(f, "PostgreSQL"),
+            StorageEngineType::MySQL => write!(f, "MySQL"),
         }
     }
 }

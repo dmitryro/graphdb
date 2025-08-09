@@ -26,8 +26,12 @@ pub mod mysql_storage;
 pub mod config;
 pub mod storage_utils;
 
+
 // Re-export key types and traits for external use
-pub use storage_engine::{GraphStorageEngine, StorageEngine};
+pub use storage_engine::{GraphStorageEngine, 
+                         StorageEngine,
+                         StorageEngineManager,
+                         GLOBAL_STORAGE_ENGINE_MANAGER};
 pub use sled_storage::{SledStorage, open_sled_db};
 #[cfg(feature = "with-rocksdb")]
 pub use rocksdb_storage::RocksDBStorage;
