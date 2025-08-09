@@ -39,7 +39,7 @@ use crate::cli::daemon_management::{
 pub use crate::cli::handlers_utils::{get_current_exe_path, format_engine_config, print_welcome_screen, write_registry_fallback, 
                                      read_registry_fallback, clear_terminal_screen, ensure_daemon_registry_paths_exist,
                                      execute_storage_query};
-pub use crate::cli::handlers_storage::{storage, start_storage_interactive, stop_storage_interactive, 
+pub use crate::cli::handlers_storage::{storage, start_storage_interactive, stop_storage_interactive, show_storage,
                                        display_storage_daemon_status, handle_storage_command, handle_storage_command_interactive, 
                                        stop_storage, use_storage_engine, handle_save_storage, reload_storage_interactive};
 pub use crate::cli::handlers_rest::{RestArgs, rest, display_rest_api_status, handle_rest_command, handle_rest_command_interactive, 

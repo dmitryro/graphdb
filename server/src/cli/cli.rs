@@ -62,7 +62,7 @@ use crate::cli::commands::{
     DaemonCliCommand, RestCliCommand, StorageAction, UseAction, SaveAction,
     StatusArgs, StopArgs, ReloadArgs, RestartArgs,
     ReloadAction, RestartAction, StartAction, StopAction, StatusAction,
-    HelpArgs
+    HelpArgs, ShowAction,
 };
 use crate::cli::config::{
     self, DEFAULT_STORAGE_CONFIG_PATH_ROCKSDB, DEFAULT_STORAGE_CONFIG_PATH_SLED,
@@ -159,6 +159,10 @@ pub enum Commands {
     Clear,
     Exit,
     Quit,
+    Show {
+        #[clap(subcommand)]
+        action: ShowAction,
+    },
 }
 
 // Custom parser for storage engine to handle hyphenated and non-hyphenated aliases
@@ -178,6 +182,7 @@ fn parse_storage_engine(engine: &str) -> Result<StorageEngineType, String> {
     }
 }
 
+// Re-usable function to handle all commands. This is called from both interactive and non-interactive modes.
 // Re-usable function to handle all commands. This is called from both interactive and non-interactive modes.
 pub async fn run_single_command(
     command: Commands,
@@ -298,10 +303,7 @@ pub async fn run_single_command(
             }
         }
         Commands::Stop(stop_args) => {
-            let updated_stop_args = StopArgs {
-                action: Some(stop_args.action.unwrap_or(StopAction::All))
-            };
-            handlers_mod::handle_stop_command(updated_stop_args).await?;
+            handlers_mod::handle_stop_command(stop_args).await?;
         }
         Commands::Status(status_args) => {
             handlers_mod::handle_status_command(
@@ -510,10 +512,7 @@ pub async fn run_single_command(
                 help_display_mod::print_help_clap_generated();
             }
         }
-        Commands::Auth { username, password } => {
-            handlers_mod::authenticate_user(username, password).await;
-        }
-        Commands::Authenticate { username, password } => {
+        Commands::Auth { username, password } | Commands::Authenticate { username, password } => {
             handlers_mod::authenticate_user(username, password).await;
         }
         Commands::Register { username, password } => {
@@ -532,6 +531,26 @@ pub async fn run_single_command(
         Commands::Exit | Commands::Quit => {
             println!("Exiting CLI. Goodbye!");
             process::exit(0);
+        }
+        Commands::Show { action } => {
+            match action {
+                ShowAction::Storage => {
+                    let config = config_mod::load_cli_config()?;
+                    let storage_config = config.storage.unwrap_or_default();
+                    println!("Current Storage Engine: {:?}", storage_config.storage_engine_type);
+                }
+                ShowAction::Plugins => {
+                    let config = config_mod::load_cli_config()?;
+                    println!("Plugins Enabled: {}", config.enable_plugins);
+                }
+                ShowAction::Config { action } => {
+                    println!("'show config' command is not yet fully implemented. Action: {:?}", action);
+                }
+            }
+        }
+        _ => {
+            // Placeholder for new or unknown commands
+            println!("Unknown command or not yet implemented");
         }
     }
     Ok(())

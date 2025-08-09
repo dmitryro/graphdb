@@ -208,3 +208,15 @@ pub async fn execute_storage_query() {
     println!("Executing storage query...");
     println!("Storage query executed (placeholder).");
 }
+
+// Helper function to convert StorageEngineType to string
+pub fn storage_engine_type_to_str(engine: StorageEngineType) -> &'static str {
+    match engine {
+        StorageEngineType::Sled => "sled",
+        StorageEngineType::RocksDB => "rocksdb",
+        StorageEngineType::InMemory => "inmemory",
+        StorageEngineType::Redis => "redis",
+        StorageEngineType::PostgreSQL => "postgresql",
+        StorageEngineType::MySQL => "mysql",
+    }
+}

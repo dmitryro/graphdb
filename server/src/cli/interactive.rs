@@ -32,6 +32,7 @@ use crate::cli::help_display::{
     print_interactive_help, print_interactive_filtered_help, collect_all_cli_elements_for_suggestions,
     print_help_clap_generated, print_filtered_help_clap_generated
 };
+use crate::cli::handlers_utils::{storage_engine_type_to_str};
 pub use lib::storage_engine::config::{StorageEngineType};
 use crate::cli::config::{load_storage_config_from_yaml};
 
@@ -1260,6 +1261,10 @@ pub async fn handle_interactive_command(
             )
             .await
         }
+        CommandType::ShowStorage => {
+            handlers::show_storage().await;
+            Ok(())
+        }
         CommandType::StartStorage {
             port,
             config_file,
@@ -1379,7 +1384,7 @@ pub async fn handle_interactive_command(
             Ok(())
         }
         CommandType::UseStorage { engine, permanent } => {
-            handlers::use_storage_engine(engine).await; // Assuming handler accepts only engine; adjust if it needs permanent
+            handlers::use_storage_engine(storage_engine_type_to_str(engine), permanent).await?; // Assuming handler accepts only engine; adjust if it needs permanent
             Ok(())
         }
         CommandType::UsePlugin { enable } => {

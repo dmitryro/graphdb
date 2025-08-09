@@ -27,6 +27,8 @@ pub fn parse_storage_engine(engine: &str) -> Result<StorageEngineType, String> {
         )),
     }
 }
+
+
 /// Enum representing the parsed command type in interactive mode.
 #[derive(Debug, PartialEq, Clone)]
 pub enum CommandType {
@@ -76,7 +78,7 @@ pub enum CommandType {
     StatusStorage(Option<u16>),
     StatusCluster,
     StatusRaft(Option<u16>),
-
+    ShowStorage,
     // Authentication and User Management
     Auth { username: String, password: String },
     Authenticate { username: String, password: String },
@@ -110,7 +112,7 @@ pub enum CommandType {
     RestartStorage { port: Option<u16>, config_file: Option<PathBuf>, cluster: Option<String>, storage_port: Option<u16>, storage_cluster: Option<String> },
     RestartDaemon { port: Option<u16>, cluster: Option<String>, daemon_port: Option<u16>, daemon_cluster: Option<String> },
     RestartCluster,
-
+  
     // Utility Commands
     Clear,
     Help(HelpArgs),
@@ -240,6 +242,11 @@ pub enum Commands {
     Exit,
     /// Quit the CLI (alias for 'exit')
     Quit,
+    // In your Commands enum:
+    Show {
+        #[clap(subcommand)]
+        action: ShowAction,
+    },
 }
 
 #[derive(Subcommand, Debug, PartialEq, Clone)]
@@ -250,6 +257,34 @@ pub enum SaveAction {
     #[clap(name = "config")]
     Configuration,
 }
+
+
+// A new enum for the Show command's subcommands:
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum ShowAction {
+    /// Show current storage engine and configuration.
+    Storage,
+    /// Show status of plugins.
+    Plugins,
+    /// Show configuration for a component.
+    Config {
+        #[clap(subcommand)]
+        action: ConfigAction,
+    },
+}
+
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum ConfigAction {
+    /// Show REST API configuration.
+    Rest,
+    /// Show Storage configuration.
+    Storage,
+    /// Show main daemon configuration.
+    Main,
+    /// Show all configurations.
+    All,
+}
+
 
 #[derive(Subcommand, Debug, PartialEq, Clone)]
 pub enum StartAction {
@@ -541,6 +576,7 @@ pub enum StorageAction {
     /// Get the version of the REST API server.
     Version,
     List,
+    Show, // New variant for 'show storage'
 }
 
 #[derive(Args, Debug, PartialEq, Clone)]

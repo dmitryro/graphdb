@@ -64,6 +64,7 @@ pub use handlers_utils::{
     clear_terminal_screen,
     ensure_daemon_registry_paths_exist,
     execute_storage_query,
+    storage_engine_type_to_str,
 };
 pub use handlers_main::{
     DaemonArgs,
@@ -77,6 +78,7 @@ pub use handlers_main::{
 };  
 pub use handlers_storage::{
     storage,
+    show_storage,
     display_storage_daemon_status,
     handle_storage_command,
     handle_storage_command_interactive,
