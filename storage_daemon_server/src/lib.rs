@@ -1,6 +1,10 @@
 // storage_daemon_server/src/lib.rs
 // Fixed: 2025-08-10 - Corrected StorageConfig initialization to match expected fields and types
 // Fixed: 2025-08-10 - Converted Map<String, Value> to HashMap<String, Value> for engine_specific_config
+// Fixed: 2025-08-10 - Removed unnecessary Some wrapper for data_directory (E0308)
+// Fixed: 2025-08-10 - Added missing StorageConfig fields (E0063)
+// Fixed: 2025-08-10 - Converted log_directory to String (E0308)
+// Fixed: 2025-08-10 - Removed invalid max_disk_space_mb field (E0560)
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -505,11 +509,17 @@ pub async fn start_storage_daemon_server_real(
     info!("[Storage Daemon] Use Raft for scale: {}", settings.use_raft_for_scale);
     info!("[Storage Daemon] Storage engine type: {}", settings.storage_engine_type);
 
-    // Initialize the storage engine
+    let cluster_range_str = settings.cluster_range.clone();
+
     let storage_config = StorageConfig {
         storage_engine_type: StorageEngineType::from_str(&settings.storage_engine_type)
             .map_err(|e| anyhow::anyhow!("Invalid storage engine type: {}", e))?,
-        data_directory: Some(settings.data_directory),
+        data_directory: settings.data_directory,
+        config_root_directory: settings.config_root_directory,
+        log_directory: settings.log_directory.display().to_string(),
+        default_port: settings.default_port,
+        cluster_range: settings.cluster_range, // moved here
+        use_raft_for_scale: settings.use_raft_for_scale,
         engine_specific_config: settings.engine_specific_config.map(|config| {
             serde_json::to_value(&config)
                 .map(|value| value.as_object().unwrap().clone().into_iter().collect::<HashMap<String, Value>>())
@@ -518,7 +528,7 @@ pub async fn start_storage_daemon_server_real(
         }),
         max_open_files: Some(settings.max_open_files as usize),
         connection_string: match settings.storage_engine_type.as_str() {
-            "redis" | "postgresql" | "mysql" => Some(format!("{}:{}", settings.cluster_range, port)),
+            "redis" | "postgresql" | "mysql" => Some(format!("{}:{}", cluster_range_str, port)),
             _ => None,
         },
     };

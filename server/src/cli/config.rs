@@ -37,6 +37,7 @@ use std::time::Duration;
 use dirs;
 use toml;
 use serde_yaml2 as serde_yaml;
+use lib::storage_engine::config::StorageConfig as EngineStorageConfig;
 use crate::cli::commands::{Commands, CommandType, StatusArgs, RestartArgs, ReloadArgs, RestartAction, 
                            ReloadAction, RestCliCommand, StatusAction, StorageAction, 
                            StartAction, StopAction, StopArgs, DaemonCliCommand, UseAction, SaveAction};
@@ -352,6 +353,28 @@ impl Default for StorageConfig {
             storage_engine_type: StorageEngineType::RocksDB, // Default to RocksDB for hybrid storage
             engine_specific_config: Some(SelectedStorageConfig::default()),
             max_open_files: 1024,
+        }
+    }
+}
+
+impl From<&CliTomlStorageConfig> for EngineStorageConfig {
+    fn from(cli: &CliTomlStorageConfig) -> Self {
+        EngineStorageConfig {
+            storage_engine_type: cli.storage_engine_type
+                .unwrap_or(StorageEngineType::RocksDB),
+            data_directory: cli.data_directory
+                .clone()
+                .map(PathBuf::from) // convert String → PathBuf
+                .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data")),
+            connection_string: None, // CLI config doesn't store this
+            max_open_files: cli.max_open_files.map(|v| v as usize),
+            engine_specific_config: None, // CLI config doesn't store this
+            default_port: cli.default_port.unwrap_or(DEFAULT_STORAGE_PORT),
+            log_directory: cli.log_directory.clone()
+                .unwrap_or_else(|| "/opt/graphdb/logs".into()),
+            config_root_directory: PathBuf::from(DEFAULT_CONFIG_ROOT_DIRECTORY_STR),
+            cluster_range: cli.cluster_range.clone().unwrap_or_default(),
+            use_raft_for_scale: cli.use_raft_for_scale.unwrap_or(false),
         }
     }
 }

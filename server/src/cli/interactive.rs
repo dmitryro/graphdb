@@ -1427,7 +1427,7 @@ pub async fn handle_interactive_command(
                             println!("'show config rest' command is not yet fully implemented.");
                         }
                         ConfigAction::Storage => {
-                            println!("'show config storage' command is not yet fully implemented.");
+                             handlers::handle_show_storage_config_command().await?;
                         }
                         ConfigAction::Main => {
                             println!("'show config main' command is not yet fully implemented.");
