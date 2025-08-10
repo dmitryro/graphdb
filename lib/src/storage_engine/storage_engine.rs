@@ -3,6 +3,14 @@
 // Fixed: 2025-08-09 - Added feature gate for mysql_storage import and usage to align with mod.rs
 // Updated: 2025-08-09 - Added global StorageEngineManager singleton with configurable path and engine-specific config support
 // Fixed: 2025-08-09 - Resolved type mismatches, field errors, borrowing issues, and unused argument warning
+// Updated: 2025-08-10 - Added support for aggregated runtime config from YAML and TOML, with session-based modifications
+// Fixed: 2025-08-10 - Removed incorrect `.map(|wrapper| wrapper.storage)` and fixed `PathBuf` references
+// Fixed: 2025-08-10 - Corrected `migrate_data` to accept `Arc<dyn GraphStorageEngine + Send + Sync>`
+// Added: 2025-08-10 - Added `get_runtime_config` to return active runtime configuration for `show` commands
+// Fixed: 2025-08-10 - Corrected `StorageConfig` to use original fields
+// Fixed: 2025-08-09 - Added `std::fmt::Debug` import to resolve E0404 errors
+// Fixed: 2025-08-10 - Resolved E0382 borrow after move errors and E0308 type mismatch
+// Fixed: 2025-08-09 - Fixed E0282, E0308, E0599 for data_directory handling
 
 use async_trait::async_trait;
 use models::errors::GraphError;
@@ -12,7 +20,7 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
-use crate::storage_engine::config::{load_storage_config_from_yaml, StorageConfig, StorageEngineType};
+use crate::storage_engine::config::{load_storage_config_from_yaml, StorageConfig, StorageEngineType, CliConfig, format_engine_config};
 use crate::storage_engine::inmemory_storage::InMemoryStorage;
 #[cfg(feature = "with-rocksdb")]
 use crate::storage_engine::rocksdb_storage::RocksdbGraphStorage;
@@ -24,32 +32,60 @@ use crate::storage_engine::postgres_storage::PostgresStorage;
 #[cfg(feature = "mysql-datastore")]
 use crate::storage_engine::mysql_storage::MySQLStorage;
 use std::fs;
-use std::fmt::Debug;
 use serde_yaml2 as serde_yaml;
 #[cfg(feature = "redis-datastore")]
 use redis::{Client, Connection};
 use std::time::Instant;
 use log::{info, error, warn};
 use once_cell::sync::OnceCell;
+use toml;
+use std::fmt::Debug;
 
 // Global StorageEngineManager singleton (uninitialized until set)
 pub static GLOBAL_STORAGE_ENGINE_MANAGER: OnceCell<Arc<Mutex<StorageEngineManager>>> = OnceCell::new();
 
 // Function to initialize the global StorageEngineManager
-pub fn init_storage_engine_manager(config_path: PathBuf) -> Result<(), GraphError> {
-    let config = load_storage_config_from_yaml(Some(config_path.clone()))
-        .unwrap_or_else(|_| {
-            warn!("Failed to load config from {:?}, using default configuration", config_path);
+pub fn init_storage_engine_manager(config_path_yaml: PathBuf, config_path_toml: PathBuf) -> Result<(), GraphError> {
+    // Load YAML config (storage-specific)
+    let yaml_config = load_storage_config_from_yaml(Some(config_path_yaml.clone()))
+        .unwrap_or_else(|e| {
+            warn!("Failed to load YAML config from {:?}: {}, using default", config_path_yaml, e);
             StorageConfig {
                 storage_engine_type: StorageEngineType::InMemory,
-                data_directory: Some(config_path.parent().unwrap_or(&PathBuf::from(".")).to_path_buf()),
+                data_directory: config_path_yaml.parent().unwrap_or_else(|| Path::new(".")).to_path_buf(),
                 connection_string: None,
                 max_open_files: None,
                 engine_specific_config: None,
+                default_port: 8049,
+                log_directory: "/opt/graphdb/logs".to_string(),
+                config_root_directory: PathBuf::from("/opt/graphdb"),
+                cluster_range: "".to_string(),
+                use_raft_for_scale: false,
             }
         });
-    
-    let manager = StorageEngineManager::new(&config, config_path)?;
+
+    // Load TOML config (CLI or general config)
+    let toml_config_str = fs::read_to_string(config_path_toml.clone())
+        .map_err(|e| GraphError::Io(e))?;
+    let toml_config: CliConfig = toml::from_str(&toml_config_str)
+        .map_err(|e| GraphError::SerializationError(e.to_string()))?;
+
+    // Aggregate configurations
+    let mut aggregated_config = yaml_config;
+    if let Some(toml_storage) = toml_config.storage {
+        aggregated_config.storage_engine_type = toml_storage.storage_engine_type;
+        aggregated_config.data_directory = toml_storage.data_directory;
+        aggregated_config.connection_string = toml_storage.connection_string;
+        aggregated_config.max_open_files = toml_storage.max_open_files;
+        aggregated_config.engine_specific_config = toml_storage.engine_specific_config;
+        aggregated_config.default_port = toml_storage.default_port;
+        aggregated_config.log_directory = toml_storage.log_directory;
+        aggregated_config.config_root_directory = toml_storage.config_root_directory;
+        aggregated_config.cluster_range = toml_storage.cluster_range;
+        aggregated_config.use_raft_for_scale = toml_storage.use_raft_for_scale;
+    }
+
+    let manager = StorageEngineManager::new(&aggregated_config, config_path_yaml, config_path_toml)?;
     GLOBAL_STORAGE_ENGINE_MANAGER
         .set(Arc::new(Mutex::new(manager)))
         .map_err(|_| GraphError::StorageError("Failed to initialize global StorageEngineManager".to_string()))?;
@@ -261,18 +297,19 @@ pub struct StorageEngineManager {
     engine: Arc<Mutex<HybridStorageEngine>>,
     session_engine_type: Option<StorageEngineType>,
     config: StorageConfig,
-    config_path: PathBuf, // Store the configuration path
+    config_path: PathBuf,
+    toml_config_path: PathBuf,
 }
 
 impl StorageEngineManager {
-    pub fn new(config: &StorageConfig, config_path: PathBuf) -> Result<Self, GraphError> {
+    pub fn new(config: &StorageConfig, config_path: PathBuf, toml_config_path: PathBuf) -> Result<Self, GraphError> {
         // Validate configuration before initializing
         Self::validate_config(config, config.storage_engine_type)?;
         
         let persistent: Box<dyn GraphStorageEngine + Send + Sync> = match config.storage_engine_type {
             StorageEngineType::Sled => {
                 let db = crate::storage_engine::sled_storage::open_sled_db(
-                    config.data_directory.as_ref().expect("Data directory is required for Sled storage")
+                    <PathBuf as AsRef<Path>>::as_ref(&config.data_directory)
                 )?;
                 Box::new(SledStorage::new(db)?)
             }
@@ -293,12 +330,10 @@ impl StorageEngineManager {
                 #[cfg(feature = "redis-datastore")]
                 {
                     let host = config.engine_specific_config.as_ref()
-                        .ok_or_else(|| GraphError::StorageError("Redis connection config is required".to_string()))?
-                        .get("host")
+                        .and_then(|c| c.get("host"))
+                        .and_then(|v| v.as_str())
                         .ok_or_else(|| GraphError::StorageError("Redis host is required".to_string()))?;
-                    let host_str = host.as_str()
-                        .ok_or_else(|| GraphError::StorageError("Redis host must be a string".to_string()))?;
-                    let client = Client::open(host_str)
+                    let client = Client::open(host)
                         .map_err(|e| GraphError::StorageError(format!("Failed to create Redis client: {}", e)))?;
                     let connection = client.get_connection()
                         .map_err(|e| GraphError::StorageError(format!("Failed to connect to Redis: {}", e)))?;
@@ -344,37 +379,43 @@ impl StorageEngineManager {
             session_engine_type: None,
             config: config.clone(),
             config_path,
+            toml_config_path,
         })
+    }
+
+    /// Returns the active runtime configuration, prioritizing session-based changes
+    pub fn get_runtime_config(&self) -> StorageConfig {
+        let mut config = self.config.clone();
+        if let Some(session_engine) = self.session_engine_type {
+            config.storage_engine_type = session_engine;
+        }
+        config
     }
 
     pub fn current_engine_type(&self) -> StorageEngineType {
-        self.session_engine_type.unwrap_or_else(|| {
-            self.engine.lock().unwrap().engine_type
-        })
+        self.session_engine_type.unwrap_or(self.engine.lock().unwrap().engine_type)
     }
 
     pub fn available_engines() -> Vec<StorageEngineType> {
-        let engines = vec![StorageEngineType::Sled, StorageEngineType::InMemory];
+        let mut engines = vec![StorageEngineType::Sled, StorageEngineType::InMemory];
         #[cfg(feature = "with-rocksdb")]
-        let engines = engines.into_iter().chain(std::iter::once(StorageEngineType::RocksDB)).collect();
+        engines.push(StorageEngineType::RocksDB);
         #[cfg(feature = "redis-datastore")]
-        let engines = engines.into_iter().chain(std::iter::once(StorageEngineType::Redis)).collect();
+        engines.push(StorageEngineType::Redis);
         #[cfg(feature = "postgres-datastore")]
-        let engines = engines.into_iter().chain(std::iter::once(StorageEngineType::PostgreSQL)).collect();
+        engines.push(StorageEngineType::PostgreSQL);
         #[cfg(feature = "mysql-datastore")]
-        let engines = engines.into_iter().chain(std::iter::once(StorageEngineType::MySQL)).collect();
+        engines.push(StorageEngineType::MySQL);
         engines
     }
 
     fn validate_config(config: &StorageConfig, engine_type: StorageEngineType) -> Result<(), GraphError> {
         match engine_type {
             StorageEngineType::Sled | StorageEngineType::RocksDB => {
-                if config.data_directory.is_none() {
-                    return Err(GraphError::StorageError("Data directory is required for Sled or RocksDB storage".to_string()));
-                }
+                // data_directory is always present in StorageConfig
             }
             StorageEngineType::Redis => {
-                if config.engine_specific_config.as_ref().map_or(true, |c| c.get("host").is_none()) {
+                if config.engine_specific_config.as_ref().and_then(|c| c.get("host")).is_none() {
                     return Err(GraphError::StorageError("Redis host is required".to_string()));
                 }
             }
@@ -394,7 +435,7 @@ impl StorageEngineManager {
     }
 
     fn get_engine_config_path(&self, engine_type: StorageEngineType) -> PathBuf {
-        let parent = self.config_path.parent().unwrap_or(&PathBuf::from(".")).to_path_buf();
+        let parent = self.config_path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
         match engine_type {
             StorageEngineType::Sled => parent.join("storage_config_sled.yaml"),
             StorageEngineType::RocksDB => parent.join("storage_config_rocksdb.yaml"),
@@ -477,7 +518,7 @@ impl StorageEngineManager {
         let new_persistent: Box<dyn GraphStorageEngine + Send + Sync> = match engine_type {
             StorageEngineType::Sled => {
                 let db = crate::storage_engine::sled_storage::open_sled_db(
-                    config.data_directory.as_ref().expect("Data directory is required for Sled storage")
+                    <PathBuf as AsRef<Path>>::as_ref(&config.data_directory)
                 )?;
                 Box::new(SledStorage::new(db)?)
             }
@@ -498,12 +539,10 @@ impl StorageEngineManager {
                 #[cfg(feature = "redis-datastore")]
                 {
                     let host = config.engine_specific_config.as_ref()
-                        .ok_or_else(|| GraphError::StorageError("Redis connection config is required".to_string()))?
-                        .get("host")
+                        .and_then(|c| c.get("host"))
+                        .and_then(|v| v.as_str())
                         .ok_or_else(|| GraphError::StorageError("Redis host is required".to_string()))?;
-                    let host_str = host.as_str()
-                        .ok_or_else(|| GraphError::StorageError("Redis host must be a string".to_string()))?;
-                    let client = Client::open(host_str)
+                    let client = Client::open(host)
                         .map_err(|e| GraphError::StorageError(format!("Failed to create Redis client: {}", e)))?;
                     let connection = client.get_connection()
                         .map_err(|e| GraphError::StorageError(format!("Failed to connect to Redis: {}", e)))?;
@@ -574,7 +613,7 @@ impl StorageEngineManager {
                 .map_err(|e| GraphError::StorageError(format!("Validation query failed: {}", e)))?;
         }
 
-        // Reload configuration for permanent changes
+        // Update configuration for permanent changes
         if permanent {
             self.config = load_storage_config_from_yaml(Some(config_file_path.clone()))
                 .map_err(|e| GraphError::StorageError(format!("Failed to reload configuration: {}", e)))?;

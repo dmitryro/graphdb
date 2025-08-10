@@ -8,7 +8,7 @@
 // Fixed: 2025-08-08 - Added feature gates for MySQL to align with Cargo.toml.
 // Fixed: 2025-08-08 - Refactored `create_storage` to use idiomatic `Result` handling.
 // Fixed: 2025-08-09 - Removed incorrect import of SerializableInternString and handled Option<PathBuf> in create_storage.
-
+// Fixed: 2025-08-09 - Fixed E0282 for data_directory by using explicit AsRef<Path>
 // Module declarations
 // Note: This file is mod.rs, so it defines the `storage_engine` module itself.
 // A declaration for `storage_engine` would be a circular reference.
@@ -25,7 +25,6 @@ pub mod postgres_storage;
 pub mod mysql_storage;
 pub mod config;
 pub mod storage_utils;
-
 
 // Re-export key types and traits for external use
 pub use storage_engine::{GraphStorageEngine, 
@@ -46,6 +45,7 @@ pub use config::{StorageConfig, StorageEngineType};
 
 // Required imports for the create_storage function
 use anyhow::{anyhow, Result};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(feature = "redis-datastore")]
 use redis::Client as RedisClient;
@@ -64,7 +64,7 @@ pub fn create_storage(config: StorageConfig) -> Result<Arc<dyn GraphStorageEngin
     match config.storage_engine_type {
         StorageEngineType::Sled => {
             let db = open_sled_db(
-                config.data_directory.as_ref().expect("Data directory is required for Sled storage")
+                <PathBuf as AsRef<Path>>::as_ref(&config.data_directory)
             )?;
             Ok(Arc::new(SledStorage::new(db)?) as Arc<dyn GraphStorageEngine>)
         }
