@@ -1665,6 +1665,38 @@ pub fn parse_cluster_range(range_str: &str) -> Result<Vec<u16>, anyhow::Error> {
     }
 }
 
+/// Checks if a given port is within a specified cluster range.
+/// If no range is provided, it returns true, indicating the port should be displayed.
+pub fn is_port_in_range(port: u16, range_str_opt: Option<&String>) -> Result<bool> {
+    if let Some(range_str) = range_str_opt {
+        let ports = parse_cluster_range(range_str)?;
+        Ok(ports.contains(&port))
+    } else {
+        // If no range is specified, assume we want to show all daemons.
+        Ok(true)
+    }
+}
+
+pub fn is_port_in_cluster_range(port: u16, range_str: &str) -> bool {
+    let parts: Vec<&str> = range_str.split('-').collect();
+    if parts.len() == 1 {
+        // Single port range
+        if let Ok(single_port) = parts[0].trim().parse::<u16>() {
+            return port == single_port;
+        }
+    } else if parts.len() == 2 {
+        // Ranged ports
+        if let (Ok(start), Ok(end)) = (parts[0].trim().parse::<u16>(), parts[1].trim().parse::<u16>()) {
+            return port >= start && port <= end;
+        }
+    }
+    false
+}
+
+pub fn is_port_within_range(port: u16, cluster_ports: &[u16]) -> bool {
+    cluster_ports.contains(&port)
+}
+
 pub async fn is_port_free(port: u16) -> bool {
     !is_port_listening(port).await
 }

@@ -311,30 +311,54 @@ pub struct StorageConfig {
 }
 
 impl StorageConfig {
-    pub fn parse_cluster_range(&self) -> Result<Vec<u16>> {
-        if self.cluster_range.contains('-') {
-            let parts: Vec<&str> = self.cluster_range.split('-').collect();
-            if parts.len() != 2 {
-                return Err(anyhow!("Invalid cluster_range format: {}", self.cluster_range));
-            }
-            let start: u16 = parts[0].parse().map_err(|e| anyhow!("Invalid start port: {}", e))?;
-            let end: u16 = parts[1].parse().map_err(|e| anyhow!("Invalid end port: {}", e))?;
-            Ok((start..=end).collect())
-        } else {
-            let port: u16 = self.cluster_range.parse().map_err(|e| anyhow!("Invalid port: {}", e))?;
-            Ok(vec![port])
-        }
-    }
-
     pub fn save(&self) -> Result<()> {
-        let config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH);
+        let default_config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH);
+        let project_config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
+        let config_path = if project_config_path.exists() {
+            project_config_path
+        } else {
+            default_config_path
+        };
+
         let wrapper = StorageConfigWrapper { storage: self.clone() };
-        let yaml_string = serde_yaml::to_string(&wrapper)
+        let mut yaml_string = serde_yaml::to_string(&wrapper)
             .context("Failed to serialize StorageConfig to YAML")?;
+
+        // Post-process to remove unnecessary quotes around simple strings
+        yaml_string = yaml_string
+            .lines()
+            .map(|line| {
+                // Remove quotes around simple strings (e.g., 'Sled' -> Sled, 'rocksdb' -> rocksdb)
+                if line.contains("'") {
+                    let trimmed = line.trim();
+                    if trimmed.starts_with("'") && trimmed.ends_with("'") {
+                        let unquoted = trimmed.trim_matches('\'');
+                        // Check if the unquoted value is a simple string (no spaces, no special chars except underscore)
+                        if unquoted.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                            return line.replace(&format!("'{}'", unquoted), unquoted);
+                        }
+                    } else if trimmed.contains(": '") && trimmed.ends_with("'") {
+                        // Handle key: 'value' format
+                        if let Some((key, value)) = trimmed.split_once(": '") {
+                            let value = value.trim_end_matches('\'');
+                            if value.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '/' || c == '.') {
+                                return format!("{}: {}", key, value);
+                            }
+                        }
+                    }
+                    line.to_string()
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<String>>()
+            .join("\n");
+
         fs::create_dir_all(config_path.parent().unwrap())
             .context(format!("Failed to create parent directories for {}", config_path.display()))?;
         fs::write(&config_path, yaml_string)
             .context(format!("Failed to write StorageConfig to file: {}", config_path.display()))?;
+        info!("Saved storage configuration to {:?}", config_path);
         Ok(())
     }
 }
@@ -1069,6 +1093,8 @@ pub fn get_rest_cluster_range() -> String {
 }
 
 /// Loads the storage configuration from a YAML file or returns a default configuration.
+/// This function now attempts to load the configuration in a more flexible way to
+/// handle different YAML file structures.
 pub fn load_storage_config_from_yaml(config_file_path: Option<PathBuf>) -> Result<StorageConfig> {
     let default_config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH);
     let project_config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
@@ -1081,21 +1107,37 @@ pub fn load_storage_config_from_yaml(config_file_path: Option<PathBuf>) -> Resul
         let config_content = fs::read_to_string(&path_to_use)
             .context(format!("Failed to read storage config file: {}", path_to_use.display()))?;
         debug!("Raw YAML content for storage_config.yaml: {}", config_content);
-        let wrapper: StorageConfigWrapper = serde_yaml::from_str(&config_content)
-            .map_err(|e| {
-                error!("Failed to parse storage config YAML at {}: {}", path_to_use.display(), e);
-                if let Ok(partial) = serde_yaml::from_str::<Value>(&config_content) {
-                    error!("Partial YAML parse: {:?}", partial);
-                }
-                anyhow!("Failed to parse storage config YAML: {}", e)
-            })?;
-        wrapper.storage
+
+        // Try to deserialize into the wrapper for the 'main_app_config.yaml' structure.
+        if let Ok(wrapper) = serde_yaml::from_str::<MainConfigWrapper>(&config_content) {
+            info!("Successfully parsed config with 'main_daemon' key.");
+            // Convert the MainDaemonConfig into a StorageConfig to ensure consistent return type
+            StorageConfig {
+                data_directory: PathBuf::from(wrapper.main_daemon.data_directory),
+                log_directory: wrapper.main_daemon.log_directory,
+                default_port: wrapper.main_daemon.default_port,
+                cluster_range: wrapper.main_daemon.cluster_range,
+                ..Default::default()
+            }
+        } else if let Ok(wrapper) = serde_yaml::from_str::<StorageConfigWrapper>(&config_content) {
+            info!("Successfully parsed config with 'storage' key.");
+            wrapper.storage
+        } else {
+            // Fallback to trying to deserialize the content directly into `StorageConfig`.
+            serde_yaml::from_str(&config_content)
+                .map_err(|e| {
+                    error!("Failed to parse storage config YAML at {}: {}", path_to_use.display(), e);
+                    if let Ok(partial) = serde_yaml::from_str::<Value>(&config_content) {
+                        error!("Partial YAML parse: {:?}", partial);
+                    }
+                    anyhow!("Failed to parse storage config YAML: {}", e)
+                })?
+        }
     } else {
         info!("Config file not found at {}. Using default storage config.", path_to_use.display());
         StorageConfig::default()
     };
 
-    // Log the loaded configuration
     info!(
         "Loaded storage config: default_port={}, cluster_range={}, data_directory={:?}, storage_engine_type={:?}, engine_specific_config={:?}, log_directory={}, max_disk_space_gb={}, min_disk_space_gb={}, use_raft_for_scale={}",
         config.default_port,

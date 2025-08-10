@@ -19,7 +19,7 @@ use crate::cli::config::{
 
 // Import daemon management utilities
 use crate::cli::daemon_management::{
-    check_process_status_by_port, is_port_free, parse_cluster_range, stop_process_by_port
+    check_process_status_by_port, is_port_free, parse_cluster_range, stop_process_by_port, is_port_in_cluster_range
 };
 
 // Import handler functions for individual components
@@ -360,7 +360,7 @@ pub async fn handle_start_all_interactive(
 /// Displays full status summary of all components.
 /// Enhanced version of display_full_status_summary with better storage formatting
 pub async fn display_full_status_summary(
-    rest_api_port_arc: Arc<TokioMutex<Option<u16>>>, 
+    rest_api_port_arc: Arc<TokioMutex<Option<u16>>>,
     storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>
 ) -> Result<()> {
     println!("\n--- GraphDB System Status Summary ---");
@@ -429,6 +429,7 @@ pub async fn display_full_status_summary(
     if rest_ports.is_empty() {
         println!("{:<20} {:<15} {:<10} {:<40}", "REST API", "Down", "N/A", "No REST API servers found in registry.");
     } else {
+        use reqwest::Client;
         let client = Client::builder()
             .timeout(Duration::from_secs(2))
             .build()
@@ -531,10 +532,17 @@ pub async fn display_full_status_summary(
                 println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", config_line);
             }
             
-            // Display data directory
+            // Display directory information
             println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Data Directory: {}", storage_config.data_directory.display()));
-            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Log Directory: {}", storage_config.log_directory));
-            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Cluster Range: {}", storage_config.cluster_range));
+            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Log Directory: {}", storage_config.log_directory.clone())); // Clone to prevent partial move
+
+            // Display cluster range with validation
+            let cluster_range = storage_config.cluster_range.clone(); // Clone to prevent partial move
+            if is_port_in_cluster_range(port, &cluster_range) {
+                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Cluster Range: {}", cluster_range));
+            } else {
+                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Cluster Range: {} (Port {} is outside this range!)", cluster_range, port));
+            }
             
             // Add separator between multiple storage daemons
             if storage_ports.len() > 1 && i < storage_ports.len() - 1 {

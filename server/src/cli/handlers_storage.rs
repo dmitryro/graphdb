@@ -3,18 +3,21 @@
 // Updated: 2025-08-09 - Fixed E0308 type mismatch in handle_show_storage_config_command
 // Fixed: 2025-08-09 - Converted CliTomlStorageConfig to lib::storage_engine::config::StorageConfig
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, Context, anyhow};
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
 use std::path::{PathBuf};
 use std::time::Duration;
 use std::net::{IpAddr, SocketAddr};
+use std::fs;
 use fs2::FileExt;
 use std::future::Future;
 use chrono::Utc;
 use log::{info, error, warn, debug};
 use futures::stream::StreamExt;
+use serde_json::Value;
+use serde_yaml2 as serde_yaml;
 use crate::cli::commands::{CommandType, Commands, StartAction, StorageAction};
 use crate::cli::config::{
     CliConfig,
@@ -38,7 +41,26 @@ use crate::cli::daemon_management::{
     check_process_status_by_port,
     stop_process_by_port,
     parse_cluster_range,
+    is_port_in_cluster_range,
 };
+
+/// A new struct to hold the information for a single daemon process.
+/// This makes it easier to pass around all the relevant details.
+#[derive(Debug)]
+pub struct DaemonInfo {
+    pub pid: u32,
+    pub port: u16,
+    pub status: String,
+    pub engine: String,
+    pub config_path: String,
+    pub max_open_files: Option<u64>,
+    pub max_disk_space: Option<u64>,
+    pub min_disk_space: Option<u64>,
+    pub use_raft: Option<bool>,
+    pub data_directory: Option<PathBuf>,
+    pub log_directory: Option<PathBuf>,
+    pub cluster_range: String,
+}
 
 pub mod storage {
     pub mod api {
@@ -89,7 +111,6 @@ pub async fn start_storage_interactive(
         Commands::Storage(StorageAction::Start { config_file, .. }) => get_config_path(config_file.clone()),
         _ => get_config_path(None),
     };
-    info!("=======> I WILL BE TRYING TO LOAD IT FROM {:?}", config_path);
     println!("SUCCESS: Determined config path: {:?}", config_path);
 
     // --- STEP 3: LOAD STORAGE CONFIGURATION ---
@@ -372,49 +393,38 @@ pub async fn stop_storage_interactive(
 /// Displays status of storage daemons only.
 // Enhanced version of display_storage_daemon_status with detailed engine configuration
 pub async fn display_storage_daemon_status(
-    port_arg: Option<u16>, 
+    port_arg: Option<u16>,
     storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>
 ) {
     let all_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
     debug!("Registry contents for storage status: {:?}", all_daemons);
-    
-    // Load actual storage configuration instead of using default
-    let storage_config = load_storage_config_from_yaml(None).unwrap_or_else(|e| {
-        warn!("Failed to load storage config: {}, using default", e);
-        StorageConfig::default()
-    });
-    
-    let running_storage_ports: Vec<u16> = futures::stream::iter(all_daemons.iter().filter(|d| d.service_type == "storage"))
-        .filter_map(|d| async move {
-            let mut attempts = 0;
-            let max_attempts = 5;
-            while attempts < max_attempts {
-                if check_process_status_by_port("Storage Daemon", d.port).await {
-                    debug!("Found running Storage Daemon on port {}", d.port);
-                    return Some(d.port);
-                }
-                debug!("No process found for Storage Daemon on port {} (attempt {})", d.port, attempts + 1);
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                attempts += 1;
-            }
-            None
-        })
-        .collect::<Vec<u16>>()
-        .await;
+
+    let storage_daemons: Vec<_> = all_daemons.iter().filter(|d| d.service_type == "storage").collect();
 
     let ports_to_display = match port_arg {
-        Some(p) if running_storage_ports.contains(&p) => vec![p],
         Some(p) => {
-            println!("No Storage Daemon found on port {}.", p);
-            vec![]
+            if storage_daemons.iter().any(|d| d.port == p) {
+                vec![p]
+            } else {
+                println!("No Storage Daemon found on port {}.", p);
+                vec![]
+            }
+        },
+        None => {
+            let mut running_ports: Vec<u16> = Vec::new();
+            for daemon in &storage_daemons {
+                if check_process_status_by_port("Storage Daemon", daemon.port).await {
+                    running_ports.push(daemon.port);
+                }
+            }
+            running_ports
         }
-        None => running_storage_ports,
     };
 
     println!("\n--- Storage Daemon Status ---");
     println!("{:<15} {:<10} {:<50}", "Status", "Port", "Configuration Details");
     println!("{:-<15} {:-<10} {:-<50}", "", "", "");
-    
+
     if ports_to_display.is_empty() {
         println!("{:<15} {:<10} {:<50}", "Down", "N/A", "No storage daemons found in registry.");
     } else {
@@ -424,41 +434,69 @@ pub async fn display_storage_daemon_status(
             } else {
                 "Down".to_string()
             };
+
+            let metadata = storage_daemons.iter().find(|d| d.port == port);
             
-            let metadata = all_daemons.iter().find(|d| d.port == port && d.service_type == "storage");
-            let pid_info = if let Some(meta) = metadata {
-                format!("PID: {} | Started: {:?}", meta.pid, meta.data_dir)
-            } else {
-                "PID: Unknown".to_string()
-            };
-            
+            let mut storage_config = StorageConfig::default();
+            let mut pid_info = "PID: Unknown".to_string();
+            let mut data_dir_display = "N/A".to_string();
+            let mut log_dir_display = "N/A".to_string();
+            let mut config_root_display = "N/A".to_string();
+
+            if let Some(meta) = metadata {
+                pid_info = format!("PID: {}", meta.pid);
+                if let Some(path) = &meta.config_path {
+                    // Corrected: Clone the PathBuf to create an owned value for the function.
+                    match load_storage_config_from_yaml(Some(path.clone())) {
+                        Ok(cfg) => {
+                            storage_config = cfg;
+                            data_dir_display = storage_config.data_directory.display().to_string();
+                            // Corrected: Clone the log_directory to avoid a partial move.
+                            log_dir_display = storage_config.log_directory.clone(); 
+                            config_root_display = storage_config.config_root_directory.display().to_string();
+                        },
+                        Err(e) => warn!("Failed to load storage config for port {}: {}, using default", port, e),
+                    }
+                }
+            }
+
+
             println!("{:<15} {:<10} {:<50}", storage_daemon_status, port, pid_info);
             println!("{:<15} {:<10} {:<50}", "", "", "");
-            
-            // Display comprehensive storage configuration
+
+            // Display comprehensive storage configuration from the loaded config
             println!("{:<15} {:<10} {:<50}", "", "", "=== Storage Configuration ===");
+            println!("{:<15} {:<10} {:<50}", "", "", format!("Port: {}", port));
+            println!("{:<15} {:<10} {:<50}", "", "", format!("Engine: {}", daemon_api_storage_engine_type_to_string(&storage_config.storage_engine_type)));
             
             // Display engine configuration details
             let engine_config_lines = format_engine_config(&storage_config);
             for config_line in engine_config_lines {
                 println!("{:<15} {:<10} {:<50}", "", "", config_line);
             }
-            
+
             println!("{:<15} {:<10} {:<50}", "", "", "");
             println!("{:<15} {:<10} {:<50}", "", "", "=== Directory Configuration ===");
-            println!("{:<15} {:<10} {:<50}", "", "", format!("Data Directory: {}", storage_config.data_directory.display()));
-            println!("{:<15} {:<10} {:<50}", "", "", format!("Log Directory: {}", storage_config.log_directory));
-            println!("{:<15} {:<10} {:<50}", "", "", format!("Config Root: {}", storage_config.config_root_directory.display()));
-            
+            println!("{:<15} {:<10} {:<50}", "", "", format!("Data Directory: {}", data_dir_display));
+            println!("{:<15} {:<10} {:<50}", "", "", format!("Log Directory: {}", log_dir_display));
+            println!("{:<15} {:<10} {:<50}", "", "", format!("Config Root: {}", config_root_display));
+
             println!("{:<15} {:<10} {:<50}", "", "", "");
             println!("{:<15} {:<10} {:<50}", "", "", "=== Network & Scaling ===");
             println!("{:<15} {:<10} {:<50}", "", "", format!("Default Port: {}", storage_config.default_port));
-            println!("{:<15} {:<10} {:<50}", "", "", format!("Cluster Range: {}", storage_config.cluster_range));
-            println!("{:<15} {:<10} {:<50}", "", "", format!("Use Raft for Scale: {}", storage_config.use_raft_for_scale));
             
+            let cluster_range = &storage_config.cluster_range;
+            if is_port_in_cluster_range(port, cluster_range) {
+                println!("{:<15} {:<10} {:<50}", "", "", format!("Cluster Range: {}", cluster_range));
+            } else {
+                println!("{:<15} {:<10} {:<50}", "", "", format!("Cluster Range: {} (Port {} is outside this range!)", cluster_range, port));
+            }
+            
+            println!("{:<15} {:<10} {:<50}", "", "", format!("Use Raft for Scale: {}", storage_config.use_raft_for_scale));
+
+
             // Add separator between multiple storage daemons
             if ports_to_display.len() > 1 && port != *ports_to_display.last().unwrap() {
-                println!("{:<15} {:<10} {:<50}", "", "", "");
                 println!("{:-<15} {:-<10} {:-<50}", "", "", "");
             }
         }
@@ -467,10 +505,11 @@ pub async fn display_storage_daemon_status(
     if port_arg.is_none() && !ports_to_display.is_empty() {
         println!("\nTo check a specific Storage, use 'status storage --port <port>'.");
     }
-    
+
     *storage_daemon_port_arc.lock().await = ports_to_display.first().copied();
     println!("--------------------------------------------------");
 }
+
 /// Displays the current storage engine configuration.
 pub async fn show_storage() -> Result<()> {
     // Load storage configuration
@@ -602,7 +641,7 @@ pub async fn handle_storage_command(storage_action: StorageAction) -> Result<()>
             } else {
                 println!("Registered Storage Daemons:");
                 for daemon in all_storage_daemons {
-                    println!("- Port: {}, PID: {}, Data Dir: {:?}, Engine: {:?}", 
+                    println!("- Port: {}, PID: {}, Data Dir: {:?}, Engine: {:?}",
                              daemon.port, daemon.pid, daemon.data_dir, daemon.engine_type);
                 }
             }
@@ -745,7 +784,22 @@ pub async fn reload_storage_interactive(
     storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
 ) -> Result<()> {
     println!("Reloading standalone Storage daemon...");
+
+    // The previous attempt failed because the hardcoded root path was incorrect.
+    // The `canonicalize()` function requires the file to exist.
+    // To resolve this, we'll now construct the path relative to the current executable's directory.
+    let mut exe_path = std::env::current_exe()
+        .context("Failed to get current executable path")?;
+    exe_path.pop(); // remove the executable name
     
+    let config_path = exe_path
+        .join(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE.trim_start_matches("./"));
+
+    let absolute_config_path = config_path.canonicalize()
+        .context(format!("Failed to get absolute path for config file: {}", config_path.display()))?;
+
+    log::info!("Attempting to reload with absolute config path: {:?}", absolute_config_path);
+
     // Pass the actual port if it's currently known, otherwise None to let it default
     let current_storage_port = storage_daemon_port_arc.lock().await.unwrap_or(DEFAULT_STORAGE_PORT);
 
@@ -758,45 +812,52 @@ pub async fn reload_storage_interactive(
 
     start_storage_interactive(
         Some(current_storage_port), // Pass Some(port) for targeted start
-        None, // config_file, assuming default if not specified
+        Some(absolute_config_path), // Now passing the explicit absolute config file path
         None, // cluster_opt
         storage_daemon_shutdown_tx_opt,
         storage_daemon_handle,
-        storage_daemon_port_arc
+        storage_daemon_port_arc,
     ).await?;
-    
-    println!("Standalone Storage daemon reloaded.");
+
     Ok(())
 }
 
 /// Handles the 'use storage' command.
 /// This function is responsible for both updating the configuration file and
 /// setting the in-memory state for the running CLI session.
+/// Handles the 'use storage' command.
 pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bool) -> Result<()> {
-    // Load the current CLI configuration
-    let mut config = load_cli_config()
-        .map_err(|e| anyhow!("Failed to load CLI config: {}", e))?;
+    // Load the configuration with the correct file path
+    let config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
+    let mut storage_config = load_storage_config_from_yaml(Some(config_path.clone()))
+        .context("Failed to load storage configuration")?;
 
-    // Ensure the storage section exists in the config
-    if config.storage.is_none() {
-        config.storage = Some(CliTomlStorageConfig::default());
-    }
+    // Update the storage engine type
+    storage_config.storage_engine_type = engine.clone();
 
-    // Get a mutable reference to the storage config
-    if let Some(storage_config) = config.storage.as_mut() {
-        // Update the storage engine type
-        storage_config.storage_engine_type = Some(engine.clone());
-    }
-
-    // If the 'permanent' flag is set, save the updated configuration to disk
+    // Save the configuration if permanent
     if permanent {
-        config.save()
-            .map_err(|e| anyhow!("Failed to save CLI config: {}", e))?;
-        println!("Set storage engine to {:?} (persisted)", engine);
-    } else {
-        println!("Set storage engine to {:?} (non-persisted)", engine);
+        storage_config.save().context("Failed to save storage configuration")?;
+        info!("Saved storage configuration to {:?}", config_path);
     }
 
+    // Attempt to update the StorageEngineManager, but continue if not initialized
+    if let Some(manager) = GLOBAL_STORAGE_ENGINE_MANAGER.get() {
+        match manager.lock().map_err(|e| anyhow!("Failed to lock StorageEngineManager: {}", e)) {
+            Ok(mut manager) => {
+                manager.use_storage(engine, permanent).await
+                    .map_err(|e| anyhow!("Failed to switch storage engine: {}", e))?;
+                info!("Updated StorageEngineManager to use {:?}", engine);
+            }
+            Err(e) => {
+                warn!("Failed to lock StorageEngineManager: {}. Configuration updated but engine not switched in memory.", e);
+            }
+        }
+    } else {
+        warn!("StorageEngineManager not initialized. Configuration updated but engine not switched in memory.");
+    }
+
+    println!("Switched to storage engine {} (persisted: {})", daemon_api_storage_engine_type_to_string(&engine), permanent);
     Ok(())
 }
 
@@ -828,7 +889,7 @@ pub async fn handle_use_storage_interactive(
     storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
 ) -> Result<()> {
     // 1. First, save the configuration to disk
-    handle_use_storage_command(engine, permanent).await?;
+    handle_use_storage_command(engine.clone(), permanent).await?;
 
     // 2. Then, reload the storage daemon to apply the new configuration
     reload_storage_interactive(
@@ -840,26 +901,39 @@ pub async fn handle_use_storage_interactive(
     Ok(())
 }
 
-pub async fn handle_show_storage_config_command() -> Result<()> {
-    let config = load_cli_config()
-        .map_err(|e| anyhow!("Failed to load CLI config: {}", e))?;
 
-    let engine_config = config
-        .storage
-        .as_ref()
-        .map(|cli_storage| EngineStorageConfig::from(cli_storage))
-        .unwrap_or_else(|| EngineStorageConfig {
-            storage_engine_type: StorageEngineType::RocksDB,
-            data_directory: PathBuf::from("/opt/graphdb/storage_data"),
-            connection_string: None,
-            max_open_files: None,
-            engine_specific_config: None,
-            default_port: DEFAULT_STORAGE_PORT,
-            log_directory: "/opt/graphdb/logs".to_string(),
-            config_root_directory: PathBuf::from(DEFAULT_CONFIG_ROOT_DIRECTORY_STR),
-            cluster_range: "".into(),
-            use_raft_for_scale: false,
-        });
+/// Handles the "show storage config" command, printing the current configuration.
+///
+/// This function is updated to load the configuration directly from the
+/// `storage_daemon_server/storage_config.yaml` file rather than relying on
+/// defaults from the CLI config.
+pub async fn handle_show_storage_config_command() -> Result<()> {
+    // Load the storage configuration from the designated YAML file.
+    let storage_config = load_storage_config_from_yaml(None)
+        .map_err(|e| anyhow!("Failed to load storage config from YAML: {}", e))?;
+
+    let engine_config = EngineStorageConfig {
+        storage_engine_type: storage_config.storage_engine_type,
+        data_directory: PathBuf::from(storage_config.data_directory),
+        connection_string: None,
+        max_open_files: Some(storage_config.max_open_files.try_into().unwrap_or_default()),
+        engine_specific_config: match storage_config.engine_specific_config {
+            Some(config) => {
+                let serialized = serde_json::to_value(&config)
+                    .map_err(|e| anyhow!("Failed to serialize engine config: {}", e))?;
+                match serialized {
+                    Value::Object(map) => Some(map.into_iter().collect()),
+                    _ => None,
+                }
+            },
+            None => None,
+        },
+        default_port: storage_config.default_port,
+        log_directory: storage_config.log_directory,
+        config_root_directory: PathBuf::from(storage_config.config_root_directory),
+        cluster_range: storage_config.cluster_range.to_string(),
+        use_raft_for_scale: storage_config.use_raft_for_scale,
+    };
 
     println!("Current Storage Configuration:");
     println!("- storage_engine_type: {:?}", engine_config.storage_engine_type);
