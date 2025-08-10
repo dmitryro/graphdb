@@ -1421,16 +1421,16 @@ pub async fn handle_interactive_command(
                 ShowAction::Config { config_type } => {
                     match config_type {
                         ConfigAction::All => {
-                            println!("'show config all' command is not yet fully implemented.");
+                             handlers::handle_show_all_config_command().await?;
                         }
                         ConfigAction::Rest => {
-                            println!("'show config rest' command is not yet fully implemented.");
+                             handlers::handle_show_rest_config_command().await?;
                         }
                         ConfigAction::Storage => {
                              handlers::handle_show_storage_config_command().await?;
                         }
                         ConfigAction::Main => {
-                            println!("'show config main' command is not yet fully implemented.");
+                             handlers::handle_show_main_config_command().await?;
                         }
                     }
                 }
