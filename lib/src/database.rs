@@ -1,20 +1,22 @@
 // lib/src/database.rs
 // Refactored: 2025-07-04 - Updated to use new InMemoryGraphStorage and RocksdbGraphStorage.
+// Fixed: 2025-08-09 - Removed incorrect Option handling for data_directory (E0308)
+// Fixed: 2025-08-09 - Added explicit AsRef<Path> for open_sled_db to resolve E0283
 
 use std::sync::Arc;
 use std::path::{Path, PathBuf};
 
 // Import the refactored storage engines
 use crate::storage_engine::{GraphStorageEngine, StorageConfig, StorageEngineType, open_sled_db};
-use crate::storage_engine::sled_storage::SledStorage; // Explicitly import SledStorage
-#[cfg(feature = "with-rocksdb")] // Apply cfg to the import itself
-use crate::storage_engine::rocksdb_storage::RocksdbGraphStorage; // Explicitly import RocksdbGraphStorage
-use crate::memory::InMemoryGraphStorage; // Import the new in-memory storage
+use crate::storage_engine::sled_storage::SledStorage;
+#[cfg(feature = "with-rocksdb")]
+use crate::storage_engine::rocksdb_storage::RocksdbGraphStorage;
+use crate::storage_engine::inmemory_storage::InMemoryStorage;
 
 use models::{Vertex, Edge, Identifier};
-use models::errors::{GraphError, GraphResult}; // Use GraphResult directly
+use models::errors::{GraphError, GraphResult};
 use uuid::Uuid;
-use serde_json::Value; // For query results
+use serde_json::Value;
 
 /// A graph database wrapper that provides a simplified interface for
 /// interacting with an underlying `GraphStorageEngine`.
@@ -39,11 +41,7 @@ impl Database {
     pub async fn new(config: StorageConfig) -> GraphResult<Self> {
         let storage_engine: Arc<dyn GraphStorageEngine> = match config.storage_engine_type {
             StorageEngineType::Sled => {
-                let db_path = match &config.data_directory {
-                    Some(path) => path.as_path(),
-                    None => return Err(GraphError::ConfigError("Sled storage requires a data directory path.".to_string())),
-                };
-                let db = open_sled_db(db_path)?;
+                let db = open_sled_db(<PathBuf as AsRef<Path>>::as_ref(&config.data_directory))?;
                 Arc::new(SledStorage::new(db)?)
             },
             StorageEngineType::RocksDB => {
@@ -59,13 +57,9 @@ impl Database {
                     ));
                 }
             },
-            StorageEngineType::InMemory => { // Added InMemory option
-                let db_path = match &config.data_directory {
-                    Some(path) => path.clone(),
-                    None => return Err(GraphError::ConfigError("In-memory storage requires a data directory path.".to_string())),
-                };
-                Arc::new(InMemoryGraphStorage::new_with_path(db_path))
-            }
+            StorageEngineType::InMemory => {
+                Arc::new(InMemoryStorage::new(config.clone())?)
+            },
             // Add other storage types here as they are implemented (e.g., PostgreSQL, Redis)
             _ => return Err(GraphError::ConfigError(
                 format!("Unsupported storage engine type: {:?}", config.storage_engine_type)

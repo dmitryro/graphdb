@@ -799,3 +799,8 @@ pub async fn reload_rest_interactive(
     Ok(())
 }
 
+pub async fn handle_show_rest_config_command() -> Result<()> {
+    println!("'show config rest' command is not yet fully implemented.");
+    Ok(())
+}
+

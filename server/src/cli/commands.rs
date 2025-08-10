@@ -2,9 +2,10 @@
 // ADDED: 2025-08-08 - Added `pub use crate::cli::config::StorageEngineType` to re-export `StorageEngineType` publicly, resolving `error[E0603]` in `interactive.rs`.
 // UPDATED: 2025-08-08 - Changed import from `lib::storage_engine::config::StorageEngineType` to `crate::cli::config::StorageEngineType` to align with project structure.
 // UPDATED: 2025-08-08 - Ensured `StorageEngineType` supports `Sled`, `RocksDB`, `InMemory`, `Redis`, `PostgreSQL`, `MySQL` as per updated enum definition.
-// NOTE: Kept `std::path::PathBuf` as it’s standard for CLI args and compatible with `fs2` in `config.rs`.
+// NOTE: Kept `std::path::PathBuf` as it's standard for CLI args and compatible with `fs2` in `config.rs`.
 // FIXED: 2025-08-08 - Added `permanent` boolean field to `UseAction::Storage` and `CommandType::UseStorage` to resolve `E0026` error in `config.rs`.
 // ADDED: 2025-08-09 - Added `Save` command with `Storage` and `Config` subcommands to save storage engine and configuration changes.
+// FIXED: 2025-08-09 - Added `ShowArgs` wrapper struct to fix `E0277` trait bound error for `ShowAction`.
 
 use clap::{Parser, Subcommand, Arg, Args};
 use std::path::PathBuf;
@@ -27,6 +28,8 @@ pub fn parse_storage_engine(engine: &str) -> Result<StorageEngineType, String> {
         )),
     }
 }
+
+
 /// Enum representing the parsed command type in interactive mode.
 #[derive(Debug, PartialEq, Clone)]
 pub enum CommandType {
@@ -76,7 +79,7 @@ pub enum CommandType {
     StatusStorage(Option<u16>),
     StatusCluster,
     StatusRaft(Option<u16>),
-
+    //ShowStorage,
     // Authentication and User Management
     Auth { username: String, password: String },
     Authenticate { username: String, password: String },
@@ -110,7 +113,7 @@ pub enum CommandType {
     RestartStorage { port: Option<u16>, config_file: Option<PathBuf>, cluster: Option<String>, storage_port: Option<u16>, storage_cluster: Option<String> },
     RestartDaemon { port: Option<u16>, cluster: Option<String>, daemon_port: Option<u16>, daemon_cluster: Option<String> },
     RestartCluster,
-
+    Show(ShowAction),
     // Utility Commands
     Clear,
     Help(HelpArgs),
@@ -240,6 +243,14 @@ pub enum Commands {
     Exit,
     /// Quit the CLI (alias for 'exit')
     Quit,
+    /// Show information about system components
+    Show(ShowArgs),
+}
+
+#[derive(Args, Debug, PartialEq, Clone)]
+pub struct ShowArgs {
+    #[clap(subcommand)]
+    pub action: ShowAction,
 }
 
 #[derive(Subcommand, Debug, PartialEq, Clone)]
@@ -250,6 +261,34 @@ pub enum SaveAction {
     #[clap(name = "config")]
     Configuration,
 }
+
+
+// A new enum for the Show command's subcommands:
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum ShowAction {
+    /// Show the current storage engine.
+    Storage,
+    /// Show configuration information.
+    Config {
+        #[clap(subcommand)]
+        config_type: ConfigAction,
+    },
+    /// Show the status of experimental plugins.
+    Plugins,
+}
+
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum ConfigAction {
+    /// Show all configurations.
+    All,
+    /// Show REST API configuration.
+    Rest,
+    /// Show Storage configuration.
+    Storage,
+    /// Show main daemon configuration.
+    Main,
+}
+
 
 #[derive(Subcommand, Debug, PartialEq, Clone)]
 pub enum StartAction {
@@ -541,6 +580,7 @@ pub enum StorageAction {
     /// Get the version of the REST API server.
     Version,
     List,
+    Show, // New variant for 'show storage'
 }
 
 #[derive(Args, Debug, PartialEq, Clone)]

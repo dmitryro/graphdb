@@ -64,6 +64,8 @@ pub use handlers_utils::{
     clear_terminal_screen,
     ensure_daemon_registry_paths_exist,
     execute_storage_query,
+    storage_engine_type_to_str,
+    parse_show_command,
 };
 pub use handlers_main::{
     DaemonArgs,
@@ -74,9 +76,11 @@ pub use handlers_main::{
     stop_main_interactive,
     stop_daemon_instance_interactive,
     reload_daemon_interactive,
+    handle_show_main_config_command,
 };  
 pub use handlers_storage::{
     storage,
+    show_storage,
     display_storage_daemon_status,
     handle_storage_command,
     handle_storage_command_interactive,
@@ -86,6 +90,11 @@ pub use handlers_storage::{
     use_storage_engine,
     handle_save_storage,
     reload_storage_interactive,
+    handle_use_storage_interactive,
+    handle_use_storage_command,
+    handle_show_storage_command,
+    handle_show_storage_command_interactive,
+    handle_show_storage_config_command,
 };
 pub use handlers_rest::{
     RestArgs,
@@ -101,6 +110,7 @@ pub use handlers_rest::{
     display_rest_api_version,
     execute_graph_query,
     reload_rest_interactive,
+    handle_show_rest_config_command
 };
 
 pub use handlers_all::{
@@ -108,6 +118,7 @@ pub use handlers_all::{
     reload_all_interactive,
     handle_start_all_interactive,
     display_full_status_summary,
+    handle_show_all_config_command,
 };
   
 pub use handlers::{
@@ -117,7 +128,10 @@ pub use handlers::{
     handle_reload_command,
     handle_restart_command_interactive, // FIX: Changed to handle_restart_command_interactive
     handle_start_command_interactive,
+    handle_show_plugins_command,
+    handle_show_plugins_command_interactive,
 };
+
 pub use interactive::{
     run_cli_interactive,
 };

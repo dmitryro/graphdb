@@ -1,42 +1,46 @@
 // server/src/cli/handlers_storage.rs
+// Created: 2025-08-09 - Implemented handlers for storage-related CLI commands
+// Updated: 2025-08-09 - Fixed E0308 type mismatch in handle_show_storage_config_command
+// Fixed: 2025-08-09 - Converted CliTomlStorageConfig to lib::storage_engine::config::StorageConfig
 
 use anyhow::{Result, Context, Error, anyhow};
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
-
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::net::{IpAddr, SocketAddr};
-
 use std::fs;
 use std::fs::OpenOptions;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
-
-use fs2::FileExt; // trait methods for lock/unlock
+use fs2::FileExt;
 use std::future::Future;
-
 use tokio::net::TcpStream;
 use tokio::time;
 use tokio::spawn;
-
 use chrono::Utc;
 use log::{info, error, warn, debug};
 use futures::stream::StreamExt;
-
 use crate::cli::commands::{CommandType, Commands, StartAction, StorageAction};
 use crate::cli::config::{
     CliConfig,
+    StorageConfig,
     DEFAULT_CONFIG_ROOT_DIRECTORY_STR,
     DEFAULT_STORAGE_CONFIG_PATH_RELATIVE,
     DEFAULT_STORAGE_PORT,
-    StorageConfig,
+    StorageConfig as CliStorageConfig,
     CliTomlStorageConfig,
     load_storage_config_from_yaml,
     load_cli_config,
     daemon_api_storage_engine_type_to_string,
 };
+use crate::cli::handlers_utils::{format_engine_config, write_registry_fallback, execute_storage_query};
+use models::errors::GraphError;
+use daemon_api::start_daemon;
+use daemon_api::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
+use lib::storage_engine::config::{StorageEngineType, StorageConfig as EngineStorageConfig};
+use lib::storage_engine::{StorageEngineManager, GLOBAL_STORAGE_ENGINE_MANAGER};
 use crate::cli::daemon_management::{
     is_port_free,
     find_pid_by_port,
@@ -44,11 +48,6 @@ use crate::cli::daemon_management::{
     stop_process_by_port,
     parse_cluster_range,
 };
-use crate::cli::handlers_utils::{format_engine_config, write_registry_fallback, execute_storage_query};
-
-use daemon_api::start_daemon;
-use daemon_api::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
-use lib::storage_engine::config::{StorageEngineType};
 
 pub mod storage {
     pub mod api {
@@ -481,7 +480,46 @@ pub async fn display_storage_daemon_status(
     *storage_daemon_port_arc.lock().await = ports_to_display.first().copied();
     println!("--------------------------------------------------");
 }
+/// Displays the current storage engine configuration.
+pub async fn show_storage() -> Result<()> {
+    // Load storage configuration
+    let config_path = PathBuf::from(DEFAULT_CONFIG_ROOT_DIRECTORY_STR).join(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
+    let storage_config = load_storage_config_from_yaml(Some(config_path.clone()))
+        .unwrap_or_else(|e| {
+            warn!("Failed to load storage config from {:?}: {}, using default", config_path, e);
+            StorageConfig::default()
+        });
 
+    // Get current engine type from StorageEngineManager
+    let current_engine = GLOBAL_STORAGE_ENGINE_MANAGER
+        .get()
+        .ok_or_else(|| anyhow!("StorageEngineManager not initialized"))?
+        .lock()
+        .map_err(|e| anyhow!("Failed to lock StorageEngineManager: {}", e))?
+        .current_engine_type();
+
+    // Format engine configuration
+    let engine_config_lines = format_engine_config(&storage_config);
+
+    // Display configuration
+    println!("\n--- Storage Engine Configuration ---");
+    println!("{:<30} {}", "Current Engine", current_engine);
+    println!("{:<30} {}", "Config File", config_path.display());
+    println!("{:-<30} {}", "", "");
+    println!("{:<30} {}", "Configuration Details", "");
+    for line in engine_config_lines {
+        println!("{:<30} {}", "", line);
+    }
+    println!("{:<30} {}", "Data Directory", storage_config.data_directory.display());
+    println!("{:<30} {}", "Log Directory", storage_config.log_directory);
+    println!("{:<30} {}", "Config Root", storage_config.config_root_directory.display());
+    println!("{:<30} {}", "Default Port", storage_config.default_port);
+    println!("{:<30} {}", "Cluster Range", storage_config.cluster_range);
+    println!("{:<30} {}", "Use Raft for Scale", storage_config.use_raft_for_scale);
+    println!("-----------------------------------");
+
+    Ok(())
+}
 
 /// Handles `storage` subcommand for direct CLI execution.
 pub async fn handle_storage_command(storage_action: StorageAction) -> Result<()> {
@@ -549,6 +587,10 @@ pub async fn handle_storage_command(storage_action: StorageAction) -> Result<()>
         }
         StorageAction::StorageQuery => {
             println!("Performing Storage Query (simulated, non-interactive mode)...");
+            Ok(())
+        }
+        StorageAction::Show => {
+            show_storage().await;
             Ok(())
         }
         StorageAction::Health => {
@@ -630,6 +672,10 @@ pub async fn handle_storage_command_interactive(
             println!("Retrieving Storage Version (simulated, interactive mode)...");
             Ok(())
         }
+        StorageAction::Show => {
+            show_storage().await;
+            Ok(())
+        }
         StorageAction::List => {
             let all_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
             let all_storage_daemons: Vec<DaemonMetadata> = all_daemons.into_iter()
@@ -661,28 +707,38 @@ pub async fn stop_storage(
     Ok(())
 }
 
-/// Updates the storage engine configuration and persists it to the config file.
-pub async fn use_storage_engine(engine: StorageEngineType) -> Result<()> {
-    // Load the current configuration from server/src/cli/config.toml
-    let config_path = PathBuf::from("server/src/cli/config.toml");
-    let mut config = load_cli_config()
-        .map_err(|e| anyhow!("Failed to load config from {}: {}", config_path.display(), e))?;
+/// Updates the storage engine configuration and applies it via StorageEngineManager.
+pub async fn use_storage_engine(engine_type_str: &str, permanent: bool) -> Result<()> {
+    // Map string to StorageEngineType
+    let engine_type = match engine_type_str.to_lowercase().as_str() {
+        "sled" => StorageEngineType::Sled,
+        "rocksdb" => StorageEngineType::RocksDB,
+        "inmemory" => StorageEngineType::InMemory,
+        "redis" => StorageEngineType::Redis,
+        "postgresql" => StorageEngineType::PostgreSQL,
+        "mysql" => StorageEngineType::MySQL,
+        _ => return Err(anyhow!("Unknown storage engine: {}", engine_type_str)),
+    };
 
-    // Store engine string for display before move
-    let engine_str = engine.to_string();
+    // Validate engine type against available engines
+    let available_engines = StorageEngineManager::available_engines();
+    if !available_engines.contains(&engine_type) {
+        return Err(anyhow!("Storage engine {} is not enabled. Available engines: {:?}", engine_type_str, available_engines));
+    }
 
-    // Update the storage engine type in the storage section
-    config.storage = Some(CliTomlStorageConfig {
-        storage_engine_type: Some(engine),
-        ..config.storage.unwrap_or_default()
-    });
+    // Lock and update the StorageEngineManager
+    info!("Executing use storage command for {} (permanent: {})", engine_type_str, permanent);
+    {
+        let mut manager = GLOBAL_STORAGE_ENGINE_MANAGER
+            .get()
+            .ok_or_else(|| anyhow!("StorageEngineManager not initialized"))?
+            .lock()
+            .map_err(|e| anyhow!("Failed to lock StorageEngineManager: {}", e))?;
+        manager.use_storage(engine_type, permanent).await
+            .map_err(|e| anyhow!("Failed to switch storage engine: {}", e))?;
+    }
 
-    // Save the updated configuration to /opt/graphdb/config.toml
-    let save_path = PathBuf::from("/opt/graphdb/config.toml");
-    config.save()
-        .map_err(|e| anyhow!("Failed to save config to {}: {}", save_path.display(), e))?;
-
-    println!("Storage engine configured to {}", engine_str);
+    println!("Switched to storage engine {} (persisted: {})", engine_type_str, permanent);
     Ok(())
 }
 
@@ -719,5 +775,115 @@ pub async fn reload_storage_interactive(
     ).await?;
     
     println!("Standalone Storage daemon reloaded.");
+    Ok(())
+}
+
+/// Handles the 'use storage' command.
+/// This function is responsible for both updating the configuration file and
+/// setting the in-memory state for the running CLI session.
+pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bool) -> Result<()> {
+    // Load the current CLI configuration
+    let mut config = load_cli_config()
+        .map_err(|e| anyhow!("Failed to load CLI config: {}", e))?;
+
+    // Ensure the storage section exists in the config
+    if config.storage.is_none() {
+        config.storage = Some(CliTomlStorageConfig::default());
+    }
+
+    // Get a mutable reference to the storage config
+    if let Some(storage_config) = config.storage.as_mut() {
+        // Update the storage engine type
+        storage_config.storage_engine_type = Some(engine.clone());
+    }
+
+    // If the 'permanent' flag is set, save the updated configuration to disk
+    if permanent {
+        config.save()
+            .map_err(|e| anyhow!("Failed to save CLI config: {}", e))?;
+        println!("Set storage engine to {:?} (persisted)", engine);
+    } else {
+        println!("Set storage engine to {:?} (non-persisted)", engine);
+    }
+
+    Ok(())
+}
+
+/// Handles the 'show storage' command.
+pub async fn handle_show_storage_command() -> Result<()> {
+    let config = load_cli_config()
+        .map_err(|e| anyhow!("Failed to load CLI config: {}", e))?;
+    let engine_type = config.storage.and_then(|s| s.storage_engine_type);
+    println!("Current Storage Engine: {:?}", engine_type);
+    Ok(())
+}
+
+pub async fn handle_show_storage_command_interactive() -> Result<()> {
+    let config = load_cli_config()
+        .map_err(|e| anyhow!("Failed to load CLI config: {}", e))?;
+    let engine_type = config.storage.and_then(|s| s.storage_engine_type);
+    println!("Current Storage Engine: {:?}", engine_type);
+    Ok(())
+}
+
+/// Handles the interactive 'use storage' command.
+/// This function first calls the core handler to save the config, then
+/// reloads the storage daemon to apply the new settings.
+pub async fn handle_use_storage_interactive(
+    engine: StorageEngineType,
+    permanent: bool,
+    storage_daemon_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
+    storage_daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
+    storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
+) -> Result<()> {
+    // 1. First, save the configuration to disk
+    handle_use_storage_command(engine, permanent).await?;
+
+    // 2. Then, reload the storage daemon to apply the new configuration
+    reload_storage_interactive(
+        storage_daemon_shutdown_tx_opt,
+        storage_daemon_handle,
+        storage_daemon_port_arc,
+    ).await?;
+
+    Ok(())
+}
+
+pub async fn handle_show_storage_config_command() -> Result<()> {
+    let config = load_cli_config()
+        .map_err(|e| anyhow!("Failed to load CLI config: {}", e))?;
+
+    let engine_config = config
+        .storage
+        .as_ref()
+        .map(|cli_storage| EngineStorageConfig::from(cli_storage))
+        .unwrap_or_else(|| EngineStorageConfig {
+            storage_engine_type: StorageEngineType::RocksDB,
+            data_directory: PathBuf::from("/opt/graphdb/storage_data"),
+            connection_string: None,
+            max_open_files: None,
+            engine_specific_config: None,
+            default_port: DEFAULT_STORAGE_PORT,
+            log_directory: "/opt/graphdb/logs".to_string(),
+            config_root_directory: PathBuf::from(DEFAULT_CONFIG_ROOT_DIRECTORY_STR),
+            cluster_range: "".into(),
+            use_raft_for_scale: false,
+        });
+
+    println!("Current Storage Configuration:");
+    println!("- storage_engine_type: {:?}", engine_config.storage_engine_type);
+    println!("- data_directory: {}", engine_config.data_directory.display());
+    println!("- default_port: {}", engine_config.default_port);
+    println!("- log_directory: {}", engine_config.log_directory);
+    println!("- config_root_directory: {}", engine_config.config_root_directory.display());
+    println!("- cluster_range: {}", engine_config.cluster_range);
+    println!("- use_raft_for_scale: {}", engine_config.use_raft_for_scale);
+    println!(
+        "- max_open_files: {}",
+        engine_config.max_open_files
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "None".into())
+    );
+
     Ok(())
 }
