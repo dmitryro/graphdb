@@ -28,10 +28,10 @@ use crate::cli::daemon_management::{
 };
 
 // Import handler functions for individual components
-use crate::cli::handlers_rest::{start_rest_api_interactive, stop_rest_api_interactive};
-use crate::cli::handlers_storage::{start_storage_interactive, stop_storage_interactive};
+use crate::cli::handlers_rest::{start_rest_api_interactive, stop_rest_api_interactive, handle_show_rest_config_command};
+use crate::cli::handlers_storage::{start_storage_interactive, stop_storage_interactive, handle_show_storage_config_command};
 use crate::cli::handlers_utils::{format_engine_config};
-use crate::cli::handlers_main::{start_daemon_instance_interactive, stop_main_interactive};
+use crate::cli::handlers_main::{start_daemon_instance_interactive, stop_main_interactive, handle_show_main_config_command};
 
 // Import daemon registry
 use daemon_api::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
@@ -554,8 +554,17 @@ pub async fn display_full_status_summary(
     Ok(())
 }
 
+/// A handler for the 'show config all' command.
+/// It calls the individual show config handlers to display all services configurations.
 pub async fn handle_show_all_config_command() -> Result<()> {
-    println!("'show config all' command is not yet fully implemented.");
+    println!("==================================================");
+    handle_show_main_config_command().await?;
+    println!("==================================================");
+    handle_show_rest_config_command().await?;
+    println!("==================================================");
+    handle_show_storage_config_command().await?;
+    println!("==================================================");
     Ok(())
 }
+
 

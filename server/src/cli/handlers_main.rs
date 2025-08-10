@@ -485,7 +485,18 @@ pub async fn stop_daemon_instance_interactive(
     Ok(())
 }
 
+/// A handler for the 'show config main' command.
+/// It loads the current main daemon configuration and displays the settings.
 pub async fn handle_show_main_config_command() -> Result<()> {
-    println!("'show config main' command is not yet fully implemented.");
+    // Load the main daemon configuration.
+    let config = load_main_daemon_config(None)
+        .map_err(|e| anyhow!("Failed to load Main Daemon config: {}", e))?;
+
+    println!("Current Main Daemon Configuration:");
+    println!("- data_directory: {}", config.data_directory);
+    println!("- log_directory: {}", config.log_directory);
+    println!("- default_port: {}", config.default_port);
+    println!("- cluster_range: {}", config.cluster_range);
+
     Ok(())
 }

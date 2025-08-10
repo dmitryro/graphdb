@@ -31,7 +31,7 @@ use crate::cli::config::{
     DEFAULT_REST_API_PORT, DEFAULT_STORAGE_PORT, DEFAULT_REST_CONFIG_PATH_RELATIVE,
     DEFAULT_CONFIG_ROOT_DIRECTORY_STR, DEFAULT_DAEMON_PORT,
     RestApiConfig, load_rest_config, CliConfig,
-    default_config_root_directory, load_cli_config
+    default_config_root_directory, load_cli_config,
 };
 
 // Import daemon management utilities
@@ -49,6 +49,15 @@ use crate::cli::handlers_utils::{
 
 use daemon_api::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
 use daemon_api::{stop_daemon, start_daemon};
+
+/// A temporary struct to hold the combined REST configuration for display.
+#[derive(Debug)]
+struct DisplayRestConfig {
+    rest_api_enabled: bool,
+    default_port: u16,
+    cluster_range: String,
+    config_root_directory: PathBuf,
+}
 
 // Placeholder struct for RestArgs
 #[derive(Debug, Clone)]
@@ -799,8 +808,20 @@ pub async fn reload_rest_interactive(
     Ok(())
 }
 
+/// A handler for the 'show config rest' command.
+/// It loads the current configuration and displays the REST API settings.
 pub async fn handle_show_rest_config_command() -> Result<()> {
-    println!("'show config rest' command is not yet fully implemented.");
+    // Load the main CLI configuration from the default file path.
+    // We assume the load_rest_config function exists and is in scope.
+    let config = load_rest_config(None)
+        .map_err(|e| anyhow!("Failed to load REST API config: {}", e))?;
+
+    println!("Current REST API Configuration:");
+    println!("- default_port: {}", config.default_port);
+    println!("- cluster_range: {}", config.cluster_range);
+    println!("- data_directory: {}", config.data_directory);
+    println!("- log_directory: {}", config.log_directory);
+
     Ok(())
 }
 
