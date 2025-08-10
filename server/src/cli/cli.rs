@@ -74,10 +74,10 @@ use crate::cli::handlers as handlers_mod;
 use crate::cli::interactive as interactive_mod;
 use crate::cli::help_display as help_display_mod;
 use crate::cli::daemon_management;
+use crate::cli::handlers_utils::{parse_storage_engine};
 use lib::query_parser::{parse_query_from_string, QueryType};
 use lib::storage_engine::config::StorageEngineType;
 use storage_daemon_server::{StorageSettingsWrapper};
-
 /// GraphDB Command Line Interface
 #[derive(Parser, Debug)]
 #[clap(author, version, about = "GraphDB Command Line Interface", long_about = None)]
@@ -163,23 +163,6 @@ pub enum Commands {
         #[clap(subcommand)]
         action: ShowAction,
     },
-}
-
-// Custom parser for storage engine to handle hyphenated and non-hyphenated aliases
-fn parse_storage_engine(engine: &str) -> Result<StorageEngineType, String> {
-    match engine.to_lowercase().as_str() {
-        "sled" => Ok(StorageEngineType::Sled),
-        "rocksdb" | "rocks-db" => Ok(StorageEngineType::RocksDB),
-        "inmemory" | "in-memory" => Ok(StorageEngineType::InMemory),
-        "redis" => Ok(StorageEngineType::Redis),
-        "postgres" | "postgresql" | "postgre-sql" => Ok(StorageEngineType::PostgreSQL),
-        "mysql" | "my-sql" => Ok(StorageEngineType::MySQL),
-        "config" | "configuration" => Err("Use 'save configuration' or 'save config' for configuration saving".to_string()),
-        _ => Err(format!(
-            "Invalid storage engine: {}. Supported: sled, rocksdb, rocks-db, inmemory, in-memory, redis, postgres, postgresql, postgre-sql, mysql, my-sql",
-            engine
-        )),
-    }
 }
 
 // Re-usable function to handle all commands. This is called from both interactive and non-interactive modes.

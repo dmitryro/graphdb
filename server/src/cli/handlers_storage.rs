@@ -3,22 +3,15 @@
 // Updated: 2025-08-09 - Fixed E0308 type mismatch in handle_show_storage_config_command
 // Fixed: 2025-08-09 - Converted CliTomlStorageConfig to lib::storage_engine::config::StorageConfig
 
-use anyhow::{Result, Context, Error, anyhow};
+use anyhow::{Result, anyhow};
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
-use std::path::{Path, PathBuf};
+use std::path::{PathBuf};
 use std::time::Duration;
 use std::net::{IpAddr, SocketAddr};
-use std::fs;
-use std::fs::OpenOptions;
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
 use fs2::FileExt;
 use std::future::Future;
-use tokio::net::TcpStream;
-use tokio::time;
-use tokio::spawn;
 use chrono::Utc;
 use log::{info, error, warn, debug};
 use futures::stream::StreamExt;
@@ -29,14 +22,12 @@ use crate::cli::config::{
     DEFAULT_CONFIG_ROOT_DIRECTORY_STR,
     DEFAULT_STORAGE_CONFIG_PATH_RELATIVE,
     DEFAULT_STORAGE_PORT,
-    StorageConfig as CliStorageConfig,
     CliTomlStorageConfig,
     load_storage_config_from_yaml,
     load_cli_config,
     daemon_api_storage_engine_type_to_string,
 };
 use crate::cli::handlers_utils::{format_engine_config, write_registry_fallback, execute_storage_query};
-use models::errors::GraphError;
 use daemon_api::start_daemon;
 use daemon_api::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
 use lib::storage_engine::config::{StorageEngineType, StorageConfig as EngineStorageConfig};

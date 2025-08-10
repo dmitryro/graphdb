@@ -66,6 +66,7 @@ pub use handlers_utils::{
     execute_storage_query,
     storage_engine_type_to_str,
     parse_show_command,
+    parse_storage_engine,
 };
 pub use handlers_main::{
     DaemonArgs,

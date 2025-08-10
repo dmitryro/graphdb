@@ -5,16 +5,11 @@ use std::path::{PathBuf, Path};
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
-use std::net::SocketAddr;
 use std::time::Duration;
 use futures::stream::StreamExt;
 use log::{info, error, warn, debug};
 use config::Config;
 use reqwest::Client;
-use serde_json::Value;
-
-// Import command structs from commands.rs
-use crate::cli::commands::{CliArgs};
 
 // Import configuration-related items
 use crate::cli::config::{
@@ -34,7 +29,7 @@ use crate::cli::handlers_utils::{format_engine_config};
 use crate::cli::handlers_main::{start_daemon_instance_interactive, stop_main_interactive, handle_show_main_config_command};
 
 // Import daemon registry
-use daemon_api::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
+use daemon_api::daemon_registry::{GLOBAL_DAEMON_REGISTRY};
 
 /// Stops all components managed by the interactive CLI, then attempts to stop any others.
 pub async fn stop_all_interactive(
