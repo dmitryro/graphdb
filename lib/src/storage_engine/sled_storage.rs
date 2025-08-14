@@ -18,6 +18,7 @@
 // Fixed: 2025-08-13 - Corrected lock file path to `/opt/graphdb/storage_data/sled/db/LOCK`
 // Fixed: 2025-08-13 - Added lsof-based lock file cleanup in `open_sled_db` and `close`
 // Fixed: 2025-08-13 - Enhanced `open_sled_db` with more robust lock cleanup and increased retries
+// Fixed: 2025-08-13 - Moved `close` method to GraphStorageEngine implementation
 
 use std::any::Any;
 use async_trait::async_trait;
@@ -45,14 +46,12 @@ pub struct SledStorage {
 }
 
 pub fn open_sled_db<P: AsRef<Path>>(path: P) -> GraphResult<Db> {
-    let max_attempts = 15; // Increased for robustness
+    let max_attempts = 15;
     let retry_delay_ms = 2000;
 
-    // Remove stale lock file and terminate holding processes
     let lock_path = path.as_ref().join("LOCK");
     if lock_path.exists() {
         debug!("Found lock file at {:?}", lock_path);
-        // Check for processes holding the lock
         let lsof_output = Command::new("lsof")
             .arg(lock_path.to_str().unwrap())
             .output();
@@ -69,7 +68,7 @@ pub fn open_sled_db<P: AsRef<Path>>(path: P) -> GraphResult<Db> {
                             .output()
                             .map_err(|e| GraphError::Io(e))?;
                         info!("Terminated PID {} holding lock file {:?}", pid, lock_path);
-                        std::thread::sleep(std::time::Duration::from_millis(1000)); // Increased delay
+                        std::thread::sleep(std::time::Duration::from_millis(1000));
                     }
                 }
             }
@@ -77,7 +76,6 @@ pub fn open_sled_db<P: AsRef<Path>>(path: P) -> GraphResult<Db> {
             debug!("No processes found holding lock file {:?}", lock_path);
         }
 
-        // Attempt to remove the lock file
         let max_remove_attempts = 5;
         for attempt in 0..max_remove_attempts {
             match fs::remove_file(&lock_path) {
@@ -117,7 +115,6 @@ pub fn open_sled_db<P: AsRef<Path>>(path: P) -> GraphResult<Db> {
                     e,
                     retry_delay_ms
                 );
-                // Recheck for holding processes
                 let lsof_output = Command::new("lsof")
                     .arg(lock_path.to_str().unwrap())
                     .output();
@@ -139,7 +136,6 @@ pub fn open_sled_db<P: AsRef<Path>>(path: P) -> GraphResult<Db> {
                         }
                     }
                 }
-                // Retry removing lock file
                 if lock_path.exists() {
                     match fs::remove_file(&lock_path) {
                         Ok(_) => info!("Removed stale lock file at {:?}", lock_path),
@@ -207,64 +203,6 @@ impl SledStorage {
         self.vertices.clear().map_err(|e| GraphError::StorageError(e.to_string()))?;
         self.edges.clear().map_err(|e| GraphError::StorageError(e.to_string()))?;
         self.db.flush().map_err(|e| GraphError::Io(e.into()))?;
-        Ok(())
-    }
-
-    pub async fn close(&self) -> GraphResult<()> {
-        self.flush().await?;
-        let lock_path = Path::new(&self.config.data_directory).join("db/LOCK");
-        if lock_path.exists() {
-            debug!("Found lock file at {:?}", lock_path);
-            // Check for processes holding the lock
-            let lsof_output = Command::new("lsof")
-                .arg(lock_path.to_str().unwrap())
-                .output();
-            if let Ok(output) = lsof_output {
-                let output_str = String::from_utf8_lossy(&output.stdout);
-                for line in output_str.lines().skip(1) {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() > 1 {
-                        if let Ok(pid) = parts[1].parse::<u32>() {
-                            warn!("Found process PID {} holding lock file {:?}", pid, lock_path);
-                            Command::new("kill")
-                                .arg("-9")
-                                .arg(pid.to_string())
-                                .output()
-                                .map_err(|e| GraphError::Io(e))?;
-                            info!("Terminated PID {} holding lock file {:?}", pid, lock_path);
-                            std::thread::sleep(std::time::Duration::from_millis(1000));
-                        }
-                    }
-                }
-            } else {
-                debug!("No processes found holding lock file {:?}", lock_path);
-            }
-
-            // Attempt to remove the lock file
-            let max_remove_attempts = 5;
-            for attempt in 0..max_remove_attempts {
-                match fs::remove_file(&lock_path) {
-                    Ok(_) => {
-                        info!("Removed Sled lock file at {:?}", lock_path);
-                        break;
-                    }
-                    Err(e) if e.raw_os_error() == Some(35) && attempt < max_remove_attempts - 1 => {
-                        warn!("Failed to remove lock file at {:?} (attempt {}/{}): {}. Retrying after 1000ms", 
-                            lock_path, attempt + 1, max_remove_attempts, e);
-                        std::thread::sleep(std::time::Duration::from_millis(1000));
-                    }
-                    Err(e) => {
-                        warn!("Failed to remove lock file at {:?}: {}", lock_path, e);
-                        break;
-                    }
-                }
-            }
-        } else {
-            debug!("No lock file found at {:?}", lock_path);
-        }
-
-        // Final flush to ensure clean shutdown
-        self.db.flush_async().await.map_err(|e| GraphError::Io(e.into()))?;
         Ok(())
     }
 }
@@ -412,5 +350,61 @@ impl GraphStorageEngine for SledStorage {
             edges.push(edge);
         }
         Ok(edges)
+    }
+
+    async fn close(&self) -> GraphResult<()> {
+        self.flush().await?;
+        let lock_path = Path::new(&self.config.data_directory).join("db/LOCK");
+        if lock_path.exists() {
+            debug!("Found lock file at {:?}", lock_path);
+            let lsof_output = Command::new("lsof")
+                .arg(lock_path.to_str().unwrap())
+                .output();
+            if let Ok(output) = lsof_output {
+                let output_str = String::from_utf8_lossy(&output.stdout);
+                for line in output_str.lines().skip(1) {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() > 1 {
+                        if let Ok(pid) = parts[1].parse::<u32>() {
+                            warn!("Found process PID {} holding lock file {:?}", pid, lock_path);
+                            Command::new("kill")
+                                .arg("-9")
+                                .arg(pid.to_string())
+                                .output()
+                                .map_err(|e| GraphError::Io(e))?;
+                            info!("Terminated PID {} holding lock file {:?}", pid, lock_path);
+                            std::thread::sleep(std::time::Duration::from_millis(1000));
+                        }
+                    }
+                }
+            } else {
+                debug!("No processes found holding lock file {:?}", lock_path);
+            }
+
+            let max_remove_attempts = 5;
+            for attempt in 0..max_remove_attempts {
+                match fs::remove_file(&lock_path) {
+                    Ok(_) => {
+                        info!("Removed Sled lock file at {:?}", lock_path);
+                        break;
+                    }
+                    Err(e) if e.raw_os_error() == Some(35) && attempt < max_remove_attempts - 1 => {
+                        warn!("Failed to remove lock file at {:?} (attempt {}/{}): {}. Retrying after 1000ms", 
+                            lock_path, attempt + 1, max_remove_attempts, e);
+                        std::thread::sleep(std::time::Duration::from_millis(1000));
+                    }
+                    Err(e) => {
+                        warn!("Failed to remove lock file at {:?}: {}", lock_path, e);
+                        break;
+                    }
+                }
+            }
+        } else {
+            debug!("No lock file found at {:?}", lock_path);
+        }
+
+        self.db.flush_async().await.map_err(|e| GraphError::Io(e.into()))?;
+        info!("SledStorage closed");
+        Ok(())
     }
 }

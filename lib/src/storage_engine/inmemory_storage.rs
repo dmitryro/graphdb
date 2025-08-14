@@ -2,6 +2,7 @@
 // Created: 2025-07-04 - Implemented in-memory storage engine
 // Fixed: 2025-08-14 - Corrected import path for `SerializableUuid`.
 // Fixed: 2025-08-15 - Resolved E0308 mismatched types error in `is_running` function.
+// Added: 2025-08-13 - Added `close` method to GraphStorageEngine implementation
 
 use std::any::Any;
 use async_trait::async_trait;
@@ -13,6 +14,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use uuid::Uuid;
+use log::info; // Added for logging
 
 #[derive(Debug)]
 pub struct InMemoryStorage {
@@ -151,5 +153,11 @@ impl GraphStorageEngine for InMemoryStorage {
     async fn get_all_edges(&self) -> GraphResult<Vec<Edge>> {
         let edges = self.edges.lock().map_err(|e| GraphError::LockError(e.to_string()))?;
         Ok(edges.values().cloned().collect())
+    }
+
+    async fn close(&self) -> GraphResult<()> {
+        self.flush().await?;
+        info!("InMemoryStorage closed");
+        Ok(())
     }
 }
