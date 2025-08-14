@@ -1,12 +1,15 @@
 storage:
   config_root_directory: "./storage_daemon_server"
-  data_directory: "/opt/graphdb/storage_data"
-  log_directory: "/var/log/graphdb"
+  data_directory: "./storage_daemon_server/data"
+  log_directory: "/opt/graphdb/logs"
   default_port: 8083
   cluster_range: "8083"
   max_disk_space_gb: 1000
   min_disk_space_gb: 10
   use_raft_for_scale: true
   storage_engine_type: "rocksdb"
-  engine_specific_config: null
+  engine_specific_config:
+    path: "/opt/graphdb/storage_data/rocksdb"
+    host: "127.0.0.1"
+    port: 8086
   max_open_files: 100

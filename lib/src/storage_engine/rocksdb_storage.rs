@@ -6,6 +6,7 @@
 // Added: 2025-08-13 - Added recover_rocksdb for database recovery.
 // Fixed: 2025-08-13 - Used .into() for SerializableUuid and replaced edge_type with t.
 // Fixed: 2025-08-13 - Updated util.rs imports and create_edge_key for GraphResult.
+// Added: 2025-08-13 - Added `close` method to GraphStorageEngine implementation
 
 #[cfg(feature = "with-rocksdb")]
 use rocksdb::{DB, Options, WriteBatch, ColumnFamilyDescriptor, DBCompactionStyle};
@@ -35,6 +36,8 @@ use super::storage_utils::{serialize_vertex, deserialize_vertex, serialize_edge,
 use crate::util::{build as util_build_key, UtilComponent, read_uuid, read_identifier};
 #[cfg(feature = "with-rocksdb")]
 use std::io::Cursor;
+#[cfg(feature = "with-rocksdb")]
+use log::info; // Added for logging
 
 #[cfg(feature = "with-rocksdb")]
 const CF_NAMES: &[&str] = &[
@@ -144,6 +147,10 @@ impl StorageEngine for RocksdbGraphStorage {
 #[cfg(feature = "with-rocksdb")]
 #[async_trait]
 impl GraphStorageEngine for RocksdbGraphStorage {
+    fn as_any(&self) -> &dyn Any {
+        &*self.db
+    }
+
     async fn start(&self) -> GraphResult<()> {
         Ok(())
     }
@@ -316,5 +323,11 @@ impl GraphStorageEngine for RocksdbGraphStorage {
             edges.push(edge);
         }
         Ok(edges)
+    }
+
+    async fn close(&self) -> GraphResult<()> {
+        self.db.flush_wal(true).map_err(|e| GraphError::Io(e.into()))?;
+        info!("RocksdbGraphStorage closed");
+        Ok(())
     }
 }
