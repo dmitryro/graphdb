@@ -704,16 +704,19 @@ pub async fn start_daemon_process(
 
     let data_dir = if is_storage {
         load_storage_config(config_path_str.as_deref())
-            .map(|c| PathBuf::from(c.data_directory))
-            .unwrap_or_else(|_| PathBuf::from(format!("{}/storage_data", DEFAULT_CONFIG_ROOT_DIRECTORY_STR)))
+            .ok()
+            .and_then(|c| c.data_directory) // c.data_directory is Option<PathBuf>
+            .unwrap_or_else(|| PathBuf::from(format!("{}/storage_data", DEFAULT_CONFIG_ROOT_DIRECTORY_STR)))
     } else if is_rest {
         load_rest_config(config_path_str.as_deref())
-            .map(|c| PathBuf::from(c.data_directory))
-            .unwrap_or_else(|_| PathBuf::from(format!("{}/rest_api_data", DEFAULT_CONFIG_ROOT_DIRECTORY_STR)))
+            .ok()
+            .and_then(|c| Some(PathBuf::from(c.data_directory))) // c.data_directory is String, convert to PathBuf
+            .unwrap_or_else(|| PathBuf::from(format!("{}/rest_api_data", DEFAULT_CONFIG_ROOT_DIRECTORY_STR)))
     } else {
         load_main_daemon_config(config_path_str.as_deref())
-            .map(|c| PathBuf::from(c.data_directory))
-            .unwrap_or_else(|_| PathBuf::from(format!("{}/daemon_data", DEFAULT_CONFIG_ROOT_DIRECTORY_STR)))
+            .ok()
+            .and_then(|c| Some(PathBuf::from(c.data_directory))) // c.data_directory is String, convert to PathBuf
+            .unwrap_or_else(|| PathBuf::from(format!("{}/daemon_data", DEFAULT_CONFIG_ROOT_DIRECTORY_STR)))
     };
 
     // Spawn as TokioCommand so we can pipe stdout/stderr
@@ -1244,7 +1247,7 @@ pub fn spawn_rest_api_server(
         match start_rest_server(
             port,
             shutdown_rx,
-            data_directory.to_string_lossy().into_owned(),
+            data_directory.as_ref().map_or_else(String::new, |p| p.to_string_lossy().into_owned())
         ).await {
             Ok(_) => info!("REST API server on port {} stopped successfully.", port),
             Err(e) => error!("REST API server on port {} exited with error: {:?}", port, e),

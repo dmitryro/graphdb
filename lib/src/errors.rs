@@ -56,6 +56,9 @@ pub enum GraphError {
     #[error("GraphQL error: {0}")]
     GraphQLError(String),
 
+    #[error("Invalid storage engine: {0}")]
+    InvalidStorageEngine(String),
+
     #[error("File I/O error: {0}")]
     IoError(#[from] std::io::Error),
 

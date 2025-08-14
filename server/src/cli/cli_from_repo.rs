@@ -40,10 +40,9 @@
 // FIXED: 2025-08-08 - Corrected filename typo (`sorage` → `storage`) in config.rs constants.
 // ADDED: 2025-08-09 - Added `Save` subcommand with `Configuration` and `Storage` variants to support `save configuration` and `save storage` commands.
 // FIXED: 2025-08-09 - Removed `permanent` field from `Commands::Save` and `UseAction::Plugin` to fix `E0027` at `cli.rs:459`. Kept `config`/`configuration` aliases in `parse_storage_engine`.
-// ADDED: 2025-08-13 - Added `Exec`, `Query`, and `Kv` commands to support storage engine execution, querying, and key-value operations.
 
 use clap::{Parser, Subcommand, CommandFactory};
-use anyhow::{Result, Context, anyhow};
+use anyhow::{Result, Context};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -53,7 +52,6 @@ use std::process;
 use std::env;
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
 use serde_yaml2;
 use std::fs;
 use toml;
@@ -69,8 +67,7 @@ use crate::cli::commands::{
 use crate::cli::config::{
     self, DEFAULT_STORAGE_CONFIG_PATH_ROCKSDB, DEFAULT_STORAGE_CONFIG_PATH_SLED,
     DEFAULT_STORAGE_CONFIG_PATH_POSTGRES, DEFAULT_STORAGE_CONFIG_PATH_MYSQL,
-    DEFAULT_STORAGE_CONFIG_PATH_REDIS, SelectedStorageConfig, StorageConfigInner, 
-    load_storage_config_from_yaml, StorageConfig as CliStorageConfig, StorageEngineType,
+    DEFAULT_STORAGE_CONFIG_PATH_REDIS, SelectedStorageConfig, StorageConfigInner
 };
 use crate::cli::config as config_mod;
 use crate::cli::handlers as handlers_mod;
@@ -78,14 +75,9 @@ use crate::cli::interactive as interactive_mod;
 use crate::cli::help_display as help_display_mod;
 use crate::cli::daemon_management;
 use crate::cli::handlers_utils::{parse_storage_engine};
-use lib::query_exec_engine::{QueryExecEngine};
-use lib::database::Database;
-use lib::query_parser::config::KeyValueStore;
 use lib::query_parser::{parse_query_from_string, QueryType};
-use lib::storage_engine::config::{StorageEngineType as LibStorageEngineType, StorageConfig as LibStorageConfig};
-use lib::storage_engine::storage_engine::{StorageEngineManager, GLOBAL_STORAGE_ENGINE_MANAGER};
+use lib::storage_engine::config::StorageEngineType;
 use storage_daemon_server::{StorageSettingsWrapper};
-
 /// GraphDB Command Line Interface
 #[derive(Parser, Debug)]
 #[clap(author, version, about = "GraphDB Command Line Interface", long_about = None)]
@@ -171,61 +163,6 @@ pub enum Commands {
         #[clap(subcommand)]
         action: ShowAction,
     },
-    Exec {
-        #[arg(long, help = "Command to execute on the storage engine")]
-        command: String,
-    },
-    Query {
-        #[arg(long, help = "Query to execute on the storage engine")]
-        query: String,
-    },
-    Kv {
-        #[arg(long, help = "Key-value operation (e.g., get, set, delete)")]
-        operation: String,
-        #[arg(long, help = "Key for the key-value operation")]
-        key: String,
-        #[arg(long, help = "Value for the key-value operation (optional for get/delete)")]
-        value: Option<String>,
-    },
-}
-
-// Maps CliStorageConfig to LibStorageConfig
-fn map_cli_to_lib_storage_config(cli_config: CliStorageConfig) -> LibStorageConfig {
-    let engine_specific_config = cli_config.engine_specific_config.map(|selected_config| {
-        let mut map = Map::new();
-        if let Some(port) = selected_config.storage.port {
-            map.insert("port".to_string(), Value::Number(port.into()));
-        }
-        // Convert serde_json::Map into HashMap<String, Value>
-        map.into_iter().collect::<HashMap<_, _>>()
-    });
-
-    LibStorageConfig {
-        config_root_directory: cli_config.config_root_directory.unwrap_or_else(|| PathBuf::from("/opt/graphdb/config")),
-        data_directory: cli_config.data_directory.unwrap_or_else(|| PathBuf::from("/opt/graphdb/data")),
-        log_directory: cli_config.log_directory.map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| "/opt/graphdb/logs".to_string()),
-        default_port: cli_config.default_port,
-        cluster_range: cli_config.cluster_range,
-        max_disk_space_gb: cli_config.max_disk_space_gb,
-        min_disk_space_gb: cli_config.min_disk_space_gb,
-        use_raft_for_scale: cli_config.use_raft_for_scale,
-        storage_engine_type: match cli_config.storage_engine_type {
-            StorageEngineType::RocksDB => LibStorageEngineType::RocksDB,
-            StorageEngineType::Sled => LibStorageEngineType::Sled,
-            StorageEngineType::PostgreSQL => LibStorageEngineType::PostgreSQL,
-            StorageEngineType::MySQL => LibStorageEngineType::MySQL,
-            StorageEngineType::Redis => LibStorageEngineType::Redis,
-            StorageEngineType::InMemory => LibStorageEngineType::InMemory,
-        },
-        engine_specific_config,
-        max_open_files: Some(cli_config.max_open_files.try_into().expect("max_open_files out of i32 range")),
-        connection_string: match cli_config.storage_engine_type {
-            StorageEngineType::PostgreSQL => Some("postgres://localhost:5432/graphdb".to_string()),
-            StorageEngineType::MySQL => Some("mysql://localhost:3306/graphdb".to_string()),
-            StorageEngineType::Redis => Some("redis://localhost:6379".to_string()),
-            _ => Some("".to_string()),
-        },
-    }
 }
 
 // Re-usable function to handle all commands. This is called from both interactive and non-interactive modes.
@@ -240,39 +177,6 @@ pub async fn run_single_command(
     storage_daemon_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     storage_daemon_port_arc: Arc<Mutex<Option<u16>>>,
 ) -> Result<()> {
-    // Initialize Database and KeyValueStore only for commands that need them
-    let query_engine = match command {
-        Commands::Exec { .. } | Commands::Query { .. } | Commands::Kv { .. } => {
-            // Load storage engine
-            let _storage_engine = GLOBAL_STORAGE_ENGINE_MANAGER
-                .get()
-                .ok_or_else(|| anyhow!("StorageEngineManager not initialized"))?
-                .lock()
-                .map_err(|e| anyhow!("Failed to lock StorageEngineManager: {}", e))?
-                .get_persistent_engine();
-
-            // Load or create StorageConfig
-            let storage_config_path = PathBuf::from("/opt/graphdb/storage_data/config.yaml");
-            let cli_storage_config = load_storage_config_from_yaml(Some(storage_config_path))
-                .map_err(|e| anyhow!("Failed to load storage config: {}", e))?;
-
-            // Map CliStorageConfig to LibStorageConfig
-            let lib_storage_config = map_cli_to_lib_storage_config(cli_storage_config);
-
-            // Create Database instance
-            let database = Database::new(lib_storage_config)
-                .map_err(|e| anyhow!("Failed to create Database: {}", e))?;
-            let database = Arc::new(database);
-
-            // Create KeyValueStore instance
-            let kv_store = Arc::new(KeyValueStore::new());
-
-            // Initialize QueryExecEngine
-            Some(Arc::new(QueryExecEngine::new(database, kv_store)))
-        }
-        _ => None,
-    };
-
     match command {
         Commands::Start {
             port: top_port,
@@ -394,6 +298,8 @@ pub async fn run_single_command(
         Commands::Use(action) => {
             match action {
                 UseAction::Storage { engine, permanent } => {
+                    // Delegate all logic to the new handler function.
+                    // This replaces the entire block of code that was here before.
                     handlers_mod::handle_use_storage_command(engine, permanent).await?;
                 }
                 UseAction::Plugin { enable } => {
@@ -532,6 +438,10 @@ pub async fn run_single_command(
         Commands::Show { action } => {
             match action {
                 ShowAction::Storage => {
+                   //  let config = config_mod::load_cli_config()?;
+                   // let storage_config = config.storage.unwrap_or_default();
+
+                    // println!("Current Storage Engine: {:?}", storage_config.storage_engine_type);
                     handlers_mod::handle_show_storage_command().await?;
                 }
                 ShowAction::Plugins => {
@@ -546,6 +456,8 @@ pub async fn run_single_command(
                             handlers_mod::handle_show_rest_config_command().await?;
                         }
                         ConfigAction::Storage => {
+                            //let config = config_mod::load_cli_config()?;
+                            //let storage_config = config.storage.unwrap_or_default();
                             handlers_mod::handle_show_storage_config_command().await?;
                         }
                         ConfigAction::Main => {
@@ -555,14 +467,9 @@ pub async fn run_single_command(
                 }
             }
         }
-        Commands::Exec { command } => {
-            handlers_mod::handle_exec_command(query_engine.unwrap(), command).await?;
-        }
-        Commands::Query { query } => {
-            handlers_mod::handle_query_command(query_engine.unwrap(), query).await?;
-        }
-        Commands::Kv { operation, key, value } => {
-            handlers_mod::handle_kv_command(query_engine.unwrap(), operation, key, value).await?;
+        _ => {
+            // Placeholder for new or unknown commands
+            println!("Unknown command or not yet implemented");
         }
     }
     Ok(())

@@ -15,10 +15,13 @@ pub mod handlers_main;
 pub mod handlers_storage;
 pub mod handlers_rest;
 pub mod handlers_all;
+pub mod handlers_queries;
+pub mod serializers;
 
 // Re-export the main CLI entry point from cli.rs
 pub use cli::{start_cli, CliArgs, Commands}; // Corrected: Changed run_cli to start_cli
 
+pub use serializers::{string_or_u16, string_or_u16_non_option};
 pub use config::{
     load_cli_config,
     load_storage_config_str,
@@ -67,6 +70,13 @@ pub use handlers_utils::{
     storage_engine_type_to_str,
     parse_show_command,
     parse_storage_engine,
+};
+pub use handlers_queries::{
+    handle_interactive_query,
+    handle_kv_command,
+    handle_unified_query,
+    handle_exec_command,
+    handle_query_command,
 };
 pub use handlers_main::{
     DaemonArgs,

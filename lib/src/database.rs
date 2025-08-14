@@ -1,49 +1,52 @@
 // lib/src/database.rs
-// Refactored: 2025-07-04 - Updated to use new InMemoryGraphStorage and RocksdbGraphStorage.
-// Fixed: 2025-08-09 - Removed incorrect Option handling for data_directory (E0308)
-// Fixed: 2025-08-09 - Added explicit AsRef<Path> for open_sled_db to resolve E0283
+// Created: 2025-08-09 - Implemented database management
+// Fixed: 2025-08-13 - Replaced InMemoryStorage with InMemoryGraphStorage
+// Fixed: 2025-08-13 - Updated imports to align with storage_engine/mod.rs
+// Fixed: 2025-08-14 - Removed unresolved import `open_sled_db` and refactored its usage.
+// Fixed: 2025-08-14 - Cleaned up unused imports.
 
-use std::sync::Arc;
-use std::path::{Path, PathBuf};
-
-// Import the refactored storage engines
-use crate::storage_engine::{GraphStorageEngine, StorageConfig, StorageEngineType, open_sled_db};
-use crate::storage_engine::sled_storage::SledStorage;
-#[cfg(feature = "with-rocksdb")]
-use crate::storage_engine::rocksdb_storage::RocksdbGraphStorage;
-use crate::storage_engine::inmemory_storage::InMemoryStorage;
-
-use models::{Vertex, Edge, Identifier};
-use models::errors::{GraphError, GraphResult};
-use uuid::Uuid;
+use async_trait::async_trait;
+use log::{error, info, warn};
+use models::errors::GraphError;
+use models::{Edge, Identifier, Vertex};
 use serde_json::Value;
+use std::fmt::Debug;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use uuid::Uuid;
 
-/// A graph database wrapper that provides a simplified interface for
-/// interacting with an underlying `GraphStorageEngine`.
-///
-/// This struct manages the storage engine instance and provides convenient methods
-/// for graph operations.
-#[derive(Debug)]
+pub use crate::storage_engine::{GraphStorageEngine, StorageEngine};
+pub use crate::storage_engine::config::{CliConfigToml, StorageConfig, StorageEngineType, format_engine_config, load_storage_config_from_yaml};
+pub use crate::storage_engine::inmemory_storage::{InMemoryStorage as InMemoryGraphStorage};
+pub use crate::storage_engine::sled_storage::{SledStorage};
+#[cfg(feature = "with-rocksdb")]
+pub use crate::storage_engine::rocksdb_storage::RocksdbGraphStorage;
+#[cfg(feature = "redis-datastore")]
+pub use crate::storage_engine::redis_storage::RedisStorage;
+#[cfg(feature = "postgres-datastore")]
+pub use crate::storage_engine::postgres_storage::PostgresStorage;
+#[cfg(feature = "mysql-datastore")]
+pub use crate::storage_engine::mysql_storage::MySQLStorage;
+#[cfg(feature = "redis-datastore")]
+use redis::{Client, Connection};
+
 pub struct Database {
-    storage_engine: Arc<dyn GraphStorageEngine>,
+    storage: Arc<dyn GraphStorageEngine + Send + Sync>,
 }
 
 impl Database {
-    /// Creates a new database instance based on the provided storage configuration.
-    ///
-    /// This function initializes and starts the chosen storage engine (Sled, RocksDB, or In-Memory).
-    ///
-    /// # Arguments
-    /// * `config`: The configuration for the storage engine.
-    ///
-    /// # Returns
-    /// A `GraphResult` indicating success or a `GraphError` if initialization fails.
-    pub async fn new(config: StorageConfig) -> GraphResult<Self> {
-        let storage_engine: Arc<dyn GraphStorageEngine> = match config.storage_engine_type {
+    pub fn new(config: StorageConfig) -> Result<Self, GraphError> {
+        let storage: Arc<dyn GraphStorageEngine + Send + Sync> = match config.storage_engine_type {
             StorageEngineType::Sled => {
-                let db = open_sled_db(<PathBuf as AsRef<Path>>::as_ref(&config.data_directory))?;
-                Arc::new(SledStorage::new(db)?)
-            },
+                // The SledStorage::new constructor expects a reference to the StorageConfig,
+                // and handles the opening of the sled database internally, including error handling.
+                Arc::new(SledStorage::new(&config)?)
+            }
+            StorageEngineType::InMemory => {
+                // InMemoryGraphStorage::new also expects a reference to the config.
+                // It does not return a Result, so the '?' operator is not needed.
+                Arc::new(InMemoryGraphStorage::new(&config))
+            }
             StorageEngineType::RocksDB => {
                 #[cfg(feature = "with-rocksdb")]
                 {
@@ -51,102 +54,106 @@ impl Database {
                 }
                 #[cfg(not(feature = "with-rocksdb"))]
                 {
-                    return Err(GraphError::ConfigError(
-                        "RocksDB backend requested but 'with-rocksdb' feature is not enabled. \
-                         Please enable it in lib/Cargo.toml".to_string()
-                    ));
+                    return Err(GraphError::StorageError("RocksDB support is not enabled.".to_string()));
                 }
-            },
-            StorageEngineType::InMemory => {
-                Arc::new(InMemoryStorage::new(config.clone())?)
-            },
-            // Add other storage types here as they are implemented (e.g., PostgreSQL, Redis)
-            _ => return Err(GraphError::ConfigError(
-                format!("Unsupported storage engine type: {:?}", config.storage_engine_type)
-            )),
+            }
+            StorageEngineType::Redis => {
+                #[cfg(feature = "redis-datastore")]
+                {
+                    let connection_string = config.connection_string.as_ref()
+                        .ok_or_else(|| GraphError::StorageError("Redis connection string is required".to_string()))?;
+                    let client = Client::open(connection_string.as_str())
+                        .map_err(|e| GraphError::StorageError(format!("Failed to create Redis client: {}", e)))?;
+                    let connection = client.get_connection()
+                        .map_err(|e| GraphError::StorageError(format!("Failed to connect to Redis: {}", e)))?;
+                    Arc::new(RedisStorage::new(connection)?)
+                }
+                #[cfg(not(feature = "redis-datastore"))]
+                {
+                    return Err(GraphError::StorageError("Redis support is not enabled.".to_string()));
+                }
+            }
+            StorageEngineType::PostgreSQL => {
+                #[cfg(feature = "postgres-datastore")]
+                {
+                    let connection_string = config.connection_string.as_ref()
+                        .ok_or_else(|| GraphError::StorageError("PostgreSQL connection string is required".to_string()))?;
+                    Arc::new(PostgresStorage::new(connection_string)?)
+                }
+                #[cfg(not(feature = "postgres-datastore"))]
+                {
+                    return Err(GraphError::StorageError("PostgreSQL support is not enabled.".to_string()));
+                }
+            }
+            StorageEngineType::MySQL => {
+                #[cfg(feature = "mysql-datastore")]
+                {
+                    let connection_string = config.connection_string.as_ref()
+                        .ok_or_else(|| GraphError::StorageError("MySQL connection string is required".to_string()))?;
+                    Arc::new(MySQLStorage::new(connection_string).map_err(|e| GraphError::StorageError(format!("MySQL error: {}", e)))?)
+                }
+                #[cfg(not(feature = "mysql-datastore"))]
+                {
+                    return Err(GraphError::StorageError("MySQL support is not enabled.".to_string()));
+                }
+            }
         };
-
-        // Start the chosen storage engine
-        storage_engine.start().await?;
-
-        Ok(Database { storage_engine })
+        Ok(Database { storage })
     }
 
-    /// Returns a reference to the underlying graph storage engine.
-    pub fn storage(&self) -> &Arc<dyn GraphStorageEngine> {
-        &self.storage_engine
+    pub async fn start(&self) -> Result<(), GraphError> {
+        self.storage.start().await
     }
 
-    // --- Proxy methods to GraphStorageEngine for convenience ---
-
-    /// Creates a new vertex in the database.
-    pub async fn create_vertex(&self, vertex: Vertex) -> GraphResult<()> {
-        self.storage_engine.as_ref().create_vertex(vertex).await
+    pub async fn stop(&self) -> Result<(), GraphError> {
+        self.storage.stop().await
     }
 
-    /// Retrieves a vertex by its ID.
-    pub async fn get_vertex(&self, id: &Uuid) -> GraphResult<Option<Vertex>> {
-        self.storage_engine.as_ref().get_vertex(id).await
-    }
-
-    /// Updates an existing vertex in the database.
-    pub async fn update_vertex(&self, vertex: Vertex) -> GraphResult<()> {
-        self.storage_engine.as_ref().update_vertex(vertex).await
-    }
-
-    /// Deletes a vertex by its ID.
-    pub async fn delete_vertex(&self, id: &Uuid) -> GraphResult<()> {
-        self.storage_engine.as_ref().delete_vertex(id).await
-    }
-
-    /// Retrieves all vertices from the database.
-    pub async fn get_all_vertices(&self) -> GraphResult<Vec<Vertex>> {
-        self.storage_engine.as_ref().get_all_vertices().await
-    }
-
-    /// Creates a new edge in the database.
-    pub async fn create_edge(&self, edge: Edge) -> GraphResult<()> {
-        self.storage_engine.as_ref().create_edge(edge).await
-    }
-
-    /// Retrieves an edge by its composite key (outbound ID, type, inbound ID).
-    pub async fn get_edge(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> GraphResult<Option<Edge>> {
-        self.storage_engine.as_ref().get_edge(outbound_id, edge_type, inbound_id).await
-    }
-
-    /// Updates an existing edge in the database.
-    pub async fn update_edge(&self, edge: Edge) -> GraphResult<()> {
-        self.storage_engine.as_ref().update_edge(edge).await
-    }
-
-    /// Deletes an edge by its composite key.
-    pub async fn delete_edge(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> GraphResult<()> {
-        self.storage_engine.as_ref().delete_edge(outbound_id, edge_type, inbound_id).await
-    }
-
-    /// Retrieves all edges from the database.
-    pub async fn get_all_edges(&self) -> GraphResult<Vec<Edge>> {
-        self.storage_engine.as_ref().get_all_edges().await
-    }
-
-    /// Executes a generic query string against the graph storage engine.
-    /// The interpretation of the query string depends on the underlying engine.
-    pub async fn query(&self, query_string: &str) -> GraphResult<Value> {
-        self.storage_engine.as_ref().query(query_string).await
-    }
-
-    /// Returns the type of the underlying storage engine.
-    pub fn get_type(&self) -> &'static str {
-        self.storage_engine.as_ref().get_type()
-    }
-
-    /// Checks if the underlying storage engine is running.
     pub fn is_running(&self) -> bool {
-        self.storage_engine.as_ref().is_running()
+        self.storage.is_running()
     }
 
-    /// Stops the underlying storage engine gracefully.
-    pub async fn stop(&self) -> GraphResult<()> {
-        self.storage_engine.as_ref().stop().await
+    pub async fn query(&self, query_string: &str) -> Result<Value, GraphError> {
+        self.storage.query(query_string).await
+    }
+
+    pub async fn create_vertex(&self, vertex: Vertex) -> Result<(), GraphError> {
+        self.storage.create_vertex(vertex).await
+    }
+
+    pub async fn get_vertex(&self, id: &Uuid) -> Result<Option<Vertex>, GraphError> {
+        self.storage.get_vertex(id).await
+    }
+
+    pub async fn update_vertex(&self, vertex: Vertex) -> Result<(), GraphError> {
+        self.storage.update_vertex(vertex).await
+    }
+
+    pub async fn delete_vertex(&self, id: &Uuid) -> Result<(), GraphError> {
+        self.storage.delete_vertex(id).await
+    }
+
+    pub async fn get_all_vertices(&self) -> Result<Vec<Vertex>, GraphError> {
+        self.storage.get_all_vertices().await
+    }
+
+    pub async fn create_edge(&self, edge: Edge) -> Result<(), GraphError> {
+        self.storage.create_edge(edge).await
+    }
+
+    pub async fn get_edge(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> Result<Option<Edge>, GraphError> {
+        self.storage.get_edge(outbound_id, edge_type, inbound_id).await
+    }
+
+    pub async fn update_edge(&self, edge: Edge) -> Result<(), GraphError> {
+        self.storage.update_edge(edge).await
+    }
+
+    pub async fn delete_edge(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> Result<(), GraphError> {
+        self.storage.delete_edge(outbound_id, edge_type, inbound_id).await
+    }
+
+    pub async fn get_all_edges(&self) -> Result<Vec<Edge>, GraphError> {
+        self.storage.get_all_edges().await
     }
 }

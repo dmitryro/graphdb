@@ -1,5 +1,6 @@
-// Query Execution Engine
 // lib/src/query_exec_engine/query_exec_engine.rs
+// Corrected: 2025-08-10 - Added a public method to retrieve the key-value store.
+//
 // This file defines the core query execution engine, which takes a raw query string,
 // identifies the query language, and delegates the parsing and execution to the
 // appropriate handler (e.g., the Cypher parser and executor).
@@ -11,8 +12,8 @@ use std::sync::Arc;
 // Import the Cypher parsing and execution logic
 use crate::query_parser::cypher_parser::{is_cypher, parse_cypher, execute_cypher};
 // Import the database and key-value store components
-use crate::database::Database;
-use crate::query_parser::config::KeyValueStore;
+pub use crate::database::Database;
+pub use crate::query_parser::config::KeyValueStore;
 use models::errors::GraphError;
 
 /// The central query execution engine.
@@ -33,6 +34,15 @@ impl QueryExecEngine {
     /// * `kv_store` - An `Arc` to the key-value store instance.
     pub fn new(db: Arc<Database>, kv_store: Arc<KeyValueStore>) -> Self {
         Self { db, kv_store }
+    }
+
+    /// Returns a shared reference to the internal `KeyValueStore`.
+    ///
+    /// This method provides a safe way for other components to interact
+    /// with the key-value store without needing direct access to the
+    /// engine's internal fields.
+    pub fn get_kv_store(&self) -> Arc<KeyValueStore> {
+        self.kv_store.clone()
     }
 
     /// Executes a given query string.

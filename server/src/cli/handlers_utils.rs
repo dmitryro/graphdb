@@ -94,6 +94,7 @@ pub fn format_engine_config(storage_config: &StorageConfig) -> Vec<String> {
     config_lines
 }
 
+
 /// Prints a visually appealing welcome screen for the CLI.
 pub fn print_welcome_screen() {
     let (cols, rows) = terminal_size().unwrap_or((120, 40)); // Get actual terminal size, default to 120x40
