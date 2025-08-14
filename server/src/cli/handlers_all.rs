@@ -580,18 +580,18 @@ pub async fn display_full_status_summary(
                 for config_line in engine_config_lines {
                     println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", config_line);
                 }
+
+                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Data Directory: {}", data_dir_display));
+                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Log Directory: {}", log_dir_display));
                 
-                println!("{:<30} {}", "Data Directory", data_dir_display);
-                println!(
-                    "{:<20} {:<15} {:<10} {:<40}",
-                    "", "", "",
-                    format!("Log Directory: {}", log_dir_display)
-                );
-                println!(
-                    "{:<20} {:<15} {:<10} {:<40}",
-                    "", "", "",
-                    format!("Config Root: {}", config_root_display)
-                );
+                // Fixed: Ensure Config Root is displayed correctly when a config is loaded.
+                // Also, check if the config_root_directory is None and use the default value.
+                let final_config_root = if config_root_display == "N/A" {
+                    DEFAULT_CONFIG_ROOT_DIRECTORY_STR.to_string()
+                } else {
+                    config_root_display.clone()
+                };
+                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Config Root: {}", final_config_root));
 
                 let cluster_range = storage_config.cluster_range.clone();
                 if is_port_in_cluster_range(port, &cluster_range) {

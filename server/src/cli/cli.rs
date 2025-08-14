@@ -244,11 +244,11 @@ pub async fn run_single_command(
     let query_engine = match command {
         Commands::Exec { .. } | Commands::Query { .. } | Commands::Kv { .. } => {
             // Load storage engine
-            let _storage_engine = GLOBAL_STORAGE_ENGINE_MANAGER
+            let storage_engine = GLOBAL_STORAGE_ENGINE_MANAGER
                 .get()
                 .ok_or_else(|| anyhow!("StorageEngineManager not initialized"))?
                 .lock()
-                .map_err(|e| anyhow!("Failed to lock StorageEngineManager: {}", e))?
+                .await
                 .get_persistent_engine();
 
             // Load or create StorageConfig
@@ -413,7 +413,7 @@ pub async fn run_single_command(
                     println!("CLI configuration saved persistently");
                 }
                 SaveAction::Storage => {
-                    if let Some(engine) = config.storage.as_ref().and_then(|s| s.storage_engine_type.clone()) {
+                    if let Some(engine) = config.storage.storage_engine_type.clone() {
                         let engine_config_file = match engine {
                             StorageEngineType::RocksDB => DEFAULT_STORAGE_CONFIG_PATH_ROCKSDB,
                             StorageEngineType::Sled => DEFAULT_STORAGE_CONFIG_PATH_SLED,
@@ -425,7 +425,6 @@ pub async fn run_single_command(
                                 return Ok(());
                             }
                         };
-
                         let storage_config_path = PathBuf::from("/opt/graphdb/storage_data/config.yaml");
                         let storage_settings = if storage_config_path.exists() {
                             StorageSettings::load_from_yaml(&storage_config_path)
@@ -602,7 +601,7 @@ pub async fn start_cli() -> Result<()> {
         Err(e) => return Err(e),
     };
 
-    if let Some(engine) = config.storage.as_ref().and_then(|s| s.storage_engine_type.clone()) {
+    if let Some(engine) = config.storage.storage_engine_type.clone() {
         let storage_config_path = PathBuf::from("/opt/graphdb/storage_data/config.yaml");
         if storage_config_path.exists() {
             let storage_settings = StorageSettings::load_from_yaml(&storage_config_path)?;
@@ -620,7 +619,7 @@ pub async fn start_cli() -> Result<()> {
 
     let args = CliArgs {
         enable_plugins: config.enable_plugins,
-        internal_storage_engine: config.storage.as_ref().and_then(|s| s.storage_engine_type.clone()),
+        internal_storage_engine: config.storage.storage_engine_type.clone(),
         ..args
     };
 
