@@ -52,7 +52,10 @@ pub use crate::cli::handlers_all::{stop_all_interactive, reload_all_interactive,
                                    display_full_status_summary, handle_show_all_config_command};     
 pub use crate::cli::handlers_main::{display_daemon_status, handle_daemon_command, handle_daemon_command_interactive, 
                                     start_daemon_instance_interactive, stop_main_interactive, reload_daemon_interactive,
-                                    stop_daemon_instance_interactive, handle_show_main_config_command};   
+                                    stop_daemon_instance_interactive, handle_show_main_config_command}; 
+pub use crate::cli::handlers_queries::{handle_interactive_query, handle_unified_query, handle_kv_command, 
+                                       handle_exec_command, handle_query_command};
+
 use daemon_api::{stop_daemon, start_daemon};
 use daemon_api::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};                                    
 
@@ -242,6 +245,7 @@ pub async fn handle_start_command_interactive(
 
 /// Handles `stop` subcommand for direct CLI execution.
 pub async fn handle_stop_command(args: StopArgs) -> Result<()> {
+    println!("--->> STOP NON-INTERACTIVE");
     info!("Processing stop command with args: {:?}", args);
     match args.action.unwrap_or(StopAction::All) {
         StopAction::All => {
@@ -922,7 +926,6 @@ pub async fn use_plugin(enable: bool) -> Result<()> {
     let config_path = PathBuf::from("server/src/cli/config.toml");
     let mut config = load_cli_config()
         .map_err(|e| anyhow!("Failed to load config from {}: {}", config_path.display(), e))?;
-
     // Update the plugins_enabled field
     config.enable_plugins = enable;
 

@@ -704,16 +704,19 @@ pub async fn start_daemon_process(
 
     let data_dir = if is_storage {
         load_storage_config(config_path_str.as_deref())
-            .map(|c| PathBuf::from(c.data_directory))
-            .unwrap_or_else(|_| PathBuf::from(format!("{}/storage_data", DEFAULT_CONFIG_ROOT_DIRECTORY_STR)))
+            .ok()
+            .and_then(|c| c.data_directory) // c.data_directory is Option<PathBuf>
+            .unwrap_or_else(|| PathBuf::from(format!("{}/storage_data", DEFAULT_CONFIG_ROOT_DIRECTORY_STR)))
     } else if is_rest {
         load_rest_config(config_path_str.as_deref())
-            .map(|c| PathBuf::from(c.data_directory))
-            .unwrap_or_else(|_| PathBuf::from(format!("{}/rest_api_data", DEFAULT_CONFIG_ROOT_DIRECTORY_STR)))
+            .ok()
+            .and_then(|c| Some(PathBuf::from(c.data_directory))) // c.data_directory is String, convert to PathBuf
+            .unwrap_or_else(|| PathBuf::from(format!("{}/rest_api_data", DEFAULT_CONFIG_ROOT_DIRECTORY_STR)))
     } else {
         load_main_daemon_config(config_path_str.as_deref())
-            .map(|c| PathBuf::from(c.data_directory))
-            .unwrap_or_else(|_| PathBuf::from(format!("{}/daemon_data", DEFAULT_CONFIG_ROOT_DIRECTORY_STR)))
+            .ok()
+            .and_then(|c| Some(PathBuf::from(c.data_directory))) // c.data_directory is String, convert to PathBuf
+            .unwrap_or_else(|| PathBuf::from(format!("{}/daemon_data", DEFAULT_CONFIG_ROOT_DIRECTORY_STR)))
     };
 
     // Spawn as TokioCommand so we can pipe stdout/stderr
@@ -1244,7 +1247,7 @@ pub fn spawn_rest_api_server(
         match start_rest_server(
             port,
             shutdown_rx,
-            data_directory.to_string_lossy().into_owned(),
+            data_directory.as_ref().map_or_else(String::new, |p| p.to_string_lossy().into_owned())
         ).await {
             Ok(_) => info!("REST API server on port {} stopped successfully.", port),
             Err(e) => error!("REST API server on port {} exited with error: {:?}", port, e),
@@ -1663,6 +1666,38 @@ pub fn parse_cluster_range(range_str: &str) -> Result<Vec<u16>, anyhow::Error> {
             range_str
         ))
     }
+}
+
+/// Checks if a given port is within a specified cluster range.
+/// If no range is provided, it returns true, indicating the port should be displayed.
+pub fn is_port_in_range(port: u16, range_str_opt: Option<&String>) -> Result<bool> {
+    if let Some(range_str) = range_str_opt {
+        let ports = parse_cluster_range(range_str)?;
+        Ok(ports.contains(&port))
+    } else {
+        // If no range is specified, assume we want to show all daemons.
+        Ok(true)
+    }
+}
+
+pub fn is_port_in_cluster_range(port: u16, range_str: &str) -> bool {
+    let parts: Vec<&str> = range_str.split('-').collect();
+    if parts.len() == 1 {
+        // Single port range
+        if let Ok(single_port) = parts[0].trim().parse::<u16>() {
+            return port == single_port;
+        }
+    } else if parts.len() == 2 {
+        // Ranged ports
+        if let (Ok(start), Ok(end)) = (parts[0].trim().parse::<u16>(), parts[1].trim().parse::<u16>()) {
+            return port >= start && port <= end;
+        }
+    }
+    false
+}
+
+pub fn is_port_within_range(port: u16, cluster_ports: &[u16]) -> bool {
+    cluster_ports.contains(&port)
 }
 
 pub async fn is_port_free(port: u16) -> bool {

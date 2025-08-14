@@ -10,7 +10,7 @@
 pub mod datastore;
 
 // Removed: pub use datastore::MemoryDatastore; // Obsolete
-pub use datastore::InMemoryGraphStorage; // Correct re-export
+pub use crate::storage_engine::inmemory_storage::{InMemoryStorage as InMemoryGraphStorage}; // Correct re-export
 
 #[cfg(feature = "bench-suite")]
 full_bench_impl!(InMemoryGraphStorage::new()); // Updated to use InMemoryGraphStorage::new()

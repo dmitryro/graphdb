@@ -5,50 +5,40 @@
 // the logic for interacting with the REST API components.
 
 use anyhow::{Result, Context, anyhow};
-use std::path::{PathBuf, Path};
+use std::path::{PathBuf};
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
-use std::net::{IpAddr, SocketAddr};
-use tokio::process::Command as TokioCommand;
-use std::process::Stdio;
 use std::time::{Duration, Instant};
-use std::io::{self, Write};
-use futures::future;
 use futures::stream::StreamExt;
-use sysinfo::Pid;
 use chrono::Utc;
 use log::{info, error, warn, debug};
 use std::fs;
-use reqwest::Client;
-use serde_json::Value;
 
 // Import command structs from commands.rs
-use crate::cli::commands::{RestCliCommand, StatusArgs, StopArgs, StartAction, CliArgs};
+use crate::cli::commands::{RestCliCommand};
 
 // Import configuration-related items
 use crate::cli::config::{
-    DEFAULT_REST_API_PORT, DEFAULT_STORAGE_PORT, DEFAULT_REST_CONFIG_PATH_RELATIVE,
+    DEFAULT_REST_API_PORT, DEFAULT_STORAGE_PORT,
     DEFAULT_CONFIG_ROOT_DIRECTORY_STR, DEFAULT_DAEMON_PORT,
-    RestApiConfig, load_rest_config, CliConfig,
-    default_config_root_directory, load_cli_config,
+    RestApiConfig, load_rest_config, 
 };
 
 // Import daemon management utilities
 use crate::cli::daemon_management::{
-    is_rest_api_running, find_all_running_rest_api_ports, start_daemon_process,
-    stop_process_by_port, is_port_listening, find_pid_by_port,
+    find_all_running_rest_api_ports, 
+    stop_process_by_port, find_pid_by_port,
     check_process_status_by_port, is_port_free,
 };
 
 // Import utility functions
 use crate::cli::handlers_utils::{
-    get_current_exe_path, clear_terminal_screen, ensure_daemon_registry_paths_exist,
     write_registry_fallback, read_registry_fallback, execute_storage_query,
 };
 
 use daemon_api::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
-use daemon_api::{stop_daemon, start_daemon};
+use daemon_api::{start_daemon};
 
 /// A temporary struct to hold the combined REST configuration for display.
 #[derive(Debug)]
@@ -376,7 +366,6 @@ pub async fn start_rest_api_interactive(
     use fs2::FileExt;
     use std::fs::OpenOptions;
     use std::os::unix::fs::OpenOptionsExt;
-    use std::io::Write;
 
     let config_path = PathBuf::from(DEFAULT_CONFIG_ROOT_DIRECTORY_STR).join("rest_api/rest_api_config.yaml");
     let config_path_str = config_path.to_string_lossy().into_owned();

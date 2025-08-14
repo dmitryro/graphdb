@@ -33,9 +33,8 @@ use crate::cli::help_display::{
     print_interactive_help, print_interactive_filtered_help, collect_all_cli_elements_for_suggestions,
     print_help_clap_generated, print_filtered_help_clap_generated
 };
-use crate::cli::handlers_utils::{storage_engine_type_to_str, parse_show_command};
+use crate::cli::handlers_utils::{parse_show_command};
 pub use lib::storage_engine::config::{StorageEngineType};
-use crate::cli::config::{load_storage_config_from_yaml};
 
 struct SharedState {
     daemon_handles: Arc<TokioMutex<HashMap<u16, (JoinHandle<()>, oneshot::Sender<()>)>>>,

@@ -518,21 +518,23 @@ pub async fn start_storage_daemon_server_real(
         config_root_directory: settings.config_root_directory,
         log_directory: settings.log_directory.display().to_string(),
         default_port: settings.default_port,
-        cluster_range: settings.cluster_range, // moved here
+        cluster_range: settings.cluster_range,
         use_raft_for_scale: settings.use_raft_for_scale,
+        max_disk_space_gb: 10,
+        min_disk_space_gb: 1,
         engine_specific_config: settings.engine_specific_config.map(|config| {
             serde_json::to_value(&config)
                 .map(|value| value.as_object().unwrap().clone().into_iter().collect::<HashMap<String, Value>>())
                 .map_err(|e| anyhow::anyhow!("Failed to serialize engine_specific_config: {}", e))
                 .unwrap()
         }),
-        max_open_files: Some(settings.max_open_files as usize),
+        max_open_files: Some(settings.max_open_files as i32),
         connection_string: match settings.storage_engine_type.as_str() {
             "redis" | "postgresql" | "mysql" => Some(format!("{}:{}", cluster_range_str, port)),
             _ => None,
         },
     };
-    let storage = create_storage(storage_config)?;
+    let storage = create_storage(&storage_config)?;
     info!("[Storage Daemon] Initialized storage backend: {}", settings.storage_engine_type);
 
     // Initialize Raft if enabled
