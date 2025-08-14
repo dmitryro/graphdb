@@ -60,6 +60,12 @@ pub enum GraphError {
     Unknown,
     #[error("Authentication error: {0}")]
     Auth(String), // General authentication error
+   
+    #[error("Invalid storage engine: {0}")]
+    InvalidStorageEngine(String),
+
+    #[error("Configuration error: {0}")]
+    ConfigurationError(String),
 }
 
 // Implement From for serde_json::Error to convert into GraphError variants.

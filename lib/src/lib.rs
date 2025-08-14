@@ -47,7 +47,8 @@ pub use crate::errors::*;
 pub use crate::memory::InMemoryGraphStorage; // Re-export the new in-memory storage
 
 // Re-export from storage_engine/mod.rs (assuming it exists and re-exports these)
-pub use crate::storage_engine::{open_sled_db, StorageEngine, GraphStorageEngine};
+pub use crate::storage_engine::{StorageEngine, GraphStorageEngine};
+pub use crate::storage_engine::sled_storage::{open_sled_db};
 #[cfg(feature = "with-rocksdb")]
 pub use crate::storage_engine::rocksdb_storage::RocksdbGraphStorage; // Re-export the new RocksDB storage
 

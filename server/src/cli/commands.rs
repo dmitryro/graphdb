@@ -127,6 +127,16 @@ pub struct HelpArgs {
     pub command_path: Vec<String>,
 }
 
+/// Arguments for a unified query command.
+#[derive(Args, Debug, PartialEq, Clone)]
+pub struct QueryArgs {
+    /// The query string to execute.
+    pub query_string: String,
+    /// Optional flag to explicitly specify the query language (e.g., cypher, sql, graphql, kv).
+    #[clap(long, short)]
+    pub language: Option<String>,
+}
+
 /// GraphDB Command Line Interface
 #[derive(Parser, Debug)]
 #[clap(author, version, about = "GraphDB Command Line Interface", long_about = None)]
@@ -245,7 +255,39 @@ pub enum Commands {
     Quit,
     /// Show information about system components
     Show(ShowArgs),
+    /// Execute a query against the running GraphDB REST API.
+    #[clap(alias = "q")]
+    Query(QueryArgs),
+    /// An alias for the `query` command.
+    #[clap(alias = "e")]
+    Exec(QueryArgs),
+     /// Interact with the key-value store.
+    #[clap(alias = "k")]
+    Kv {
+        #[clap(subcommand)]
+        action: KvAction,
+    },
 }
+
+#[derive(Subcommand, Debug, PartialEq, Clone)]
+pub enum KvAction {
+    /// Get a value by its key from the storage engine.
+    Get {
+        /// The key to retrieve.
+        #[clap(name = "KEY")]
+        key: String,
+    },
+    /// Set a key-value pair in the storage engine.
+    Set {
+        /// The key to set.
+        #[clap(name = "KEY")]
+        key: String,
+        /// The value to associate with the key.
+        #[clap(name = "VALUE")]
+        value: String,
+    },
+}
+
 
 #[derive(Args, Debug, PartialEq, Clone)]
 pub struct ShowArgs {

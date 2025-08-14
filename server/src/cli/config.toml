@@ -17,6 +17,15 @@ group = "GraphDBGroup"
 [storage]
 port = 9000
 engine_type = "Sled"
+data_directory = "/opt/graphdb/storage_data"
+config_root_directory = "./storage_daemon_server"
+log_directory = "/var/log/graphdb"
+cluster_range = 8083 # Note: This will be parsed as a string by your custom deserializer
+max_disk_space_gb = 10
+min_disk_space_gb = 1
+use_raft_for_scale = true
+max_open_files = 100
+default_port = 8082
 
 [deployment]
 config_root_directory = "/opt/graphdb"

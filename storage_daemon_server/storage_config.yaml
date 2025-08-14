@@ -3,10 +3,10 @@ storage:
   data_directory: "/opt/graphdb/storage_data"
   log_directory: "/var/log/graphdb"
   default_port: 8083
-  cluster_range: 8083
+  cluster_range: "8083"
   max_disk_space_gb: 1000
   min_disk_space_gb: 10
   use_raft_for_scale: true
-  storage_engine_type: "sled" # Try scalar first, adjust to mapping if needed
+  storage_engine_type: "rocksdb"
   engine_specific_config: null
   max_open_files: 100

@@ -1,5 +1,5 @@
 use anyhow::{Result, Context, anyhow}; // Added `anyhow` macro import
-use std::path::{PathBuf, Path};
+use std::path::{PathBuf};
 use std::io::{self, Write};
 use std::fs;
 use log::{info, error, warn, debug};
@@ -93,6 +93,7 @@ pub fn format_engine_config(storage_config: &StorageConfig) -> Vec<String> {
     
     config_lines
 }
+
 
 /// Prints a visually appealing welcome screen for the CLI.
 pub fn print_welcome_screen() {
@@ -219,6 +220,23 @@ pub fn storage_engine_type_to_str(engine: StorageEngineType) -> &'static str {
         StorageEngineType::Redis => "redis",
         StorageEngineType::PostgreSQL => "postgresql",
         StorageEngineType::MySQL => "mysql",
+    }
+}
+
+// Custom parser for storage engine to handle hyphenated and non-hyphenated aliases
+pub fn parse_storage_engine(engine: &str) -> Result<StorageEngineType, String> {
+    match engine.to_lowercase().as_str() {
+        "sled" => Ok(StorageEngineType::Sled),
+        "rocksdb" | "rocks-db" => Ok(StorageEngineType::RocksDB),
+        "inmemory" | "in-memory" => Ok(StorageEngineType::InMemory),
+        "redis" => Ok(StorageEngineType::Redis),
+        "postgres" | "postgresql" | "postgre-sql" => Ok(StorageEngineType::PostgreSQL),
+        "mysql" | "my-sql" => Ok(StorageEngineType::MySQL),
+        "config" | "configuration" => Err("Use 'save configuration' or 'save config' for configuration saving".to_string()),
+        _ => Err(format!(
+            "Invalid storage engine: {}. Supported: sled, rocksdb, rocks-db, inmemory, in-memory, redis, postgres, postgresql, postgre-sql, mysql, my-sql",
+            engine
+        )),
     }
 }
 
