@@ -42,6 +42,7 @@ pub use config::{
     DaemonYamlConfig,
     StorageEngineType,
     CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS,
+    DAEMON_NAME_STORAGE_DAEMON,
 };
 // Re-export specific types/functions from other modules if they are part of the public CLI API
 pub use commands::{

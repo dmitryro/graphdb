@@ -72,6 +72,16 @@ impl GraphStorageEngine for InMemoryStorage {
         self
     }
 
+    async fn clear_data(&self) -> Result<(), GraphError> {
+        let mut vertices = self.vertices.lock().map_err(|e| GraphError::LockError(e.to_string()))?;
+        let mut edges = self.edges.lock().map_err(|e| GraphError::LockError(e.to_string()))?;
+        
+        vertices.clear();
+        edges.clear();
+
+        Ok(())
+    }
+    
     async fn start(&self) -> GraphResult<()> {
         let mut running = self.running.lock().map_err(|e| GraphError::LockError(e.to_string()))?;
         *running = true;
@@ -88,7 +98,7 @@ impl GraphStorageEngine for InMemoryStorage {
         "in-memory"
     }
 
-    fn is_running(&self) -> bool {
+    async fn is_running(&self) -> bool {
         *self.running.lock().unwrap()
     }
 

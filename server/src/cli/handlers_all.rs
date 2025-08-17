@@ -10,12 +10,13 @@ use futures::stream::StreamExt;
 use log::{info, error, warn, debug};
 use config::Config;
 use reqwest::Client;
+use chrono::Utc;
 
 // Import configuration-related items
 use crate::cli::config::{
     DEFAULT_DAEMON_PORT, DEFAULT_REST_API_PORT, DEFAULT_STORAGE_PORT,
     DEFAULT_STORAGE_CONFIG_PATH_RELATIVE, StorageConfig, load_storage_config_from_yaml, 
-    DEFAULT_CONFIG_ROOT_DIRECTORY_STR,
+    DEFAULT_CONFIG_ROOT_DIRECTORY_STR, StorageEngineType, daemon_api_storage_engine_type_to_string,
 };
 
 // Import daemon management utilities
@@ -28,9 +29,10 @@ use crate::cli::handlers_rest::{start_rest_api_interactive, stop_rest_api_intera
 use crate::cli::handlers_storage::{start_storage_interactive, stop_storage_interactive, handle_show_storage_config_command};
 use crate::cli::handlers_utils::{format_engine_config};
 use crate::cli::handlers_main::{start_daemon_instance_interactive, stop_main_interactive, handle_show_main_config_command};
-
+use lib::storage_engine::{StorageEngineManager, GLOBAL_STORAGE_ENGINE_MANAGER,
+                          emergency_cleanup_storage_engine_manager};
 // Import daemon registry
-use daemon_api::daemon_registry::{GLOBAL_DAEMON_REGISTRY};
+use lib::daemon_registry::{GLOBAL_DAEMON_REGISTRY};
 
 /// Stops all components managed by the interactive CLI, then attempts to stop any others.
 pub async fn stop_all_interactive(
@@ -361,9 +363,10 @@ pub async fn handle_start_all_interactive(
 /// and configuration details for the Storage daemons.
 /// Displays full status summary of all components.
 /// Enhanced version of display_full_status_summary with better storage formatting
+/// Displays the full status summary for all GraphDB components.
 pub async fn display_full_status_summary(
     rest_api_port_arc: Arc<TokioMutex<Option<u16>>>,
-    storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>
+    storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
 ) -> Result<()> {
     info!("Displaying full status summary");
     println!("\n--- GraphDB System Status Summary ---");
@@ -373,7 +376,7 @@ pub async fn display_full_status_summary(
     let all_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
     debug!("Registry contents: {:?}", all_daemons);
 
-    // GraphDB Daemon status (unchanged)
+    // GraphDB Daemon status
     let daemon_ports: Vec<u16> = futures::stream::iter(all_daemons.iter().filter(|d| d.service_type == "main"))
         .filter_map(|d| async move {
             let mut attempts = 0;
@@ -391,7 +394,7 @@ pub async fn display_full_status_summary(
         })
         .collect::<Vec<u16>>()
         .await;
-    
+
     if daemon_ports.is_empty() {
         println!("{:<20} {:<15} {:<10} {:<40}", "GraphDB Daemon", "Down", "N/A", "No daemons found in registry.");
     } else {
@@ -408,7 +411,7 @@ pub async fn display_full_status_summary(
     }
     println!("\n");
 
-    // REST API status (unchanged)
+    // REST API status
     let rest_ports: Vec<u16> = futures::stream::iter(all_daemons.iter().filter(|d| d.service_type == "rest"))
         .filter_map(|d| async move {
             let mut attempts = 0;
@@ -434,11 +437,11 @@ pub async fn display_full_status_summary(
             .timeout(Duration::from_secs(2))
             .build()
             .context("Failed to build reqwest client")?;
-            
+
         for (i, &port) in rest_ports.iter().enumerate() {
             let mut rest_api_status = "Running";
             let mut rest_api_details = String::new();
-            
+
             let health_url = format!("http://127.0.0.1:{}/api/v1/health", port);
             match client.get(&health_url).send().await {
                 Ok(resp) if resp.status().is_success() => {
@@ -458,20 +461,20 @@ pub async fn display_full_status_summary(
                     rest_api_details = "Health check failed".to_string();
                 }
             }
-            
+
             let metadata = all_daemons.iter().find(|d| d.port == port && d.service_type == "rest");
             if let Some(meta) = metadata {
                 rest_api_details = format!("PID: {} | {}", meta.pid, rest_api_details);
             }
-            
+
             let component_name = if i == 0 { "REST API" } else { "" };
             println!("{:<20} {:<15} {:<10} {:<40}", component_name, rest_api_status, port, rest_api_details);
-            
+
             if let Some(meta) = metadata {
                 println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Data Directory: {:?}", meta.data_dir));
                 println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", "Service Type: HTTP REST API");
             }
-            
+
             if rest_ports.len() > 1 && i < rest_ports.len() - 1 {
                 println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", "");
             }
@@ -503,93 +506,71 @@ pub async fn display_full_status_summary(
     } else {
         for (i, &port) in storage_ports.iter().enumerate() {
             let storage_daemon_status = if check_process_status_by_port("Storage Daemon", port).await {
-                "Running"
+                "Running".to_string()
             } else {
-                "Down"
+                "Down".to_string()
             };
-            
+
             let metadata = all_daemons.iter().find(|d| d.port == port && d.service_type == "storage");
-            let pid_info = if let Some(meta) = metadata {
-                format!("PID: {}", meta.pid)
-            } else {
-                "PID: Unknown".to_string()
-            };
-            
-            let component_name = if i == 0 { "Storage Daemon" } else { "" };
-            println!("{:<20} {:<15} {:<10} {:<40}", component_name, storage_daemon_status, port, pid_info);
-            
-            // Load port-specific config from metadata
-            let mut storage_config = StorageConfig::default();
-            let mut config_loaded = false;
-            let mut data_dir_display = "N/A".to_string();
-            let mut log_dir_display = "N/A".to_string();
-            let mut config_root_display = "N/A".to_string();
-            
-            if let Some(meta) = metadata {
-                if let Some(config_path) = &meta.config_path {
-                    match load_storage_config_from_yaml(Some(config_path.clone())) {
-                        Ok(config) => {
-                            storage_config = config;
-                            config_loaded = true;
-                            data_dir_display = storage_config.data_directory
-                                .as_ref()
-                                .map_or("N/A".to_string(), |p| p.display().to_string());
-                            log_dir_display = storage_config.log_directory
-                                .as_ref()
-                                .map_or("N/A".to_string(), |p| p.display().to_string());
-                            config_root_display = storage_config.config_root_directory
-                                .as_ref()
-                                .map_or("N/A".to_string(), |p| p.display().to_string());
-                            debug!("Loaded storage config for port {} from {:?}", port, config_path);
-                        }
-                        Err(e) => {
-                            warn!("Failed to load storage config for port {} from {:?}: {}", port, config_path, e);
-                            if e.to_string().contains("WouldBlock") {
-                                debug!("WouldBlock error during config load for port {}", port);
-                            }
-                        }
-                    }
-                } else {
-                    // Fallback to default config path
-                    let config_path = PathBuf::from(DEFAULT_CONFIG_ROOT_DIRECTORY_STR).join("storage_config.yaml");
-                    match load_storage_config_from_yaml(Some(config_path.clone())) {
-                        Ok(config) => {
-                            storage_config = config;
-                            config_loaded = true;
-                            data_dir_display = storage_config.data_directory
-                                .as_ref()
-                                .map_or("N/A".to_string(), |p| p.display().to_string());
-                            log_dir_display = storage_config.log_directory
-                                .as_ref()
-                                .map_or("N/A".to_string(), |p| p.display().to_string());
-                            config_root_display = storage_config.config_root_directory
-                                .as_ref()
-                                .map_or("N/A".to_string(), |p| p.display().to_string());
-                            debug!("Loaded default storage config for port {} from {:?}", port, config_path);
-                        }
-                        Err(e) => {
-                            warn!("Failed to load default storage config for port {}: {}", port, e);
+            let pid_info = metadata.map_or("PID: Unknown".to_string(), |meta| format!("PID: {}", meta.pid));
+
+            // Load StorageConfig from DaemonMetadata or default path
+            let config_path = metadata
+                .and_then(|meta| meta.config_path.clone())
+                .unwrap_or_else(|| PathBuf::from("./storage_daemon_server/storage_config.yaml"));
+            let storage_config = load_storage_config_from_yaml(Some(config_path.clone()))
+                .unwrap_or_else(|e| {
+                    warn!("Failed to load storage config from {:?}: {}, using default", config_path, e);
+                    StorageConfig::default()
+                });
+
+            // Use StorageEngineManager for engine type
+            let engine_type = if let Some(manager) = GLOBAL_STORAGE_ENGINE_MANAGER.get() {
+                let current_engine = manager.current_engine_type().await;
+                let engine_type_str = daemon_api_storage_engine_type_to_string(&current_engine);
+                // Update DaemonMetadata if engine_type or config_path is outdated
+                if let Some(meta) = metadata {
+                    if meta.engine_type.as_ref().map_or(true, |et| et.to_lowercase() != engine_type_str.to_lowercase()) ||
+                       meta.config_path.as_ref().map_or(true, |cp| cp != &config_path) {
+                        let mut updated_metadata = (*meta).clone();
+                        updated_metadata.engine_type = Some(engine_type_str.clone());
+                        updated_metadata.config_path = Some(config_path.clone());
+                        updated_metadata.last_seen_nanos = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                        if let Err(e) = GLOBAL_DAEMON_REGISTRY.register_daemon(updated_metadata).await {
+                            warn!("Failed to update DaemonMetadata engine_type to {} or config_path to {:?} for port {}: {}", engine_type_str, config_path, port, e);
+                        } else {
+                            info!("Updated DaemonMetadata engine_type to {} and config_path to {:?} for port {}", engine_type_str, config_path, port);
                         }
                     }
                 }
-            }
+                engine_type_str
+            } else {
+                warn!("StorageEngineManager not initialized for port {}; falling back to config engine type.", port);
+                daemon_api_storage_engine_type_to_string(&storage_config.storage_engine_type)
+            };
 
-            // Display config only if loaded
+            let component_name = if i == 0 { "Storage Daemon" } else { "" };
+            println!("{:<20} {:<15} {:<10} {:<40}", component_name, storage_daemon_status, port, format!("{} | Engine: {}", pid_info, engine_type));
+
+            // Check if configuration is valid
+            let config_loaded = storage_config.data_directory.is_some() &&
+                               storage_config.log_directory.is_some() &&
+                               storage_config.config_root_directory.is_some();
             if config_loaded {
-                let engine_config_lines = format_engine_config(&storage_config);
+                let mut engine_config_lines = format_engine_config(&storage_config);
+                engine_config_lines.retain(|line| !line.starts_with("Engine:"));
                 for config_line in engine_config_lines {
                     println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", config_line);
                 }
 
-                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Data Directory: {}", data_dir_display));
-                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Log Directory: {}", log_dir_display));
-                
-                // Fixed: Ensure Config Root is displayed correctly when a config is loaded.
-                // Also, check if the config_root_directory is None and use the default value.
+                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Data Directory: {}", storage_config.data_directory.as_ref().map_or("N/A".to_string(), |p| p.display().to_string())));
+                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Log Directory: {}", storage_config.log_directory.as_ref().map_or("N/A".to_string(), |p| p.display().to_string())));
+
+                let config_root_display = storage_config.config_root_directory.as_ref().map_or("N/A".to_string(), |p| p.display().to_string());
                 let final_config_root = if config_root_display == "N/A" {
                     DEFAULT_CONFIG_ROOT_DIRECTORY_STR.to_string()
                 } else {
-                    config_root_display.clone()
+                    config_root_display
                 };
                 println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Config Root: {}", final_config_root));
 
@@ -599,10 +580,12 @@ pub async fn display_full_status_summary(
                 } else {
                     println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Cluster Range: {} (Port {} is outside this range!)", cluster_range, port));
                 }
+
+                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Use Raft for Scale: {}", storage_config.use_raft_for_scale));
             } else {
                 println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", "Configuration not loaded due to error");
             }
-            
+
             if storage_ports.len() > 1 && i < storage_ports.len() - 1 {
                 println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", "");
             }

@@ -44,7 +44,7 @@ use crate::cli::config::{
     load_main_daemon_config,
     load_rest_config,
 };
-use daemon_api::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
+use lib::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
 use lib::storage_engine::config::StorageEngineType;
 
 /// Helper to run an external command with a timeout.
@@ -70,7 +70,7 @@ pub async fn check_process_status_by_pid(pid: Pid) -> bool {
 }
 
 // Helper function to check if a string is a valid cluster range (e.g., "8081-8084")
-fn is_valid_cluster_range(range: &str) -> bool {
+pub fn is_valid_cluster_range(range: &str) -> bool {
     range.contains('-') && range.split('-').all(|s| s.parse::<u16>().is_ok())
 }
 

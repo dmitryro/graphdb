@@ -6,13 +6,14 @@
 // Fixed: 2025-08-10 - Converted log_directory to String (E0308)
 // Fixed: 2025-08-10 - Removed invalid max_disk_space_mb field (E0560)
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use tokio::sync::oneshot;
 use tokio::sync::mpsc::Sender;
 use tokio::signal;
+
 use lib::storage_engine::{GraphStorageEngine, StorageConfig, StorageEngineType, create_storage};
 use std::sync::{Arc, Mutex};
 use openraft::{Config as RaftConfig, Raft, BasicNode};
@@ -27,7 +28,7 @@ use std::str::FromStr;
 use serde_yaml2 as serde_yaml;
 use std::io::Cursor;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use log::{info, warn, error};
+use log::{info, error, warn, debug};
 use simplelog::{CombinedLogger, TermLogger, WriteLogger, LevelFilter, Config, ConfigBuilder, TerminalMode, ColorChoice};
 use serde_json::{Value, Map};
 
@@ -112,7 +113,9 @@ pub struct StorageSettings {
     pub min_disk_space_gb: u64,
     pub use_raft_for_scale: bool,
     pub storage_engine_type: String,
-    pub engine_specific_config: Option<EngineSpecificConfig>,
+    // Corrected: Use a HashMap to handle arbitrary key-value pairs from the YAML file.
+    #[serde(default)]
+    pub engine_specific_config: HashMap<String, serde_json::Value>,
     pub max_open_files: u64,
 }
 
@@ -120,15 +123,15 @@ impl Default for StorageSettings {
     fn default() -> Self {
         StorageSettings {
             config_root_directory: PathBuf::from("./storage_daemon_server"),
-            data_directory: PathBuf::from("/opt/graphdb/storage_data"),
-            log_directory: PathBuf::from("/var/log/graphdb"),
+            data_directory: PathBuf::from("/opt/graphdb/storage_data"), // Corrected to match your YAML
+            log_directory: PathBuf::from("/opt/graphdb/logs"),
             default_port: 8083,
             cluster_range: "8083".to_string(),
             max_disk_space_gb: 1000,
             min_disk_space_gb: 10,
             use_raft_for_scale: true,
             storage_engine_type: "sled".to_string(),
-            engine_specific_config: None,
+            engine_specific_config: HashMap::new(), // Initialize with an empty HashMap
             max_open_files: 100,
         }
     }
@@ -148,6 +151,7 @@ impl StorageSettings {
     }
 }
 
+// The `StorageSettingsWrapper` struct can remain as is.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageSettingsWrapper {
     pub storage: StorageSettings,
@@ -480,6 +484,7 @@ impl RaftStorage<TypeConfig> for InMemoryRaftStorage {
     }
 }
 
+// --- Corrected `start_storage_daemon_server_real` function ---
 pub async fn start_storage_daemon_server_real(
     port: u16,
     settings: StorageSettings,
@@ -508,6 +513,31 @@ pub async fn start_storage_daemon_server_real(
     info!("[Storage Daemon] Min disk space: {} GB", settings.min_disk_space_gb);
     info!("[Storage Daemon] Use Raft for scale: {}", settings.use_raft_for_scale);
     info!("[Storage Daemon] Storage engine type: {}", settings.storage_engine_type);
+    info!("[Storage Daemon] Engine specific config: {:?}", settings.engine_specific_config);
+
+    // Verify RocksDB path if engine is RocksDB
+    if settings.storage_engine_type.to_lowercase() == "rocksdb" {
+        if !settings.engine_specific_config.is_empty() {
+            if let Some(path) = settings.engine_specific_config.get("path").and_then(|p| p.as_str()) {
+                let rocksdb_path = PathBuf::from(path);
+                if !rocksdb_path.exists() {
+                    error!("[Storage Daemon] RocksDB path does not exist: {:?}", rocksdb_path);
+                    return Err(anyhow!("RocksDB path does not exist: {:?}", rocksdb_path));
+                }
+                if !rocksdb_path.is_dir() {
+                    error!("[Storage Daemon] RocksDB path is not a directory: {:?}", rocksdb_path);
+                    return Err(anyhow!("RocksDB path is not a directory: {:?}", rocksdb_path));
+                }
+                debug!("[Storage Daemon] Verified RocksDB path: {:?}", rocksdb_path);
+            } else {
+                error!("[Storage Daemon] RocksDB path not specified in engine_specific_config: {:?}", settings.engine_specific_config);
+                return Err(anyhow!("RocksDB path not specified in engine_specific_config"));
+            }
+        } else {
+            error!("[Storage Daemon] No engine_specific_config for RocksDB");
+            return Err(anyhow!("No engine_specific_config for RocksDB"));
+        }
+    }
 
     let cluster_range_str = settings.cluster_range.clone();
 
@@ -522,20 +552,23 @@ pub async fn start_storage_daemon_server_real(
         use_raft_for_scale: settings.use_raft_for_scale,
         max_disk_space_gb: 10,
         min_disk_space_gb: 1,
-        engine_specific_config: settings.engine_specific_config.map(|config| {
-            serde_json::to_value(&config)
-                .map(|value| value.as_object().unwrap().clone().into_iter().collect::<HashMap<String, Value>>())
-                .map_err(|e| anyhow::anyhow!("Failed to serialize engine_specific_config: {}", e))
-                .unwrap()
-        }),
+        engine_specific_config: Some(settings.engine_specific_config),
         max_open_files: Some(settings.max_open_files as i32),
         connection_string: match settings.storage_engine_type.as_str() {
             "redis" | "postgresql" | "mysql" => Some(format!("{}:{}", cluster_range_str, port)),
             _ => None,
         },
     };
-    let storage = create_storage(&storage_config)?;
-    info!("[Storage Daemon] Initialized storage backend: {}", settings.storage_engine_type);
+    let storage = match create_storage(&storage_config) {
+        Ok(storage) => {
+            info!("[Storage Daemon] Initialized storage backend: {}", settings.storage_engine_type);
+            storage
+        },
+        Err(e) => {
+            error!("[Storage Daemon] Failed to initialize storage backend {}: {}", settings.storage_engine_type, e);
+            return Err(anyhow!("Failed to create storage engine {}: {}", settings.storage_engine_type, e));
+        },
+    };
 
     // Initialize Raft if enabled
     if settings.use_raft_for_scale {

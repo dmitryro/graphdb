@@ -247,8 +247,6 @@ pub async fn run_single_command(
             let storage_engine = GLOBAL_STORAGE_ENGINE_MANAGER
                 .get()
                 .ok_or_else(|| anyhow!("StorageEngineManager not initialized"))?
-                .lock()
-                .await
                 .get_persistent_engine();
 
             // Load or create StorageConfig

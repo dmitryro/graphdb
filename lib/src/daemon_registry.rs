@@ -40,7 +40,7 @@ struct ImprovedSledPool {
 impl ImprovedSledPool {
     async fn new(db_path: PathBuf, max_concurrent: usize) -> Result<Self> {
         Self::validate_environment(&db_path).await?;
-        
+
         let db = tokio::task::spawn_blocking(move || {
             Config::new()
                 .path(db_path)
@@ -49,13 +49,13 @@ impl ImprovedSledPool {
                 .use_compression(true)
                 .open()
         }).await??;
-        
+
         Ok(ImprovedSledPool {
             db: Arc::new(db),
             _semaphore: Arc::new(Semaphore::new(max_concurrent)),
         })
     }
-    
+
     async fn validate_environment(db_path: &PathBuf) -> Result<()> {
         if let Some(parent) = db_path.parent() {
             fs::create_dir_all(parent).await?;
@@ -64,40 +64,49 @@ impl ImprovedSledPool {
             perms.set_mode(0o755);
             fs::set_permissions(parent, perms).await?;
         }
-        
+
         Ok(())
     }
-    
+
     async fn insert(&self, key: &[u8], value: &[u8]) -> Result<()> {
         let _permit = self._semaphore.acquire().await?;
         let db = self.db.clone();
         let key = key.to_vec();
         let value = value.to_vec();
-        
+
         tokio::task::spawn_blocking(move || -> Result<()> {
             db.insert(key, value)
                 .map(|_| ())
                 .map_err(|e| anyhow::anyhow!("Failed to insert into sled: {}", e))
         }).await?
     }
-    
+
     async fn get(&self, key: &[u8]) -> Result<Option<IVec>> {
         let _permit = self._semaphore.acquire().await?;
         let db = self.db.clone();
         let key = key.to_vec();
-        
+
         tokio::task::spawn_blocking(move || -> Result<Option<IVec>> {
             db.get(key).map_err(|e| anyhow::anyhow!("Failed to get from sled: {}", e))
         }).await?
     }
-    
+
     async fn remove(&self, key: &[u8]) -> Result<Option<IVec>> {
         let _permit = self._semaphore.acquire().await?;
         let db = self.db.clone();
         let key = key.to_vec();
-        
+
         tokio::task::spawn_blocking(move || -> Result<Option<IVec>> {
             db.remove(key).map_err(|e| anyhow::anyhow!("Failed to remove from sled: {}", e))
+        }).await?
+    }
+
+    async fn iter_all(&self) -> Result<Vec<(IVec, IVec)>> {
+        let _permit = self._semaphore.acquire().await?;
+        let db = self.db.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<Vec<(IVec, IVec)>> {
+            db.iter().map(|result| result.map_err(|e| anyhow::anyhow!("Failed to iterate sled: {}", e))).collect()
         }).await?
     }
 }
@@ -187,45 +196,45 @@ impl NonBlockingDaemonRegistry {
             db_path: Self::get_db_path(),
             max_concurrent_ops: 10,
         });
-        
+
         let memory_store = Arc::new(RwLock::new(HashMap::new()));
         let storage = Arc::new(RwLock::new(None));
-        
+
         let registry = NonBlockingDaemonRegistry {
             memory_store,
             storage,
             config: config.clone(),
             background_tasks: Arc::new(RwLock::new(Vec::new())),
         };
-        
+
         if !config.is_fallback_mode {
             registry.initialize_storage_background().await;
         }
-        
+
         registry.load_initial_data().await?;
-        
+
         Ok(registry)
     }
-    
+
     fn should_use_fallback_mode() -> bool {
         std::env::args().any(|arg| {
             matches!(arg.as_str(), "status" | "stop" | "list" | "--help" | "-h")
         })
     }
-    
+
     fn get_fallback_file_path() -> PathBuf {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("/tmp"))
             .join(".graphdb")
             .join("daemon_registry_fallback.json")
     }
-    
+
     fn get_db_path() -> PathBuf {
         dirs::home_dir()
             .map(|home| home.join(".graphdb").join("daemon_registry_db"))
             .unwrap_or_else(|| PathBuf::from("/tmp/graphdb_registry"))
     }
-    
+
     async fn initialize_storage_background(&self) {
         let storage = self.storage.clone();
         let db_path = self.config.db_path.clone();
@@ -247,17 +256,13 @@ impl NonBlockingDaemonRegistry {
             }
         });
 
-        // Await the task and handle error BEFORE storing it
         if let Err(e) = task.await {
             warn!("Storage initialization task failed: {}", e);
         } else {
-            // Store completed task (if needed for bookkeeping; otherwise, you can skip this)
             let mut tasks = self.background_tasks.write().await;
-            // Only push if tracking is necessary (though usually you wouldn’t store completed tasks)
-            // tasks.push(task); <-- task is already consumed, don’t push again unless needed
         }
-    }    
-    
+    }
+
     async fn load_initial_data(&self) -> Result<()> {
         if let Ok(data) = self.load_from_fallback().await {
             let mut memory = self.memory_store.write().await;
@@ -268,38 +273,38 @@ impl NonBlockingDaemonRegistry {
             }
             info!("Loaded initial data from fallback file");
         }
-        
+
         if !self.config.is_fallback_mode {
             self.schedule_storage_sync().await;
         }
-        
+
         Ok(())
     }
-    
+
     async fn schedule_storage_sync(&self) {
         let storage = self.storage.clone();
-        
+
         let task = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            
+
             let storage_guard = storage.read().await;
-            if let Some(_pool) = &*storage_guard {
+            if let Some(pool) = &*storage_guard {
                 info!("Background storage sync completed");
             }
         });
-        
+
         let mut tasks = self.background_tasks.write().await;
         tasks.push(task);
     }
-    
+
     async fn validate_process_fast(&self, pid: u32, _port: u16) -> Result<bool> {
         let validation_result = tokio::spawn(async move {
             NonBlockingDaemonRegistry::is_pid_running(pid).await
         }).await?;
-        
+
         validation_result
     }
-    
+
     async fn is_pid_running(pid: u32) -> Result<bool> {
         tokio::task::spawn_blocking(move || {
             let mut sys = System::new();
@@ -308,43 +313,27 @@ impl NonBlockingDaemonRegistry {
             Ok(sys.process(sysinfo_pid).is_some())
         }).await?
     }
-    
+
     pub async fn register_daemon(&self, metadata: DaemonMetadata) -> Result<()> {
         let is_valid = self.validate_process_fast(metadata.pid, metadata.port).await?;
         if !is_valid {
             return Err(anyhow::anyhow!("Process validation failed for PID {}", metadata.pid));
         }
-        
-        // Clean stale daemons before registering
+
         self.clean_stale_daemons().await?;
-        
-        {
-            let mut memory = self.memory_store.write().await;
-            memory.insert(metadata.port, metadata.clone());
-        }
-        
-        self.persist_in_background(metadata.clone()).await?;
-        
-        info!("Registered daemon: {} on port {}", metadata.service_type, metadata.port);
-        Ok(())
-    }
-    
-    async fn persist_in_background(&self, metadata: DaemonMetadata) -> Result<()> {
+
+        // First, clear any existing entries for this port to prevent stale data.
+        let mut memory = self.memory_store.write().await;
+        memory.remove(&metadata.port);
+        memory.insert(metadata.port, metadata.clone());
+        drop(memory);
+
+        // Now, update the Sled database synchronously to ensure persistence.
         let storage = self.storage.clone();
-        let fallback_file = self.config.fallback_file.clone();
-        let memory_store = self.memory_store.clone();
         let metadata_clone = metadata.clone();
-
+        
+        // This is a crucial change: we await the persistence task.
         let task = tokio::spawn(async move {
-            let memory = memory_store.read().await;
-            let all_metadata: Vec<_> = memory.values().cloned().collect();
-            drop(memory);
-
-            if let Err(e) = Self::save_fallback_file(&fallback_file, &all_metadata).await {
-                warn!("Failed to save fallback file for port {}: {}", metadata_clone.port, e);
-                return Err(e);
-            }
-
             let storage_guard = storage.read().await;
             if let Some(pool) = &*storage_guard {
                 let key = metadata_clone.port.to_string().into_bytes();
@@ -352,43 +341,31 @@ impl NonBlockingDaemonRegistry {
                     .map_err(|e| anyhow::anyhow!("Failed to encode metadata for port {}: {}", metadata_clone.port, e))?;
                 if let Err(e) = pool.insert(&key, &encoded).await {
                     warn!("Failed to insert into sled for port {}: {}", metadata_clone.port, e);
-                    return Err(e);
                 }
-            } else {
-                warn!("Sled storage not initialized for port {}", metadata_clone.port);
             }
-
             Ok::<_, anyhow::Error>(())
         });
+        task.await??;
 
-        let result = task.await;
+        // Also update the fallback file
+        let memory = self.memory_store.read().await;
+        let all_metadata: Vec<_> = memory.values().cloned().collect();
+        drop(memory);
+        Self::save_fallback_file(&self.config.fallback_file, &all_metadata).await?;
 
-        match &result {
-            Err(join_err) => {
-                warn!("Persistence task panicked for port {}: {}", metadata.port, join_err);
-            }
-            Ok(inner_result) => {
-                if let Err(err) = inner_result {
-                    warn!("Persistence task failed for port {}: {}", metadata.port, err);
-                }
-            }
-        }
-
-        // Push dummy task to track that something was spawned
-        let mut tasks = self.background_tasks.write().await;
-        tasks.push(tokio::spawn(async {}));
-        tasks.retain(|task| !task.is_finished());
-
-        result??; // Propagate any error
+        info!("Registered daemon: {} on port {}", metadata.service_type, metadata.port);
         Ok(())
     }
-
+    
+    // This function now reloads from Sled to guarantee fresh data.
     pub async fn get_daemon_metadata(&self, port: u16) -> Result<Option<DaemonMetadata>> {
+        self.clean_stale_daemons().await?;
+
         let memory = self.memory_store.read().await;
         if let Some(metadata) = memory.get(&port) {
             let metadata_clone = metadata.clone();
             drop(memory);
-            
+
             if self.validate_process_fast(metadata_clone.pid, port).await.unwrap_or(false) {
                 return Ok(Some(metadata_clone));
             }
@@ -403,6 +380,20 @@ impl NonBlockingDaemonRegistry {
     
     pub async fn get_all_daemon_metadata(&self) -> Result<Vec<DaemonMetadata>> {
         self.clean_stale_daemons().await?;
+        
+        // CRUCIAL CHANGE: Re-sync with the Sled database on every call.
+        let storage_guard = self.storage.read().await;
+        if let Some(pool) = &*storage_guard {
+            let mut memory = self.memory_store.write().await;
+            memory.clear();
+            
+            let all_sled_entries = pool.iter_all().await?;
+            for (_, encoded_value) in all_sled_entries {
+                let metadata: DaemonMetadata = decode_from_slice(&encoded_value, config::standard())?.0;
+                memory.insert(metadata.port, metadata);
+            }
+        }
+        drop(storage_guard);
         
         let memory = self.memory_store.read().await;
         let all_metadata: Vec<_> = memory.values().cloned().collect();
@@ -512,7 +503,7 @@ impl NonBlockingDaemonRegistry {
                 let pid_files = vec![
                     format!("/tmp/{}{}.pid", DAEMON_PID_FILE_NAME_PREFIX, metadata.port),
                     format!("/tmp/{}{}.pid", REST_PID_FILE_NAME_PREFIX, metadata.port),
-                    format!("/tmp/{}{}.pid", STORAGE_PID_FILE_NAME_PREFIX, metadata.port),
+                    format!("/tmp/graphdb-storage-{}.pid", metadata.port),
                 ];
                 
                 for pid_file in pid_files {

@@ -30,16 +30,14 @@ use simplelog::{
 use log::LevelFilter;
 pub mod cli_schema;
 pub mod help_generator;
-pub mod daemon_config;
-pub mod daemon_registry;
 
 pub use cli_schema::{CliArgs, GraphDbCommands, DaemonCliCommand, RestCliCommand, StorageAction, StatusArgs, StopArgs, StopAction, StatusAction, HelpArgs};
 pub use help_generator::{generate_full_help, generate_help_for_path};
-pub use daemon_registry::{
+pub use lib::daemon_registry::{
     GLOBAL_DAEMON_REGISTRY,
     DaemonRegistry, DaemonMetadata,
 };
-pub use crate::daemon_config::{
+pub use lib::daemon_config::{
     CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS,
     DEFAULT_DAEMON_PORT,
     DEFAULT_REST_API_PORT,

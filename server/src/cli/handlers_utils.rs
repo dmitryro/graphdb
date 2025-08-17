@@ -10,7 +10,7 @@ use crossterm::style::{self, Stylize};
 use crossterm::terminal::{Clear, ClearType, size as terminal_size};
 use crossterm::execute;
 use crossterm::cursor::MoveTo;
-use daemon_api::daemon_registry::{DaemonMetadata};
+use lib::daemon_registry::{DaemonMetadata};
 
 /// Helper to get the path to the current executable.
 pub fn get_current_exe_path() -> Result<PathBuf> {
@@ -19,81 +19,107 @@ pub fn get_current_exe_path() -> Result<PathBuf> {
 }
 
 /// Helper function to format engine-specific configuration details
-pub fn format_engine_config(storage_config: &StorageConfig) -> Vec<String> {
-    let mut config_lines = Vec::new();
-    
-    // Display the storage engine type prominently
-    config_lines.push(format!("Engine: {}", daemon_api_storage_engine_type_to_string(&storage_config.storage_engine_type)));
-    
+/// Formats the engine configuration into a vector of strings for display.
+pub fn format_engine_config(config: &StorageConfig) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    // Log the input config for debugging
+    debug!("Formatting engine config: {:?}", config);
+
+    // Display the storage engine type
+    let engine_type = config.storage_engine_type.to_string();
+    lines.push(format!("Engine: {}", engine_type));
+
     // Display engine-specific configuration if available
-    if let Some(ref engine_config) = storage_config.engine_specific_config {
+    if let Some(engine_config) = &config.engine_specific_config {
         let storage_inner = &engine_config.storage;
-        
-        match storage_config.storage_engine_type {
+
+        match config.storage_engine_type {
             StorageEngineType::RocksDB | StorageEngineType::Sled => {
                 // File-based storage engines
-                if let Some(ref path) = storage_inner.path {
-                    config_lines.push(format!("  Data Path: {}", path.display()));
+                if let Some(path) = &storage_inner.path {
+                    lines.push(format!("Data Path: {}", path.display()));
+                } else {
+                    lines.push("Data Path: Not specified".to_string());
                 }
-                if let Some(ref host) = storage_inner.host {
-                    config_lines.push(format!("  Host: {}", host));
+                if let Some(host) = &storage_inner.host {
+                    lines.push(format!("Host: {}", host));
+                } else {
+                    lines.push("Host: Not specified".to_string());
                 }
                 if let Some(port) = storage_inner.port {
-                    config_lines.push(format!("  Port: {}", port));
+                    lines.push(format!("Port: {}", port));
+                } else {
+                    lines.push("Port: Not specified".to_string());
                 }
             },
             StorageEngineType::PostgreSQL | StorageEngineType::MySQL => {
                 // Database storage engines
-                if let Some(ref host) = storage_inner.host {
-                    config_lines.push(format!("  Host: {}", host));
+                if let Some(host) = &storage_inner.host {
+                    lines.push(format!("Host: {}", host));
+                } else {
+                    lines.push("Host: Not specified".to_string());
                 }
                 if let Some(port) = storage_inner.port {
-                    config_lines.push(format!("  Port: {}", port));
+                    lines.push(format!("Port: {}", port));
+                } else {
+                    lines.push("Port: Not specified".to_string());
                 }
-                if let Some(ref database) = storage_inner.database {
-                    config_lines.push(format!("  Database: {}", database));
+                if let Some(database) = &storage_inner.database {
+                    lines.push(format!("Database: {}", database));
+                } else {
+                    lines.push("Database: Not specified".to_string());
                 }
-                if let Some(ref username) = storage_inner.username {
-                    config_lines.push(format!("  Username: {}", username));
+                if let Some(username) = &storage_inner.username {
+                    lines.push(format!("Username: {}", username));
+                } else {
+                    lines.push("Username: Not specified".to_string());
                 }
-                // Don't display password for security reasons
                 if storage_inner.password.is_some() {
-                    config_lines.push("  Password: [CONFIGURED]".to_string());
+                    lines.push("Password: [CONFIGURED]".to_string());
+                } else {
+                    lines.push("Password: Not specified".to_string());
                 }
             },
             StorageEngineType::Redis => {
                 // Redis storage engine
-                if let Some(ref host) = storage_inner.host {
-                    config_lines.push(format!("  Host: {}", host));
+                if let Some(host) = &storage_inner.host {
+                    lines.push(format!("Host: {}", host));
+                } else {
+                    lines.push("Host: Not specified".to_string());
                 }
                 if let Some(port) = storage_inner.port {
-                    config_lines.push(format!("  Port: {}", port));
+                    lines.push(format!("Port: {}", port));
+                } else {
+                    lines.push("Port: Not specified".to_string());
                 }
-                if let Some(ref database) = storage_inner.database {
-                    config_lines.push(format!("  Database: {}", database));
+                if let Some(database) = &storage_inner.database {
+                    lines.push(format!("Database: {}", database));
+                } else {
+                    lines.push("Database: Not specified".to_string());
                 }
                 if storage_inner.password.is_some() {
-                    config_lines.push("  Password: [CONFIGURED]".to_string());
+                    lines.push("Password: [CONFIGURED]".to_string());
+                } else {
+                    lines.push("Password: Not specified".to_string());
                 }
             },
             StorageEngineType::InMemory => {
-                // In-memory storage doesn't need additional config
-                config_lines.push("  Config: In-memory storage (no additional configuration)".to_string());
+                lines.push("Config: In-memory storage (no additional configuration)".to_string());
             }
         }
     } else {
-        config_lines.push("  Config: Using default configuration".to_string());
+        lines.push("Config: Using default configuration".to_string());
     }
-    
-    // Add general storage configuration
-    config_lines.push(format!("  Max Open Files: {}", storage_config.max_open_files));
-    config_lines.push(format!("  Max Disk Space: {} GB", storage_config.max_disk_space_gb));
-    config_lines.push(format!("  Min Disk Space: {} GB", storage_config.min_disk_space_gb));
-    config_lines.push(format!("  Use Raft: {}", storage_config.use_raft_for_scale));
-    
-    config_lines
-}
 
+    // Add general storage configuration
+    lines.push(format!("Max Open Files: {}", config.max_open_files));
+    lines.push(format!("Max Disk Space: {} GB", config.max_disk_space_gb));
+    lines.push(format!("Min Disk Space: {} GB", config.min_disk_space_gb));
+    lines.push(format!("Use Raft: {}", config.use_raft_for_scale));
+
+    lines
+}
 
 /// Prints a visually appealing welcome screen for the CLI.
 pub fn print_welcome_screen() {
@@ -264,3 +290,4 @@ pub fn parse_show_command(args: &[String]) -> Result<CommandType, anyhow::Error>
         _ => Err(anyhow!("Unknown subcommand for 'show': {}", args[1])),
     }
 }
+

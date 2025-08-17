@@ -5,6 +5,6 @@ storage:
   storage_engine_type: rocksdb
   # Path to local RocksDB data directory (required for local setup).
   path: /opt/graphdb/storage_data/rocksdb
+  host: "127.0.0.1"
+  port: "8001"
   # Optional remote connection fields (uncomment and configure if using a remote RocksDB server).
-  host: 127.0.0.1
-  port: 8086

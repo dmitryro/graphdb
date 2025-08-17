@@ -107,7 +107,7 @@ impl GraphStorageEngine for MySQLStorage {
         "mysql"
     }
 
-    fn is_running(&self) -> bool {
+    async fn is_running(&self) -> bool {
         let rt = tokio::runtime::Handle::current();
         rt.block_on(self.client.lock()).ping().is_ok()
     }

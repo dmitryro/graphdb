@@ -15,6 +15,8 @@ pub mod query_exec_engine;
 pub mod storage_engine; // This declares the directory `storage_engine`
 pub mod transact_indexing;
 pub mod indexing_caching;
+pub mod daemon_registry;
+pub mod daemon_config;
 pub mod util;
 pub use storage_engine::config::StorageEngineType;
 // REMOVED: pub mod rdb; // Obsolete after RocksDB consolidation
@@ -46,9 +48,22 @@ pub use crate::database::*; // Re-exports the main Database struct
 pub use crate::errors::*;
 pub use crate::memory::InMemoryGraphStorage; // Re-export the new in-memory storage
 
+pub use daemon_registry::{
+    GLOBAL_DAEMON_REGISTRY,
+    DaemonRegistry, DaemonMetadata,
+};
+pub use crate::daemon_config::{
+    CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS,
+    DEFAULT_DAEMON_PORT,
+    DEFAULT_REST_API_PORT,
+    DAEMON_REGISTRY_DB_PATH,
+    DAEMON_PID_FILE_NAME_PREFIX,
+    REST_PID_FILE_NAME_PREFIX,
+    STORAGE_PID_FILE_NAME_PREFIX
+};
+
 // Re-export from storage_engine/mod.rs (assuming it exists and re-exports these)
-pub use crate::storage_engine::{StorageEngine, GraphStorageEngine};
-pub use crate::storage_engine::sled_storage::{open_sled_db};
+pub use crate::storage_engine::{StorageEngine, GraphStorageEngine, SledStorage};
 #[cfg(feature = "with-rocksdb")]
 pub use crate::storage_engine::rocksdb_storage::RocksdbGraphStorage; // Re-export the new RocksDB storage
 
