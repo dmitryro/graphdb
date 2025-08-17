@@ -1123,7 +1123,6 @@ pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bo
         }
         debug!("Successfully saved storage configuration to {:?}", config_path);
     }
-    println!(" =======> USE STORAGE STEP 1 ");
     
     // Ensure storage daemon is running with the new configuration
     info!("Ensuring storage daemon is running on port {}", new_config.default_port);
@@ -1163,7 +1162,6 @@ pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bo
         warn!("Cannot reinitialize StorageEngineManager due to OnceCell limitation. The daemon is assumed to handle the configuration change.");
     }
     
-    println!(" =======> USE STORAGE STEP 3 ");
     
     info!("Updating StorageEngineManager to use {:?}", engine);
     
@@ -1173,13 +1171,11 @@ pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bo
     
     // FIX: Calling the use_storage method directly on the manager.
     // This method handles the internal locking.
-    println!(" =======> USE STORAGE STEP 4 ");
     manager
         .use_storage(engine.clone(), permanent)
         .await
         .context("Failed to switch storage engine")?;
     
-    println!(" =======> USE STORAGE STEP 5 ");
     
     // Synchronize the daemon registry with the new state
     let port = new_config.default_port;
@@ -1187,7 +1183,6 @@ pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bo
         warn!("Failed to synchronize daemon registry: {}", e);
     }
     
-    println!(" =======> USE STORAGE STEP 6 ");
     
     // Get a reference to the global manager again to read the current engine.
     let final_manager = GLOBAL_STORAGE_ENGINE_MANAGER

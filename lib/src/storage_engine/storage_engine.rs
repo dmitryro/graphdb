@@ -639,7 +639,6 @@ pub struct StorageEngineManager {
 
 impl StorageEngineManager {
     pub async fn new(config_path_yaml: &Path) -> Result<Arc<StorageEngineManager>, GraphError> {
-        println!("AND WE ARE TRYING TO CONSTRUCT STEP 0");
         info!("Creating StorageEngineManager with YAML config: {:?}", config_path_yaml);
 
         // Get an existing manager if it has been initialized
@@ -688,7 +687,6 @@ impl StorageEngineManager {
         let mut config = config_result
             .map_err(|e| GraphError::ConfigurationError(format!("Failed to load YAML config: {}", e)))?;
 
-        println!("AND WE ARE TRYING TO CONSTRUCT STEP 1");
 
         // Log deserialized config for debugging
         debug!("Deserialized config: {:?}", config);
@@ -732,7 +730,6 @@ impl StorageEngineManager {
                 GraphError::ConfigurationError(format!("Configuration validation failed: {}", e))
             })?;
         info!("Configuration validated successfully");
-        println!("AND WE ARE TRYING TO CONSTRUCT STEP 2");
 
         // Determine engine path
         let engine_path = match engine_type {
@@ -771,7 +768,6 @@ impl StorageEngineManager {
                 path
             }
         };
-        println!("AND WE ARE TRYING TO CONSTRUCT STEP 3");
         info!("Selected engine path: {:?}", engine_path);
 
         // Pre-check lock file for RocksDB to prevent corruption
@@ -783,7 +779,6 @@ impl StorageEngineManager {
                 debug!("No lock file found for RocksDB at {:?}", engine_path.join("LOCK"));
             }
         }
-        println!("AND WE ARE TRYING TO CONSTRUCT STEP 4");
 
         // Initialize storage engine
         let persistent: Arc<dyn GraphStorageEngine + Send + Sync> = match engine_type {
@@ -794,7 +789,6 @@ impl StorageEngineManager {
             StorageEngineType::Sled => {
                 #[cfg(feature = "with-sled")]
                 {
-                    println!("AND WE ARE TRYING TO CONSTRUCT STEP 5 Sled");
                     let sled_config = {
                         let path = engine_path;
                         let host = config.engine_specific_config
@@ -814,7 +808,6 @@ impl StorageEngineManager {
                             port: Some(port),
                         }
                     };
-                    println!("AND WE ARE TRYING TO CONSTRUCT STEP 6 Sled");
                     info!("Initializing Sled engine with path: {:?}", sled_config.path);
                     trace!("Checking for existing Sled singleton");
 
@@ -834,7 +827,6 @@ impl StorageEngineManager {
             }
             #[cfg(feature = "with-rocksdb")]
             StorageEngineType::RocksDB => {
-                println!("AND WE ARE TRYING TO CONSTRUCT STEP 5 ROKSDB");
                 let rocksdb_config = {
                     let path = engine_path;
                     let host = config.engine_specific_config
@@ -853,7 +845,6 @@ impl StorageEngineManager {
                         port: Some(port),
                     }
                 };
-                println!("AND WE ARE TRYING TO CONSTRUCT STEP 6 ROKSDB");
                 info!("Initializing RocksDB engine with path: {:?}", rocksdb_config.path);
                 trace!("RocksDB PERMANENT flag: assumed true (persistent mode, not read-only)");
 
@@ -863,7 +854,6 @@ impl StorageEngineManager {
                     trace!("RocksDB initialized in persistent mode (PERMANENT=true)");
                     Arc::new(storage) as Arc<dyn GraphStorageEngine + Send + Sync>
                 }).await;
-                println!("AND WE ARE TRYING TO CONSTRUCT STEP 7 ROKSDB");
                 Arc::clone(&rocksdb_instance)
             }
             #[cfg(not(feature = "with-rocksdb"))]
@@ -948,7 +938,6 @@ impl StorageEngineManager {
                 return Err(GraphError::StorageError("MySQL support is not enabled. Please enable the 'mysql-datastore' feature.".to_string()));
             }
         };
-        println!("AND WE ARE TRYING TO CONSTRUCT STEP 8");
 
         let engine = Arc::new(TokioMutex::new(HybridStorageEngine {
             inmemory: Arc::new(InMemoryGraphStorage::new(&config)),
@@ -957,7 +946,6 @@ impl StorageEngineManager {
             engine_type,
         }));
 
-        println!("AND WE ARE TRYING TO CONSTRUCT STEP 9");
         info!("StorageEngineManager initialized with engine: {:?}", engine_type);
 
         let manager = StorageEngineManager {
@@ -967,7 +955,6 @@ impl StorageEngineManager {
             config,
             config_path: config_path_yaml.to_path_buf(),
         };
-        println!("AND WE ARE TRYING TO CONSTRUCT STEP 10");
         Ok(Arc::new(manager))
     }
 
