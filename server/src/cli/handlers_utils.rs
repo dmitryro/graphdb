@@ -1,10 +1,12 @@
 use anyhow::{Result, Context, anyhow}; // Added `anyhow` macro import
 use std::path::{PathBuf};
 use std::io::{self, Write};
+use std::collections::HashMap;
 use std::fs;
 use log::{info, error, warn, debug};
+use serde_json::{self, Value};
 use crate::cli::commands::{CommandType, ShowAction,  ConfigAction};
-use crate::cli::config::{StorageConfig, daemon_api_storage_engine_type_to_string, DAEMON_REGISTRY_DB_PATH};
+use crate::cli::config::{StorageConfig, SelectedStorageConfig, daemon_api_storage_engine_type_to_string, DAEMON_REGISTRY_DB_PATH};
 use lib::storage_engine::config::{StorageEngineType};
 use crossterm::style::{self, Stylize};
 use crossterm::terminal::{Clear, ClearType, size as terminal_size};
@@ -16,6 +18,21 @@ use lib::daemon_registry::{DaemonMetadata};
 pub fn get_current_exe_path() -> Result<PathBuf> {
     std::env::current_exe()
         .context("Failed to get current executable path")
+}
+
+// Helper function to convert HashMap<String, Value> to SelectedStorageConfig
+pub fn convert_hashmap_to_selected_config(
+    config_map: HashMap<String, Value>
+) -> Result<SelectedStorageConfig, anyhow::Error> {
+    // Wrap the config_map in a storage object since SelectedStorageConfig expects a storage field
+    let wrapped_config = serde_json::json!({
+        "storage": config_map
+    });
+    
+    let selected_config: SelectedStorageConfig = serde_json::from_value(wrapped_config)
+        .context("Failed to deserialize JSON to SelectedStorageConfig")?;
+    
+    Ok(selected_config)
 }
 
 /// Helper function to format engine-specific configuration details
@@ -35,7 +52,7 @@ pub fn format_engine_config(config: &StorageConfig) -> Vec<String> {
         let storage_inner = &engine_config.storage;
 
         match config.storage_engine_type {
-            StorageEngineType::RocksDB | StorageEngineType::Sled => {
+            StorageEngineType::RocksDB | StorageEngineType::Sled | StorageEngineType::TiKV => {
                 // File-based storage engines
                 if let Some(path) = &storage_inner.path {
                     lines.push(format!("Data Path: {}", path.display()));
@@ -242,6 +259,7 @@ pub fn storage_engine_type_to_str(engine: StorageEngineType) -> &'static str {
     match engine {
         StorageEngineType::Sled => "sled",
         StorageEngineType::RocksDB => "rocksdb",
+        StorageEngineType::TiKV => "tikv",
         StorageEngineType::InMemory => "inmemory",
         StorageEngineType::Redis => "redis",
         StorageEngineType::PostgreSQL => "postgresql",
@@ -254,6 +272,7 @@ pub fn parse_storage_engine(engine: &str) -> Result<StorageEngineType, String> {
     match engine.to_lowercase().as_str() {
         "sled" => Ok(StorageEngineType::Sled),
         "rocksdb" | "rocks-db" => Ok(StorageEngineType::RocksDB),
+        "tikv" => Ok(StorageEngineType::TiKV),
         "inmemory" | "in-memory" => Ok(StorageEngineType::InMemory),
         "redis" => Ok(StorageEngineType::Redis),
         "postgres" | "postgresql" | "postgre-sql" => Ok(StorageEngineType::PostgreSQL),

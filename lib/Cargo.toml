@@ -8,6 +8,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+libc = "0.2.175"
+fs2 = "0.4.3"
+surrealdb = { version = "2.3.7", features = ["kv-mem", "kv-rocksdb", "kv-tikv"] } 
+keyv = { version = "0.2.1", optional = true}
+tikv-client = "0.3.0"
+futures = "0.3.31"
 ordered-float = "5.0.0"
 rand = "0.8.5"
 actix-web = "4.11.0"
@@ -34,6 +40,7 @@ diesel_json = "0.2.1"
 open-cypher = "0.1.1"
 nom = "8.0.0"
 sled = { version= "0.34.7", optional = true}
+typed-sled = { version = "0.2.3" }
 bytes = "1.10.0"
 clap = { version = "4.5.29", features = ["derive"] }
 hashbrown = "0.15.2"
@@ -89,8 +96,9 @@ tokio-test = "0.4.4"
 mockall = "0.13.1"
 
 [features]
-default = ["with-rocksdb", "with-sled"] # Reset to an empty default to avoid the previous error.
+default = ["with-rocksdb", "with-sled", "with-tikv"] # Reset to an empty default to avoid the previous error.
 sled-datastore = ["sled"]
+tikv-datasource = ["keyv"]
 rocksdb-datastore = ["rocksdb"] # This feature now correctly enables the optional rocksdb dependency.
 redis-datastore = ["redis"]
 postgres-datastore = ["sqlx"]
@@ -99,4 +107,5 @@ in-memory-datastore = ["dashmap"]
 test-suite = []
 bench-suite = []
 with-rocksdb = ["rocksdb"]
+with-tikv = ["surrealdb/kv-tikv", "keyv"]
 with-sled = ["sled"]

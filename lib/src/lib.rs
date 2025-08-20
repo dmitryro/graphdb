@@ -65,7 +65,7 @@ pub use crate::daemon_config::{
 // Re-export from storage_engine/mod.rs (assuming it exists and re-exports these)
 pub use crate::storage_engine::{StorageEngine, GraphStorageEngine, SledStorage};
 #[cfg(feature = "with-rocksdb")]
-pub use crate::storage_engine::rocksdb_storage::RocksdbGraphStorage; // Re-export the new RocksDB storage
+pub use crate::storage_engine::rocksdb_storage::RocksdbStorage; // Re-export the new RocksDB storage
 
 
 // Do NOT glob-import engine and models together to avoid ambiguity
@@ -94,7 +94,7 @@ pub mod api {
 
 // Type alias for CurrentDatastore, now using GraphStorageEngine implementations
 #[cfg(feature = "with-rocksdb")]
-pub type CurrentGraphStorage = RocksdbGraphStorage; // If RocksDB is enabled, use it
+pub type CurrentGraphStorage = RocksdbStorage; // If RocksDB is enabled, use it
 #[cfg(not(feature = "with-rocksdb"))]
 pub type CurrentGraphStorage = InMemoryGraphStorage; // Otherwise, default to in-memory (or Sled if preferred)
 

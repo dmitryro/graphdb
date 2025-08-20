@@ -633,7 +633,7 @@ impl DaemonRegistryWrapper {
         }
     }
     
-    async fn get(&self) -> &AsyncRegistryWrapper {
+    pub async fn get(&self) -> &AsyncRegistryWrapper {
         self.inner
             .get_or_init(|| async {
                 AsyncRegistryWrapper::new().await.unwrap_or_else(|e| {

@@ -69,6 +69,7 @@ use crate::cli::commands::{
 use crate::cli::config::{
     self, DEFAULT_STORAGE_CONFIG_PATH_ROCKSDB, DEFAULT_STORAGE_CONFIG_PATH_SLED,
     DEFAULT_STORAGE_CONFIG_PATH_POSTGRES, DEFAULT_STORAGE_CONFIG_PATH_MYSQL,
+    DEFAULT_STORAGE_CONFIG_PATH_TIKV,
     DEFAULT_STORAGE_CONFIG_PATH_REDIS, SelectedStorageConfig, StorageConfigInner, 
     load_storage_config_from_yaml, StorageConfig as CliStorageConfig, StorageEngineType,
 };
@@ -211,6 +212,7 @@ fn map_cli_to_lib_storage_config(cli_config: CliStorageConfig) -> LibStorageConf
         use_raft_for_scale: cli_config.use_raft_for_scale,
         storage_engine_type: match cli_config.storage_engine_type {
             StorageEngineType::RocksDB => LibStorageEngineType::RocksDB,
+            StorageEngineType::TiKV => LibStorageEngineType::TiKV ,
             StorageEngineType::Sled => LibStorageEngineType::Sled,
             StorageEngineType::PostgreSQL => LibStorageEngineType::PostgreSQL,
             StorageEngineType::MySQL => LibStorageEngineType::MySQL,
@@ -258,9 +260,8 @@ pub async fn run_single_command(
             let lib_storage_config = map_cli_to_lib_storage_config(cli_storage_config);
 
             // Create Database instance
-            let database = Database::new(lib_storage_config)
-                .map_err(|e| anyhow!("Failed to create Database: {}", e))?;
-            let database = Arc::new(database);
+            let database = Arc::new(Database::new(lib_storage_config).await
+                .map_err(|e| anyhow!("Failed to create Database: {}", e))?);
 
             // Create KeyValueStore instance
             let kv_store = Arc::new(KeyValueStore::new());
@@ -415,6 +416,7 @@ pub async fn run_single_command(
                         let engine_config_file = match engine {
                             StorageEngineType::RocksDB => DEFAULT_STORAGE_CONFIG_PATH_ROCKSDB,
                             StorageEngineType::Sled => DEFAULT_STORAGE_CONFIG_PATH_SLED,
+                            StorageEngineType::TiKV => DEFAULT_STORAGE_CONFIG_PATH_TIKV,
                             StorageEngineType::PostgreSQL => DEFAULT_STORAGE_CONFIG_PATH_POSTGRES,
                             StorageEngineType::MySQL => DEFAULT_STORAGE_CONFIG_PATH_MYSQL,
                             StorageEngineType::Redis => DEFAULT_STORAGE_CONFIG_PATH_REDIS,

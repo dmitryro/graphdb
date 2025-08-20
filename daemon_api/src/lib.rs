@@ -9,7 +9,7 @@ use anyhow::Result;
 use chrono::Utc;
 use config::{Config, File as ConfigFile};
 use daemon::{DaemonizeBuilder, DaemonizeError};
-use log::{error, info};
+use log::{error, info, warn, debug, trace};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid as NixPid;
 use sysinfo::{System, Pid as SysinfoPid, ProcessesToUpdate};
@@ -18,6 +18,9 @@ use tokio::process::Command;
 use tokio::time::{sleep, Duration};
 use serde_json;
 use std::collections::HashSet;
+use lib::storage_engine::config::{daemon_api_storage_engine_type_to_string, load_storage_config_from_yaml,
+                                  StorageConfig as EngineStorageConfig,
+                                  DEFAULT_STORAGE_CONFIG_PATH};
 use storage_daemon_server::{StorageSettings, start_storage_daemon_server_real};
 use simplelog::{
     CombinedLogger,
@@ -64,6 +67,23 @@ pub struct DaemonStartConfig {
 
 lazy_static! {
     pub static ref SHUTDOWN_FLAG: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+}
+
+// Conversion function: EngineStorageConfig to StorageSettings
+pub fn engine_storage_config_to_storage_settings(config: EngineStorageConfig) -> StorageSettings {
+    StorageSettings {
+        config_root_directory: config.config_root_directory,
+        data_directory: config.data_directory,
+        log_directory: PathBuf::from(config.log_directory),
+        default_port: config.default_port,
+        cluster_range: config.cluster_range,
+        max_disk_space_gb: config.max_disk_space_gb,
+        min_disk_space_gb: config.min_disk_space_gb,
+        use_raft_for_scale: config.use_raft_for_scale,
+        storage_engine_type: daemon_api_storage_engine_type_to_string(&config.storage_engine_type),
+        engine_specific_config: config.engine_specific_config.unwrap_or_default(),
+        max_open_files: config.max_open_files.unwrap_or(1024) as u64,
+    }
 }
 
 pub async fn is_process_running(pid: u32) -> bool {
@@ -159,7 +179,7 @@ pub async fn start_daemon(
     let config_path = "server/src/cli/config.toml";
     let main_config_yaml = "server/main_app_config.yaml";
     let rest_config_yaml = "rest_api/rest_api_config.yaml";
-    let storage_config_yaml = "storage_daemon_server/storage_config.yaml";
+    let storage_config_yaml = DEFAULT_STORAGE_CONFIG_PATH;
 
     let mut host_to_use = "127.0.0.1".to_string();
     let mut default_port = match daemon_type {
@@ -212,14 +232,15 @@ pub async fn start_daemon(
         }
     }
 
+    // Load storage config for storage daemon
     let settings = if daemon_type == "storage" {
-        Some(
-            StorageSettings::load_from_yaml(&PathBuf::from(storage_config_yaml))
-                .map_err(DaemonError::Anyhow)?,
-        )
+        let config_result = load_storage_config_from_yaml(Some(&PathBuf::from(storage_config_yaml)))
+            .map_err(|e| anyhow::Error::new(e).context(format!("Failed to load storage config from {}", storage_config_yaml)))?;
+        Some(config_result)
     } else {
         None
     };
+    debug!("Using settings for {} daemon: {:?}", daemon_type, settings);
 
     let mut ports_to_start: Vec<u16> = Vec::new();
     if let Some(range_str) = cluster_range {
@@ -340,30 +361,42 @@ pub async fn start_daemon(
 
                         let rt = tokio::runtime::Runtime::new().unwrap();
                         rt.block_on(async {
-                            let settings = StorageSettings::load_from_yaml(
-                                &PathBuf::from(storage_config_yaml),
-                            )
-                            .expect("Failed to load storage settings");
-                            let (shutdown_tx, shutdown_rx) =
-                                tokio::sync::oneshot::channel();
+                            match settings.clone() {
+                                Some(config) => {
+                                    let settings = engine_storage_config_to_storage_settings(config);
+                                    let (shutdown_tx, shutdown_rx) =
+                                        tokio::sync::oneshot::channel();
 
-                            tokio::spawn(async move {
-                                tokio::signal::ctrl_c()
+                                    tokio::spawn(async move {
+                                        tokio::signal::ctrl_c()
+                                            .await
+                                            .expect("Failed to listen for Ctrl+C");
+                                        let _ = shutdown_tx.send(());
+                                    });
+
+                                    if let Err(e) = start_storage_daemon_server_real(
+                                        current_port,
+                                        settings,
+                                        shutdown_rx,
+                                    )
                                     .await
-                                    .expect("Failed to listen for Ctrl+C");
-                                let _ = shutdown_tx.send(());
-                            });
-
-                            if let Err(e) = start_storage_daemon_server_real(
-                                current_port,
-                                settings,
-                                shutdown_rx,
-                            )
-                            .await
-                            {
-                                error!("Storage daemon failed: {:?}", e);
-                                std::process::exit(1);
+                                    {
+                                        error!("Storage daemon failed: {:?}", e);
+                                        return Err(DaemonError::Anyhow(e));
+                                    }
+                                    Ok(())
+                                }
+                                None => {
+                                    error!("Storage settings not loaded");
+                                    return Err(DaemonError::GeneralError(
+                                        "Storage settings not loaded".to_string(),
+                                    ));
+                                }
                             }
+                        })
+                        .unwrap_or_else(|e: DaemonError| {
+                            error!("Async block failed: {:?}", e);
+                            std::process::exit(1);
                         });
                         std::process::exit(0);
                     } else {
@@ -430,20 +463,14 @@ pub async fn start_daemon(
                     port: current_port,
                     pid: confirmed_pid,
                     ip_address: host_to_use.clone(),
-                    data_dir: if daemon_type == "storage" {
-                        Some(PathBuf::from("/opt/graphdb/storage_data"))
-                    } else {
-                        None
-                    },
+                    data_dir: settings.as_ref().map(|s| s.data_directory.clone()),
                     config_path: if daemon_type == "storage" {
                         Some(PathBuf::from(storage_config_yaml))
                     } else {
                         None
                     },
                     engine_type: if daemon_type == "storage" {
-                        settings
-                            .as_ref()
-                            .map(|s| s.storage_engine_type.clone())
+                        settings.as_ref().map(|s| daemon_api_storage_engine_type_to_string(&s.storage_engine_type))
                     } else {
                         None
                     },

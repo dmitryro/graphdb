@@ -1,21 +1,10 @@
-// lib/src/storage_engine/config.rs
-// Corrected: 2025-08-11 - Removed duplicate imports and structs.
-// Corrected: 2025-08-11 - Reverted `CliConfig` back to `CliConfigToml` and fixed paths.
-// Updated: 2025-08-13 - Added custom deserializer to handle both snake_case and kebab-case fields.
-// Updated: 2025-08-13 - Enhanced `load_storage_config_from_yaml` with directory creation and detailed error logging.
-// Updated: 2025-08-14 - Fixed serde_yaml2 compatibility issues
-// Updated: 2025-08-14 - Added extensive debugging and tracing for configuration loading and validation
-// Updated: 2025-08-14 - Fixed parse_cluster_range to handle single ports and quoted strings as valid clusters
-// Updated: 2025-08-14 - Ensured engine_specific_config port is applied to default_port
-// Updated: 2025-08-14 - Enhanced RocksDB path validation with detailed logging
-// Updated: 2025-08-14 - Added engine validation and consistent RocksDB defaults
-
+use anyhow::{Result, Context, anyhow, Error};
 use serde::{Deserialize, Serialize, Deserializer};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use models::errors::{GraphError, GraphError::StorageError as StorageError};
 use serde_yaml2 as serde_yaml;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::fs;
 use std::fmt::{self, Display, Formatter, Result as FmtResult};
 use std::collections::HashMap;
@@ -36,6 +25,7 @@ pub const DEFAULT_STORAGE_CONFIG_PATH: &str = "./storage_daemon_server/storage_c
 pub const DEFAULT_STORAGE_CONFIG_PATH_RELATIVE: &str = "./storage_daemon_server/storage_config.yaml";
 pub const DEFAULT_STORAGE_CONFIG_PATH_ROCKSDB: &str = "./storage_daemon_server/storage_config_rocksdb.yaml";
 pub const DEFAULT_STORAGE_CONFIG_PATH_SLED: &str = "./storage_daemon_server/storage_config_sled.yaml";
+pub const DEFAULT_STORAGE_CONFIG_PATH_TIKV: &str = "./storage_daemon_server/storage_config_tikv.yaml";
 pub const DEFAULT_STORAGE_CONFIG_PATH_POSTGRES: &str = "./storage_daemon_server/storage_config_postgres.yaml";
 pub const DEFAULT_STORAGE_CONFIG_PATH_MYSQL: &str = "./storage_daemon_server/storage_config_mysql.yaml";
 pub const DEFAULT_STORAGE_CONFIG_PATH_REDIS: &str = "./storage_daemon_server/storage_config_redis.yaml";
@@ -134,12 +124,13 @@ mod option_storage_engine_type_serde {
 }
 
 /// An enum representing the supported storage engine types.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StorageEngineType {
     Sled,
     RocksDB,
     InMemory,
+    TiKV,
     Redis,
     PostgreSQL,
     MySQL,
@@ -154,6 +145,7 @@ impl FromStr for StorageEngineType {
             "sled" => Ok(StorageEngineType::Sled),
             "rocksdb" | "rocks-db" => Ok(StorageEngineType::RocksDB),
             "inmemory" | "in-memory" => Ok(StorageEngineType::InMemory),
+            "tikv" => Ok(StorageEngineType::TiKV),
             "redis" => Ok(StorageEngineType::Redis),
             "postgresql" | "postgres" | "postgre-sql" => Ok(StorageEngineType::PostgreSQL),
             "mysql" | "my-sql" => Ok(StorageEngineType::MySQL),
@@ -170,10 +162,30 @@ impl fmt::Display for StorageEngineType {
         match self {
             StorageEngineType::Sled => write!(f, "sled"),
             StorageEngineType::RocksDB => write!(f, "rocksdb"),
+            StorageEngineType::TiKV => write!(f, "tikv"),
             StorageEngineType::InMemory => write!(f, "inmemory"),
             StorageEngineType::Redis => write!(f, "redis"),
             StorageEngineType::PostgreSQL => write!(f, "postgresql"),
             StorageEngineType::MySQL => write!(f, "mysql"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for StorageEngineType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "inmemory" => Ok(StorageEngineType::InMemory),
+            "sled" => Ok(StorageEngineType::Sled),
+            "rocksdb" => Ok(StorageEngineType::RocksDB),
+            "tikv" => Ok(StorageEngineType::TiKV),
+            "redis" => Ok(StorageEngineType::Redis),
+            "postgresql" => Ok(StorageEngineType::PostgreSQL),
+            "mysql" => Ok(StorageEngineType::MySQL),
+            _ => Err(serde::de::Error::custom(format!("Unknown storage engine type: {}", s))),
         }
     }
 }
@@ -195,7 +207,20 @@ pub fn available_engines() -> Vec<StorageEngineType> {
     engines
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+// Helper function to convert StorageEngineType to String
+pub fn daemon_api_storage_engine_type_to_string(engine_type: &StorageEngineType) -> String {
+    match engine_type {
+        StorageEngineType::Sled => "sled".to_string(),
+        StorageEngineType::RocksDB => "rocksdb".to_string(),
+        StorageEngineType::InMemory => "inmemory".to_string(),
+        StorageEngineType::TiKV => "tikv".to_string(),
+        StorageEngineType::Redis => "redis".to_string(),
+        StorageEngineType::PostgreSQL => "postgresql".to_string(),
+        StorageEngineType::MySQL => "mysql".to_string(),
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct EngineTypeOnly {
     pub storage_engine_type: StorageEngineType,
 }
@@ -204,7 +229,6 @@ pub struct EngineTypeOnly {
 pub struct RocksdbConfig {
     pub storage_engine_type: StorageEngineType,
     pub path: PathBuf,
-        // Added host and port to match the YAML configuration
     pub host: Option<String>,
     pub port: Option<u16>,
 }
@@ -213,7 +237,38 @@ pub struct RocksdbConfig {
 pub struct SledConfig {
     pub storage_engine_type: StorageEngineType,
     pub path: PathBuf,
-        // Added host and port to match the YAML configuration
+    pub host: Option<String>,
+    pub port: Option<u16>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct TikvConfig {
+    pub storage_engine_type: StorageEngineType,
+    pub path: PathBuf,
+    pub host: Option<String>,
+    pub port: Option<u16>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct RedisConfig {
+    pub storage_engine_type: StorageEngineType,
+    pub path: PathBuf,
+    pub host: Option<String>,
+    pub port: Option<u16>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct MySQLConfig {
+    pub storage_engine_type: StorageEngineType,
+    pub path: PathBuf,
+    pub host: Option<String>,
+    pub port: Option<u16>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct PostgreSQLConfig {
+    pub storage_engine_type: StorageEngineType,
+    pub path: PathBuf,
     pub host: Option<String>,
     pub port: Option<u16>,
 }
@@ -222,42 +277,30 @@ pub struct SledConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct StorageConfig {
-    /// The root directory for configuration files.
     #[serde(default = "default_config_root_directory")]
     #[serde(with = "path_buf_serde")]
     pub config_root_directory: PathBuf,
-    /// The directory where persistent data will be stored.
     #[serde(default = "default_data_directory")]
     #[serde(with = "path_buf_serde")]
     pub data_directory: PathBuf,
-    /// Directory for log files.
     #[serde(default = "default_log_directory")]
     pub log_directory: String,
-    /// Default port for storage daemon.
     #[serde(default = "default_default_port")]
     pub default_port: u16,
-    /// Cluster range for distributed setup.
     #[serde(default = "default_cluster_range")]
     pub cluster_range: String,
-    /// Maximum disk space allowed (in GB).
     #[serde(default = "default_max_disk_space_gb")]
     pub max_disk_space_gb: u64,
-    /// Minimum disk space required (in GB).
     #[serde(default = "default_min_disk_space_gb")]
     pub min_disk_space_gb: u64,
-    /// Whether to use Raft for scaling.
     #[serde(default = "default_use_raft_for_scale")]
     pub use_raft_for_scale: bool,
-    /// The type of storage engine to use.
     #[serde(default = "default_storage_engine_type")]
     pub storage_engine_type: StorageEngineType,
-    /// Connection string for database engines.
     #[serde(default)]
     pub connection_string: Option<String>,
-    /// Engine-specific configuration.
     #[serde(default)]
     pub engine_specific_config: Option<HashMap<String, Value>>,
-    /// Maximum number of open files for the storage engine.
     #[serde(default = "default_max_open_files")]
     pub max_open_files: Option<i32>,
 }
@@ -277,7 +320,7 @@ impl Default for StorageConfig {
             storage_engine_type: default_storage_engine_type(),
             connection_string: None,
             engine_specific_config: Some(HashMap::from_iter(vec![
-                ("path".to_string(), Value::String(format!("{}/rocksdb", DEFAULT_DATA_DIRECTORY))),
+                ("path".to_string(), Value::String(format!("{}/sled", DEFAULT_DATA_DIRECTORY))),
                 ("host".to_string(), Value::String("127.0.0.1".to_string())),
                 ("port".to_string(), Value::Number(DEFAULT_STORAGE_PORT.into())),
             ])),
@@ -286,17 +329,102 @@ impl Default for StorageConfig {
     }
 }
 
+impl StorageConfig {
+    pub fn save(&self) -> Result<()> {
+        let default_config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH);
+        let project_config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
+        let config_path = if project_config_path.exists() {
+            project_config_path
+        } else {
+            default_config_path
+        };
+        
+        let (engine_path, engine_host, engine_port) = match self.engine_specific_config.as_ref() {
+            Some(es) => {
+                let p = es.get("path")
+                    .and_then(|v| v.as_str())
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| {
+                        PathBuf::from(format!("{}/{}", DEFAULT_DATA_DIRECTORY, self.storage_engine_type.to_string().to_lowercase()))
+                    });
+                let h = es.get("host")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("127.0.0.1")
+                    .to_string();
+                let pt = es.get("port")
+                    .and_then(|v| v.as_u64())
+                    .map(|p| p as u16)
+                    .unwrap_or(self.default_port);
+                (p, h, pt)
+            },
+            None => {
+                let default_path = PathBuf::from(format!("{}/{}", DEFAULT_DATA_DIRECTORY, self.storage_engine_type.to_string().to_lowercase()));
+                let default_host = "127.0.0.1".to_string();
+                let default_port = self.default_port;
+                (default_path, default_host, default_port)
+            }
+        };
+        
+        let yaml_string = format!(
+r#"storage:
+  config_root_directory: "{}"
+  data_directory: "{}"
+  log_directory: "{}"
+  default_port: {}
+  cluster_range: "{}"
+  max_disk_space_gb: {}
+  min_disk_space_gb: {}
+  use_raft_for_scale: {}
+  storage_engine_type: "{}"
+  engine_specific_config:
+    path: "{}"
+    host: "{}"
+    port: {}
+  max_open_files: {}
+"#,
+            self.config_root_directory.display(),
+            self.data_directory.display(),
+            self.log_directory,
+            self.default_port,
+            self.cluster_range,
+            self.max_disk_space_gb,
+            self.min_disk_space_gb,
+            self.use_raft_for_scale,
+            self.storage_engine_type.to_string(),
+            engine_path.display(),
+            engine_host,
+            engine_port,
+            self.max_open_files.unwrap_or(-1)
+        );
+        
+        fs::create_dir_all(config_path.parent().unwrap())
+            .context(format!("Failed to create parent directories for {}", config_path.display()))?;
+        fs::write(&config_path, yaml_string)
+            .context(format!("Failed to write StorageConfig to file: {}", config_path.display()))?;
+        info!("Saved storage configuration to {:?}", config_path);
+        
+        let written_content = fs::read_to_string(&config_path)
+            .context(format!("Failed to read back storage config file: {}", config_path.display()))?;
+        match serde_yaml::from_str::<StorageConfigWrapper>(&written_content) {
+            Ok(_) => info!("Successfully verified written storage config at {:?}", config_path),
+            Err(e) => warn!("Failed to verify written storage config at {:?}: {}", config_path, e),
+        };
+        
+        Ok(())
+    }
+}
+
 fn default_config_root_directory() -> PathBuf {
     trace!("Default config_root_directory: {}", DEFAULT_CONFIG_ROOT_DIRECTORY_STR);
     PathBuf::from(DEFAULT_CONFIG_ROOT_DIRECTORY_STR)
 }
 
-fn default_data_directory() -> PathBuf {
+pub fn default_data_directory() -> PathBuf {
     trace!("Default data_directory: {}", DEFAULT_DATA_DIRECTORY);
     PathBuf::from(DEFAULT_DATA_DIRECTORY)
 }
 
-fn default_log_directory() -> String {
+pub fn default_log_directory() -> String {
     trace!("Default log_directory: {}", DEFAULT_LOG_DIRECTORY);
     DEFAULT_LOG_DIRECTORY.to_string()
 }
@@ -336,13 +464,11 @@ fn default_max_open_files() -> Option<i32> {
     Some(1024)
 }
 
-/// A wrapper struct for deserializing the nested YAML configuration.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StorageConfigWrapper {
     pub storage: StorageConfig,
 }
 
-// ---- START OF NEW STRUCTS REQUIRED BY LIB CRATE ----
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct AppConfig {
     pub version: Option<String>,
@@ -407,7 +533,6 @@ impl Default for DaemonConfig {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct LogConfig {
-    // This is an empty struct in the provided TOML, so we just define it.
 }
 
 impl Default for LogConfig {
@@ -419,7 +544,6 @@ impl Default for LogConfig {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct PathsConfig {
-    // This is an empty struct in the provided TOML, so we just define it.
 }
 
 impl Default for PathsConfig {
@@ -431,7 +555,6 @@ impl Default for PathsConfig {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct SecurityConfig {
-    // This is an empty struct in the provided TOML, so we just define it.
 }
 
 impl Default for SecurityConfig {
@@ -546,244 +669,173 @@ impl Default for CliConfigToml {
     }
 }
 
-// --- Updated `load_storage_config_from_yaml` function ---
-pub fn load_storage_config_from_yaml(config_path: Option<&PathBuf>) -> Result<StorageConfig, GraphError> {
-    trace!("Starting load_storage_config_from_yaml with config_path: {:?}", config_path);
-    let path = match config_path {
-        Some(p) => {
-            info!("Loading storage config from provided path: {:?}", p);
-            trace!("Using provided path: {:?}", p);
-            p.to_owned()
+pub fn is_port_in_cluster_range(port: u16, range_str: &str) -> bool {
+    let parts: Vec<&str> = range_str.split('-').collect();
+    if parts.len() == 1 {
+        if let Ok(single_port) = parts[0].trim().parse::<u16>() {
+            return port == single_port;
         }
-        None => {
-            let default_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH);
-            info!("No config path provided, using default: {:?}", default_path);
-            trace!("Using default path: {:?}", default_path);
-            default_path
+    } else if parts.len() == 2 {
+        if let (Ok(start), Ok(end)) = (parts[0].trim().parse::<u16>(), parts[1].trim().parse::<u16>()) {
+            return port >= start && port <= end;
         }
-    };
-    debug!("In Storage Engine - Loading config from {:?}", path);
-
-    // Read and log raw YAML content
-    let content = match fs::read_to_string(&path) {
-        Ok(content) => {
-            debug!("Raw YAML content from {:?}:\n{}", path, content);
-            trace!("Successfully read YAML content, length: {} bytes", content.len());
-            content
-        }
-        Err(e) => {
-            warn!("Failed to read YAML file at {:?}: {}. Using default config.", path, e);
-            trace!("Error reading YAML: {:?}", e);
-            let config = StorageConfig::default();
-            trace!("Default config created: {:?}", config);
-            // Ensure directories for default config
-            fs::create_dir_all(&config.data_directory)
-                .map_err(|e| {
-                    error!("Failed to create data directory {:?}: {}", config.data_directory, e);
-                    GraphError::Io(e)
-                })?;
-            info!("Ensured default data directory exists: {:?}", config.data_directory);
-            fs::create_dir_all(&config.log_directory)
-                .map_err(|e| {
-                    error!("Failed to create log directory {:?}: {}", config.log_directory, e);
-                    GraphError::Io(e)
-                })?;
-            info!("Ensured default log directory exists: {:?}", config.log_directory);
-            return Ok(config);
-        }
-    };
-
-    // Attempt to deserialize YAML
-    let mut config = match serde_yaml::from_str::<StorageConfigWrapper>(&content) {
-        Ok(wrapper) => {
-            info!("Successfully parsed YAML config with 'storage' key from {:?}", path);
-            trace!("Parsed StorageConfigWrapper: {:?}", wrapper);
-            wrapper.storage
-        }
-        Err(e1) => {
-            warn!("Failed to parse as StorageConfigWrapper: {}. Trying direct StorageConfig.", e1);
-            trace!("StorageConfigWrapper parse error: {:?}", e1);
-            match serde_yaml::from_str::<StorageConfig>(&content) {
-                Ok(config) => {
-                    info!("Successfully parsed YAML config directly as StorageConfig from {:?}", path);
-                    trace!("Parsed StorageConfig directly: {:?}", config);
-                    config
-                }
-                Err(e2) => {
-                    error!("Failed to parse YAML config at {:?}: {}", path, e2);
-                    trace!("StorageConfig parse error: {:?}", e2);
-                    // Log partial parse for debugging
-                    if let Ok(partial) = serde_yaml::from_str::<serde_json::Value>(&content) {
-                        debug!("Partial YAML parse result: {:?}", partial);
-                        trace!("Partial parse successful, content: {:?}", partial);
-                    } else {
-                        debug!("Failed to parse YAML content as JSON for partial logging");
-                        trace!("Partial parse failed");
-                    }
-                    return Err(GraphError::SerializationError(e2.to_string()));
-                }
-            }
-        }
-    };
-    debug!("In Storage Engine - Parsed config: {:?}", config);
-    trace!("Config details - storage_engine_type: {:?}, default_port: {}, cluster_range: {}", 
-        config.storage_engine_type, config.default_port, config.cluster_range);
-
-    // Validate storage engine
-    if !available_engines().contains(&config.storage_engine_type) {
-        error!("Storage engine type {:?} is not available. Available engines: {:?}", 
-            config.storage_engine_type, available_engines());
-        return Err(GraphError::InvalidData(format!(
-            "Storage engine type {:?} is not available. Available engines: {:?}", 
-            config.storage_engine_type, available_engines()
-        )));
     }
+    false
+}   
 
-    // Normalize storage_engine_type
-    let engine_type_str = config.storage_engine_type.to_string();
-    trace!("Raw storage_engine_type: {}", engine_type_str);
-    let normalized_engine_type = engine_type_str.to_lowercase();
-    trace!("Normalized storage_engine_type: {}", normalized_engine_type);
-    config.storage_engine_type = match normalized_engine_type.as_str() {
-        "rocksdb" => StorageEngineType::RocksDB,
-        "sled" => StorageEngineType::Sled,
-        "inmemory" => StorageEngineType::InMemory,
-        "redis" => StorageEngineType::Redis,
-        "postgresql" => StorageEngineType::PostgreSQL,
-        "mysql" => StorageEngineType::MySQL,
-        other => {
-            error!("Invalid storage_engine_type '{}'", other);
-            return Err(GraphError::InvalidData(format!("Invalid storage_engine_type '{}'", other)));
-        }
-    };
-    trace!("Set storage_engine_type to: {:?}", config.storage_engine_type);
-
-    // Validate and create RocksDB path if engine is RocksDB
-    if config.storage_engine_type == StorageEngineType::RocksDB {
-        trace!("Validating RocksDB configuration");
-        let rocksdb_path = config
-            .engine_specific_config
-            .as_ref()
-            .and_then(|cfg| {
-                trace!("Extracting path from engine_specific_config: {:?}", cfg);
-                cfg.get("path").and_then(|v| v.as_str()).map(PathBuf::from)
-            })
-            .unwrap_or_else(|| {
-                let fallback_path = config.data_directory.join("rocksdb");
-                warn!("No path in engine_specific_config, using fallback: {:?}", fallback_path);
-                trace!("Fallback RocksDB path: {:?}", fallback_path);
-                fallback_path
-            });
-        debug!("RocksDB path: {:?}", rocksdb_path);
-        if !rocksdb_path.exists() {
-            warn!("RocksDB path does not exist: {:?}", rocksdb_path);
-            trace!("Creating RocksDB directory: {:?}", rocksdb_path);
-            fs::create_dir_all(&rocksdb_path)
-                .map_err(|e| {
-                    error!("Failed to create RocksDB directory {:?}: {}", rocksdb_path, e);
-                    GraphError::Io(e)
-                })?;
-            info!("Created RocksDB directory: {:?}", rocksdb_path);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let permissions = fs::Permissions::from_mode(0o755);
-                trace!("Setting permissions for RocksDB path: {:?}", rocksdb_path);
-                fs::set_permissions(&rocksdb_path, permissions)
-                    .map_err(|e| {
-                        error!("Failed to set permissions for {:?}: {}", rocksdb_path, e);
-                        GraphError::Io(e)
-                    })?;
-                debug!("Set permissions for RocksDB path: {:?}", rocksdb_path);
-            }
-        }
-        if !rocksdb_path.is_dir() {
-            error!("RocksDB path is not a directory: {:?}", rocksdb_path);
-            trace!("Path validation failed: not a directory");
-            return Err(GraphError::InvalidData(format!("RocksDB path is not a directory: {:?}", rocksdb_path)));
-        }
-        if let Ok(metadata) = fs::metadata(&rocksdb_path) {
-            debug!("RocksDB path permissions: {:?}", metadata.permissions());
-            trace!("RocksDB path metadata: {:?}", metadata);
-        } else {
-            warn!("Failed to retrieve metadata for RocksDB path: {:?}", rocksdb_path);
-            trace!("Metadata retrieval failed");
-        }
-        debug!("Verified RocksDB path: {:?}", rocksdb_path);
-
-        // Update default_port with engine-specific port if available
-        if let Some(engine_config) = &config.engine_specific_config {
-            trace!("Checking engine_specific_config for port: {:?}", engine_config);
-            if let Some(port_value) = engine_config.get("port") {
-                trace!("Found port value: {:?}", port_value);
-                if let Some(port) = port_value.as_u64().and_then(|p| u16::try_from(p).ok()) {
-                    debug!("Updating default_port to engine-specific port: {}", port);
-                    trace!("Setting default_port to {}", port);
-                    config.default_port = port;
-                } else {
-                    warn!("Invalid port value in engine_specific_config: {:?}", port_value);
-                    trace!("Port value parsing failed: {:?}", port_value);
-                }
+pub fn load_storage_config_from_yaml(config_file_path: Option<&PathBuf>) -> Result<StorageConfig, GraphError> {
+    let default_config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH);
+    let project_config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
+    let path_to_use = config_file_path
+        .unwrap_or_else(|| {
+            if project_config_path.exists() {
+                debug!("Using project config path: {:?}", project_config_path);
+                &project_config_path
             } else {
-                warn!("No port found in engine_specific_config");
-                trace!("engine_specific_config keys: {:?}", engine_config.keys());
+                debug!("Using default config path: {:?}", default_config_path);
+                &default_config_path
             }
-        } else {
-            warn!("No engine_specific_config provided for RocksDB");
-            trace!("engine_specific_config is None");
+        });
+    info!("Loading storage config from {:?}", path_to_use);
+    debug!("Current working directory: {:?}", std::env::current_dir().unwrap_or_default());
+
+    let mut config = if path_to_use.exists() {
+        let config_content = fs::read_to_string(&path_to_use)
+            .context(format!("Failed to read storage config file: {}", path_to_use.display()))?;
+        debug!("Raw YAML content:\n{}", config_content);
+
+        // Replace underscores with hyphens for all relevant fields
+        let modified_content = config_content
+            .replace("storage_engine_type", "storage-engine-type")
+            .replace("engine_specific_config", "engine-specific-config");
+        debug!("Modified YAML content:\n{}", modified_content);
+
+        // Try parsing as StorageConfigWrapper
+        match serde_yaml::from_str::<StorageConfigWrapper>(&modified_content) {
+            Ok(wrapper) => {
+                info!("Successfully parsed config with 'storage' key.");
+                debug!("Parsed StorageConfigWrapper: {:?}", wrapper);
+                let mut config = wrapper.storage;
+                // Ensure engine_specific_config is populated
+                if config.engine_specific_config.is_none() {
+                    warn!("engine_specific_config is None after parsing StorageConfigWrapper. Populating from JSON.");
+                    if let Ok(json_value) = serde_yaml::from_str::<serde_json::Value>(&modified_content) {
+                        if let Some(storage) = json_value.get("storage").and_then(|v| v.get("engine-specific-config")) {
+                            config.engine_specific_config = Some(serde_json::from_value(storage.clone()).map_err(|e| {
+                                error!("Failed to deserialize engine_specific_config from JSON: {}", e);
+                                GraphError::SerializationError(e.to_string())
+                            })?);
+                            debug!("Populated engine_specific_config: {:?}", config.engine_specific_config);
+                        }
+                    }
+                }
+                config
+            }
+            Err(e1) => {
+                warn!("Failed to parse as StorageConfigWrapper: {}. Trying direct StorageConfig.", e1);
+                // Try direct StorageConfig
+                match serde_yaml::from_str::<StorageConfig>(&modified_content) {
+                    Ok(config) => {
+                        info!("Successfully parsed config directly as StorageConfig.");
+                        debug!("Parsed StorageConfig: {:?}", config);
+                        config
+                    }
+                    Err(e2) => {
+                        error!("Failed to parse storage config YAML at {}: {}", path_to_use.display(), e2);
+                        if let Ok(json_value) = serde_yaml::from_str::<serde_json::Value>(&modified_content) {
+                            error!("Partial YAML parse result: {:?}", json_value);
+                        } else {
+                            error!("Failed to parse YAML content as JSON for partial logging");
+                        }
+                        return Err(anyhow!("Serialization error: {}", e2).into());
+                    }
+                }
+            }
         }
     } else {
-        trace!("Non-RocksDB engine, skipping path validation");
-    }
+        warn!("Config file not found at {}. Using default storage config.", path_to_use.display());
+        StorageConfig::default()
+    };
 
-    // Create directories
-    trace!("Creating data directory: {:?}", config.data_directory);
-    fs::create_dir_all(&config.data_directory)
-        .map_err(|e| {
-            error!("Failed to create data directory {:?}: {}", config.data_directory, e);
-            GraphError::Io(e)
-        })?;
-    info!("Ensured data directory exists: {:?}", config.data_directory);
-    trace!("Creating log directory: {:?}", config.log_directory);
-    fs::create_dir_all(&config.log_directory)
-        .map_err(|e| {
-            error!("Failed to create log directory {:?}: {}", config.log_directory, e);
-            GraphError::Io(e)
-        })?;
-    info!("Ensured log directory exists: {:?}", config.log_directory);
+    // Set data_directory to default if empty
+    if config.data_directory.as_os_str().is_empty() {
+        warn!("No data_directory specified in config, applying default: {:?}", default_data_directory());
+        config.data_directory = default_data_directory();
+    }
 
     // Validate cluster range
-    trace!("Validating cluster range: {}", config.cluster_range);
-    if let Ok(range) = parse_cluster_range(&config.cluster_range) {
-        trace!("Parsed cluster range: {:?}", range);
-        if !range.contains(&config.default_port) {
-            warn!(
-                "Default port {} is outside cluster range {}",
-                config.default_port, config.cluster_range
-            );
-            trace!("Port validation failed: {} not in {:?}", config.default_port, range);
-            return Err(GraphError::InvalidData(format!(
-                "Default port {} is not within cluster range {}",
-                config.default_port, config.cluster_range
-            )));
-        }
-        debug!("Validated default port {} is within cluster range {}", config.default_port, config.cluster_range);
-    } else {
-        error!("Invalid cluster range format: {}", config.cluster_range);
-        trace!("Cluster range parsing failed");
-        return Err(GraphError::InvalidData(format!(
-            "Invalid cluster range format: {}",
-            config.cluster_range
-        )));
+    let range = parse_cluster_range(&config.cluster_range)?;
+    if !range.contains(&config.default_port) {
+        warn!("Port {} is outside cluster range {}", config.default_port, config.cluster_range);
+        return Err(anyhow!("Port {} is outside cluster range {}", config.default_port, config.cluster_range).into());
     }
 
-    info!("Successfully loaded and validated storage config: {:?}", config);
-    trace!("Final config - storage_engine_type: {:?}, default_port: {}, cluster_range: {}", 
-        config.storage_engine_type, config.default_port, config.cluster_range);
+    // Ensure directories exist
+    fs::create_dir_all(&config.data_directory)
+        .context(format!("Failed to create data directory {:?}", config.data_directory))?;
+    info!("Ensured data directory exists: {:?}", config.data_directory);
+
+    if config.log_directory.is_empty() {
+        warn!("No log_directory specified in config, using default: {:?}", default_log_directory());
+        config.log_directory = default_log_directory();
+    }
+    fs::create_dir_all(&config.log_directory)
+        .context(format!("Failed to create log directory {:?}", config.log_directory))?;
+    info!("Ensured log directory exists: {:?}", config.log_directory);
+
+    // Ensure engine_specific_config has storage_engine_type
+    if let Some(ref mut engine_config) = config.engine_specific_config {
+        let storage_type_value = serde_json::to_value(config.storage_engine_type.clone())
+            .map_err(|e| GraphError::ConfigurationError(format!("Failed to serialize StorageEngineType: {}", e)))?;
+        engine_config.insert("storage_engine_type".to_string(), storage_type_value);
+    }
+
+    info!(
+        "Loaded storage config: default_port={}, cluster_range={}, data_directory={:?}, storage_engine_type={:?}, engine_specific_config={:?}, log_directory={:?}, max_disk_space_gb={}, min_disk_space_gb={}, use_raft_for_scale={}",
+        config.default_port,
+        config.cluster_range,
+        config.data_directory,
+        config.storage_engine_type,
+        config.engine_specific_config,
+        config.log_directory,
+        config.max_disk_space_gb,
+        config.min_disk_space_gb,
+        config.use_raft_for_scale
+    );
+    println!(
+        "[DEBUG] => Loaded config: default_port={}, cluster_range={}, data_directory={:?}, storage_engine_type={:?}, engine_specific_config={:?}, log_directory={:?}, max_disk_space_gb={}, min_disk_space_gb={}, use_raft_for_scale={}",
+        config.default_port,
+        config.cluster_range,
+        config.data_directory,
+        config.storage_engine_type,
+        config.engine_specific_config,
+        config.log_directory,
+        config.max_disk_space_gb,
+        config.min_disk_space_gb,
+        config.use_raft_for_scale
+    );
     Ok(config)
 }
 
-// --- Updated `parse_cluster_range` function ---
+fn replace_underscore_with_hyphen(v: &mut serde_json::Value) {
+    if let serde_json::Value::Object(map) = v {
+        let mut new_map = Map::new();
+        let keys: Vec<String> = map.keys().cloned().collect();
+        for k in keys {
+            let new_k = k.replace('_', "-");
+            if let Some(mut v) = map.remove(&k) {
+                replace_underscore_with_hyphen(&mut v);
+                new_map.insert(new_k, v);
+            }
+        }
+        *map = new_map;
+    } else if let serde_json::Value::Array(seq) = v {
+        for item in seq {
+            replace_underscore_with_hyphen(item);
+        }
+    }
+}
+
 fn parse_cluster_range(range: &str) -> Result<std::ops::RangeInclusive<u16>, GraphError> {
     trace!("Parsing cluster range: {}", range);
     let cleaned_range = range.trim_matches(|c| c == '"' || c == '\'');
@@ -823,16 +875,13 @@ fn parse_cluster_range(range: &str) -> Result<std::ops::RangeInclusive<u16>, Gra
     }
 }
 
-// --- Updated `format_engine_config` function ---
 pub fn format_engine_config(storage_config: &StorageConfig) -> Vec<String> {
     trace!("Formatting engine config for {:?}", storage_config);
     let mut config_lines = Vec::new();
     
-    // Display the storage engine type prominently.
     config_lines.push(format!("Engine: {}", storage_config.storage_engine_type));
     trace!("Added engine type: {}", storage_config.storage_engine_type);
     
-    // Display engine-specific configuration if available.
     if let Some(ref engine_config_map) = storage_config.engine_specific_config {
         config_lines.push("  Engine-Specific Configuration:".to_string());
         trace!("Processing engine_specific_config: {:?}", engine_config_map);
@@ -845,7 +894,6 @@ pub fn format_engine_config(storage_config: &StorageConfig) -> Vec<String> {
         trace!("No engine_specific_config, using default configuration");
     }
     
-    // Add general storage configuration.
     if let Some(files) = storage_config.max_open_files {
         config_lines.push(format!("  Max Open Files: {}", files));
         trace!("Added max_open_files: {}", files);
@@ -865,7 +913,6 @@ pub fn format_engine_config(storage_config: &StorageConfig) -> Vec<String> {
     config_lines
 }
 
-// Option 2: Remove the validation if it's not critical
 fn create_default_yaml_config(yaml_path: &PathBuf, engine_type: StorageEngineType) -> Result<(), GraphError> {
     info!("Creating default YAML config at {:?}", yaml_path);
     trace!("Creating default config for engine_type: {:?}", engine_type);
@@ -874,7 +921,6 @@ fn create_default_yaml_config(yaml_path: &PathBuf, engine_type: StorageEngineTyp
     config.storage_engine_type = engine_type;
     trace!("Set storage_engine_type to: {:?}", engine_type);
     
-    // Set engine-specific configuration
     let engine_path = match engine_type {
         StorageEngineType::Sled => format!("{}/sled", DEFAULT_DATA_DIRECTORY),
         StorageEngineType::RocksDB => format!("{}/rocksdb", DEFAULT_DATA_DIRECTORY),
@@ -882,13 +928,14 @@ fn create_default_yaml_config(yaml_path: &PathBuf, engine_type: StorageEngineTyp
         StorageEngineType::PostgreSQL => DEFAULT_DATA_DIRECTORY.to_string(),
         StorageEngineType::MySQL => DEFAULT_DATA_DIRECTORY.to_string(),
         StorageEngineType::InMemory => DEFAULT_DATA_DIRECTORY.to_string(),
+        StorageEngineType::TiKV => format!("{}/tikv", DEFAULT_DATA_DIRECTORY),
     };
     
     let engine_port = match engine_type {
         StorageEngineType::Redis => 6379,
         StorageEngineType::PostgreSQL => 5432,
         StorageEngineType::MySQL => 3306,
-        _ => DEFAULT_STORAGE_PORT, // Fixed the wildcard pattern
+        _ => DEFAULT_STORAGE_PORT,
     };
     
     trace!("Setting engine_path: {}, engine_port: {}", engine_path, engine_port);
@@ -941,14 +988,10 @@ fn create_default_yaml_config(yaml_path: &PathBuf, engine_type: StorageEngineTyp
     Ok(())
 }
 
-/// Loads engine-specific configuration from a YAML file (e.g., storage_config_rocksdb.yaml).
-/// Returns a HashMap containing engine-specific settings, ensuring a 'path' key for RocksDB/Sled.
-/// Host and port are optional and only included if present in the YAML or needed as defaults.
 pub fn load_engine_specific_config(
     engine_type: StorageEngineType,
     base_path: &Path,
 ) -> Result<HashMap<String, Value>, GraphError> {
-    // Construct the path to the specific engine config file (e.g., storage_config_sled.yaml)
     let engine_config_path = base_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -959,7 +1002,6 @@ pub fn load_engine_specific_config(
     let mut engine_specific_config = HashMap::new();
 
     if engine_config_path.exists() {
-        // Read and log the raw YAML content from the engine-specific file
         let content = fs::read_to_string(&engine_config_path)
             .map_err(|e| {
                 error!("Failed to read engine-specific YAML file at {:?}: {}", engine_config_path, e);
@@ -968,7 +1010,6 @@ pub fn load_engine_specific_config(
         debug!("Raw engine-specific YAML content from {:?}:\n{}", engine_config_path, content);
         trace!("Successfully read content from engine config file.");
 
-        // Deserialize the content into the `StorageConfigWrapper` to extract the `engine_specific_config`
         let wrapper: StorageConfigWrapper = serde_yaml::from_str(&content)
             .map_err(|e| {
                 error!("Failed to deserialize engine-specific YAML from {:?}: {}", engine_config_path, e);
@@ -976,7 +1017,6 @@ pub fn load_engine_specific_config(
                 GraphError::SerializationError(format!("Failed to deserialize engine-specific YAML: {}", e))
             })?;
 
-        // Extract the `engine_specific_config` map, using a default empty map if it's null
         engine_specific_config = wrapper.storage.engine_specific_config.unwrap_or_default();
         debug!("Deserialized engine-specific config: {:?}", engine_specific_config);
         trace!("Successfully deserialized engine-specific config.");
@@ -985,8 +1025,6 @@ pub fn load_engine_specific_config(
         trace!("Engine config file does not exist. Proceeding with default values.");
     }
 
-    // Ensure a 'path' key is present for RocksDB and Sled, which require a file path.
-    // Use the DEFAULT_DATA_DIRECTORY constant as the base for the default path.
     if matches!(engine_type, StorageEngineType::RocksDB | StorageEngineType::Sled) &&
         (!engine_specific_config.contains_key("path") ||
          engine_specific_config.get("path").and_then(|v| v.as_str()).unwrap_or("").is_empty()) {
@@ -996,7 +1034,6 @@ pub fn load_engine_specific_config(
         trace!("Inserted default path into config.");
     }
 
-    // Ensure 'host' and 'port' keys are present for remote-capable engines.
     if !engine_specific_config.contains_key("host") &&
         matches!(engine_type, StorageEngineType::RocksDB | StorageEngineType::Sled) {
         debug!("No 'host' in engine-specific config for {:?}, using default: 127.0.0.1", engine_type);
@@ -1006,9 +1043,7 @@ pub fn load_engine_specific_config(
     if !engine_specific_config.contains_key("port") &&
         matches!(engine_type, StorageEngineType::RocksDB | StorageEngineType::Sled) {
         let default_port = match engine_type {
-            // These engines have a default port for local operations.
             StorageEngineType::RocksDB | StorageEngineType::Sled => 8049,
-            // Other engines may not have a specific port defined here
             _ => 0,
         };
         debug!("No 'port' in engine-specific config for {:?}, using default: {}", engine_type, default_port);
@@ -1016,8 +1051,6 @@ pub fn load_engine_specific_config(
         trace!("Inserted default port into config.");
     }
 
-    // A crucial step to ensure the engine_specific_config deserializes correctly:
-    // It must contain the `storage_engine_type` field.
     let storage_type_value = serde_json::to_value(engine_type.clone())
         .map_err(|e| GraphError::ConfigurationError(format!("Failed to serialize StorageEngineType: {}", e)))?;
     engine_specific_config.insert("storage_engine_type".to_string(), storage_type_value);

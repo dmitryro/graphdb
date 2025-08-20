@@ -53,13 +53,13 @@ const CF_NAMES: &[&str] = &[
 
 #[cfg(feature = "with-rocksdb")]
 #[derive(Debug)]
-pub struct RocksdbGraphStorage {
+pub struct RocksdbStorage {
     db: Arc<DB>,
 }
 
 #[cfg(feature = "with-rocksdb")]
-impl RocksdbGraphStorage {
-    /// Constructs a new `RocksdbGraphStorage` instance from a `RocksdbConfig`.
+impl RocksdbStorage {
+    /// Constructs a new `RocksdbStorage` instance from a `RocksdbConfig`.
     /// This function is updated to directly use the specific RocksDB configuration
     /// object, resolving the type mismatch error.
     pub fn new(config: &RocksdbConfig) -> GraphResult<Self> {
@@ -67,9 +67,8 @@ impl RocksdbGraphStorage {
         
         let path = &config.path;
         info!("  ✅ Path: {:?}", path);
-        info!(" ✅ Host: {:?}", config.host);
-        info!(" ✅ Port: {:?}", config.port);
-
+        info!("  ✅ Host: {:?}", config.host);
+        info!("  ✅ Port: {:?}", config.port);
 
         debug!("Opening RocksDB at path: {:?}", path);
 
@@ -89,7 +88,7 @@ impl RocksdbGraphStorage {
         let mut options = Options::default();
         options.create_if_missing(true);
         // The RocksdbConfig does not have `max_open_files`, so we set it to a reasonable default.
-        options.set_max_open_files(-1); 
+        options.set_max_open_files(-1);
         options.set_compaction_style(DBCompactionStyle::Level);
         options.set_write_buffer_size(67_108_864);
         options.set_max_write_buffer_number(3);
@@ -169,7 +168,7 @@ impl RocksdbGraphStorage {
             GraphError::StorageError("Failed to open RocksDB after multiple attempts due to lock error.".to_string())
         })?;
 
-        Ok(RocksdbGraphStorage { db: Arc::new(db) })
+        Ok(RocksdbStorage { db: Arc::new(db) })
     }
 
     fn cf_handle(&self, cf_name: &str) -> GraphResult<&rocksdb::ColumnFamily> {
@@ -189,23 +188,23 @@ impl RocksdbGraphStorage {
 
 #[cfg(feature = "with-rocksdb")]
 #[async_trait]
-impl StorageEngine for RocksdbGraphStorage {
+impl StorageEngine for RocksdbStorage {
     async fn connect(&self) -> GraphResult<()> {
         Ok(())
     }
 
-    async fn insert(&self, key: &[u8], value: &[u8]) -> GraphResult<()> {
+    async fn insert(&self, key: Vec<u8>, value: Vec<u8>) -> GraphResult<()> {
         self.db.put(key, value)
             .map_err(|e| GraphError::StorageError(e.to_string()))?;
         Ok(())
     }
 
-    async fn retrieve(&self, key: &[u8]) -> GraphResult<Option<Vec<u8>>> {
+    async fn retrieve(&self, key: &Vec<u8>) -> GraphResult<Option<Vec<u8>>> {
         self.db.get(key)
             .map_err(|e| GraphError::StorageError(e.to_string()))
     }
 
-    async fn delete(&self, key: &[u8]) -> GraphResult<()> {
+    async fn delete(&self, key: &Vec<u8>) -> GraphResult<()> {
         self.db.delete(key)
             .map_err(|e| GraphError::StorageError(e.to_string()))?;
         Ok(())
@@ -220,7 +219,7 @@ impl StorageEngine for RocksdbGraphStorage {
 
 #[cfg(feature = "with-rocksdb")]
 #[async_trait]
-impl GraphStorageEngine for RocksdbGraphStorage {
+impl GraphStorageEngine for RocksdbStorage {
     async fn clear_data(&self) -> GraphResult<()> {
         // This is inefficient but functional. A better approach would be to drop and recreate the CFs.
         info!("Clearing all data from RocksDB");
@@ -251,7 +250,7 @@ impl GraphStorageEngine for RocksdbGraphStorage {
     async fn stop(&self) -> GraphResult<()> {
         self.db.flush_wal(true)
             .map_err(|e| GraphError::StorageError(format!("Failed to flush WAL: {}", e)))?;
-        info!("RocksdbGraphStorage stopped");
+        info!("RocksdbStorage stopped");
         Ok(())
     }
 
@@ -264,7 +263,7 @@ impl GraphStorageEngine for RocksdbGraphStorage {
     }
 
     async fn query(&self, query_string: &str) -> GraphResult<Value> {
-        println!("Executing query against RocksdbGraphStorage: {}", query_string);
+        println!("Executing query against RocksdbStorage: {}", query_string);
         Ok(serde_json::json!({
             "status": "success",
             "query": query_string,
@@ -421,7 +420,7 @@ impl GraphStorageEngine for RocksdbGraphStorage {
     async fn close(&self) -> GraphResult<()> {
         self.db.flush_wal(true)
             .map_err(|e| GraphError::StorageError(format!("Failed to flush WAL: {}", e)))?;
-        info!("RocksdbGraphStorage closed");
+        info!("RocksdbStorage closed");
         Ok(())
     }
 }

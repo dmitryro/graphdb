@@ -3,6 +3,7 @@
 // Fixed: 2025-08-14 - Corrected import path for `SerializableUuid`.
 // Fixed: 2025-08-15 - Resolved E0308 mismatched types error in `is_running` function.
 // Added: 2025-08-13 - Added `close` method to GraphStorageEngine implementation
+// Fixed: 2025-08-19 - Resolved trait bound mismatch for StorageEngine methods.
 
 use std::any::Any;
 use async_trait::async_trait;
@@ -14,13 +15,14 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use uuid::Uuid;
-use log::info; // Added for logging
+use log::info;
 
 #[derive(Debug)]
 pub struct InMemoryStorage {
     config: StorageConfig,
     vertices: Mutex<HashMap<Uuid, Vertex>>,
     edges: Mutex<HashMap<(Uuid, Identifier, Uuid), Edge>>,
+    kv_store: Mutex<HashMap<Vec<u8>, Vec<u8>>>, // New field for generic key-value storage
     running: Mutex<bool>,
 }
 
@@ -30,6 +32,7 @@ impl InMemoryStorage {
             config: config.clone(),
             vertices: Mutex::new(HashMap::new()),
             edges: Mutex::new(HashMap::new()),
+            kv_store: Mutex::new(HashMap::new()),
             running: Mutex::new(false),
         }
     }
@@ -37,8 +40,12 @@ impl InMemoryStorage {
     pub fn reset(&mut self) -> GraphResult<()> {
         let mut vertices = self.vertices.lock().map_err(|e| GraphError::LockError(e.to_string()))?;
         let mut edges = self.edges.lock().map_err(|e| GraphError::LockError(e.to_string()))?;
+        let mut kv_store = self.kv_store.lock().map_err(|e| GraphError::LockError(e.to_string()))?;
+
         vertices.clear();
         edges.clear();
+        kv_store.clear();
+
         Ok(())
     }
 }
@@ -49,16 +56,21 @@ impl StorageEngine for InMemoryStorage {
         Ok(())
     }
 
-    async fn insert(&self, key: &[u8], value: &[u8]) -> GraphResult<()> {
-        unimplemented!()
+    async fn insert(&self, key: Vec<u8>, value: Vec<u8>) -> GraphResult<()> {
+        let mut kv_store = self.kv_store.lock().map_err(|e| GraphError::LockError(e.to_string()))?;
+        kv_store.insert(key, value);
+        Ok(())
     }
 
-    async fn retrieve(&self, key: &[u8]) -> GraphResult<Option<Vec<u8>>> {
-        unimplemented!()
+    async fn retrieve(&self, key: &Vec<u8>) -> GraphResult<Option<Vec<u8>>> {
+        let kv_store = self.kv_store.lock().map_err(|e| GraphError::LockError(e.to_string()))?;
+        Ok(kv_store.get(key).cloned())
     }
 
-    async fn delete(&self, key: &[u8]) -> GraphResult<()> {
-        unimplemented!()
+    async fn delete(&self, key: &Vec<u8>) -> GraphResult<()> {
+        let mut kv_store = self.kv_store.lock().map_err(|e| GraphError::LockError(e.to_string()))?;
+        kv_store.remove(key);
+        Ok(())
     }
 
     async fn flush(&self) -> GraphResult<()> {

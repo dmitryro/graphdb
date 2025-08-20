@@ -5,7 +5,7 @@
 // Added: 2025-08-13 - Added storage_utils module
 // Fixed: 2025-08-15 - Corrected re-export of InMemoryStorage and removed non-existent open_sled_db function.
 // Updated: 2025-08-14 - Added detailed debugging for create_storage to trace RocksDB failures
-// Fixed: 2025-08-14 - Fixed type mismatch for RocksdbGraphStorage::new error handling
+// Fixed: 2025-08-14 - Fixed type mismatch for RocksdbStorage::new error handling
 
 use log::{info, error, warn, debug};
 use std::sync::Arc;
@@ -15,11 +15,12 @@ use std::path::{Path, PathBuf};
 // Declare submodules
 pub mod config;
 pub mod inmemory_storage;
-pub mod sled_storage;
 pub mod storage_utils;
 pub mod storage_engine;
 #[cfg(feature = "with-rocksdb")]
 pub mod rocksdb_storage;
+#[cfg(feature = "with-tikv")]
+pub mod tikv_storage;
 #[cfg(feature = "redis-datastore")]
 pub mod redis_storage;
 #[cfg(feature = "postgres-datastore")]
@@ -28,18 +29,24 @@ pub mod postgres_storage;
 pub mod mysql_storage;
 
 // Re-export key items
-pub use config::{CliConfigToml, StorageConfig, StorageEngineType, RocksdbConfig, SledConfig, 
+pub use config::{CliConfigToml, StorageConfig, StorageEngineType, RocksdbConfig, SledConfig, TikvConfig,
                  format_engine_config, load_storage_config_from_yaml};
 pub use inmemory_storage::{InMemoryStorage as InMemoryGraphStorage};
-pub use sled_storage::SledStorage;
+#[cfg(feature = "with-sled")]
+pub mod sled_storage;
+#[cfg(feature = "with-sled")]
+pub use self::sled_storage::SledStorage;
+#[cfg(feature = "with-sled")]
 pub use storage_engine::{ AsyncStorageEngineManager, GraphStorageEngine, HybridStorageEngine, StorageEngine, 
                          StorageEngineManager, emergency_cleanup_storage_engine_manager, init_storage_engine_manager, 
-                         GLOBAL_STORAGE_ENGINE_MANAGER};
+                         GLOBAL_STORAGE_ENGINE_MANAGER, recover_sled, log_lock_file_diagnostics, lock_file_exists };
 pub use storage_utils::{serialize_vertex, deserialize_vertex, serialize_edge, deserialize_edge, create_edge_key};
 
-// Correctly re-export RocksdbGraphStorage from its module under the feature flag
+// Correctly re-export RocksdbStorage from its module under the feature flag
 #[cfg(feature = "with-rocksdb")]
-pub use rocksdb_storage::RocksdbGraphStorage;
+pub use rocksdb_storage::RocksdbStorage;
+#[cfg(feature = "with-tikv")]
+pub use tikv_storage::TikvStorage;
 #[cfg(feature = "redis-datastore")]
 pub use redis_storage::RedisStorage;
 #[cfg(feature = "postgres-datastore")]
@@ -73,7 +80,7 @@ pub fn create_storage(config: &StorageConfig) -> Result<Arc<dyn GraphStorageEngi
                         .clone()
                 ).map_err(|e| anyhow!("Failed to deserialize RocksDB config: {}", e))?;
 
-                match RocksdbGraphStorage::new(&rocksdb_config) {
+                match RocksdbStorage::new(&rocksdb_config) {
                     Ok(storage) => {
                         info!("Created RocksDB storage");
                         Ok(Arc::new(storage))
@@ -121,6 +128,39 @@ pub fn create_storage(config: &StorageConfig) -> Result<Arc<dyn GraphStorageEngi
                 Err(anyhow!("Sled support is not enabled. Please enable the 'with-sled' feature."))
             }
         }
+
+        StorageEngineType::TiKV => {
+            debug!("Attempting to create TiKV storage");
+            #[cfg(feature = "with-tikv")]
+            {
+                // Correctly deserialize the specific SledConfig from the generic HashMap
+                let tikv_config: SledConfig = serde_json::from_value(
+                    config.engine_specific_config
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("TiKV configuration is missing."))?
+                        .get("sled")
+                        .ok_or_else(|| anyhow!("TiKV configuration not found in engine_specific_config."))?
+                        .clone()
+                ).map_err(|e| anyhow!("Failed to deserialize Sled config: {}", e))?;
+
+                match SledStorage::new(&tikv_config) {
+                    Ok(storage) => {
+                        info!("Created Sled storage");
+                        Ok(Arc::new(storage) as Arc<dyn GraphStorageEngine>)
+                    },
+                    Err(e) => {
+                        error!("Failed to create Sled storage: {}", e);
+                        Err(anyhow::Error::from(e))
+                    }
+                }
+            }
+            #[cfg(not(feature = "with-sled"))]
+            {
+                error!("TiKV support is not enabled in this build");
+                Err(anyhow!("TiKV support is not enabled. Please enable the 'with-sled' feature."))
+            }
+        }
+
         StorageEngineType::InMemory => {
             debug!("Attempting to create InMemory storage");
             info!("Created InMemory storage");
