@@ -210,6 +210,7 @@ pub async fn reload_all_interactive(
         None, // port
         None, // config_file
         None, // cluster_opt
+        None,
         storage_daemon_shutdown_tx_opt,
         storage_daemon_handle,
         storage_daemon_port_arc
@@ -330,6 +331,7 @@ pub async fn handle_start_all_interactive(
     if let Err(e) = start_storage_interactive(
         storage_port,
         Some(actual_storage_config),
+        None,
         None,
         storage_daemon_shutdown_tx_opt.clone(),
         storage_daemon_handle.clone(),

@@ -519,6 +519,7 @@ pub async fn handle_internal_daemon_run(
             Some(daemon_listen_port),
             Some(storage_config_path),
             None,
+            None,
             storage_daemon_shutdown_tx_opt,
             storage_daemon_handle,
             storage_daemon_port_arc,

@@ -20,8 +20,9 @@ use surrealdb::engine::any::Any as SurrealAny;
 use surrealdb::sql::Thing;
 use keyv::Keyv;
 use tokio::fs;
+use tokio::time::{self, Duration as TokioDuration};
 use std::process;
-use anyhow::{Result, Context};
+use anyhow::{Result, Context, anyhow};
 use std::io::Error;
 use serde_yaml2 as serde_yaml;
 use serde_json::{Map, Value};
@@ -32,7 +33,7 @@ use nix::unistd::{Pid, getpid, getuid};
 use sysinfo::System;
 #[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt, MetadataExt};
-use crate::storage_engine::config::{DEFAULT_DATA_DIRECTORY, DEFAULT_LOG_DIRECTORY, 
+use crate::storage_engine::config::{DEFAULT_DATA_DIRECTORY, DEFAULT_LOG_DIRECTORY, LOCK_FILE_PATH,
                                     DEFAULT_STORAGE_PORT, StorageConfig, SledConfig, RocksdbConfig,
                                     RedisConfig, MySQLConfig, PostgreSQLConfig, 
                                     StorageConfigWrapper, load_storage_config_from_yaml, 
@@ -719,50 +720,70 @@ async fn recover_rocksdb(data_dir: &PathBuf) -> Result<(), GraphError> {
 }
 
 /// Performs emergency cleanup of the storage engine manager
-pub async fn emergency_cleanup_storage_engine_manager() -> Result<(), GraphError> {
-    info!("Starting emergency cleanup of storage engine manager");
-    let db_path = PathBuf::from("/opt/graphdb/storage_data/rocksdb");
-
-    if db_path.exists() {
-        let db_path_clone = db_path.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            std::fs::remove_dir_all(&db_path_clone)?;
-            info!("Removed RocksDB directory {:?}", db_path_clone);
-            std::fs::create_dir_all(&db_path_clone)?;
-            let metadata = std::fs::metadata(&db_path_clone)?;
-            let mut perms = metadata.permissions();
-            #[cfg(unix)]
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&db_path_clone, perms)?;
-            info!("Recreated clean RocksDB directory at {:?}", db_path_clone);
-            Ok(())
-        }).await
-        .map_err(|e| GraphError::StorageError(format!("Failed to clean RocksDB directory: {}", e)))??;
-    }
-
-    // Clear ROCKSDB_SINGLETON
-    #[cfg(feature = "with-rocksdb")]
-    {
-        let mut rocksdb_singleton = ROCKSDB_SINGLETON.lock().await;
-        if rocksdb_singleton.is_some() {
-            warn!("Clearing ROCKSDB_SINGLETON for reinitialization");
-            *rocksdb_singleton = None;
+/// Performs emergency cleanup of the storage engine manager
+pub async fn emergency_cleanup_storage_engine_manager() -> Result<(), anyhow::Error> {
+    info!("Performing emergency cleanup for StorageEngineManager");
+    
+    // Clean up FileLock
+    let lock_path = PathBuf::from(LOCK_FILE_PATH);
+    if lock_path.exists() {
+        if let Err(e) = fs::remove_file(&lock_path).await {
+            warn!("Failed to remove lock file at {:?}: {}", lock_path, e);
+        } else {
+            info!("Removed lock file at {:?}", lock_path);
         }
     }
-
-    // Clear GLOBAL_STORAGE_ENGINE_MANAGER
+    
+    // Clean up GLOBAL_STORAGE_ENGINE_MANAGER
     if let Some(manager) = GLOBAL_STORAGE_ENGINE_MANAGER.get() {
-        warn!("Clearing GLOBAL_STORAGE_ENGINE_MANAGER for reinitialization");
-        // Shutdown existing manager
-        let manager_instance = manager.get_manager();
-        let mut mgr = manager_instance.lock().await;
-        let mut engine = mgr.engine.lock().await;
-        if let Err(e) = (*engine).stop().await {
-            warn!("Failed to shut down existing manager during cleanup: {}", e);
+        let mutex = manager.get_manager();
+        let mut locked_manager = mutex.lock().await;
+        if let Err(e) = locked_manager.shutdown().await {
+            warn!("Failed to shutdown StorageEngineManager: {}", e);
         }
-        // Cannot unset OnceCell, but shutdown ensures resources are released
+        drop(locked_manager);
     }
-    info!("Finished emergency cleanup of storage engine manager");
+    
+    // Additional Sled-specific cleanup
+    #[cfg(feature = "with-sled")]
+    {
+        let sled_path = PathBuf::from("/opt/graphdb/storage_data/sled");
+        if sled_path.exists() {
+            // Call SledStorage::force_unlock (needs to be made public in sled_storage.rs)
+            if let Err(e) = SledStorage::force_unlock(&sled_path) {
+                warn!("Failed to force unlock Sled database at {:?}: {}", sled_path, e);
+            } else {
+                info!("Successfully forced unlock on Sled database at {:?}", sled_path);
+            }
+        }
+        
+        // Kill any processes holding file descriptors
+        if let Ok(output) = tokio::process::Command::new("lsof")
+            .arg("-t")
+            .arg(sled_path.to_str().ok_or_else(|| anyhow!("Invalid sled path"))?)
+            .output()
+            .await
+        {
+            let pids = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|pid| pid.trim().parse::<u32>().ok())
+                .collect::<Vec<u32>>();
+            
+            for pid in pids {
+                if let Err(e) = tokio::process::Command::new("kill")
+                    .arg("-9")
+                    .arg(pid.to_string())
+                    .status()
+                    .await
+                {
+                    warn!("Failed to kill process {}: {}", pid, e);
+                } else {
+                    info!("Killed process {} holding Sled database", pid);
+                }
+            }
+        }
+    }
+    
     Ok(())
 }
 
@@ -1425,16 +1446,62 @@ impl StorageEngineManager {
 
     #[cfg(feature = "with-rocksdb")]
     async fn init_rocksdb(config: &StorageConfig) -> Result<Arc<dyn GraphStorageEngine + Send + Sync>, GraphError> {
-        info!("Initializing RocksDB engine via SurrealDB");
+        use tokio::time::{self, Duration as TokioDuration};
+        println!("IT'S TIME TO INITIALIZE ROCKSDB");
+        info!("Initializing RocksDB engine with SurrealDB backend");
+
+        // Get the path for the RocksDB engine.
         let engine_path = Self::get_engine_path(config, StorageEngineType::RocksDB)?;
+        
+        // Ensure the directory exists to avoid filesystem errors.
+        info!("Ensuring directory exists: {:?}", engine_path);
         Self::ensure_directory_exists(&engine_path).await?;
 
-        let db = Surreal::new::<RocksDb>(engine_path).await
-            .map_err(|e| GraphError::StorageError(format!("Failed to connect to SurrealDB RocksDB backend: {}", e)))?;
+        let mut db_instance = None;
+        let mut attempt = 0;
+        let max_attempts = 5;
+        let base_delay_ms = 100;
+
+        while attempt < max_attempts {
+            debug!("Attempting to connect to SurrealDB RocksDB backend... (Attempt {} of {})", attempt + 1, max_attempts);
+            
+            match Surreal::new::<RocksDb>(engine_path.clone()).await {
+                Ok(db) => {
+                    info!("Successfully connected to SurrealDB RocksDB backend on attempt {}.", attempt + 1);
+                    db_instance = Some(db);
+                    break; // Connection successful, exit the loop.
+                },
+                Err(e) => {
+                    let error_string = e.to_string();
+                    
+                    // We're looking for a specific kind of lock error. These often contain keywords
+                    // like "lock", "busy", or "occupied". The SurrealDB error message might not be
+                    // exact, so we'll check for keywords.
+                    if error_string.contains("lock") || error_string.contains("occupied") {
+                        warn!("Detected a potential RocksDB lock conflict. Attempting retry after a delay. Error: {}", error_string);
+                        let delay = TokioDuration::from_millis(base_delay_ms * 2u64.pow(attempt));
+                        info!("Retrying in {:?}...", delay);
+                        time::sleep(delay).await;
+                        attempt += 1;
+                    } else {
+                        // For any other type of error, we should fail immediately as it's likely
+                        // a permanent issue (e.g., corrupt data, invalid config).
+                        error!("A non-retryable error occurred while connecting to RocksDB: {}", error_string);
+                        return Err(GraphError::StorageError(format!("Failed to connect to SurrealDB RocksDB backend: {}", error_string)));
+                    }
+                }
+            }
+        }
+
+        // After the loop, check if we have a valid database instance.
+        let db = db_instance.ok_or_else(|| {
+            error!("Failed to connect to RocksDB after {} attempts.", max_attempts);
+            GraphError::StorageError(format!("Failed to open RocksDB after {} attempts due to lock error.", max_attempts))
+        })?;
         
         db.use_ns("graphdb").use_db("graph").await
             .map_err(|e| GraphError::StorageError(e.to_string()))?;
-
+        println!("SUCCESSFULLY INITIALIZED ROCKSDB");
         Ok(Arc::new(SurrealdbGraphStorage { db, backend_type: StorageEngineType::RocksDB }))
     }
 

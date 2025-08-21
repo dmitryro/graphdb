@@ -42,7 +42,7 @@ pub const DEFAULT_HTTP_TIMEOUT_SECONDS: u64 = 30;
 pub const DEFAULT_HTTP_RETRIES: u32 = 3;
 pub const DEFAULT_GRPC_TIMEOUT_SECONDS: u64 = 60;
 pub const DEFAULT_GRPC_RETRIES: u32 = 5;
-
+pub const LOCK_FILE_PATH: &str = "/tmp/graphdb_storage_lock";
 // --- Custom PathBuf Serialization Module ---
 pub mod path_buf_serde {
     use super::*;

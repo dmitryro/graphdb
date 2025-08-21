@@ -64,11 +64,16 @@ impl RocksdbStorage {
     /// object, resolving the type mismatch error.
     pub fn new(config: &RocksdbConfig) -> GraphResult<Self> {
         info!("--- Loading RocksDB configuration ---");
-        
+        println!("Initializing Rocksdb STEP 1");
         let path = &config.path;
         info!("  ✅ Path: {:?}", path);
         info!("  ✅ Host: {:?}", config.host);
         info!("  ✅ Port: {:?}", config.port);
+
+
+        println!("  ✅ Path: {:?}", path);
+        println!("  ✅ Host: {:?}", config.host);
+        println!("  ✅ Port: {:?}", config.port);
 
         debug!("Opening RocksDB at path: {:?}", path);
 
@@ -84,7 +89,7 @@ impl RocksdbStorage {
             error!("RocksDB path is not a directory: {:?}", path);
             return Err(GraphError::StorageError(format!("RocksDB path is not a directory: {:?}", path)));
         }
-
+        println!("Initializing Rocksdb STEP 2");
         let mut options = Options::default();
         options.create_if_missing(true);
         // The RocksdbConfig does not have `max_open_files`, so we set it to a reasonable default.
@@ -106,7 +111,7 @@ impl RocksdbStorage {
         let mut attempt = 0;
         let max_attempts = 5;
         let base_delay_ms = 100;
-
+        println!("Initializing Rocksdb STEP 3");
         while attempt < max_attempts {
             // Recreate the ColumnFamilyDescriptor vector on each attempt
             // because `DB::open_cf_descriptors` consumes it (takes ownership).
@@ -162,12 +167,12 @@ impl RocksdbStorage {
                 }
             }
         }
-
+        println!("Initializing Rocksdb STEP 4");
         // If after all attempts we still don't have a DB instance, return an error.
         let db = db.ok_or_else(|| {
             GraphError::StorageError("Failed to open RocksDB after multiple attempts due to lock error.".to_string())
         })?;
-
+        println!("Initializing Rocksdb STEP 5");
         Ok(RocksdbStorage { db: Arc::new(db) })
     }
 

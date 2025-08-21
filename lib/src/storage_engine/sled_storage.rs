@@ -152,7 +152,7 @@ impl SledStorage {
     
     /// Aggressively attempts to break any existing locks on the Sled database.
     /// This uses multiple strategies to deal with stale locks from crashed processes.
-    fn force_unlock(path: &Path) -> GraphResult<()> {
+    pub fn force_unlock(path: &Path) -> GraphResult<()> {
         info!("Attempting to forcefully break locks on Sled database at {:?}", path);
         
         let db_path = path.join("db");
@@ -253,7 +253,7 @@ impl SledStorage {
     }
     
     #[cfg(unix)]
-    fn kill_graphdb_processes(current_pid: u32) -> GraphResult<()> {
+    pub fn kill_graphdb_processes(current_pid: u32) -> GraphResult<()> {
         use std::process::Command;
         
         info!("Searching for all processes with 'graphdb' in their name/command");

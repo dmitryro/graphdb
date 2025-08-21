@@ -132,6 +132,7 @@ pub async fn handle_start_command(
             Some(actual_port),
             Some(actual_config_file),
             None,
+            None,
             rest_api_shutdown_tx_opt.clone(), // Reuse existing mutex to avoid registry conflicts
             rest_api_handle.clone(), // Reuse existing handle
             rest_api_port_arc.clone(), // Reuse existing port arc
@@ -214,6 +215,7 @@ pub async fn handle_start_command_interactive(
         let storage_result = start_storage_interactive(
             Some(actual_port),
             Some(actual_config_file),
+            None,
             None,
             rest_api_shutdown_tx_opt.clone(), // Reuse existing mutex to avoid registry conflicts
             rest_api_handle.clone(), // Reuse existing handle
@@ -636,6 +638,7 @@ pub async fn handle_restart_command_interactive(
             start_storage_interactive(
                 Some(actual_port),
                 config_file,
+                None,
                 cluster.or(storage_cluster),
                 storage_daemon_shutdown_tx_opt,
                 storage_daemon_handle,
