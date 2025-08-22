@@ -559,7 +559,7 @@ pub async fn start_storage_daemon_server_real(
             _ => None,
         },
     };
-    let storage = match create_storage(&storage_config) {
+    let storage = match create_storage(&storage_config).await {
         Ok(storage) => {
             info!("[Storage Daemon] Initialized storage backend: {}", settings.storage_engine_type);
             storage

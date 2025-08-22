@@ -19,7 +19,6 @@ pub mod daemon_registry;
 pub mod daemon_config;
 pub mod util;
 pub use storage_engine::config::StorageEngineType;
-// REMOVED: pub mod rdb; // Obsolete after RocksDB consolidation
 
 // Now, import directly from the 'models' crate.
 pub use models::{Edge, Identifier, Json, Vertex}; // Added Vertex here for convenience
@@ -63,10 +62,9 @@ pub use crate::daemon_config::{
 };
 
 // Re-export from storage_engine/mod.rs (assuming it exists and re-exports these)
-pub use crate::storage_engine::{StorageEngine, GraphStorageEngine, SledStorage};
+pub use crate::storage_engine::{StorageEngine, GraphStorageEngine, SledStorage, log_lock_file_diagnostics};
 #[cfg(feature = "with-rocksdb")]
 pub use crate::storage_engine::rocksdb_storage::RocksdbStorage; // Re-export the new RocksDB storage
-
 
 // Do NOT glob-import engine and models together to avoid ambiguity
 // Instead, re-export them under namespaces

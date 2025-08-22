@@ -81,7 +81,7 @@ impl Database {
                         // Corrected: Removed the `Sled()` and `Some()` wrapper, as `sled_config_map.port` is already an Option<u16>.
                         port: sled_config_map.port,
                     };
-                    Arc::new(SledStorage::new(&sled_config)?)
+                    Arc::new(SledStorage::new(&sled_config).await?)
                 }
                 #[cfg(not(feature = "with-sled"))]
                 {
@@ -208,7 +208,7 @@ impl Database {
                 let sled_config_map = config_wrapper.storage.engine_specific_config.ok_or_else(|| anyhow!("Sled config not found"))?;
                 let sled_config: SledConfig = serde_json::from_value(Value::Object(Map::from_iter(sled_config_map)))
                     .context("Failed to deserialize sled config")?;
-                Arc::new(SledStorage::new(&sled_config)?)
+                Arc::new(SledStorage::new(&sled_config).await?)
             }
             StorageEngineType::RocksDB => {
                 let rocksdb_config_map = config_wrapper.storage.engine_specific_config.ok_or_else(|| anyhow!("Rocksdb config not found"))?;

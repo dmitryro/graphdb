@@ -59,7 +59,7 @@ pub use mysql_storage::MySQLStorage;
 /// Uses Sled as the default storage engine (as per StorageConfig::default).
 /// Supports RocksDB (if "with-rocksdb" feature is enabled), InMemory, Redis (if "redis-datastore" feature is enabled),
 /// PostgreSQL (if "postgres-datastore" feature is enabled), and MySQL (if "mysql-datastore" feature is enabled) storage.
-pub fn create_storage(config: &StorageConfig) -> Result<Arc<dyn GraphStorageEngine>> {
+pub async fn create_storage(config: &StorageConfig) -> Result<Arc<dyn GraphStorageEngine>> {
     debug!("Creating storage with config: {:?}", config);
     debug!("Storage engine type: {:?}", config.storage_engine_type);
     debug!("Engine specific config: {:?}", config.engine_specific_config);
@@ -111,7 +111,7 @@ pub fn create_storage(config: &StorageConfig) -> Result<Arc<dyn GraphStorageEngi
                         .clone()
                 ).map_err(|e| anyhow!("Failed to deserialize Sled config: {}", e))?;
 
-                match SledStorage::new(&sled_config) {
+                match SledStorage::new(&sled_config).await {
                     Ok(storage) => {
                         info!("Created Sled storage");
                         Ok(Arc::new(storage) as Arc<dyn GraphStorageEngine>)
@@ -143,7 +143,7 @@ pub fn create_storage(config: &StorageConfig) -> Result<Arc<dyn GraphStorageEngi
                         .clone()
                 ).map_err(|e| anyhow!("Failed to deserialize Sled config: {}", e))?;
 
-                match SledStorage::new(&tikv_config) {
+                match SledStorage::new(&tikv_config).await {
                     Ok(storage) => {
                         info!("Created Sled storage");
                         Ok(Arc::new(storage) as Arc<dyn GraphStorageEngine>)

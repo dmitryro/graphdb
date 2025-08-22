@@ -1,4 +1,3 @@
-
 use anyhow::{anyhow, Context, Result};
 use clap::ValueEnum;
 use std::path::PathBuf;
@@ -67,6 +66,30 @@ pub async fn check_process_status_by_pid(pid: Pid) -> bool {
     let mut system = System::new();
     system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
     system.process(pid).is_some()
+}
+
+// Helper to get process ID by port provided
+pub async fn get_pid_for_port(port: u16) -> Result<u32> {
+    let output = Command::new("lsof")
+        .arg("-i")
+        .arg("-P")
+        .arg(format!(":{}", port))
+        .output()
+        .await
+        .context("Failed to execute lsof")?; // <-- moved after `.await`
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines().skip(1) {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        debug!("lsof output for port {}: {:?}", port, line);
+        if parts.len() > 1 {
+            if let Ok(pid) = parts[1].parse::<u32>() {
+                return Ok(pid);
+            }
+        }
+    }
+
+    Err(anyhow!("No process found listening on port {}", port))
 }
 
 // Helper function to check if a string is a valid cluster range (e.g., "8081-8084")

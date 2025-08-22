@@ -11,6 +11,7 @@ use tokio::fs::{remove_file};
 use std::io::ErrorKind;
 use fs2::FileExt;
 use chrono::Utc;
+use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use log::{info, debug, warn, error, trace};
 use futures::stream::StreamExt;
@@ -47,7 +48,7 @@ use lib::storage_engine::config::{StorageEngineType, StorageConfig as EngineStor
                                   RedisConfig, MySQLConfig, PostgreSQLConfig, RocksdbConfig, SledConfig,
                                  };
 use lib::storage_engine::{AsyncStorageEngineManager, StorageEngineManager, GLOBAL_STORAGE_ENGINE_MANAGER, 
-                          emergency_cleanup_storage_engine_manager};
+                          emergency_cleanup_storage_engine_manager,  SledStorage, RocksdbStorage, log_lock_file_diagnostics};
 
 use crate::cli::daemon_management::{
     is_port_free,
@@ -57,6 +58,7 @@ use crate::cli::daemon_management::{
     parse_cluster_range,
     is_port_in_cluster_range,
     is_storage_daemon_running,
+    get_pid_for_port,
 };
 use lib::query_parser::{parse_query_from_string, QueryType};
 
@@ -242,63 +244,6 @@ fn convert_engine_storage_config_to_storage_config(
     }
 }
 
-/// Ensures the storage daemon is running on the specified port, starting it if necessary.
-pub async fn ensure_storage_daemon_running(
-    port: Option<u16>,
-    config_file: Option<PathBuf>,
-    storage_daemon_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
-    storage_daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
-    storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
-) -> Result<()> {
-    let config_path = config_file.unwrap_or_else(|| PathBuf::from("./storage_daemon_server/storage_config.yaml"));
-    let storage_config = load_storage_config_from_yaml(Some(config_path.clone()))
-        .map_err(|e| {
-            warn!("Failed to load storage config from {:?}: {}", config_path, e);
-            anyhow!("Failed to load storage config: {}", e)
-        })?;
-    let selected_port = port.unwrap_or(storage_config.default_port);
-    debug!("Ensuring storage daemon on port {} with config {:?}", selected_port, config_path);
-
-    // Check if the daemon is running and StorageEngineManager is initialized
-    if check_process_status_by_port("Storage Daemon", selected_port).await {
-        if let Some(manager) = GLOBAL_STORAGE_ENGINE_MANAGER.get() {
-            let current_engine = manager.current_engine_type().await;
-            debug!("Current engine from StorageEngineManager: {:?}", current_engine);
-            info!("Storage daemon already running on port {} with engine {:?}", selected_port, current_engine);
-            return Ok(());
-        } else {
-            warn!("Storage daemon running on port {} but StorageEngineManager not initialized. Restarting.", selected_port);
-        }
-    }
-
-    // Start the storage daemon
-    info!("Starting storage daemon on port {}", selected_port);
-    start_storage_interactive(
-        Some(selected_port),
-        Some(config_path),
-        None,
-        None,
-        storage_daemon_shutdown_tx_opt,
-        storage_daemon_handle,
-        storage_daemon_port_arc,
-    ).await?;
-
-    // Verify StorageEngineManager is initialized
-    let max_attempts = 5;
-    for attempt in 0..max_attempts {
-        if let Some(manager) = GLOBAL_STORAGE_ENGINE_MANAGER.get() {
-            let current_engine = manager.current_engine_type().await;
-            debug!("StorageEngineManager initialized on attempt {} with engine {:?}", attempt + 1, current_engine);
-            return Ok(());
-        }
-        warn!("StorageEngineManager not initialized on attempt {}. Retrying...", attempt + 1);
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-
-    Err(anyhow!("Failed to initialize StorageEngineManager after {} attempts", max_attempts))
-}
-
-
 // Function to perform the mapping from CLI config to daemon config
 fn map_cli_config_to_daemon_config(
     cli_config: &StorageConfig,
@@ -361,6 +306,61 @@ fn map_cli_config_to_daemon_config(
     })
 }
 
+/// Ensures the storage daemon is running on the specified port, starting it if necessary.
+pub async fn ensure_storage_daemon_running(
+    port: Option<u16>,
+    config_file: Option<PathBuf>,
+    storage_daemon_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
+    storage_daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
+    storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
+) -> Result<()> {
+    let config_path = config_file.unwrap_or_else(|| PathBuf::from("./storage_daemon_server/storage_config.yaml"));
+    let storage_config = load_storage_config_from_yaml(Some(config_path.clone()))
+        .map_err(|e| {
+            warn!("Failed to load storage config from {:?}: {}", config_path, e);
+            anyhow!("Failed to load storage config: {}", e)
+        })?;
+    let selected_port = port.unwrap_or(storage_config.default_port);
+    debug!("Ensuring storage daemon on port {} with config {:?}", selected_port, config_path);
+
+    // Check if the daemon is running and StorageEngineManager is initialized
+    if check_process_status_by_port("Storage Daemon", selected_port).await {
+        if let Some(manager) = GLOBAL_STORAGE_ENGINE_MANAGER.get() {
+            let current_engine = manager.current_engine_type().await;
+            debug!("Current engine from StorageEngineManager: {:?}", current_engine);
+            info!("Storage daemon already running on port {} with engine {:?}", selected_port, current_engine);
+            return Ok(());
+        } else {
+            warn!("Storage daemon running on port {} but StorageEngineManager not initialized. Restarting.", selected_port);
+        }
+    }
+
+    // Start the storage daemon
+    info!("Starting storage daemon on port {}", selected_port);
+    start_storage_interactive(
+        Some(selected_port),
+        Some(config_path),
+        None,
+        None,
+        storage_daemon_shutdown_tx_opt,
+        storage_daemon_handle,
+        storage_daemon_port_arc,
+    ).await?;
+
+    // Verify StorageEngineManager is initialized
+    let max_attempts = 5;
+    for attempt in 0..max_attempts {
+        if let Some(manager) = GLOBAL_STORAGE_ENGINE_MANAGER.get() {
+            let current_engine = manager.current_engine_type().await;
+            debug!("StorageEngineManager initialized on attempt {} with engine {:?}", attempt + 1, current_engine);
+            return Ok(());
+        }
+        warn!("StorageEngineManager not initialized on attempt {}. Retrying...", attempt + 1);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    Err(anyhow!("Failed to initialize StorageEngineManager after {} attempts", max_attempts))
+}
 
 pub async fn ensure_storage_daemon_is_running(
     new_config: Option<StorageConfig>,
@@ -369,8 +369,8 @@ pub async fn ensure_storage_daemon_is_running(
     storage_daemon_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
     storage_daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
     storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
-) -> Result<()> {
-    // Safely unwrap the new_config or return a clear error if it is not provided.
+) -> Result<(), anyhow::Error> {
+    // Safely unwrap the new_config or return a clear error if it is not provided
     let config = match new_config {
         Some(conf) => conf,
         None => return Err(anyhow!("A storage configuration is required to ensure the daemon is running.")),
@@ -378,8 +378,27 @@ pub async fn ensure_storage_daemon_is_running(
 
     let selected_port = port.unwrap_or(config.default_port);
     let engine_type = config.storage_engine_type.clone();
-    let config_path = config_file.clone().unwrap_or_else(|| PathBuf::from("./storage_daemon_server/storage_config.yaml"));
+    let config_path = config_file.unwrap_or_else(|| PathBuf::from("./storage_daemon_server/storage_config.yaml"));
     debug!("Ensuring storage daemon on port {} with engine {:?}", selected_port, engine_type);
+
+    // Sled-specific: Ensure no conflicting processes or locks
+    if engine_type == StorageEngineType::Sled {
+        debug!("Running Sled-specific process cleanup before starting daemon");
+        SledStorage::kill_processes(std::process::id()).await
+            .context("Failed to kill conflicting graphdb processes for Sled")?;
+        let lock_path = config.data_directory.as_ref()
+            .map(|d| PathBuf::from(d).join("sled").join("db.lck"))
+            .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data/sled/db.lck"));
+        debug!("Checking Sled lock file at {:?}", lock_path);
+        log_lock_file_diagnostics(lock_path.clone()).await.unwrap_or_else(|e| {
+            warn!("Failed to log lock file diagnostics: {}", e);
+        });
+        if lock_path.exists() {
+            info!("Removing Sled lock file at {:?}", lock_path);
+            fs::remove_file(&lock_path).context(format!("Failed to remove Sled lock file at {:?}", lock_path))?;
+        }
+        SledStorage::force_unlock(&lock_path.parent().unwrap_or_else(|| Path::new("/opt/graphdb/storage_data/sled"))).await?;
+    }
 
     // Check if a daemon is already running on the selected port. If so, stop it.
     if check_process_status_by_port("Storage Daemon", selected_port).await {
@@ -387,14 +406,11 @@ pub async fn ensure_storage_daemon_is_running(
         stop_process_by_port("Storage Daemon", selected_port).await?;
     }
 
-    // Start the new storage daemon with the provided new_config.
+    // Start the new storage daemon with the provided config
     info!("Starting storage daemon on port {} with engine {:?}", selected_port, engine_type);
-
-    // Call the start function, passing the required arguments.
-    // We clone new_config here to retain ownership for later use.
     start_storage_interactive(
         Some(selected_port),
-        config_file.clone(),
+        Some(config_path),
         Some(config.clone()),
         None,
         storage_daemon_shutdown_tx_opt,
@@ -402,30 +418,40 @@ pub async fn ensure_storage_daemon_is_running(
         storage_daemon_port_arc,
     ).await?;
 
-    // --- CRITICAL FIX: WAIT FOR THE DAEMON TO START AND BIND TO THE PORT ---
-    // Poll the port to ensure the daemon is ready to handle connections.
-    // This is the correct way to handle the race condition and avoid file lock errors.
-    let max_attempts = 10;
+    // Poll the port to ensure the daemon is ready to handle connections
+    const MAX_ATTEMPTS: u32 = 15;
+    const TIMEOUT_PER_ATTEMPT_MS: u64 = 30000; // 30 seconds per attempt
+    let start_time = Instant::now();
     let mut is_ready = false;
-    for attempt in 0..max_attempts {
-        // The check_process_status_by_port function checks for an active listener on the port.
+
+    while start_time.elapsed() < Duration::from_millis(TIMEOUT_PER_ATTEMPT_MS) {
         if check_process_status_by_port("Storage Daemon", selected_port).await {
-            info!("Daemon on port {} is ready after {} attempts.", selected_port, attempt + 1);
-            is_ready = true;
-            break;
+            if let Some(manager) = GLOBAL_STORAGE_ENGINE_MANAGER.get() {
+                let current_engine = manager.current_engine_type().await;
+                info!("Daemon on port {} is ready with engine {:?}", selected_port, current_engine);
+                is_ready = true;
+                break;
+            } else {
+                warn!("Daemon running on port {} but StorageEngineManager not initialized. Waiting...", selected_port);
+            }
         }
-        debug!("Waiting for daemon to start... Attempt {} of {}", attempt + 1, max_attempts);
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        debug!("Waiting for daemon to start on port {} (elapsed: {:?})", selected_port, start_time.elapsed());
+        tokio::time::sleep(Duration::from_millis(2000)).await;
     }
 
     if !is_ready {
-        return Err(anyhow!("Failed to start storage daemon on port {} after {} attempts", selected_port, max_attempts));
+        // Sled-specific: Log lock file status on failure
+        if engine_type == StorageEngineType::Sled {
+            let lock_path = config.data_directory.as_ref()
+                .map(|d| PathBuf::from(d).join("sled").join("db.lck"))
+                .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data/sled/db.lck"));
+            debug!("Checking Sled lock file status at {:?}", lock_path);
+            log_lock_file_diagnostics(lock_path.clone()).await.unwrap_or_else(|e| {
+                warn!("Failed to log lock file diagnostics: {}", e);
+            });
+        }
+        return Err(anyhow!("Failed to start storage daemon on port {} after {:?}", selected_port, Duration::from_millis(TIMEOUT_PER_ATTEMPT_MS)));
     }
-
-    // At this point, the daemon is guaranteed to be running.
-    // The main process should now rely on the daemon for all storage access.
-    // The previous code block that tried to initialize the GLOBAL_STORAGE_ENGINE_MANAGER here is
-    // the source of the lock error and has been removed.
 
     Ok(())
 }
@@ -1489,6 +1515,7 @@ pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bo
         }
     };
 
+    debug!("Initial loaded config: {:?}", current_config);
     println!(
         "Loaded storage config: default_port={}, cluster_range={}, data_directory={:?}, storage_engine_type={:?}, engine_specific_config={:?}, log_directory={:?}, max_disk_space_gb={}, min_disk_space_gb={}, use_raft_for_scale={}",
         current_config.default_port,
@@ -1503,7 +1530,7 @@ pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bo
     );
     println!("===> USE STORAGE HANDLER - STEP 3");
 
-    // Fix: Safely handle the Option and prevent panic
+    // Safely handle the Option and prevent panic
     let config_root_directory = match current_config.config_root_directory.as_ref() {
         Some(path) => path,
         None => {
@@ -1519,7 +1546,7 @@ pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bo
     let mut new_config = current_config.clone();
     new_config.storage_engine_type = engine.clone();
 
-    // Fix: Manually construct the SelectedStorageConfig, providing the missing `storage_engine_type`
+    // Manually construct the SelectedStorageConfig
     let engine_config = SelectedStorageConfig {
         storage_engine_type: engine.clone(),
         storage: StorageConfigInner {
@@ -1531,12 +1558,31 @@ pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bo
             password: engine_specific_config_map.get("password").and_then(|v| v.as_str()).map(String::from),
         },
     };
-    
+
     // Update the default_port from the engine-specific config
     if let Some(port) = engine_config.storage.port {
         new_config.default_port = port;
     }
-    
+
+    // Sled-specific: Ensure the data directory exists before proceeding
+    if engine == StorageEngineType::Sled {
+        let sled_path = new_config.data_directory.as_ref()
+            .map(|d| PathBuf::from(d).join("sled"))
+            .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data/sled"));
+        debug!("Ensuring Sled data directory exists at {:?}", sled_path);
+        fs::create_dir_all(&sled_path)
+            .context(format!("Failed to create Sled data directory at {:?}", sled_path))?;
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(&sled_path)
+                .map_err(|e| anyhow!("Failed to get metadata for {:?}: {}", sled_path, e))?
+                .permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&sled_path, perms)
+                .map_err(|e| anyhow!("Failed to set permissions for {:?}: {}", sled_path, e))?;
+        }
+    }
+
     new_config.engine_specific_config = Some(engine_config);
     new_config.cluster_range = new_config.default_port.to_string();
     debug!("Updated storage config: {:?}", new_config);
@@ -1553,17 +1599,18 @@ pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bo
             .context("Failed to save updated StorageConfig")?;
         debug!("Successfully saved storage configuration to {:?}", absolute_config_path);
     }
-    
+
     println!("------------------------------> SEE IT <--------------------------------");
     println!("Reloaded storage config for daemon management: {:?}", new_config);
 
-    println!("===> USE STORAGE HANDLER - STEP 5");
+    println!("===> USE STORAGE HANDLER - STEP 5: Stopping existing daemon");
 
-    const MAX_SHUTDOWN_RETRIES: u32 = 5;
-    const SHUTDOWN_RETRY_DELAY_MS: u64 = 1000;
+    const MAX_SHUTDOWN_RETRIES: u32 = 10;
+    const SHUTDOWN_RETRY_DELAY_MS: u64 = 2500;
     let mut is_daemon_stopped = false;
 
     for attempt in 0..MAX_SHUTDOWN_RETRIES {
+        debug!("Attempt {} to stop storage daemon on port {}", attempt + 1, config_port);
         if let Err(e) = stop_storage_interactive(
             Some(config_port),
             Arc::new(TokioMutex::new(None)),
@@ -1573,7 +1620,7 @@ pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bo
             warn!("Failed to stop storage daemon on attempt {}: {}", attempt + 1, e);
         }
 
-        if !is_storage_daemon_running(config_port).await {
+        if !check_process_status_by_port("Storage Daemon", config_port).await {
             info!("Storage daemon on port {} is confirmed stopped.", config_port);
             is_daemon_stopped = true;
             break;
@@ -1583,22 +1630,46 @@ pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bo
         tokio::time::sleep(Duration::from_millis(SHUTDOWN_RETRY_DELAY_MS)).await;
     }
 
+    // Sled-specific: Terminate any lingering graphdb processes
+    if engine == StorageEngineType::Sled {
+        debug!("Running Sled-specific process cleanup");
+        SledStorage::kill_processes(std::process::id()).await
+            .context("Failed to kill conflicting graphdb processes for Sled")?;
+    }
+
     if !is_daemon_stopped {
-        error!("Failed to stop existing storage daemon after {} attempts. The new daemon will likely fail to start due to a locked database.", MAX_SHUTDOWN_RETRIES);
-        return Err(anyhow!("Failed to stop existing storage daemon. Aborting."));
+        error!("Failed to stop existing storage daemon on port {} after {} attempts. The new daemon will likely fail to start due to a locked database.", config_port, MAX_SHUTDOWN_RETRIES);
+        return Err(anyhow!("Failed to stop existing storage daemon on port {}. Aborting.", config_port));
     }
 
     println!("===> USE STORAGE HANDLER - STEP 5.5: Cleaning up lock files for {:?}", expected_engine_type);
+    // Sled-specific: Extended lock cleanup
+    if engine == StorageEngineType::Sled {
+        let lock_path = new_config.data_directory.as_ref()
+            .map(|d| PathBuf::from(d).join("sled").join("db.lck"))
+            .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data/sled/db.lck"));
+        debug!("Checking Sled lock file at {:?}", lock_path);
+        log_lock_file_diagnostics(lock_path.clone()).await.unwrap_or_else(|e| {
+            warn!("Failed to log lock file diagnostics: {}", e);
+        });
+        if lock_path.exists() {
+            info!("Removing Sled lock file at {:?}", lock_path);
+            fs::remove_file(&lock_path).context(format!("Failed to remove Sled lock file at {:?}", lock_path))?;
+        }
+        SledStorage::force_unlock(&lock_path.parent().unwrap_or_else(|| Path::new("/opt/graphdb/storage_data/sled"))).await?;
+    }
     force_cleanup_engine_lock(expected_engine_type.clone(), &new_config.data_directory).await
         .context("Failed to clean up engine lock file")?;
 
     println!("===> USE STORAGE HANDLER - STEP 6");
 
-    const MAX_STARTUP_RETRIES: u32 = 5;
+    const MAX_STARTUP_RETRIES: u32 = 15;
+    const STARTUP_TIMEOUT_MS: u64 = 30000; // 30 seconds per attempt
     let mut last_error = None;
 
     for attempt in 0..MAX_STARTUP_RETRIES {
         info!("Starting storage daemon on port {} with engine {:?} (attempt {})", config_port, expected_engine_type, attempt + 1);
+        debug!("Attempt {}: Config: {:?}", attempt + 1, new_config);
         println!("Starting storage daemon on port {} with engine {:?} (attempt {})", config_port, expected_engine_type, attempt + 1);
         match ensure_storage_daemon_is_running(
             Some(new_config.clone()),
@@ -1614,6 +1685,17 @@ pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bo
                 break;
             },
             Err(e) => {
+                // Sled-specific: Log lock file status on failure
+                if engine == StorageEngineType::Sled {
+                    let lock_path = new_config.data_directory.as_ref()
+                        .map(|d| PathBuf::from(d).join("sled").join("db.lck"))
+                        .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data/sled/db.lck"));
+                    debug!("Checking Sled lock file status at {:?}", lock_path);
+                    log_lock_file_diagnostics(lock_path.clone()).await.unwrap_or_else(|e| {
+                        warn!("Failed to log lock file diagnostics: {}", e);
+                    });
+                    SledStorage::force_unlock(&lock_path.parent().unwrap_or_else(|| Path::new("/opt/graphdb/storage_data/sled"))).await?;
+                }
                 warn!("Failed to start storage daemon on attempt {}: {}", attempt + 1, e);
                 last_error = Some(e);
                 if attempt < MAX_STARTUP_RETRIES - 1 {
@@ -1621,13 +1703,14 @@ pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bo
                     if let Err(cleanup_err) = emergency_cleanup_storage_engine_manager().await {
                         warn!("Emergency cleanup failed: {}", cleanup_err);
                     }
-                    tokio::time::sleep(Duration::from_millis(1000)).await;
+                    tokio::time::sleep(Duration::from_millis(3000)).await;
                 }
             }
         }
     }
-    if last_error.is_some() {
-        return Err(last_error.unwrap().context("Failed to ensure storage daemon is running after retries"));
+    if let Some(err) = last_error {
+        error!("Failed to start storage daemon after {} attempts", MAX_STARTUP_RETRIES);
+        return Err(err.context("Failed to ensure storage daemon is running after retries"));
     }
 
     println!("===> USE STORAGE HANDLER - STEP 8");

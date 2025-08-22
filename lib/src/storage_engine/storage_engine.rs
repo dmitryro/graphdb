@@ -61,10 +61,13 @@ pub static CLEANUP_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 pub static GLOBAL_STORAGE_ENGINE_MANAGER: OnceCell<Arc<AsyncStorageEngineManager>> = OnceCell::const_new();
 
 // Singleton instances for each persistent engine type
+//static SLED_SINGLETON: OnceCell<Arc<SledStorage>> = OnceCell::const_new();
 #[cfg(feature = "with-sled")]
-static SLED_SINGLETON: OnceCell<Arc<SledStorage>> = OnceCell::const_new();
+static SLED_SINGLETON: TokioMutex<Option<Arc<SledStorage>>> = TokioMutex::const_new(None);
 #[cfg(feature = "with-rocksdb")]
-static ROCKSDB_SINGLETON: tokio::sync::Mutex<Option<Arc<RocksdbStorage>>> = tokio::sync::Mutex::const_new(None);
+static ROCKSDB_SINGLETON: TokioMutex<Option<Arc<RocksdbStorage>>> = TokioMutex::const_new(None);
+#[cfg(feature = "with-tikv")]
+static TIKV_SINGLETON: TokioMutex<Option<Arc<TikvStorage>>> = TokioMutex::const_new(None);
 #[cfg(feature = "redis-datastore")]
 static REDIS_SINGLETON: OnceCell<Arc<RedisStorage>> = OnceCell::const_new();
 #[cfg(feature = "postgres-datastore")]
@@ -434,6 +437,22 @@ pub async fn log_lock_file_diagnostics(lock_path: PathBuf) -> Result<(), GraphEr
 }
 
 #[cfg(feature = "with-sled")]
+async fn handle_sled_retry_error(sled_lock_path: &PathBuf, _sled_path: &PathBuf, attempt: u32) {
+    warn!(
+        "Sled lock contention (attempt {}/5) — another process may hold the lock",
+        attempt + 1
+    );
+    if sled_lock_path.exists() {
+        warn!("Lock file exists at {:?}", sled_lock_path);
+        if let Err(e) = std::fs::remove_file(&sled_lock_path) {
+            error!("Failed to remove lock file at {:?}: {}", sled_lock_path, e);
+        } else {
+            info!("Successfully removed lock file at {:?}", sled_lock_path);
+        }
+    }
+}
+
+#[cfg(feature = "with-sled")]
 pub async fn recover_sled(lock_path: PathBuf) -> Result<(), GraphError> {
     debug!("Starting recover_sled for {:?}", lock_path);
     if let Some(parent) = lock_path.parent() {
@@ -750,7 +769,7 @@ pub async fn emergency_cleanup_storage_engine_manager() -> Result<(), anyhow::Er
         let sled_path = PathBuf::from("/opt/graphdb/storage_data/sled");
         if sled_path.exists() {
             // Call SledStorage::force_unlock (needs to be made public in sled_storage.rs)
-            if let Err(e) = SledStorage::force_unlock(&sled_path) {
+            if let Err(e) = SledStorage::force_unlock(&sled_path).await {
                 warn!("Failed to force unlock Sled database at {:?}: {}", sled_path, e);
             } else {
                 info!("Successfully forced unlock on Sled database at {:?}", sled_path);
@@ -1281,101 +1300,203 @@ impl StorageEngineManager {
         Ok(Arc::new(InMemoryGraphStorage::new(config)))
     }
 
-    #[cfg(feature = "with-sled")]
-    async fn init_sled(
-        config: &StorageConfig,
-    ) -> Result<Arc<dyn GraphStorageEngine + Send + Sync>, GraphError> {
-        info!("Initializing Sled engine using raw sled crate");
-        println!("IN SLED INIT - STEP 1");
+#[cfg(feature = "with-sled")]
+async fn init_sled(
+    config: &StorageConfig,
+) -> Result<Arc<dyn GraphStorageEngine + Send + Sync>, GraphError> {
+    info!("Initializing Sled engine using raw sled crate");
+    println!("IN SLED INIT - STEP 1");
 
-        // Build SledConfig
-        let sled_config = match &config.engine_specific_config {
-            Some(sled_config) => {
-                debug!(
-                    "Using SledConfig from engine_specific_config: {:?}",
-                    sled_config
-                );
-                SledConfig {
-                    path: sled_config
-                        .get("path")
-                        .and_then(|v| v.as_str())
-                        .map(PathBuf::from)
-                        .unwrap_or_else(|| config.data_directory.join("sled")),
-                    storage_engine_type: StorageEngineType::Sled,
-                    host: sled_config
-                        .get("host")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
-                    port: sled_config
-                        .get("port")
-                        .and_then(|v| v.as_u64())
-                        .map(|p| p as u16),
-                }
+    // Validate configuration to ensure Sled is explicitly set
+    if config.storage_engine_type != StorageEngineType::Sled {
+        warn!(
+            "Configuration mismatch: expected Sled, found {:?}",
+            config.storage_engine_type
+        );
+        return Err(GraphError::ConfigurationError(
+            format!("Expected storage_engine_type Sled, found {:?}", config.storage_engine_type)
+        ));
+    }
+
+    // Build SledConfig
+    let sled_config = match &config.engine_specific_config {
+        Some(sled_config) => {
+            debug!(
+                "Using SledConfig from engine_specific_config: {:?}",
+                sled_config
+            );
+            SledConfig {
+                path: sled_config
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| config.data_directory.join("sled")),
+                storage_engine_type: StorageEngineType::Sled,
+                host: sled_config
+                    .get("host")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                port: sled_config
+                    .get("port")
+                    .and_then(|v| v.as_u64())
+                    .map(|p| p as u16),
             }
-            None => {
-                warn!(
-                    "engine_specific_config is None, constructing default SledConfig with path: {:?}",
-                    config.data_directory.join("sled")
-                );
-                SledConfig {
-                    path: config.data_directory.join("sled"),
-                    storage_engine_type: StorageEngineType::Sled,
-                    host: None,
-                    port: None,
-                }
-            }
-        };
-
-        println!("IN SLED INIT - STEP 2");
-
-        // Ensure path exists
-        if !sled_config.path.exists() {
-            debug!("Creating Sled data directory at {:?}", sled_config.path);
-            std::fs::create_dir_all(&sled_config.path).map_err(|e| {
-                error!(
-                    "Failed to create Sled data directory at {:?}: {}",
-                    sled_config.path, e
-                );
-                GraphError::Io(e) // <-- fixed to your enum
-            })?;
         }
+        None => {
+            warn!(
+                "engine_specific_config is None, constructing default SledConfig with path: {:?}",
+                config.data_directory.join("sled")
+            );
+            SledConfig {
+                path: config.data_directory.join("sled"),
+                storage_engine_type: StorageEngineType::Sled,
+                host: None,
+                port: None,
+            }
+        }
+    };
+    println!("IN SLED INIT - STEP 2");
 
-        println!("IN SLED INIT - STEP 3");
+    // Ensure path exists
+    if !sled_config.path.exists() {
+        debug!("Creating Sled data directory at {:?}", sled_config.path);
+        std::fs::create_dir_all(&sled_config.path).map_err(|e| {
+            error!(
+                "Failed to create Sled data directory at {:?}: {}",
+                sled_config.path, e
+            );
+            GraphError::Io(e)
+        })?;
+    }
+    println!("IN SLED INIT - STEP 3");
 
-        const MAX_RETRIES: usize = 5;
-        let mut db_result = None;
+    // Handle lock file with enhanced diagnostics
+    let lock_path = sled_config.path.join("db.lck");
+    if lock_file_exists(lock_path.clone()).await? {
+        warn!("Lock file exists at {:?}", lock_path);
+        log_lock_file_diagnostics(lock_path.clone()).await?;
 
-        for attempt in 1..=MAX_RETRIES {
-            match SledStorage::new(&sled_config) {
-                Ok(storage) => {
-                    db_result = Some(storage);
-                    break;
-                }
-                Err(e) => {
-                    if format!("{}", e).contains("WouldBlock") {
-                        warn!(
-                            "Sled lock contention (attempt {}/{}) — another process may hold the lock",
-                            attempt, MAX_RETRIES
-                        );
-                        std::thread::sleep(std::time::Duration::from_secs(2));
-                    } else {
-                        return Err(e); 
+        // Check for processes holding the lock file
+        #[cfg(unix)]
+        {
+            if let Ok(output) = tokio::process::Command::new("lsof")
+                .arg("-t")
+                .arg(lock_path.to_str().ok_or_else(|| GraphError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Invalid lock file path"
+                )))?)
+                .output()
+                .await
+            {
+                let pids = String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .filter_map(|pid| pid.trim().parse::<u32>().ok())
+                    .collect::<Vec<u32>>();
+                
+                for pid in pids {
+                    if pid != process::id() {
+                        warn!("Process {} is holding lock file {:?}", pid, lock_path);
+                        if let Err(e) = tokio::process::Command::new("kill")
+                            .arg("-TERM")
+                            .arg(pid.to_string())
+                            .status()
+                            .await
+                        {
+                            warn!("Failed to send SIGTERM to process {}: {}", pid, e);
+                        } else {
+                            info!("Sent SIGTERM to process {} holding lock file", pid);
+                            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        }
                     }
                 }
             }
         }
 
-        let sled_storage = db_result.ok_or_else(|| {
-            GraphError::StorageError(format!(
-                "Failed to acquire sled lock after {} attempts at {:?}",
-                MAX_RETRIES, sled_config.path
-            ))
-        })?;
-
-        println!("IN SLED INIT - STEP 4");
-
-        Ok(Arc::new(sled_storage))
+        // Attempt to recover the lock file
+        recover_sled(lock_path.clone()).await?;
     }
+
+    // Acquire the singleton lock for checking or creating instance
+    let mut singleton_guard = SLED_SINGLETON.lock().await;
+
+    // Check for existing instance
+    if let Some(existing_storage) = singleton_guard.as_ref() {
+        info!("Returning existing Sled singleton instance");
+        return Ok(existing_storage.clone() as Arc<dyn GraphStorageEngine + Send + Sync>);
+    }
+
+    const MAX_RETRIES: u32 = 8;
+    let mut attempt = 0;
+    let mut sled_instance = None;
+
+    while attempt < MAX_RETRIES {
+        match SledStorage::new(&sled_config).await {
+            Ok(storage) => {
+                sled_instance = Some(Arc::new(storage));
+                break;
+            }
+            Err(e) => {
+                error!("Failed to initialize Sled on attempt {}: {}", attempt + 1, e);
+                if e.to_string().contains("WouldBlock") {
+                    warn!("Lock contention detected, retrying after {}s", 2 + attempt as u64);
+                    handle_sled_retry_error(&lock_path, &sled_config.path, attempt).await;
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2 + attempt as u64)).await;
+                } else {
+                    return Err(e);
+                }
+                attempt += 1;
+                if attempt >= MAX_RETRIES {
+                    warn!("Max retries reached, attempting force reset");
+                    log_lock_file_diagnostics(lock_path.clone()).await?;
+                    let storage = SledStorage::force_reset(&sled_config).await?;
+                    sled_instance = Some(Arc::new(storage));
+                }
+            }
+        }
+    }
+
+    let sled_instance = match sled_instance {
+        Some(instance) => instance,
+        None => {
+            error!("Failed to initialize Sled after {} attempts", MAX_RETRIES);
+            log_lock_file_diagnostics(lock_path.clone()).await?;
+            return Err(GraphError::StorageError(
+                "Failed to initialize Sled after retries and reset".to_string()
+            ));
+        }
+    };
+
+    println!("IN SLED INIT - STEP 4");
+
+    // Store in singleton
+    *singleton_guard = Some(sled_instance.clone());
+
+    // Register SIGTERM handler for graceful shutdown
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let sled_instance_clone = sled_instance.clone();
+        tokio::spawn(async move {
+            let mut sigterm = signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
+            sigterm.recv().await;
+            info!("Received SIGTERM, closing Sled instance");
+            if let Err(e) = sled_instance_clone.close().await {
+                error!("Failed to close Sled instance on SIGTERM: {}", e);
+            }
+            if lock_path.exists() {
+                if let Err(e) = std::fs::remove_file(&lock_path) {
+                    error!("Failed to remove lock file on SIGTERM: {}", e);
+                } else {
+                    info!("Removed lock file on SIGTERM: {:?}", lock_path);
+                }
+            }
+            info!("Sled instance closed gracefully");
+        });
+    }
+
+    info!("Successfully created and stored Sled singleton instance");
+    Ok(sled_instance as Arc<dyn GraphStorageEngine + Send + Sync>)
+}
 
     #[cfg(feature = "with-tikv")]
     async fn init_tikv(config: &StorageConfig) -> Result<Arc<dyn GraphStorageEngine + Send + Sync>, GraphError> {
@@ -1404,44 +1525,6 @@ impl StorageEngineManager {
         Err(GraphError::StorageError(
             "Sled support is not enabled. Please enable the 'with-tikv' feature.".to_string()
         ))
-    }
-
-    #[cfg(feature = "with-sled")]
-    async fn init_sled_with_retries(
-        sled_config: &SledConfig,
-        engine_path: &PathBuf,
-    ) -> Result<Arc<dyn GraphStorageEngine + Send + Sync>, GraphError> {
-        const MAX_RETRIES: u32 = 5;
-        let sled_lock_path = engine_path.join("db.lck");
-        
-        for attempt in 0..MAX_RETRIES {
-            match SledStorage::new(sled_config) {
-                Ok(storage) => {
-                    let instance = Arc::new(storage);
-                    SLED_SINGLETON.get_or_init(|| async { instance.clone() }).await;
-                    
-                    // Fix: Clone the path and use the `?` operator to handle the `Result`.
-                    if lock_file_exists(sled_lock_path.clone()).await? {
-                        warn!("Lock file at {:?} still exists after successful initialization", sled_lock_path);
-                    }
-                    return Ok(instance);
-                }
-                Err(e) => {
-                    warn!("Failed to initialize SledStorage on attempt {}: {}", attempt + 1, e);
-                    
-                    if attempt < MAX_RETRIES - 1 {
-                        Self::handle_sled_retry_error(&sled_lock_path, &sled_config.path, attempt).await;
-                        tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
-                    } else {
-                        Self::log_final_sled_error(&sled_lock_path).await;
-                        return Err(GraphError::StorageError(format!(
-                            "Failed to initialize Sled after {} retries: {}", MAX_RETRIES, e
-                        )));
-                    }
-                }
-            }
-        }
-        unreachable!()
     }
 
     #[cfg(feature = "with-rocksdb")]
@@ -2264,12 +2347,18 @@ impl StorageEngineManager {
                     };
                     println!("IN USE STORAGE METHOD of STORAGE ENGNIE - STEP 3.1 - SLED");
                     info!("Initializing Sled engine with path: {:?}", sled_config.path);
-                    let sled_instance = SLED_SINGLETON.get_or_init(|| async {
-                        trace!("Creating new SledStorage singleton");
-                        let storage = SledStorage::new(&sled_config).expect("Failed to initialize Sled singleton");
-                        Arc::new(storage)
-                    }).await;
-                    sled_instance.clone() as Arc<dyn GraphStorageEngine + Send + Sync>
+                    let mut sled_singleton = SLED_SINGLETON.lock().await;
+                    let sled_instance = match sled_singleton.as_ref() {
+                        Some(instance) => instance.clone(),
+                        None => {
+                            trace!("Creating new SledStorage singleton");
+                            let storage = SledStorage::new(&sled_config).await?;
+                            let instance = Arc::new(storage);
+                            *sled_singleton = Some(instance.clone());
+                            instance
+                        }
+                    };
+                    sled_instance as Arc<dyn GraphStorageEngine + Send + Sync>
                 }
                 #[cfg(not(feature = "with-sled"))]
                 {

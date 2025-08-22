@@ -27,6 +27,8 @@ use fs2::FileExt;
 #[cfg(unix)]
 use std::fs::File;
 use tokio::sync::Mutex as TokioMutex;
+#[cfg(unix)]
+use tokio::signal::unix::{signal, SignalKind};
 
 // Static Tokio runtime initialized once for fallback
 #[cfg(feature = "with-sled")]
@@ -72,8 +74,8 @@ pub struct SledStorage {
 }
 
 impl SledStorage {
-    /// Creates a new SledStorage instance with a robust and safe retry mechanism.
-    pub fn new(config: &SledConfig) -> GraphResult<Self> {
+    /// Creates a new SledStorage instance with a robust retry mechanism.
+    pub async fn new(config: &SledConfig) -> GraphResult<Self> {
         info!("Initializing Sled storage engine with config: {:?}", config);
         let path = &config.path;
 
@@ -96,91 +98,149 @@ impl SledStorage {
             }
         }
 
-        // Try to unlock the directory forcefully before attempting to open the database.
-        Self::force_unlock(path)?;
+        // Try to unlock the directory before attempting to open the database
+        debug!("Running force_unlock for Sled database at {:?}", path);
+        Self::force_unlock(path).await?;
 
-        // Initialize Sled with a safe retry loop using exponential backoff.
-        const MAX_RETRIES: u32 = 10;
+        // Initialize Sled with a retry loop for lock contention
+        const MAX_RETRIES: u32 = 20;
+        const BASE_DELAY_MS: u64 = 500;
         let mut attempt = 0;
-        let mut sleep_duration = Duration::from_millis(500);
+        let mut db = None;
 
-        let db = loop {
+        while attempt < MAX_RETRIES {
+            info!("Attempt {} of {} to open Sled DB at {:?}", attempt + 1, MAX_RETRIES, path);
             match Config::new()
                 .path(path)
                 .use_compression(false)
                 .flush_every_ms(None)
                 .open()
             {
-                Ok(db) => {
+                Ok(db_instance) => {
                     info!("Successfully opened Sled DB at {:?}", path);
-                    break db;
+                    db = Some(db_instance);
+                    break;
                 }
                 Err(e) => {
                     error!("Failed to open Sled DB on attempt {}: {}. Error details: {:?}", attempt + 1, e, e);
-
-                    // Check if the error is due to a lock issue.
+                    let lock_path = path.join("db.lck");
                     if e.to_string().contains("WouldBlock") {
-                        warn!("'WouldBlock' error detected. The database is likely in use. Retrying in {:?}...", sleep_duration);
-                        
+                        warn!("Detected lock contention. Attempt {} of {}. Retrying after delay.", attempt + 1, MAX_RETRIES);
+                        run_sync(log_lock_file_diagnostics(lock_path.clone()))?;
+                        run_sync(recover_sled(lock_path.clone()))?;
+                        Self::kill_processes(std::process::id()).await?;
+                        sleep(Duration::from_millis(BASE_DELAY_MS * (attempt as u64 + 1)));
                         attempt += 1;
-                        if attempt >= MAX_RETRIES {
-                            error!("Failed to open Sled DB after {} retries. Giving up.", MAX_RETRIES);
-                            return Err(GraphError::StorageError(format!("Failed to open Sled DB at {:?} after {} retries", path, MAX_RETRIES)));
-                        }
-                        std::thread::sleep(sleep_duration);
-                        sleep_duration *= 2; // Exponential backoff
                         continue;
+                    } else if e.to_string().contains("corruption") {
+                        warn!("Detected Sled database corruption at {:?}", path);
+                        Self::backup_and_recreate_database(path)?;
+                        match Config::new()
+                            .path(path)
+                            .use_compression(false)
+                            .flush_every_ms(None)
+                            .open()
+                        {
+                            Ok(db_instance) => {
+                                info!("Successfully opened Sled DB after recovery at {:?}", path);
+                                db = Some(db_instance);
+                                break;
+                            }
+                            Err(e) => {
+                                error!("Failed to open Sled DB after recovery: {}", e);
+                                return Err(GraphError::StorageError(format!("Failed to open Sled DB after recovery: {}", e)));
+                            }
+                        }
+                    } else {
+                        error!("Unhandled Sled open error: {}", e);
+                        return Err(GraphError::StorageError(format!("Unhandled Sled open error: {}", e)));
                     }
-                    
-                    // For any other error, return it immediately.
-                    return Err(GraphError::StorageError(format!("Failed to open Sled DB at {:?}: {}", path, e)));
                 }
             }
-        };
+        }
+
+        let db = db.ok_or_else(|| {
+            let lock_path = path.join("db.lck");
+            error!("Failed to open Sled DB after {} attempts.", MAX_RETRIES);
+            run_sync(log_lock_file_diagnostics(lock_path.clone())).unwrap_or_else(|e| {
+                error!("Failed to log lock file diagnostics: {}", e);
+            });
+            GraphError::StorageError(format!("Failed to open Sled DB after {} attempts due to lock error.", MAX_RETRIES))
+        })?;
 
         let vertices = db.open_tree("vertices").map_err(|e| GraphError::StorageError(e.to_string()))?;
         let edges = db.open_tree("edges").map_err(|e| GraphError::StorageError(e.to_string()))?;
 
-        Ok(SledStorage {
+        let storage = SledStorage {
             db,
             vertices,
             edges,
             config: config.clone(),
             running: TokioMutex::new(true),
-        })
+        };
+
+        // Register SIGTERM handler for graceful shutdown with extended delay
+        #[cfg(unix)]
+        {
+            let path_clone = path.to_path_buf();
+            let storage_clone = storage.db.clone();
+            let lock_path = path_clone.join("db.lck");
+            tokio::spawn(async move {
+                let mut sigterm = signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
+                sigterm.recv().await;
+                info!("Received SIGTERM, initiating graceful shutdown for Sled instance at {:?}", path_clone);
+                // Extended delay to ensure cleanup
+                tokio::time::sleep(Duration::from_millis(3000)).await;
+                if let Err(e) = storage_clone.flush_async().await {
+                    error!("Failed to flush Sled instance on SIGTERM: {}", e);
+                }
+                if lock_path.exists() {
+                    if let Err(e) = std::fs::remove_file(&lock_path) {
+                        error!("Failed to remove lock file on SIGTERM: {}", e);
+                    } else {
+                        info!("Removed lock file on SIGTERM: {:?}", lock_path);
+                    }
+                }
+                info!("Sled instance closed gracefully");
+                std::process::exit(0);
+            });
+        }
+
+        info!("SledStorage initialized successfully");
+        Ok(storage)
     }
-    
+
     /// Aggressively attempts to break any existing locks on the Sled database.
-    /// This uses multiple strategies to deal with stale locks from crashed processes.
-    pub fn force_unlock(path: &Path) -> GraphResult<()> {
+    pub async fn force_unlock(path: &Path) -> GraphResult<()> {
         info!("Attempting to forcefully break locks on Sled database at {:?}", path);
-        
+
         let db_path = path.join("db");
-        let lock_path = path.join("db.lock");
-        
-        // Strategy 1: Check for and remove stale lock files
+        let lock_path = path.join("db.lck");
+
+        // Check and remove stale lock files
         if lock_path.exists() {
-            warn!("Found potential lock file at {:?}, attempting to remove", lock_path);
+            warn!("Found potential lock file at {:?}", lock_path);
+            run_sync(log_lock_file_diagnostics(lock_path.clone()))?;
             if let Err(e) = std::fs::remove_file(&lock_path) {
                 error!("Failed to remove lock file: {}", e);
             } else {
                 info!("Successfully removed stale lock file");
             }
         }
-        
-        // Strategy 2: Check for processes using the database directory
+
+        // Check for processes using the database directory
         #[cfg(unix)]
         {
-            Self::kill_processes_using_path(path)?;
+            Self::kill_processes_using_path(path).await?;
         }
-        
-        // Strategy 3: Try to break file locks using flock
+
+        // Try to break file locks using flock
         #[cfg(unix)]
         {
             Self::break_file_locks(&db_path)?;
         }
-        
-        // Strategy 4: If all else fails, backup and recreate the database
+
+        // Verify database accessibility
         if db_path.exists() {
             match Self::verify_database_accessible(&db_path) {
                 Ok(false) => {
@@ -195,38 +255,26 @@ impl SledStorage {
                 }
             }
         }
-        
+
         Ok(())
     }
-    
+
     #[cfg(unix)]
-    fn kill_processes_using_path(path: &Path) -> GraphResult<()> {
-        use std::process::Command;
-        
-        info!("Aggressively hunting down all 'graphdb' processes except current one");
-        let current_pid = std::process::id();
-        info!("Current process PID: {}", current_pid);
-        
-        // Strategy 1: Kill all processes with 'graphdb' in their name/command line
-        Self::kill_graphdb_processes(current_pid)?;
-        
-        // Strategy 2: Also check specifically for processes using the database path
-        debug!("Checking for processes using database path: {:?}", path);
-        
+    async fn kill_processes_using_path(path: &Path) -> GraphResult<()> {
+        info!("Checking for processes using database path: {:?}", path);
+
         let output = Command::new("lsof")
-            .arg("+D")  // Search directory recursively
+            .arg("+D")
             .arg(path)
             .output();
-            
+
         match output {
             Ok(output) if output.status.success() => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 if !stdout.trim().is_empty() {
-                    warn!("Found processes using database directory:");
-                    warn!("{}", stdout);
-                    
-                    // Extract PIDs and kill them if they're not the current process
-                    for line in stdout.lines().skip(1) { // Skip header
+                    warn!("Found processes using database directory:\n{}", stdout);
+                    let current_pid = process::id();
+                    for line in stdout.lines().skip(1) {
                         let parts: Vec<&str> = line.split_whitespace().collect();
                         if parts.len() > 1 {
                             if let Ok(pid) = parts[1].parse::<u32>() {
@@ -245,38 +293,36 @@ impl SledStorage {
                 debug!("lsof found no processes using the database directory");
             }
             Err(e) => {
-                debug!("lsof command failed (this is not critical): {}", e);
+                debug!("lsof command failed (non-critical): {}", e);
             }
         }
-        
+
+        // Also check for graphdb processes
+        Self::kill_processes(process::id()).await?;
+
         Ok(())
     }
-    
+
     #[cfg(unix)]
-    pub fn kill_graphdb_processes(current_pid: u32) -> GraphResult<()> {
-        use std::process::Command;
-        
+    pub async fn kill_processes(current_pid: u32) -> GraphResult<()> {
         info!("Searching for all processes with 'graphdb' in their name/command");
-        
-        // Use ps to find all graphdb processes
+
         let output = Command::new("ps")
             .args(&["aux"])
             .output();
-            
+
         match output {
             Ok(output) if output.status.success() => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let mut killed_count = 0;
-                
+
                 for line in stdout.lines() {
-                    // Check if line contains 'graphdb' but skip header and current process
                     if line.contains("graphdb") && !line.contains("PID") {
                         let parts: Vec<&str> = line.split_whitespace().collect();
                         if parts.len() > 1 {
                             if let Ok(pid) = parts[1].parse::<u32>() {
                                 if pid != current_pid {
-                                    info!("Found graphdb process - PID: {}, Command: {}", pid, 
-                                         parts.get(10..).unwrap_or(&[]).join(" "));
+                                    info!("Found graphdb process - PID: {}, Command: {}", pid, parts.get(10..).unwrap_or(&[]).join(" "));
                                     Self::terminate_process(pid as i32);
                                     killed_count += 1;
                                 } else {
@@ -286,11 +332,10 @@ impl SledStorage {
                         }
                     }
                 }
-                
+
                 if killed_count > 0 {
                     info!("Terminated {} graphdb processes", killed_count);
-                    // Give terminated processes time to cleanup
-                    std::thread::sleep(std::time::Duration::from_millis(2000));
+                    sleep(Duration::from_millis(2000));
                 } else {
                     debug!("No other graphdb processes found to terminate");
                 }
@@ -302,12 +347,11 @@ impl SledStorage {
                 warn!("ps command failed: {}", e);
             }
         }
-        
-        // Also use pgrep for a more targeted search
+
         let output = Command::new("pgrep")
             .args(&["-f", "graphdb"])
             .output();
-            
+
         match output {
             Ok(output) if output.status.success() => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
@@ -324,24 +368,21 @@ impl SledStorage {
                 debug!("pgrep command executed but failed or found no processes");
             }
             Err(e) => {
-                debug!("pgrep command failed (not critical): {}", e);
+                debug!("pgrep command failed (non-critical): {}", e);
             }
         }
-        
+
         Ok(())
     }
-    
+
     #[cfg(unix)]
     fn terminate_process(pid: i32) {
-        use std::process::Command;
-        
         info!("Terminating process PID: {}", pid);
-        
-        // First try SIGTERM (graceful shutdown)
+
         match Command::new("kill")
             .arg("-TERM")
             .arg(pid.to_string())
-            .status() 
+            .status()
         {
             Ok(status) if status.success() => {
                 debug!("Sent SIGTERM to PID: {}", pid);
@@ -350,27 +391,21 @@ impl SledStorage {
                 warn!("Failed to send SIGTERM to PID: {}", pid);
             }
         }
-        
-        // Give it a moment to exit gracefully
-        std::thread::sleep(std::time::Duration::from_millis(1000));
-        
-        // Check if process is still running
+
+        sleep(Duration::from_millis(2000));
+
         match Command::new("kill")
-            .arg("-0")  // Just check if process exists
+            .arg("-0")
             .arg(pid.to_string())
             .status()
         {
             Ok(status) if status.success() => {
-                // Process still exists, use SIGKILL
                 warn!("Process {} still running, sending SIGKILL", pid);
                 let _ = Command::new("kill")
                     .arg("-KILL")
                     .arg(pid.to_string())
                     .status();
-                    
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                
-                // Final check
+                sleep(Duration::from_millis(500));
                 match Command::new("kill")
                     .arg("-0")
                     .arg(pid.to_string())
@@ -389,33 +424,29 @@ impl SledStorage {
             }
         }
     }
-    
+
     #[cfg(unix)]
     fn break_file_locks(db_path: &Path) -> GraphResult<()> {
         use std::os::unix::io::AsRawFd;
-        
+
         debug!("Attempting to break file locks on {:?}", db_path);
-        
+
         if !db_path.exists() {
             debug!("Database file doesn't exist, nothing to unlock");
             return Ok(());
         }
-        
-        // Try to open the file and break any locks
+
         match File::options().read(true).write(true).open(db_path) {
             Ok(file) => {
                 debug!("Successfully opened database file for lock breaking");
-                
-                // Try to acquire and immediately release an exclusive lock
+
                 match file.try_lock_exclusive() {
                     Ok(()) => {
                         info!("Successfully acquired exclusive lock, releasing immediately");
-                        let _ = file.unlock(); // Ignore unlock errors
+                        let _ = file.unlock();
                     }
                     Err(e) => {
                         warn!("Could not acquire exclusive lock: {}", e);
-                        
-                        // Try using raw system calls to break the lock
                         unsafe {
                             let fd = file.as_raw_fd();
                             let result = libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB);
@@ -433,66 +464,59 @@ impl SledStorage {
                 warn!("Could not open database file for lock breaking: {}", e);
             }
         }
-        
+
         Ok(())
     }
-    
+
     fn verify_database_accessible(db_path: &Path) -> GraphResult<bool> {
-        // Try to open the database file briefly to see if it's accessible
         match std::fs::File::open(db_path) {
             Ok(_) => Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
-            Err(_) => Ok(true), // Other errors don't necessarily mean it's locked
+            Err(_) => Ok(true),
         }
     }
-    
+
     fn backup_and_recreate_database(path: &Path) -> GraphResult<()> {
         warn!("Attempting to backup and recreate potentially corrupted database");
-        
+
         let backup_path = path.with_extension("backup");
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
         let backup_path = backup_path.with_extension(format!("backup.{}", timestamp));
-        
-        // Move the entire database directory to backup
+
         if let Err(e) = std::fs::rename(path, &backup_path) {
             error!("Failed to backup database directory: {}", e);
-            // If we can't move it, try to remove it entirely (dangerous!)
             warn!("Attempting to remove locked database directory entirely");
             if let Err(e2) = std::fs::remove_dir_all(path) {
                 return Err(GraphError::StorageError(format!(
-                    "Failed to backup or remove locked database: backup error: {}, remove error: {}", 
+                    "Failed to backup or remove locked database: backup error: {}, remove error: {}",
                     e, e2
                 )));
             }
         } else {
             info!("Successfully backed up database to {:?}", backup_path);
         }
-        
-        // Recreate the directory
-        std::fs::create_dir_all(path).map_err(|e| {
-            GraphError::Io(e)
-        })?;
-        
+
+        std::fs::create_dir_all(path).map_err(|e| GraphError::Io(e))?;
+
         Ok(())
     }
 
     /// Nuclear option: completely destroy and recreate the database
-    pub fn force_reset(config: &SledConfig) -> GraphResult<Self> {
+    pub async fn force_reset(config: &SledConfig) -> GraphResult<Self> {
         warn!("FORCE RESET: Completely destroying and recreating database at {:?}", config.path);
-        
-        // Remove the entire directory
+
         if config.path.exists() {
             std::fs::remove_dir_all(&config.path).map_err(|e| {
                 GraphError::StorageError(format!("Failed to remove database directory: {}", e))
             })?;
         }
-        
-        // Recreate and initialize
-        Self::new(config)
+
+        Self::new(config).await
     }
+
     pub fn reset(&mut self) -> GraphResult<()> {
         self.vertices.clear().map_err(|e| GraphError::StorageError(e.to_string()))?;
         self.edges.clear().map_err(|e| GraphError::StorageError(e.to_string()))?;
