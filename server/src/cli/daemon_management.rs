@@ -562,7 +562,7 @@ pub async fn start_daemon_with_port(p: u16, service_type: &str) -> Result<(), an
         return Ok(());
     }
 
-    start_daemon(Some(p), None, Vec::new(), service_type)
+    start_daemon(Some(p), None, Vec::new(), service_type, None)
         .await
         .map_err(|e| anyhow!("Failed to start daemon via daemon_api: {}", e))?;
 
@@ -632,7 +632,7 @@ pub async fn spawn_daemon_process(
     };
 
     debug!("Starting daemon: port={}, cluster_range={:?}, skip_ports={:?}, service_type={}", actual_port, effective_cluster, skip_ports, service_type);
-    start_daemon(Some(actual_port), effective_cluster, skip_ports, service_type)
+    start_daemon(Some(actual_port), effective_cluster, skip_ports, service_type, None)
         .await
         .map_err(|e| {
             error!("Failed to start daemon: port={}, error={}", actual_port, e);
@@ -826,7 +826,7 @@ pub async fn start_daemon_with_pid(
     
     let pid = child.id().context("Failed to get PID of spawned daemon process")?;
     
-    start_daemon(port, cluster.clone(), args_u16, service_type)
+    start_daemon(port, cluster.clone(), args_u16, service_type, None)
         .await
         .context("Failed to initialize daemon via daemon_api")?;
 

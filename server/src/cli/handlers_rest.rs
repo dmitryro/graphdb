@@ -424,7 +424,7 @@ pub async fn start_rest_api_interactive(
     // Log registry state before starting daemon
     debug!("Registry state before starting REST API: {:?}", all_daemons);
 
-    start_daemon(Some(actual_port), None, vec![DEFAULT_DAEMON_PORT, DEFAULT_STORAGE_PORT], "rest")
+    start_daemon(Some(actual_port), None, vec![DEFAULT_DAEMON_PORT, DEFAULT_STORAGE_PORT], "rest", None)
         .await
         .map_err(|e| anyhow!("Failed to start REST API via daemon_api: {}", e))?;
 
