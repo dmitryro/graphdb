@@ -197,8 +197,6 @@ pub async fn start_daemon(
     };
 
 
-
-    println!("=====================> IN START DAEMON!!!!");
     // Correctly handle the Option<EngineStorageConfig> to access its fields
     match &storage_config {
         Some(config) => {

@@ -669,6 +669,21 @@ impl Default for CliConfigToml {
     }
 }
 
+/*
+impl ToString for StorageEngineType {
+    fn to_string(&self) -> String {
+        match self {
+            StorageEngineType::Sled => "sled".to_string(),
+            StorageEngineType::RocksDB => "rocksdb".to_string(),
+            StorageEngineType::TiKV => "tikv".to_string(),
+            StorageEngineType::Redis => "redis".to_string(),
+            StorageEngineType::PostgreSQL => "postgresql".to_string(),
+            StorageEngineType::MySQL => "mysql".to_string(),
+            StorageEngineType::InMemory => "inmemory".to_string(),
+        }
+    }
+}*/
+
 pub fn is_port_in_cluster_range(port: u16, range_str: &str) -> bool {
     let parts: Vec<&str> = range_str.split('-').collect();
     if parts.len() == 1 {

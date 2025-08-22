@@ -1652,13 +1652,12 @@ pub async fn handle_show_storage_command() -> Result<(), GraphError> {
     let config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH);
     let absolute_config_path = cwd.join(&config_path);
     debug!("Attempting to load storage config from {:?}", absolute_config_path);
-    println!("=====> TIME TO SHOW STORAGE CONFIG");
 
     // Load the storage config from file (primary source)
     let file_config = load_storage_config_from_yaml(Some(absolute_config_path.clone()))
         .map_err(|e| GraphError::ConfigurationError(format!("Failed to load storage config from {:?}: {}", absolute_config_path, e)))?;
     debug!("Loaded config from file: {:?}", file_config);
-
+      
     let is_daemon_running = GLOBAL_STORAGE_ENGINE_MANAGER.get().is_some();
     let mut storage_config = file_config.clone(); // Default to file config
 

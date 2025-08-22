@@ -12,4 +12,5 @@ storage:
     path: "/opt/graphdb/storage_data/rocksdb"
     host: "127.0.0.1"
     port: 8049
+    storage_engine_type: "rocksdb"
   max_open_files: 100
