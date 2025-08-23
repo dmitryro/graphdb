@@ -862,6 +862,7 @@ impl StorageConfig {
 
         let config_content = fs::read_to_string(path)
             .context(format!("Failed to read storage config file: {}", path.display()))?;
+        debug!("Raw YAML content from {:?}:\n{}", path, config_content);
 
         let mut config: StorageConfig = serde_yaml::from_str::<StorageConfigWrapper>(&config_content)
             .map(|wrapper| wrapper.storage)
@@ -879,45 +880,75 @@ impl StorageConfig {
                     config.storage_engine_type, engine_config.storage_engine_type
                 );
                 config.storage_engine_type = engine_config.storage_engine_type;
+                // Ensure the path matches the engine_specific_config.storage_engine_type
+                let mut storage = engine_config.storage.clone();
+                storage.path = Some(PathBuf::from(format!(
+                    "{}/{}",
+                    DEFAULT_DATA_DIRECTORY,
+                    engine_config.storage_engine_type.to_string().to_lowercase()
+                )));
+                config.engine_specific_config = Some(SelectedStorageConfig {
+                    storage_engine_type: engine_config.storage_engine_type,
+                    storage,
+                });
             }
         } else {
             warn!("'engine_specific_config' was missing, setting to default for engine: {:?}", config.storage_engine_type);
             config.engine_specific_config = create_default_engine_specific_config(config.storage_engine_type);
         }
 
+        // Ensure directories exist
+        if let Some(ref data_dir) = config.data_directory {
+            fs::create_dir_all(data_dir)
+                .context(format!("Failed to create data directory {:?}", data_dir))?;
+            info!("Ensured data directory exists: {:?}", data_dir);
+        }
+        if let Some(ref log_dir) = config.log_directory {
+            fs::create_dir_all(log_dir)
+                .context(format!("Failed to create log directory {:?}", log_dir))?;
+            info!("Ensured log directory exists: {:?}", log_dir);
+        }
+
+        // Validate configuration
+        debug!(
+            "Validated config: default_port={}, cluster_range={}, data_directory={:?}, log_directory={:?}, config_root_directory={:?}, storage_engine_type={:?}, engine_specific_config={:?}, max_disk_space_gb={}, min_disk_space_gb={}, use_raft_for_scale={}",
+            config.default_port,
+            config.cluster_range,
+            config.data_directory,
+            config.log_directory,
+            config.config_root_directory,
+            config.storage_engine_type,
+            config.engine_specific_config,
+            config.max_disk_space_gb,
+            config.min_disk_space_gb,
+            config.use_raft_for_scale
+        );
+
+        println!(
+            "Validated config: default_port={}, cluster_range={}, data_directory={:?}, log_directory={:?}, config_root_directory={:?}, storage_engine_type={:?}, engine_specific_config={:?}, max_disk_space_gb={}, min_disk_space_gb={}, use_raft_for_scale={}",
+            config.default_port,
+            config.cluster_range,
+            config.data_directory,
+            config.log_directory,
+            config.config_root_directory,
+            config.storage_engine_type,
+            config.engine_specific_config,
+            config.max_disk_space_gb,
+            config.min_disk_space_gb,
+            config.use_raft_for_scale
+        );
         info!("Successfully loaded storage configuration from {:?}", path);
         Ok(config)
     }
-    /// Saves the StorageConfig to a YAML file.
-    ///
-    /// This function uses serde_yaml to serialize the struct into a YAML string
-    /// and writes it to a file. This is the correct and reliable way to
-    /// create a configuration file without manual formatting errors.
-    pub fn save(&self) -> Result<()> {
-        let default_config_path = PathBuf::from("./storage_daemon_server/storage_config.yaml");
-        let project_config_path = PathBuf::from("./storage_daemon_server/storage_config.yaml");
-        let config_path = if project_config_path.exists() {
-            project_config_path
-        } else {
-            default_config_path
-        };
 
-        let (engine_path, engine_host, engine_port) = match self.engine_specific_config.as_ref() {
-            Some(es) => {
-                let p = es.storage.path
-                    .clone()
-                    .unwrap_or_else(|| PathBuf::from(format!("{}/{}", DEFAULT_DATA_DIRECTORY, self.storage_engine_type.to_string().to_lowercase())));
-                let h = es.storage.host.clone().unwrap_or_else(|| "127.0.0.1".to_string());
-                let pt = es.storage.port.unwrap_or(self.default_port);
-                (p, h, pt)
-            },
-            None => {
-                let default_path = PathBuf::from(format!("{}/{}", DEFAULT_DATA_DIRECTORY, self.storage_engine_type.to_string().to_lowercase()));
-                let default_host = "127.0.0.1".to_string();
-                let default_port = self.default_port;
-                (default_path, default_host, default_port)
-            }
-        };
+    pub fn save(&self) -> Result<()> {
+        let config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH);
+        fs::create_dir_all(config_path.parent().unwrap())
+            .context(format!("Failed to create parent directories for {}", config_path.display()))?;
+
+        let engine_specific = self.engine_specific_config.clone().unwrap_or_else(|| {
+            create_default_engine_specific_config(self.storage_engine_type).unwrap()
+        });
 
         let yaml_string = format!(
 r#"storage:
@@ -937,34 +968,42 @@ r#"storage:
     storage_engine_type: "{}"
   max_open_files: {}
 "#,
-            self.config_root_directory.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "".to_string()),
-            self.data_directory.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "".to_string()),
-            self.log_directory.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "".to_string()),
+            self.config_root_directory.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "./storage_daemon_server".to_string()),
+            self.data_directory.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| DEFAULT_DATA_DIRECTORY.to_string()),
+            self.log_directory.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| DEFAULT_LOG_DIRECTORY.to_string()),
             self.default_port,
             self.cluster_range,
             self.max_disk_space_gb,
             self.min_disk_space_gb,
             self.use_raft_for_scale,
-            self.storage_engine_type.to_string(), // Use the top-level storage_engine_type
-            engine_path.display(),
-            engine_host,
-            engine_port,
-            self.storage_engine_type.to_string(), // Ensure engine_specific_config matches
-            self.max_open_files as i64
+            self.storage_engine_type.to_string(),
+            engine_specific.storage.path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| format!("{}/{}", DEFAULT_DATA_DIRECTORY, self.storage_engine_type.to_string().to_lowercase())),
+            engine_specific.storage.host.as_deref().unwrap_or("127.0.0.1"),
+            engine_specific.storage.port.unwrap_or(self.default_port),
+            self.storage_engine_type.to_string(), // Ensure engine_specific_config matches top-level
+            self.max_open_files
         );
 
-        fs::create_dir_all(config_path.parent().unwrap())
-            .context(format!("Failed to create parent directories for {}", config_path.display()))?;
         fs::write(&config_path, yaml_string)
             .context(format!("Failed to write StorageConfig to file: {}", config_path.display()))?;
         info!("Saved storage configuration to {:?}", config_path);
 
+        // Verify the written configuration
         let written_content = fs::read_to_string(&config_path)
             .context(format!("Failed to read back storage config file: {}", config_path.display()))?;
-        match serde_yaml::from_str::<StorageConfigWrapper>(&written_content) {
-            Ok(_) => info!("Successfully verified written storage config at {:?}", config_path),
-            Err(e) => warn!("Failed to verify written storage config at {:?}: {}", config_path, e),
-        };
+        let saved_config: StorageConfig = serde_yaml::from_str::<StorageConfigWrapper>(&written_content)
+            .map(|wrapper| wrapper.storage)
+            .or_else(|_| serde_yaml::from_str(&written_content))
+            .context(format!("Failed to parse written YAML from file '{}'", config_path.display()))?;
+
+        if saved_config.storage_engine_type != self.storage_engine_type {
+            warn!(
+                "Written storage_engine_type ({:?}) does not match expected ({:?})",
+                saved_config.storage_engine_type, self.storage_engine_type
+            );
+        } else {
+            info!("Successfully verified written storage config at {:?}", config_path);
+        }
 
         Ok(())
     }
@@ -1001,37 +1040,70 @@ impl From<&CliTomlStorageConfig> for EngineStorageConfig {
 /// Implements the `From` trait to allow easy conversion from the library's
 /// `StorageConfig` to the CLI's `StorageConfig`. This is the core fix for the
 /// type mismatch error.
-impl From<LibStorageConfig> for StorageConfig {
-    /// Converts a `LibStorageConfig` instance into a `StorageConfig` instance.
-    fn from(item: LibStorageConfig) -> Self {
-        // Here, we manually map each field from the source (`item`) to the
-        // destination (`Self`). We handle the type conversions as needed.
+impl From<EngineStorageConfig> for StorageConfig {
+    fn from(item: EngineStorageConfig) -> Self {
+        let engine_specific_config = item.engine_specific_config.map(|config_map| {
+            let mut storage_config_inner = StorageConfigInner {
+                path: None,
+                host: None,
+                port: None,
+                username: None,
+                password: None,
+                database: None,
+            };
+
+            if let Some(path) = config_map.get("path").and_then(|v| v.as_str()) {
+                storage_config_inner.path = Some(PathBuf::from(path));
+            } else {
+                // Set default path based on engine type
+                storage_config_inner.path = Some(PathBuf::from(format!(
+                    "{}/{}",
+                    DEFAULT_DATA_DIRECTORY,
+                    item.storage_engine_type.to_string().to_lowercase()
+                )));
+            }
+            if let Some(host) = config_map.get("host").and_then(|v| v.as_str()) {
+                storage_config_inner.host = Some(host.to_string());
+            } else {
+                storage_config_inner.host = Some("127.0.0.1".to_string());
+            }
+            if let Some(port) = config_map.get("port").and_then(|v| v.as_u64()) {
+                storage_config_inner.port = Some(port as u16);
+            } else {
+                storage_config_inner.port = Some(DEFAULT_STORAGE_PORT);
+            }
+            if let Some(username) = config_map.get("username").and_then(|v| v.as_str()) {
+                storage_config_inner.username = Some(username.to_string());
+            }
+            if let Some(password) = config_map.get("password").and_then(|v| v.as_str()) {
+                storage_config_inner.password = Some(password.to_string());
+            }
+            if let Some(database) = config_map.get("database").and_then(|v| v.as_str()) {
+                storage_config_inner.database = Some(database.to_string());
+            }
+
+            SelectedStorageConfig {
+                storage_engine_type: item.storage_engine_type,
+                storage: storage_config_inner,
+            }
+        }).unwrap_or_else(|| create_default_engine_specific_config(item.storage_engine_type).unwrap());
+
         StorageConfig {
-            // `PathBuf` to `Option<PathBuf>` is a straightforward wrap in `Some`.
             config_root_directory: Some(item.config_root_directory),
             data_directory: Some(item.data_directory),
-            // `String` to `Option<PathBuf>` requires creating a `PathBuf` first.
             log_directory: Some(PathBuf::from(item.log_directory)),
-            // These fields have the same type, so they are a direct copy.
             default_port: item.default_port,
             cluster_range: item.cluster_range,
             max_disk_space_gb: item.max_disk_space_gb,
             min_disk_space_gb: item.min_disk_space_gb,
             use_raft_for_scale: item.use_raft_for_scale,
             storage_engine_type: item.storage_engine_type,
-            // The `engine_specific_config` field cannot be converted directly
-            // because the types are different (`Option<HashMap<String, Value>>` vs.
-            // `Option<SelectedStorageConfig>`). A custom `From` implementation
-            // for `SelectedStorageConfig` would be needed, likely involving a
-            // `match` on `item.storage_engine_type`. For now, we will return `None`.
-            engine_specific_config: None,
-            // `Option<i32>` to `u64` requires handling the `Option` and casting.
-            // `unwrap_or_default()` is a safe way to handle a `None` value by
-            // using the default value for the destination type (`0` for `u64`).
-            max_open_files: item.max_open_files.map(|val| val as u64).unwrap_or_default(),
+            engine_specific_config: Some(engine_specific_config),
+            max_open_files: item.max_open_files.unwrap_or(100) as u64,
         }
     }
 }
+
 
 // Helper function to convert StorageEngineType to String
 pub fn daemon_api_storage_engine_type_to_string(engine_type: &StorageEngineType) -> String {
@@ -2105,9 +2177,8 @@ impl CliConfigToml {
 // This function is crucial as it correctly sets the path based on the engine type.
 // The fix is to add the `storage_engine_type: engine,` line to the initializer.
 fn create_default_engine_specific_config(engine: StorageEngineType) -> Option<SelectedStorageConfig> {
-    let engine_path = PathBuf::from(&format!("{}/{}", DEFAULT_DATA_DIRECTORY, engine.to_string().to_lowercase()));
+    let engine_path = PathBuf::from(format!("{}/{}", DEFAULT_DATA_DIRECTORY, engine.to_string().to_lowercase()));
     Some(SelectedStorageConfig {
-        // The fix: Add the missing `storage_engine_type` field, which is available in the `engine` parameter.
         storage_engine_type: engine,
         storage: StorageConfigInner {
             path: Some(engine_path),
