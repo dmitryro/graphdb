@@ -1057,6 +1057,39 @@ r#"storage:
             max_open_files: default_max_open_files(),
         }
     }
+
+    pub fn validate(self) -> Result<Self, GraphError> {
+        println!("DEBUG: Validating StorageConfig: {:?}", self);
+        let available_engines = StorageEngineManager::available_engines();
+        println!("DEBUG: Available engines: {:?}", available_engines);
+        if !available_engines.contains(&self.storage_engine_type) {
+            println!("DEBUG: Invalid engine type: {:?}", self.storage_engine_type);
+            return Err(GraphError::InvalidStorageEngine(format!(
+                "Storage engine {:?} is not enabled. Available engines: {:?}", 
+                self.storage_engine_type, available_engines
+            )));
+        }
+        if let Some(engine_config) = &self.engine_specific_config {
+            if engine_config.storage_engine_type != self.storage_engine_type {
+                println!("DEBUG: Mismatched engine types: config={:?}, specific={:?}", 
+                         self.storage_engine_type, engine_config.storage_engine_type);
+                return Err(GraphError::ConfigurationError(
+                    "engine_specific_config.storage_engine_type must match storage_engine_type".to_string()
+                ));
+            }
+        }
+        // Ensure port and cluster_range are not overridden
+        if self.default_port == 0 {
+            println!("DEBUG: Invalid default_port: {}", self.default_port);
+            return Err(GraphError::ConfigurationError("default_port must be non-zero".to_string()));
+        }
+        if self.cluster_range.is_empty() {
+            println!("DEBUG: Invalid cluster_range: {}", self.cluster_range);
+            return Err(GraphError::ConfigurationError("cluster_range must be non-empty".to_string()));
+        }
+        println!("DEBUG: Validation passed for StorageConfig: {:?}", self);
+        Ok(self)
+    }
 }
 
 impl From<&CliTomlStorageConfig> for EngineStorageConfig {
@@ -1309,9 +1342,94 @@ impl CliConfig {
                 println!("Saved CLI configuration to {:?}", PathBuf::from("/opt/graphdb/config.toml"));
                 Ok(())
             }
+            Commands::Show(ShowArgs { action: ShowAction::Storage }) => {
+                let storage_config = load_storage_config_from_yaml(None)?;
+                println!("Current Storage Configuration (from {:?}):", PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE));
+                println!("- storage_engine_type: {}", storage_config.storage_engine_type.to_string().to_lowercase());
+                println!("- config_root_directory: {:?}", storage_config.config_root_directory);
+                println!("- data_directory: {:?}", storage_config.data_directory);
+                println!("- log_directory: {:?}", storage_config.log_directory);
+                println!("- default_port: {}", storage_config.default_port);
+                println!("- cluster_range: {}", storage_config.cluster_range);
+                println!("- max_disk_space_gb: {}", storage_config.max_disk_space_gb);
+                println!("- min_disk_space_gb: {}", storage_config.min_disk_space_gb);
+                println!("- use_raft_for_scale: {}", storage_config.use_raft_for_scale);
+                println!("- max_open_files: {}", storage_config.max_open_files);
+                if let Some(engine_config) = &storage_config.engine_specific_config {
+                    println!("- engine_specific_config:");
+                    println!("  - storage_engine_type: {}", engine_config.storage_engine_type.to_string().to_lowercase());
+                    println!("  - path: {:?}", engine_config.storage.path);
+                    println!("  - host: {:?}", engine_config.storage.host.clone().unwrap_or("None".to_string()));
+                    println!("  - port: {:?}", engine_config.storage.port.unwrap_or(0));
+                    println!("  - username: {:?}", engine_config.storage.username.clone().unwrap_or("None".to_string()));
+                    println!("  - password: {:?}", engine_config.storage.password.clone().unwrap_or("None".to_string()));
+                    println!("  - database: {:?}", engine_config.storage.database.clone().unwrap_or("None".to_string()));
+                } else {
+                    println!("- engine_specific_config: None");
+                }
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
+    /*
+    pub async fn execute(&self, manager: &mut StorageEngineManager) -> Result<(), GraphError> {
+        match &self.command {
+            Commands::Use(UseAction::Storage { engine, permanent }) => {
+                let is_permanent = *permanent;
+                info!(
+                    "Switching to storage engine: {:?}, permanent: {} (interactive mode: {})",
+                    engine, is_permanent, self.cli
+                );
+                // Validate engine type against available engines
+                let available_engines = StorageEngineManager::available_engines();
+                if !available_engines.contains(engine) {
+                    return Err(GraphError::InvalidStorageEngine(format!(
+                        "Storage engine {:?} is not enabled. Available engines: {:?}", engine, available_engines
+                    )));
+                }
+                // Update StorageEngineManager
+                manager.use_storage(*engine, is_permanent).await?;
+                if is_permanent {
+                    let mut storage_config = load_storage_config_from_yaml(None)
+                        .map_err(|e| GraphError::ConfigurationError(format!("Failed to load storage config: {}", e)))?;
+                    storage_config.storage_engine_type = *engine;
+                    storage_config.engine_specific_config = create_default_engine_specific_config(&*engine);
+                    storage_config.save()
+                        .map_err(|e| GraphError::ConfigurationError(format!("Failed to save storage config: {}", e)))?;
+                    info!("Saved storage engine change to {:?}", DEFAULT_STORAGE_CONFIG_PATH);
+                    // Reload the config to ensure consistency
+                    storage_config = load_storage_config_from_yaml(None)
+                        .map_err(|e| GraphError::ConfigurationError(format!("Failed to reload storage config: {}", e)))?;
+                    info!("Reloaded storage config: {:?}", storage_config);
+                }
+                println!(
+                    "Switched to storage engine: {}{}",
+                    daemon_api_storage_engine_type_to_string(engine),
+                    if is_permanent { " (persisted)" } else { " (non-persisted)" }
+                );
+                Ok(())
+            }
+            Commands::Save(SaveAction::Storage) => {
+                let storage_config = load_storage_config_from_yaml(None)
+                    .map_err(|e| GraphError::ConfigurationError(format!("Failed to load storage config: {}", e)))?;
+                storage_config.save()
+                    .map_err(|e| GraphError::ConfigurationError(format!("Failed to save storage config: {}", e)))?;
+                println!("Saved storage configuration to {:?}", DEFAULT_STORAGE_CONFIG_PATH);
+                Ok(())
+            }
+            Commands::Save(SaveAction::Configuration) => {
+                let cli_config = load_cli_config()
+                    .map_err(|e| GraphError::ConfigurationError(format!("Failed to load CLI config: {}", e)))?;
+                cli_config.save()
+                    .map_err(|e| GraphError::ConfigurationError(format!("Failed to save CLI config: {}", e)))?;
+                println!("Saved CLI configuration to {:?}", PathBuf::from("/opt/graphdb/config.toml"));
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+    */
     /// Helper function to load a YAML configuration file from a given path.
     /// It's generic over the type `T` that it's trying to deserialize.
     fn load_yaml_config<T: DeserializeOwned>(path: &Path) -> Option<T> {
@@ -1747,6 +1865,53 @@ pub fn load_main_daemon_config(config_file_path: Option<&str>) -> Result<MainDae
         warn!("Config file not found at {}. Using default Main Daemon config.", path_to_use.display());
         Ok(MainDaemonConfig::default())
     }
+}
+
+fn hashmap_to_engine_specific_config(
+    engine_type: StorageEngineType,
+    map: HashMap<String, Value>,
+) -> Result<SelectedStorageConfig, GraphError> {
+    let path = map
+        .get("path")
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from);
+    
+    let host = map
+        .get("host")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    
+    let port = map
+        .get("port")
+        .and_then(|v| v.as_u64())
+        .map(|p| p as u16);
+    
+    let username = map
+        .get("username")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    
+    let password = map
+        .get("password")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    
+    let database = map
+        .get("database")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    Ok(SelectedStorageConfig {
+        storage_engine_type: engine_type,
+        storage: StorageConfigInner {
+            path,
+            host,
+            port,
+            username,
+            password,
+            database,
+        },
+    })
 }
 
 pub fn load_rest_config(config_file_path: Option<&str>) -> Result<RestApiConfig> {
