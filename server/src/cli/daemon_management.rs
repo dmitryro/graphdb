@@ -69,14 +69,14 @@ pub async fn check_process_status_by_pid(pid: Pid) -> bool {
 }
 
 // Helper to get process ID by port provided
-pub async fn get_pid_for_port(port: u16) -> Result<u32> {
+pub async fn get_pid_for_port(port: u16) -> Result<u32, anyhow::Error> {
     let output = Command::new("lsof")
         .arg("-i")
         .arg("-P")
         .arg(format!(":{}", port))
         .output()
         .await
-        .context("Failed to execute lsof")?; // <-- moved after `.await`
+        .context("Failed to execute lsof")?;  // ✅ await first, then context
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines().skip(1) {

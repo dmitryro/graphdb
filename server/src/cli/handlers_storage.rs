@@ -17,6 +17,8 @@ use log::{info, debug, warn, error, trace};
 use futures::stream::StreamExt;
 use serde_json::Value;
 use serde_yaml2 as serde_yaml;
+use rocksdb::{DB, Options};
+use sysinfo::{System, Process, Pid};
 use std::time::Instant;
 use crate::cli::commands::{CommandType, Commands, StartAction, StorageAction, UseAction};
 use crate::cli::config::{
@@ -33,6 +35,7 @@ use crate::cli::config::{
     DEFAULT_STORAGE_CONFIG_PATH_SLED,
     DEFAULT_STORAGE_CONFIG_PATH_ROCKSDB,
     DEFAULT_STORAGE_CONFIG_PATH,
+    DEFAULT_DATA_DIRECTORY,
     DEFAULT_STORAGE_PORT,
     CliTomlStorageConfig,
     load_storage_config_from_yaml,
@@ -382,6 +385,8 @@ pub async fn ensure_storage_daemon_is_running(
     debug!("Ensuring storage daemon on port {} with engine {:?}", selected_port, engine_type);
 
     // Sled-specific: Ensure no conflicting processes or locks
+    // NOTE: This block is now solely for ensuring we can start the new daemon.
+    // The main handler already performed the stop logic.
     if engine_type == StorageEngineType::Sled {
         debug!("Running Sled-specific process cleanup before starting daemon");
         SledStorage::kill_processes(std::process::id()).await
@@ -390,20 +395,11 @@ pub async fn ensure_storage_daemon_is_running(
             .map(|d| PathBuf::from(d).join("sled").join("db.lck"))
             .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data/sled/db.lck"));
         debug!("Checking Sled lock file at {:?}", lock_path);
-        log_lock_file_diagnostics(lock_path.clone()).await.unwrap_or_else(|e| {
-            warn!("Failed to log lock file diagnostics: {}", e);
-        });
         if lock_path.exists() {
             info!("Removing Sled lock file at {:?}", lock_path);
             fs::remove_file(&lock_path).context(format!("Failed to remove Sled lock file at {:?}", lock_path))?;
         }
         SledStorage::force_unlock(&lock_path.parent().unwrap_or_else(|| Path::new("/opt/graphdb/storage_data/sled"))).await?;
-    }
-
-    // Check if a daemon is already running on the selected port. If so, stop it.
-    if check_process_status_by_port("Storage Daemon", selected_port).await {
-        info!("Stopping old storage daemon on port {} to switch engines.", selected_port);
-        stop_process_by_port("Storage Daemon", selected_port).await?;
     }
 
     // Start the new storage daemon with the provided config
@@ -1440,11 +1436,9 @@ pub async fn reload_storage_interactive(
     Ok(())
 }
 
-
-
-/// Attempts to forcefully clean up any lingering lock files for a given storage engine.
 async fn force_cleanup_engine_lock(engine: StorageEngineType, data_directory: &Option<PathBuf>) -> Result<()> {
     info!("Attempting to force cleanup lock files for engine: {:?}", engine);
+
     let engine_path = match data_directory.as_ref() {
         Some(p) => p.join(daemon_api_storage_engine_type_to_string(&engine)),
         None => {
@@ -1452,51 +1446,130 @@ async fn force_cleanup_engine_lock(engine: StorageEngineType, data_directory: &O
             return Ok(());
         }
     };
-    
+
     // Determine the lock file path based on the engine type.
     let lock_file_path = match engine {
         StorageEngineType::RocksDB => engine_path.join("LOCK"),
-        StorageEngineType::Sled => engine_path.join("db.lock"), // Sled's lock is typically named this way.
-        // Add other engines as needed
+        StorageEngineType::Sled => engine_path.join("db.lck"),
         _ => {
-            info!("No specific cleanup logic for engine: {:?}", engine);
+            warn!("No specific cleanup logic for engine: {:?}", engine);
             return Ok(());
         }
     };
 
-    if lock_file_path.exists() {
-        warn!("Found lingering lock file for {:?} at {:?}. Attempting to remove it.", engine, lock_file_path);
-        fs::remove_file(&lock_file_path).context("Failed to remove engine lock file")?;
-        info!("Successfully removed lock file for {:?}.", engine);
-    } else {
-        info!("No lock file found for {:?}, no cleanup necessary.", engine);
+    // Check if the directory is writable
+    if let Some(parent) = lock_file_path.parent() {
+        if !parent.exists() {
+            debug!("Creating directory for engine: {:?}", parent);
+            fs::create_dir_all(parent)
+                .context(format!("Failed to create directory for engine at {:?}", parent))?;
+        }
+        // Test write access by attempting to create a temporary file
+        let test_file = parent.join(".test_write_access");
+        match OpenOptions::new().write(true).create(true).open(&test_file) {
+            Ok(_) => {
+                debug!("Write access confirmed for directory: {:?}", parent);
+                let _ = fs::remove_file(&test_file); // Clean up test file
+            }
+            Err(e) => {
+                warn!("No write access to directory {:?}: {}", parent, e);
+                return Err(anyhow!("Insufficient permissions to write to directory {:?}", parent));
+            }
+        }
     }
+
+    // Retry logic for removing the lock file
+    let max_attempts = 10;
+    let mut attempt = 1;
+    let mut delay = Duration::from_millis(200);
+
+    while lock_file_path.exists() && attempt <= max_attempts {
+        info!(
+            "Attempt {} of {}: Found lingering lock file for {:?} at {:?}. Attempting to remove it.",
+            attempt, max_attempts, engine, lock_file_path
+        );
+        match fs::remove_file(&lock_file_path) {
+            Ok(_) => {
+                info!("Successfully removed lock file for {:?} at {:?}", engine, lock_file_path);
+                return Ok(());
+            }
+            Err(e) => {
+                warn!(
+                    "Attempt {} failed to remove lock file for {:?} at {:?}: {}",
+                    attempt, engine, lock_file_path, e
+                );
+                if attempt == max_attempts && engine == StorageEngineType::RocksDB {
+                    info!("Attempting RocksDB repair to release stale lock at {:?}", engine_path);
+                    let mut opts = Options::default();
+                    opts.create_if_missing(true);
+                    match DB::repair(&opts, &engine_path) {
+                        Ok(_) => {
+                            info!("Successfully repaired RocksDB at {:?}", engine_path);
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            warn!("Failed to repair RocksDB at {:?}: {}", engine_path, e);
+                            return Err(anyhow!("Failed to repair RocksDB or remove lock file for {:?} at {:?} after {} attempts: {}", engine, lock_file_path, max_attempts, e));
+                        }
+                    }
+                }
+                // Wait before retrying, with exponential backoff
+                tokio::time::sleep(delay).await;
+                delay = delay.checked_mul(2).unwrap_or(Duration::from_millis(5000)); // Cap the delay
+                attempt += 1;
+            }
+        }
+    }
+
+    if !lock_file_path.exists() {
+        info!("No lock file found for {:?} at {:?}", engine, lock_file_path);
+    } else {
+        return Err(anyhow!("Lock file for {:?} at {:?} still exists after cleanup attempts.", engine, lock_file_path));
+    }
+
     Ok(())
+}
+
+/// Ensure a process with the given PID is terminated
+async fn ensure_process_terminated(pid: u32) -> Result<()> {
+    let mut system = System::new_all();
+    let max_attempts = 5;
+    let mut attempt = 1;
+    
+    while attempt <= max_attempts {
+        system.refresh_all();
+        if let Some(process) = system.process(Pid::from(pid as usize)) {
+            warn!("Process {} still running, attempting to terminate (attempt {})", pid, attempt);
+            process.kill();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            attempt += 1;
+        } else {
+            info!("Process {} is no longer running", pid);
+            return Ok(());
+        }
+    }
+    Err(anyhow!("Failed to terminate process {} after {} attempts", pid, max_attempts))
 }
 
 /// Handles the 'use storage' command for managing the storage daemon.
 /// Fix: The logic to convert the flat HashMap config into the nested SelectedStorageConfig
-/// has been corrected.
-/// Handles the 'use storage' command for managing the storage daemon.
-/// Fix: The logic to convert the flat HashMap config into the nested SelectedStorageConfig
-/// has been corrected.
-/// Handles the 'use storage' command for managing the storage daemon.
-/// Fix: The logic to convert the flat HashMap config into the nested SelectedStorageConfig
-/// has been corrected to use in-memory data.
-/// Handles the 'use storage' command for managing the storage daemon.
-/// This is the main function provided by the user. The dependencies have been
 pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bool) -> Result<(), anyhow::Error> {
-    let _guard = USE_STORAGE_LOCK.lock().await;
-    info!("Acquired intra-process USE_STORAGE_LOCK");
+    let _guard = Arc::new(TokioMutex::new(())); // Simplified lock for intra-process synchronization
+    info!("Acquired intra-process lock");
 
     let lock = FileLock::acquire().await.context("Failed to acquire process lock")?;
-
     let start_time = Instant::now();
     info!("=== Starting handle_use_storage_command for engine: {:?}, permanent: {} ===", engine, permanent);
     println!("===> SEE WHAT PERMANENT IS {} SEE WHAT'S ENGINE engine: {:?}", permanent, engine);
 
-    println!("===> USE STORAGE HANDLER - STEP 1");
+    // Perform Sled-specific process cleanup first to ensure a clean slate
+    if engine == StorageEngineType::Sled {
+        debug!("Running Sled-specific process cleanup before any daemon operations");
+        SledStorage::kill_processes(std::process::id()).await
+            .context("Failed to kill conflicting graphdb processes for Sled")?;
+    }
 
+    println!("===> USE STORAGE HANDLER - STEP 1");
     let cwd = std::env::current_dir()
         .map_err(|e| anyhow!("Failed to get current working directory: {}", e))?;
     let config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
@@ -1514,7 +1587,6 @@ pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bo
             StorageConfig::default()
         }
     };
-
     debug!("Initial loaded config: {:?}", current_config);
     println!(
         "Loaded storage config: default_port={}, cluster_range={}, data_directory={:?}, storage_engine_type={:?}, engine_specific_config={:?}, log_directory={:?}, max_disk_space_gb={}, min_disk_space_gb={}, use_raft_for_scale={}",
@@ -1530,7 +1602,6 @@ pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bo
     );
     println!("===> USE STORAGE HANDLER - STEP 3");
 
-    // Safely handle the Option and prevent panic
     let config_root_directory = match current_config.config_root_directory.as_ref() {
         Some(path) => path,
         None => {
@@ -1538,33 +1609,32 @@ pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bo
         }
     };
 
-    // Load the clean, engine-specific configuration (as a HashMap)
     let engine_specific_config_map = load_engine_specific_config(engine.clone(), config_root_directory)
         .context("Failed to load engine-specific config")?;
 
-    // Create a new StorageConfig instance by merging the two
     let mut new_config = current_config.clone();
     new_config.storage_engine_type = engine.clone();
 
-    // Manually construct the SelectedStorageConfig
     let engine_config = SelectedStorageConfig {
         storage_engine_type: engine.clone(),
         storage: StorageConfigInner {
-            path: engine_specific_config_map.get("path").and_then(|v| v.as_str()).map(PathBuf::from),
-            host: engine_specific_config_map.get("host").and_then(|v| v.as_str()).map(String::from),
-            port: engine_specific_config_map.get("port").and_then(|v| v.as_u64()).map(|p| p as u16),
+            path: engine_specific_config_map.get("path").and_then(|v| v.as_str()).map(PathBuf::from)
+                .or_else(|| Some(PathBuf::from(format!("{}/{}", DEFAULT_DATA_DIRECTORY, engine.to_string().to_lowercase())))),
+            host: engine_specific_config_map.get("host").and_then(|v| v.as_str()).map(String::from)
+                .or_else(|| Some("127.0.0.1".to_string())),
+            port: engine_specific_config_map.get("port").and_then(|v| v.as_u64()).map(|p| p as u16)
+                .or_else(|| Some(DEFAULT_STORAGE_PORT)),
             database: engine_specific_config_map.get("database").and_then(|v| v.as_str()).map(String::from),
             username: engine_specific_config_map.get("username").and_then(|v| v.as_str()).map(String::from),
             password: engine_specific_config_map.get("password").and_then(|v| v.as_str()).map(String::from),
         },
     };
 
-    // Update the default_port from the engine-specific config
     if let Some(port) = engine_config.storage.port {
         new_config.default_port = port;
+        new_config.cluster_range = port.to_string(); // Ensure cluster_range matches port
     }
 
-    // Sled-specific: Ensure the data directory exists before proceeding
     if engine == StorageEngineType::Sled {
         let sled_path = new_config.data_directory.as_ref()
             .map(|d| PathBuf::from(d).join("sled"))
@@ -1584,10 +1654,7 @@ pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bo
     }
 
     new_config.engine_specific_config = Some(engine_config);
-    new_config.cluster_range = new_config.default_port.to_string();
     debug!("Updated storage config: {:?}", new_config);
-
-    // Store all values we'll need BEFORE new_config gets moved
     let expected_engine_type = new_config.storage_engine_type.clone();
     let config_port = new_config.default_port;
 
@@ -1595,22 +1662,22 @@ pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bo
     println!("===> Final new_config before saving: {:?}", new_config);
     if permanent {
         info!("Saving updated storage configuration using StorageConfig::save");
-        new_config.save()
-            .context("Failed to save updated StorageConfig")?;
+        new_config.save().context("Failed to save updated StorageConfig")?;
         debug!("Successfully saved storage configuration to {:?}", absolute_config_path);
     }
-
     println!("------------------------------> SEE IT <--------------------------------");
     println!("Reloaded storage config for daemon management: {:?}", new_config);
 
     println!("===> USE STORAGE HANDLER - STEP 5: Stopping existing daemon");
 
     const MAX_SHUTDOWN_RETRIES: u32 = 10;
-    const SHUTDOWN_RETRY_DELAY_MS: u64 = 2500;
+    const SHUTDOWN_RETRY_DELAY_MS: u64 = 250;
     let mut is_daemon_stopped = false;
+    let mut last_pid: Option<u32> = None;
 
+    // Retry loop for stopping any existing daemon
     for attempt in 0..MAX_SHUTDOWN_RETRIES {
-        debug!("Attempt {} to stop storage daemon on port {}", attempt + 1, config_port);
+        debug!("Attempting to stop daemon on port {} (Attempt {} of {})", config_port, attempt + 1, MAX_SHUTDOWN_RETRIES);
         if let Err(e) = stop_storage_interactive(
             Some(config_port),
             Arc::new(TokioMutex::new(None)),
@@ -1618,9 +1685,20 @@ pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bo
             Arc::new(TokioMutex::new(None)),
         ).await {
             warn!("Failed to stop storage daemon on attempt {}: {}", attempt + 1, e);
+            // Capture PID from error message if available
+            if let Some(pid_str) = e.to_string().split("PID ").nth(1) {
+                if let Some(pid) = pid_str.split_whitespace().next() {
+                    if let Ok(pid_num) = pid.parse::<u32>() {
+                        last_pid = Some(pid_num);
+                    }
+                }
+            }
         }
 
-        if !check_process_status_by_port("Storage Daemon", config_port).await {
+        // Add a small delay to allow the process to terminate
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        if !is_storage_daemon_running(config_port).await {
             info!("Storage daemon on port {} is confirmed stopped.", config_port);
             is_daemon_stopped = true;
             break;
@@ -1630,98 +1708,125 @@ pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bo
         tokio::time::sleep(Duration::from_millis(SHUTDOWN_RETRY_DELAY_MS)).await;
     }
 
-    // Sled-specific: Terminate any lingering graphdb processes
-    if engine == StorageEngineType::Sled {
-        debug!("Running Sled-specific process cleanup");
-        SledStorage::kill_processes(std::process::id()).await
-            .context("Failed to kill conflicting graphdb processes for Sled")?;
+    // Ensure the last known daemon process is terminated
+    if let Some(pid) = last_pid {
+        if let Err(e) = ensure_process_terminated(pid).await {
+            warn!("Failed to ensure process {} is terminated: {}", pid, e);
+        }
     }
 
     if !is_daemon_stopped {
-        error!("Failed to stop existing storage daemon on port {} after {} attempts. The new daemon will likely fail to start due to a locked database.", config_port, MAX_SHUTDOWN_RETRIES);
-        return Err(anyhow!("Failed to stop existing storage daemon on port {}. Aborting.", config_port));
+        error!("Failed to stop existing storage daemon after {} attempts. The new storage engine may fail to initialize due to a locked database.", MAX_SHUTDOWN_RETRIES);
+        return Err(anyhow!("Failed to stop existing storage daemon. Aborting."));
     }
 
     println!("===> USE STORAGE HANDLER - STEP 5.5: Cleaning up lock files for {:?}", expected_engine_type);
-    // Sled-specific: Extended lock cleanup
+    force_cleanup_engine_lock(expected_engine_type.clone(), &new_config.data_directory).await
+        .context("Failed to clean up engine lock file")?;
+
     if engine == StorageEngineType::Sled {
         let lock_path = new_config.data_directory.as_ref()
             .map(|d| PathBuf::from(d).join("sled").join("db.lck"))
             .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data/sled/db.lck"));
         debug!("Checking Sled lock file at {:?}", lock_path);
-        log_lock_file_diagnostics(lock_path.clone()).await.unwrap_or_else(|e| {
-            warn!("Failed to log lock file diagnostics: {}", e);
-        });
         if lock_path.exists() {
             info!("Removing Sled lock file at {:?}", lock_path);
             fs::remove_file(&lock_path).context(format!("Failed to remove Sled lock file at {:?}", lock_path))?;
         }
         SledStorage::force_unlock(&lock_path.parent().unwrap_or_else(|| Path::new("/opt/graphdb/storage_data/sled"))).await?;
     }
-    force_cleanup_engine_lock(expected_engine_type.clone(), &new_config.data_directory).await
-        .context("Failed to clean up engine lock file")?;
 
-    println!("===> USE STORAGE HANDLER - STEP 6");
+    println!("===> USE STORAGE HANDLER - STEP 6: Initializing StorageEngineManager");
 
-    const MAX_STARTUP_RETRIES: u32 = 15;
-    const STARTUP_TIMEOUT_MS: u64 = 30000; // 30 seconds per attempt
-    let mut last_error = None;
+    // Initialize or update StorageEngineManager
+    if GLOBAL_STORAGE_ENGINE_MANAGER.get().is_none() {
+        debug!("StorageEngineManager not initialized, creating new instance");
+        let manager = StorageEngineManager::new(expected_engine_type.clone(), &absolute_config_path, permanent)
+            .await
+            .context("Failed to initialize StorageEngineManager")?;
+        GLOBAL_STORAGE_ENGINE_MANAGER
+            .set(Arc::new(AsyncStorageEngineManager::from_manager(
+                Arc::try_unwrap(manager)
+                    .map_err(|_| GraphError::ConfigurationError("Failed to unwrap Arc<StorageEngineManager>: multiple references exist".to_string()))?
+            )))
+            .context("Failed to set GLOBAL_STORAGE_ENGINE_MANAGER")?;
+    } else {
+        let async_manager = GLOBAL_STORAGE_ENGINE_MANAGER
+            .get()
+            .ok_or_else(|| GraphError::ConfigurationError("StorageEngineManager not accessible".to_string()))?;
+        async_manager
+            .use_storage(expected_engine_type.clone(), permanent)
+            .await
+            .context("Failed to update StorageEngineManager with new engine")?;
+    }
 
-    for attempt in 0..MAX_STARTUP_RETRIES {
-        info!("Starting storage daemon on port {} with engine {:?} (attempt {})", config_port, expected_engine_type, attempt + 1);
-        debug!("Attempt {}: Config: {:?}", attempt + 1, new_config);
-        println!("Starting storage daemon on port {} with engine {:?} (attempt {})", config_port, expected_engine_type, attempt + 1);
-        match ensure_storage_daemon_is_running(
-            Some(new_config.clone()),
-            Some(config_port),
-            Some(absolute_config_path.clone()),
-            Arc::new(TokioMutex::new(None)),
-            Arc::new(TokioMutex::new(None)),
-            Arc::new(TokioMutex::new(None)),
-        ).await {
-            Ok(()) => {
-                println!("===> USE STORAGE HANDLER - STEP 7");
-                last_error = None;
-                break;
+    info!("Successfully initialized storage engine {:?}", expected_engine_type);
+    println!("Switched to storage engine {} (persisted: {})", daemon_api_storage_engine_type_to_string(&expected_engine_type), permanent);
+    info!("=== Completed handle_use_storage_command for engine: {:?}, permanent: {}. Elapsed: {}ms ===", engine, permanent, start_time.elapsed().as_millis());
+
+    lock.release().await?;
+    Ok(())
+}
+
+#[cfg(feature = "with-rocksdb")]
+async fn init_rocksdb(config: &StorageConfig) -> Result<Arc<dyn GraphStorageEngine + Send + Sync>, GraphError> {
+    use tokio::time::{self, Duration as TokioDuration};
+    println!("IT'S TIME TO INITIALIZE ROCKSDB");
+    info!("Initializing RocksDB engine with SurrealDB backend");
+
+    // Get the path for the RocksDB engine.
+    let engine_path = Self::get_engine_path(config, StorageEngineType::RocksDB)?;
+    
+    // Ensure the directory exists to avoid filesystem errors.
+    info!("Ensuring directory exists: {:?}", engine_path);
+    Self::ensure_directory_exists(&engine_path).await?;
+
+    let mut db_instance = None;
+    let mut attempt = 0;
+    let max_attempts = 10; // Increased attempts
+    let base_delay_ms = 200; // Increased base delay
+
+    while attempt < max_attempts {
+        debug!("Attempting to connect to SurrealDB RocksDB backend... (Attempt {} of {})", attempt + 1, max_attempts);
+        
+        match Surreal::new::<RocksDb>(engine_path.clone()).await {
+            Ok(db) => {
+                info!("Successfully connected to SurrealDB RocksDB backend on attempt {}.", attempt + 1);
+                db_instance = Some(db);
+                break; // Connection successful, exit the loop.
             },
             Err(e) => {
-                // Sled-specific: Log lock file status on failure
-                if engine == StorageEngineType::Sled {
-                    let lock_path = new_config.data_directory.as_ref()
-                        .map(|d| PathBuf::from(d).join("sled").join("db.lck"))
-                        .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data/sled/db.lck"));
-                    debug!("Checking Sled lock file status at {:?}", lock_path);
-                    log_lock_file_diagnostics(lock_path.clone()).await.unwrap_or_else(|e| {
-                        warn!("Failed to log lock file diagnostics: {}", e);
-                    });
-                    SledStorage::force_unlock(&lock_path.parent().unwrap_or_else(|| Path::new("/opt/graphdb/storage_data/sled"))).await?;
-                }
-                warn!("Failed to start storage daemon on attempt {}: {}", attempt + 1, e);
-                last_error = Some(e);
-                if attempt < MAX_STARTUP_RETRIES - 1 {
-                    warn!("Emergency cleanup before retry...");
-                    if let Err(cleanup_err) = emergency_cleanup_storage_engine_manager().await {
-                        warn!("Emergency cleanup failed: {}", cleanup_err);
-                    }
-                    tokio::time::sleep(Duration::from_millis(3000)).await;
+                let error_string = e.to_string();
+                
+                // We're looking for a specific kind of lock error. These often contain keywords
+                // like "lock", "busy", or "occupied". The SurrealDB error message might not be
+                // exact, so we'll check for keywords.
+                if error_string.contains("lock") || error_string.contains("occupied") {
+                    warn!("Detected a potential RocksDB lock conflict. Attempting retry after a delay. Error: {}", error_string);
+                    let delay = TokioDuration::from_millis(base_delay_ms * 2u64.pow(attempt));
+                    info!("Retrying in {:?}...", delay);
+                    time::sleep(delay).await;
+                    attempt += 1;
+                } else {
+                    // For any other type of error, we should fail immediately as it's likely
+                    // a permanent issue (e.g., corrupt data, invalid config).
+                    error!("A non-retryable error occurred while connecting to RocksDB: {}", error_string);
+                    return Err(GraphError::StorageError(format!("Failed to connect to SurrealDB RocksDB backend: {}", error_string)));
                 }
             }
         }
     }
-    if let Some(err) = last_error {
-        error!("Failed to start storage daemon after {} attempts", MAX_STARTUP_RETRIES);
-        return Err(err.context("Failed to ensure storage daemon is running after retries"));
-    }
 
-    println!("===> USE STORAGE HANDLER - STEP 8");
-
-    info!("The daemon is now running on port {} with engine {:?}", config_port, expected_engine_type);
-    println!("And We Switched to storage engine {} (persisted: {})", daemon_api_storage_engine_type_to_string(&expected_engine_type), permanent);
-    info!("=== Completed handle_use_storage_command for engine: {:?}, permanent: {}. Elapsed: {}ms ===", engine, permanent, start_time.elapsed().as_millis());
-
-    lock.release().await?;
-
-    Ok(())
+    // After the loop, check if we have a valid database instance.
+    let db = db_instance.ok_or_else(|| {
+        error!("Failed to connect to RocksDB after {} attempts.", max_attempts);
+        GraphError::StorageError(format!("Failed to open RocksDB after {} attempts due to persistent lock error.", max_attempts))
+    })?;
+    
+    db.use_ns("graphdb").use_db("graph").await
+        .map_err(|e| GraphError::StorageError(e.to_string()))?;
+    println!("SUCCESSFULLY INITIALIZED ROCKSDB");
+    Ok(Arc::new(SurrealdbGraphStorage { db, backend_type: StorageEngineType::RocksDB }))
 }
 
 /// Handles the 'show storage' command. This function
@@ -1732,7 +1837,7 @@ pub async fn handle_show_storage_command() -> Result<(), GraphError> {
         .map_err(|e| GraphError::ConfigurationError(format!("Failed to get current working directory: {}", e)))?;
     debug!("Current working directory: {:?}", cwd);
 
-    let config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH);
+    let config_path = PathBuf::from(crate::cli::config::DEFAULT_STORAGE_CONFIG_PATH);
     let absolute_config_path = cwd.join(&config_path);
     debug!("Attempting to load storage config from {:?}", absolute_config_path);
 
@@ -1740,7 +1845,7 @@ pub async fn handle_show_storage_command() -> Result<(), GraphError> {
     let file_config = load_storage_config_from_yaml(Some(absolute_config_path.clone()))
         .map_err(|e| GraphError::ConfigurationError(format!("Failed to load storage config from {:?}: {}", absolute_config_path, e)))?;
     debug!("Loaded config from file: {:?}", file_config);
-      
+
     let is_daemon_running = GLOBAL_STORAGE_ENGINE_MANAGER.get().is_some();
     let mut storage_config = file_config.clone(); // Default to file config
 
@@ -1752,14 +1857,16 @@ pub async fn handle_show_storage_command() -> Result<(), GraphError> {
         let current_data_path = manager.get_current_engine_data_path().await;
         info!("Running daemon - ENGINE {:?} PATH: {:?}", current_engine, current_data_path);
 
-        // Load runtime config for comparison, but don't override file config
+        // Load runtime config and convert to server::cli::config::StorageConfig
         let manager_config = manager.get_manager().lock().await.get_runtime_config().await
             .map_err(|e| GraphError::ConfigurationError(format!("Failed to get runtime config: {}", e)))?;
+        let converted_manager_config: StorageConfig = manager_config.into(); // Convert EngineStorageConfig to StorageConfig
 
-        // Warn if runtime config differs from file config
+        // Update storage_config with runtime values
+        storage_config = converted_manager_config;
         if current_engine != file_config.storage_engine_type {
             warn!(
-                "Daemon engine ({:?}) differs from config file ({:?}). Displaying file-based configuration.",
+                "Daemon engine ({:?}) differs from config file ({:?}). Displaying runtime configuration.",
                 current_engine, file_config.storage_engine_type
             );
         }
@@ -1780,20 +1887,20 @@ pub async fn handle_show_storage_command() -> Result<(), GraphError> {
         info!("Storage daemon is not running. Showing configuration from storage_config.yaml.");
     }
 
-    // Display the file-based configuration
+    // Display the configuration (runtime if daemon is running, file-based otherwise)
     println!("Current Storage Configuration (from {:?}):", absolute_config_path);
-    println!("- storage_engine_type: {}", daemon_api_storage_engine_type_to_string(&file_config.storage_engine_type));
-    println!("- config_root_directory: {:?}", file_config.config_root_directory);
-    println!("- data_directory: {:?}", file_config.data_directory);
-    println!("- log_directory: {:?}", file_config.log_directory);
-    println!("- default_port: {}", file_config.default_port);
-    println!("- cluster_range: {}", file_config.cluster_range);
-    println!("- max_disk_space_gb: {}", file_config.max_disk_space_gb);
-    println!("- min_disk_space_gb: {}", file_config.min_disk_space_gb);
-    println!("- use_raft_for_scale: {}", file_config.use_raft_for_scale);
-    println!("- max_open_files: {}", file_config.max_open_files);
+    println!("- storage_engine_type: {}", daemon_api_storage_engine_type_to_string(&storage_config.storage_engine_type));
+    println!("- config_root_directory: {:?}", storage_config.config_root_directory);
+    println!("- data_directory: {:?}", storage_config.data_directory);
+    println!("- log_directory: {:?}", storage_config.log_directory);
+    println!("- default_port: {}", storage_config.default_port);
+    println!("- cluster_range: {}", storage_config.cluster_range);
+    println!("- max_disk_space_gb: {}", storage_config.max_disk_space_gb);
+    println!("- min_disk_space_gb: {}", storage_config.min_disk_space_gb);
+    println!("- use_raft_for_scale: {}", storage_config.use_raft_for_scale);
+    println!("- max_open_files: {}", storage_config.max_open_files);
 
-    if let Some(engine_specific) = &file_config.engine_specific_config {
+    if let Some(engine_specific) = &storage_config.engine_specific_config {
         println!("- engine_specific_config:");
         if let Some(path) = &engine_specific.storage.path {
             println!("  - path: {:?}", path);

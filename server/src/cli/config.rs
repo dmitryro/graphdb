@@ -862,14 +862,27 @@ impl StorageConfig {
 
         let config_content = fs::read_to_string(path)
             .context(format!("Failed to read storage config file: {}", path.display()))?;
+        debug!("Raw YAML content from {:?}:\n{}", path, config_content);
 
-        let mut config: StorageConfig = serde_yaml::from_str::<StorageConfigWrapper>(&config_content)
-            .map(|wrapper| wrapper.storage)
-            .or_else(|_| serde_yaml::from_str(&config_content))
-            .context(format!(
-                "Failed to parse YAML from file '{}'. Check file format.",
-                path.display()
-            ))?;
+        let mut config: StorageConfig = match serde_yaml::from_str::<StorageConfigWrapper>(&config_content) {
+            Ok(wrapper) => {
+                debug!("Parsed YAML as StorageConfigWrapper: {:?}", wrapper);
+                wrapper.storage
+            }
+            Err(e1) => {
+                warn!("Failed to parse YAML as StorageConfigWrapper: {}. Attempting direct StorageConfig parse.", e1);
+                match serde_yaml::from_str(&config_content) {
+                    Ok(config) => {
+                        debug!("Parsed YAML directly as StorageConfig: {:?}", config);
+                        config
+                    }
+                    Err(e2) => {
+                        error!("Failed to parse YAML as StorageConfig: {}. Raw content:\n{}", e2, config_content);
+                        return Err(anyhow!("Failed to parse YAML from file '{}': {}", path.display(), e2));
+                    }
+                }
+            }
+        };
 
         // Synchronize storage_engine_type with engine_specific_config
         if let Some(engine_config) = &config.engine_specific_config {
@@ -885,14 +898,12 @@ impl StorageConfig {
             config.engine_specific_config = create_default_engine_specific_config(config.storage_engine_type);
         }
 
-        info!("Successfully loaded storage configuration from {:?}", path);
-        Ok(config)
+        let validated_config = ensure_storage_config_is_valid(config);
+        info!("Successfully loaded and validated storage configuration from {:?}", path);
+        debug!("Final configuration: {:?}", validated_config);
+        Ok(validated_config)
     }
-    /// Saves the StorageConfig to a YAML file.
-    ///
-    /// This function uses serde_yaml to serialize the struct into a YAML string
-    /// and writes it to a file. This is the correct and reliable way to
-    /// create a configuration file without manual formatting errors.
+
     pub fn save(&self) -> Result<()> {
         let default_config_path = PathBuf::from("./storage_daemon_server/storage_config.yaml");
         let project_config_path = PathBuf::from("./storage_daemon_server/storage_config.yaml");
@@ -1826,7 +1837,7 @@ pub fn load_storage_config_from_yaml(config_file_path: Option<PathBuf>) -> Resul
 
     // Log the validated configuration to confirm synchronization
     debug!("Final validated configuration: {:?}", validated_config);
-
+    println!("FINAL CONFIGURATION ==> {:?}", validated_config);
     Ok(validated_config)
 }
 
