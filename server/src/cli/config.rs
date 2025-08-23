@@ -1372,64 +1372,6 @@ impl CliConfig {
             _ => Ok(()),
         }
     }
-    /*
-    pub async fn execute(&self, manager: &mut StorageEngineManager) -> Result<(), GraphError> {
-        match &self.command {
-            Commands::Use(UseAction::Storage { engine, permanent }) => {
-                let is_permanent = *permanent;
-                info!(
-                    "Switching to storage engine: {:?}, permanent: {} (interactive mode: {})",
-                    engine, is_permanent, self.cli
-                );
-                // Validate engine type against available engines
-                let available_engines = StorageEngineManager::available_engines();
-                if !available_engines.contains(engine) {
-                    return Err(GraphError::InvalidStorageEngine(format!(
-                        "Storage engine {:?} is not enabled. Available engines: {:?}", engine, available_engines
-                    )));
-                }
-                // Update StorageEngineManager
-                manager.use_storage(*engine, is_permanent).await?;
-                if is_permanent {
-                    let mut storage_config = load_storage_config_from_yaml(None)
-                        .map_err(|e| GraphError::ConfigurationError(format!("Failed to load storage config: {}", e)))?;
-                    storage_config.storage_engine_type = *engine;
-                    storage_config.engine_specific_config = create_default_engine_specific_config(&*engine);
-                    storage_config.save()
-                        .map_err(|e| GraphError::ConfigurationError(format!("Failed to save storage config: {}", e)))?;
-                    info!("Saved storage engine change to {:?}", DEFAULT_STORAGE_CONFIG_PATH);
-                    // Reload the config to ensure consistency
-                    storage_config = load_storage_config_from_yaml(None)
-                        .map_err(|e| GraphError::ConfigurationError(format!("Failed to reload storage config: {}", e)))?;
-                    info!("Reloaded storage config: {:?}", storage_config);
-                }
-                println!(
-                    "Switched to storage engine: {}{}",
-                    daemon_api_storage_engine_type_to_string(engine),
-                    if is_permanent { " (persisted)" } else { " (non-persisted)" }
-                );
-                Ok(())
-            }
-            Commands::Save(SaveAction::Storage) => {
-                let storage_config = load_storage_config_from_yaml(None)
-                    .map_err(|e| GraphError::ConfigurationError(format!("Failed to load storage config: {}", e)))?;
-                storage_config.save()
-                    .map_err(|e| GraphError::ConfigurationError(format!("Failed to save storage config: {}", e)))?;
-                println!("Saved storage configuration to {:?}", DEFAULT_STORAGE_CONFIG_PATH);
-                Ok(())
-            }
-            Commands::Save(SaveAction::Configuration) => {
-                let cli_config = load_cli_config()
-                    .map_err(|e| GraphError::ConfigurationError(format!("Failed to load CLI config: {}", e)))?;
-                cli_config.save()
-                    .map_err(|e| GraphError::ConfigurationError(format!("Failed to save CLI config: {}", e)))?;
-                println!("Saved CLI configuration to {:?}", PathBuf::from("/opt/graphdb/config.toml"));
-                Ok(())
-            }
-            _ => Ok(()),
-        }
-    }
-    */
     /// Helper function to load a YAML configuration file from a given path.
     /// It's generic over the type `T` that it's trying to deserialize.
     fn load_yaml_config<T: DeserializeOwned>(path: &Path) -> Option<T> {
