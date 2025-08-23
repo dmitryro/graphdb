@@ -1831,76 +1831,86 @@ async fn init_rocksdb(config: &StorageConfig) -> Result<Arc<dyn GraphStorageEngi
 
 /// Handles the 'show storage' command. This function
 /// displays the current storage configuration by reading it
-/// directly from the local config file and checking for a running daemon.
 pub async fn handle_show_storage_command() -> Result<(), GraphError> {
+    // Determine the current working directory to resolve config paths.
     let cwd = std::env::current_dir()
         .map_err(|e| GraphError::ConfigurationError(format!("Failed to get current working directory: {}", e)))?;
     debug!("Current working directory: {:?}", cwd);
 
+    // Determine the path to the config file.
     let config_path = PathBuf::from(crate::cli::config::DEFAULT_STORAGE_CONFIG_PATH);
     let absolute_config_path = cwd.join(&config_path);
     debug!("Attempting to load storage config from {:?}", absolute_config_path);
 
-    // Load the storage config from file (primary source)
-    let file_config = load_storage_config_from_yaml(Some(absolute_config_path.clone()))
+    // Load the config from the file.
+    let file_config = crate::cli::config::load_storage_config_from_yaml(Some(absolute_config_path.clone()))
         .map_err(|e| GraphError::ConfigurationError(format!("Failed to load storage config from {:?}: {}", absolute_config_path, e)))?;
     debug!("Loaded config from file: {:?}", file_config);
 
+    // Check if the daemon is running and determine the source of truth for the config.
     let is_daemon_running = GLOBAL_STORAGE_ENGINE_MANAGER.get().is_some();
-    let mut storage_config = file_config.clone(); // Default to file config
+    let mut config_to_display = file_config.clone();
 
     if is_daemon_running {
+        // The daemon is running, so we should display its runtime configuration.
+        info!("Storage daemon is running. Fetching runtime configuration.");
         let manager = GLOBAL_STORAGE_ENGINE_MANAGER
             .get()
             .ok_or_else(|| GraphError::ConfigurationError("StorageEngineManager not initialized".to_string()))?;
-        let current_engine = manager.current_engine_type().await;
-        let current_data_path = manager.get_current_engine_data_path().await;
-        info!("Running daemon - ENGINE {:?} PATH: {:?}", current_engine, current_data_path);
 
-        // Load runtime config and convert to server::cli::config::StorageConfig
-        let manager_config = manager.get_manager().lock().await.get_runtime_config().await
+        let runtime_config_raw = manager.get_manager().lock().await.get_runtime_config().await
             .map_err(|e| GraphError::ConfigurationError(format!("Failed to get runtime config: {}", e)))?;
-        let converted_manager_config: StorageConfig = manager_config.into(); // Convert EngineStorageConfig to StorageConfig
+        
+        // Convert the runtime config into a displayable format.
+        let runtime_config: StorageConfig = runtime_config_raw.into();
+        config_to_display = runtime_config;
 
-        // Update storage_config with runtime values
-        storage_config = converted_manager_config;
-        if current_engine != file_config.storage_engine_type {
-            warn!(
-                "Daemon engine ({:?}) differs from config file ({:?}). Displaying runtime configuration.",
-                current_engine, file_config.storage_engine_type
-            );
-        }
-
-        // Update with registry metadata if available
+        // Get the registry and use it to enrich the displayed information.
         let registry = GLOBAL_DAEMON_REGISTRY.get().await;
-        if let Ok(Some(metadata)) = registry.get_daemon_metadata(storage_config.default_port).await {
-            storage_config.data_directory = metadata.data_dir.or(storage_config.data_directory);
-            println!("Storage Daemon Running on Port {}:", storage_config.default_port);
+        
+        // Now that we have the registry, we can call its asynchronous methods with `.await`.
+        if let Ok(Some(metadata)) = registry.get_daemon_metadata(config_to_display.default_port).await {
+            // The daemon is running and we have metadata.
+            config_to_display.data_directory = metadata.data_dir.or(config_to_display.data_directory);
+            println!("Storage Daemon Running on Port {}:", config_to_display.default_port);
             println!("Daemon Status: Running");
             println!("Daemon PID: {}", metadata.pid);
             if let Some(engine_type_str) = &metadata.engine_type {
                 println!("Daemon Engine Type (Runtime): {}", engine_type_str);
             }
-            println!("Configuration File Engine Type: {}", daemon_api_storage_engine_type_to_string(&file_config.storage_engine_type));
+        } else {
+            // The daemon is running, but no metadata is available.
+            println!("Storage Daemon Running on Port {}:", config_to_display.default_port);
+            println!("Daemon Status: Running (No registry metadata available)");
+        }
+
+        // Issue a warning if the runtime engine type differs from the file configuration.
+        if config_to_display.storage_engine_type != file_config.storage_engine_type {
+            warn!(
+                "Daemon engine ({:?}) differs from config file ({:?}). Displaying runtime configuration.",
+                config_to_display.storage_engine_type, file_config.storage_engine_type
+            );
         }
     } else {
-        info!("Storage daemon is not running. Showing configuration from storage_config.yaml.");
+        // The daemon is not running, so display the file configuration.
+        println!("Storage daemon is not running.");
+        println!("Displaying configuration from storage_config.yaml.");
     }
 
-    // Display the configuration (runtime if daemon is running, file-based otherwise)
+    // Display the final determined configuration.
     println!("Current Storage Configuration (from {:?}):", absolute_config_path);
-    println!("- storage_engine_type: {}", daemon_api_storage_engine_type_to_string(&storage_config.storage_engine_type));
-    println!("- config_root_directory: {:?}", storage_config.config_root_directory);
-    println!("- data_directory: {:?}", storage_config.data_directory);
-    println!("- log_directory: {:?}", storage_config.log_directory);
-    println!("- default_port: {}", storage_config.default_port);
-    println!("- cluster_range: {}", storage_config.cluster_range);
-    println!("- max_disk_space_gb: {}", storage_config.max_disk_space_gb);
-    println!("- min_disk_space_gb: {}", storage_config.min_disk_space_gb);
-    println!("- use_raft_for_scale: {}", storage_config.use_raft_for_scale);
-    println!("- max_open_files: {}", storage_config.max_open_files);
+    println!("- storage_engine_type: {}", daemon_api_storage_engine_type_to_string(&config_to_display.storage_engine_type));
+    println!("- config_root_directory: {:?}", config_to_display.config_root_directory);
+    println!("- data_directory: {:?}", config_to_display.data_directory);
+    println!("- log_directory: {:?}", config_to_display.log_directory);
+    println!("- default_port: {}", config_to_display.default_port);
+    println!("- cluster_range: {}", config_to_display.cluster_range);
+    println!("- max_disk_space_gb: {}", config_to_display.max_disk_space_gb);
+    println!("- min_disk_space_gb: {}", config_to_display.min_disk_space_gb);
+    println!("- use_raft_for_scale: {}", config_to_display.use_raft_for_scale);
+    println!("- max_open_files: {}", config_to_display.max_open_files);
 
-    if let Some(engine_specific) = &storage_config.engine_specific_config {
+    if let Some(engine_specific) = &config_to_display.engine_specific_config {
         println!("- engine_specific_config:");
         if let Some(path) = &engine_specific.storage.path {
             println!("  - path: {:?}", path);

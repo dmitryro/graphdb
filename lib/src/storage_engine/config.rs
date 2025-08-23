@@ -125,7 +125,7 @@ mod option_storage_engine_type_serde {
 
 /// An enum representing the supported storage engine types.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "lowercase")]
 pub enum StorageEngineType {
     Sled,
     RocksDB,
