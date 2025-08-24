@@ -97,7 +97,7 @@ impl GraphStorageEngine for PostgresStorage {
         "postgresql"
     }
 
-    fn is_running(&self) -> bool {
+    async fn is_running(&self) -> bool {
         true // Postgres connection is always considered running
     }
 

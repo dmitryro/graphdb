@@ -161,4 +161,3 @@ pub type GraphResult<T> = Result<T, GraphError>;
 
 /// A type alias for a `Result` that returns a `ValidationError` on failure.
 pub type ValidationResult<T> = Result<T, ValidationError>;
-

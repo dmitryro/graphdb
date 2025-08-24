@@ -1,32 +1,36 @@
-// lib/src/storage_engine/rocksdb_storage.rs
-// Refactored: 2025-07-04 - Renamed to RocksdbGraphStorage, implemented GraphStorageEngine,
-// and integrated RocksDB Column Family (CF) management.
-// UNCHANGED: 2025-08-08 - Retained as-is for hybrid storage compatibility.
-// Fixed: 2025-08-13 - Changed data_path to data_directory to match StorageConfig.
-// Added: 2025-08-13 - Added recover_rocksdb for database recovery.
-// Fixed: 2025-08-13 - Used .into() for SerializableUuid and replaced edge_type with t.
-// Fixed: 2025-08-13 - Updated util.rs imports and create_edge_key for GraphResult.
-// Added: 2025-08-13 - Added `close` method to GraphStorageEngine implementation
-
 #[cfg(feature = "with-rocksdb")]
 use rocksdb::{DB, Options, WriteBatch, ColumnFamilyDescriptor, DBCompactionStyle};
 #[cfg(feature = "with-rocksdb")]
 use async_trait::async_trait;
 #[cfg(feature = "with-rocksdb")]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 #[cfg(feature = "with-rocksdb")]
 use std::sync::Arc;
 #[cfg(feature = "with-rocksdb")]
 use std::fmt::Debug;
+#[cfg(feature = "with-rocksdb")]
+use std::any::Any;
+#[cfg(feature = "with-rocksdb")]
+use serde::{Deserialize, Serialize};
+#[cfg(feature = "with-rocksdb")]
+use std::fs;
+#[cfg(feature = "with-rocksdb")]
+use std::time::Duration;
+#[cfg(feature = "with-rocksdb")]
+use std::thread::sleep;
 
 #[cfg(feature = "with-rocksdb")]
-use crate::storage_engine::{GraphStorageEngine, StorageConfig, StorageEngine};
+use crate::storage_engine::{GraphStorageEngine, StorageEngine};
 #[cfg(feature = "with-rocksdb")]
-use models::{Edge, Identifier, Json, Vertex, SerializableUuid};
+use crate::storage_engine::config::RocksdbConfig;
+#[cfg(feature = "with-rocksdb")]
+use models::{Edge, Identifier, Json, Vertex};
+#[cfg(feature = "with-rocksdb")]
+use models::identifiers::SerializableUuid;
 #[cfg(feature = "with-rocksdb")]
 use models::errors::{GraphError, GraphResult};
 #[cfg(feature = "with-rocksdb")]
-use serde_json::Value;
+use serde_json::{Value, Map};
 #[cfg(feature = "with-rocksdb")]
 use uuid::Uuid;
 
@@ -37,7 +41,7 @@ use crate::util::{build as util_build_key, UtilComponent, read_uuid, read_identi
 #[cfg(feature = "with-rocksdb")]
 use std::io::Cursor;
 #[cfg(feature = "with-rocksdb")]
-use log::info; // Added for logging
+use log::{info, debug, error, warn};
 
 #[cfg(feature = "with-rocksdb")]
 const CF_NAMES: &[&str] = &[
@@ -49,17 +53,47 @@ const CF_NAMES: &[&str] = &[
 
 #[cfg(feature = "with-rocksdb")]
 #[derive(Debug)]
-pub struct RocksdbGraphStorage {
+pub struct RocksdbStorage {
     db: Arc<DB>,
 }
 
 #[cfg(feature = "with-rocksdb")]
-impl RocksdbGraphStorage {
-    pub fn new(config: &StorageConfig) -> GraphResult<Self> {
-        let path = Path::new(&config.data_directory);
+impl RocksdbStorage {
+    /// Constructs a new `RocksdbStorage` instance from a `RocksdbConfig`.
+    /// This function is updated to directly use the specific RocksDB configuration
+    /// object, resolving the type mismatch error.
+    pub fn new(config: &RocksdbConfig) -> GraphResult<Self> {
+        info!("--- Loading RocksDB configuration ---");
+        println!("Initializing Rocksdb STEP 1");
+        let path = &config.path;
+        info!("  ✅ Path: {:?}", path);
+        info!("  ✅ Host: {:?}", config.host);
+        info!("  ✅ Port: {:?}", config.port);
+
+
+        println!("  ✅ Path: {:?}", path);
+        println!("  ✅ Host: {:?}", config.host);
+        println!("  ✅ Port: {:?}", config.port);
+
+        debug!("Opening RocksDB at path: {:?}", path);
+
+        if !path.exists() {
+            warn!("RocksDB path does not exist, attempting to create: {:?}", path);
+            std::fs::create_dir_all(path)
+                .map_err(|e| {
+                    error!("Failed to create directory {:?}: {}", path, e);
+                    GraphError::StorageError(format!("Failed to create RocksDB directory: {}", e))
+                })?;
+        }
+        if !path.is_dir() {
+            error!("RocksDB path is not a directory: {:?}", path);
+            return Err(GraphError::StorageError(format!("RocksDB path is not a directory: {:?}", path)));
+        }
+        println!("Initializing Rocksdb STEP 2");
         let mut options = Options::default();
         options.create_if_missing(true);
-        options.set_max_open_files(config.max_open_files.unwrap_or(-1));
+        // The RocksdbConfig does not have `max_open_files`, so we set it to a reasonable default.
+        options.set_max_open_files(-1);
         options.set_compaction_style(DBCompactionStyle::Level);
         options.set_write_buffer_size(67_108_864);
         options.set_max_write_buffer_number(3);
@@ -71,32 +105,75 @@ impl RocksdbGraphStorage {
         options.set_max_bytes_for_level_base(536_870_912);
         options.set_max_bytes_for_level_multiplier(8.0);
 
-        let cf_descriptors: Vec<ColumnFamilyDescriptor> = CF_NAMES
-            .iter()
-            .map(|&name| ColumnFamilyDescriptor::new(name, Options::default()))
-            .collect();
-
-        let db = match DB::open_cf_descriptors(&options, path, cf_descriptors) {
-            Ok(db) => db,
-            Err(e) => {
-                if e.to_string().contains("corruption") {
-                    log::warn!("Detected RocksDB corruption at {:?}", path);
-                    Self::recover_rocksdb(path)?;
-                    DB::open_cf_descriptors(&options, path, cf_descriptors)
-                        .map_err(|e| GraphError::StorageError(format!("Failed to open RocksDB after recovery: {}", e)))?
-                } else {
-                    let mut db = DB::open(&options, path)
-                        .map_err(|e| GraphError::StorageError(format!("Failed to open RocksDB (initial): {}", e)))?;
-                    for cf_name in CF_NAMES {
-                        db.create_cf(cf_name, &Options::default())
-                            .map_err(|e| GraphError::StorageError(format!("Failed to create Column Family {}: {}", cf_name, e)))?;
+        // We will attempt to open the database with a retry mechanism
+        // in case a lock is held by a shutting-down process.
+        let mut db = None;
+        let mut attempt = 0;
+        let max_attempts = 5;
+        let base_delay_ms = 100;
+        println!("Initializing Rocksdb STEP 3");
+        while attempt < max_attempts {
+            // Recreate the ColumnFamilyDescriptor vector on each attempt
+            // because `DB::open_cf_descriptors` consumes it (takes ownership).
+            let cf_descriptors: Vec<ColumnFamilyDescriptor> = CF_NAMES
+                .iter()
+                .map(|&name| ColumnFamilyDescriptor::new(name, Options::default()))
+                .collect();
+            
+            let open_result = DB::open_cf_descriptors(&options, path, cf_descriptors);
+            
+            match open_result {
+                
+                Ok(db_instance) => {
+                    info!("Successfully opened RocksDB at {:?}", path);
+                    db = Some(db_instance);
+                    break;
+                },
+                Err(e) => {
+                    error!("Failed to open RocksDB at {:?}: {}", path, e);
+                    // Check for the specific lock error.
+                    if e.to_string().contains("lock hold by current process") {
+                        warn!("Detected RocksDB lock error. Attempt {} of {}. Retrying after a short delay.", attempt + 1, max_attempts);
+                        sleep(Duration::from_millis(base_delay_ms * (attempt as u64 + 1)));
+                        attempt += 1;
+                        continue;
                     }
-                    db
+                    // Handle other error cases as before.
+                    if e.to_string().contains("Column family not found") {
+                        warn!("Detected missing column families. Reopening DB to create them.");
+                        let mut db_recreate = DB::open(&options, path)
+                            .map_err(|e| GraphError::StorageError(format!("Failed to open RocksDB (initial): {}", e)))?;
+                        for cf_name in CF_NAMES {
+                            db_recreate.create_cf(cf_name, &Options::default())
+                                .map_err(|e| GraphError::StorageError(format!("Failed to create Column Family {}: {}", cf_name, e)))?;
+                        }
+                        info!("Created new RocksDB instance and column families at {:?}", path);
+                        db = Some(db_recreate);
+                        break;
+                    } else if e.to_string().contains("corruption") {
+                        warn!("Detected RocksDB corruption at {:?}", path);
+                        Self::recover_rocksdb(path)?;
+                        // Recreate cf_descriptors to avoid moved value error
+                        let cf_descriptors_recreate: Vec<ColumnFamilyDescriptor> = CF_NAMES
+                            .iter()
+                            .map(|&name| ColumnFamilyDescriptor::new(name, Options::default()))
+                            .collect();
+                        db = Some(DB::open_cf_descriptors(&options, path, cf_descriptors_recreate)
+                            .map_err(|e| GraphError::StorageError(format!("Failed to open RocksDB after recovery: {}", e)))?);
+                        break;
+                    } else {
+                        return Err(GraphError::StorageError(format!("Unhandled RocksDB open error: {}", e)));
+                    }
                 }
             }
-        };
-
-        Ok(RocksdbGraphStorage { db: Arc::new(db) })
+        }
+        println!("Initializing Rocksdb STEP 4");
+        // If after all attempts we still don't have a DB instance, return an error.
+        let db = db.ok_or_else(|| {
+            GraphError::StorageError("Failed to open RocksDB after multiple attempts due to lock error.".to_string())
+        })?;
+        println!("Initializing Rocksdb STEP 5");
+        Ok(RocksdbStorage { db: Arc::new(db) })
     }
 
     fn cf_handle(&self, cf_name: &str) -> GraphResult<&rocksdb::ColumnFamily> {
@@ -105,48 +182,68 @@ impl RocksdbGraphStorage {
     }
 
     fn recover_rocksdb(path: &Path) -> GraphResult<()> {
-        log::warn!("Attempting to repair RocksDB at {:?}", path);
+        warn!("Attempting to repair RocksDB at {:?}", path);
         let options = Options::default();
-        DB::repair(options, path)
+        DB::repair(&options, path)
             .map_err(|e| GraphError::StorageError(format!("Failed to repair RocksDB: {}", e)))?;
-        log::info!("Successfully repaired RocksDB at {:?}", path);
+        info!("Successfully repaired RocksDB at {:?}", path);
         Ok(())
     }
 }
 
 #[cfg(feature = "with-rocksdb")]
 #[async_trait]
-impl StorageEngine for RocksdbGraphStorage {
+impl StorageEngine for RocksdbStorage {
     async fn connect(&self) -> GraphResult<()> {
         Ok(())
     }
 
-    async fn insert(&self, key: &[u8], value: &[u8]) -> GraphResult<()> {
+    async fn insert(&self, key: Vec<u8>, value: Vec<u8>) -> GraphResult<()> {
         self.db.put(key, value)
             .map_err(|e| GraphError::StorageError(e.to_string()))?;
         Ok(())
     }
 
-    async fn retrieve(&self, key: &[u8]) -> GraphResult<Option<Vec<u8>>> {
+    async fn retrieve(&self, key: &Vec<u8>) -> GraphResult<Option<Vec<u8>>> {
         self.db.get(key)
             .map_err(|e| GraphError::StorageError(e.to_string()))
     }
 
-    async fn delete(&self, key: &[u8]) -> GraphResult<()> {
+    async fn delete(&self, key: &Vec<u8>) -> GraphResult<()> {
         self.db.delete(key)
             .map_err(|e| GraphError::StorageError(e.to_string()))?;
         Ok(())
     }
 
     async fn flush(&self) -> GraphResult<()> {
-        self.db.flush_wal(true).map_err(|e| GraphError::Io(e.into()))?;
+        self.db.flush_wal(true)
+            .map_err(|e| GraphError::StorageError(format!("Failed to flush WAL: {}", e)))?;
         Ok(())
     }
 }
 
 #[cfg(feature = "with-rocksdb")]
 #[async_trait]
-impl GraphStorageEngine for RocksdbGraphStorage {
+impl GraphStorageEngine for RocksdbStorage {
+    async fn clear_data(&self) -> GraphResult<()> {
+        // This is inefficient but functional. A better approach would be to drop and recreate the CFs.
+        info!("Clearing all data from RocksDB");
+        let cf_names_to_clear = ["vertices", "edges", "vertex_properties", "edge_properties"];
+        for cf_name in &cf_names_to_clear {
+            let cf = self.cf_handle(cf_name)?;
+            let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+            let mut batch = WriteBatch::default();
+            for item in iter {
+                let (key, _) = item.map_err(|e| GraphError::StorageError(e.to_string()))?;
+                batch.delete_cf(cf, key);
+            }
+            self.db.write(batch).map_err(|e| GraphError::StorageError(e.to_string()))?;
+            info!("Cleared column family '{}'", cf_name);
+        }
+
+        Ok(())
+    }
+
     fn as_any(&self) -> &dyn Any {
         &*self.db
     }
@@ -156,7 +253,9 @@ impl GraphStorageEngine for RocksdbGraphStorage {
     }
 
     async fn stop(&self) -> GraphResult<()> {
-        self.db.flush_wal(true).map_err(|e| GraphError::Io(e.into()))?;
+        self.db.flush_wal(true)
+            .map_err(|e| GraphError::StorageError(format!("Failed to flush WAL: {}", e)))?;
+        info!("RocksdbStorage stopped");
         Ok(())
     }
 
@@ -164,12 +263,12 @@ impl GraphStorageEngine for RocksdbGraphStorage {
         "RocksDB"
     }
 
-    fn is_running(&self) -> bool {
+    async fn is_running(&self) -> bool {
         true
     }
 
     async fn query(&self, query_string: &str) -> GraphResult<Value> {
-        println!("Executing query against RocksdbGraphStorage: {}", query_string);
+        println!("Executing query against RocksdbStorage: {}", query_string);
         Ok(serde_json::json!({
             "status": "success",
             "query": query_string,
@@ -188,7 +287,7 @@ impl GraphStorageEngine for RocksdbGraphStorage {
         for (prop_name, prop_value) in vertex.properties {
             let prop_key = util_build_key(&[
                 UtilComponent::Uuid(vertex.id.0),
-                UtilComponent::Identifier(Identifier::new(&prop_name).map_err(|e| GraphError::InvalidData(format!("Invalid property name: {}", e)))?),
+                UtilComponent::Identifier(Identifier::new(prop_name).map_err(|e| GraphError::InvalidData(format!("Invalid property name: {}", e)))?),
             ])?;
             let prop_value_bytes = serde_json::to_vec(&prop_value)
                 .map_err(|e| GraphError::SerializationError(e.to_string()))?;
@@ -218,53 +317,51 @@ impl GraphStorageEngine for RocksdbGraphStorage {
                     let prop_name = read_identifier(&mut cursor)?;
                     let prop_value: models::PropertyValue = serde_json::from_slice(&value_bytes)
                         .map_err(|e| GraphError::DeserializationError(e.to_string()))?;
-                    vertex.properties.insert(prop_name.0.0, prop_value);
+                    vertex.properties.insert(prop_name.0.0.to_string(), prop_value);
                 }
             }
         }
         Ok(vertex_opt)
     }
 
+    // Updated to be more efficient. Overwrites the existing vertex and its properties.
     async fn update_vertex(&self, vertex: Vertex) -> GraphResult<()> {
-        self.delete_vertex(&vertex.id.into()).await?;
         self.create_vertex(vertex).await
     }
 
     async fn delete_vertex(&self, id: &Uuid) -> GraphResult<()> {
+        let mut batch = WriteBatch::default();
+        
+        // 1. Delete the vertex itself
         let cf = self.cf_handle("vertices")?;
         let key = id.as_bytes();
-        self.db.delete_cf(cf, key)
-            .map_err(|e| GraphError::StorageError(e.to_string()))?;
-
+        batch.delete_cf(cf, key);
+        
+        // 2. Delete the vertex properties
         let prop_cf = self.cf_handle("vertex_properties")?;
         let prefix = util_build_key(&[UtilComponent::Uuid(*id)])?;
         let iter = self.db.iterator_cf(prop_cf, rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward));
-        let mut batch = WriteBatch::default();
         for item in iter {
             let (key_bytes, _) = item.map_err(|e| GraphError::StorageError(e.to_string()))?;
-            let mut cursor = Cursor::new(&key_bytes);
-            unsafe {
-                let owner_id = read_uuid(&mut cursor)?;
-                if owner_id != *id { break; }
+            // A simple check to ensure we only delete properties for this vertex.
+            if !key_bytes.starts_with(id.as_bytes()) {
+                break;
             }
             batch.delete_cf(prop_cf, key_bytes);
         }
-        self.db.write(batch)?;
-
+        
+        // 3. Delete all edges connected to this vertex (both inbound and outbound)
         let edge_cf = self.cf_handle("edges")?;
-        let mut batch = WriteBatch::default();
-        let prefix_out = create_edge_key(&SerializableUuid(*id), &Identifier::min(), &SerializableUuid(Uuid::min()))?;
-        let iter_out = self.db.iterator_cf(edge_cf, rocksdb::IteratorMode::From(&prefix_out, rocksdb::Direction::Forward));
-        for item in iter_out {
-            let (key_bytes, _) = item.map_err(|e| GraphError::StorageError(e.to_string()))?;
-            let mut cursor = Cursor::new(&key_bytes);
-            unsafe {
-                let current_out_id = read_uuid(&mut cursor)?;
-                if current_out_id != *id { break; }
+        let iter = self.db.iterator_cf(edge_cf, rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (key_bytes, value_bytes) = item.map_err(|e| GraphError::StorageError(e.to_string()))?;
+            let edge = deserialize_edge(&value_bytes)?;
+            if edge.outbound_id.0 == *id || edge.inbound_id.0 == *id {
+                batch.delete_cf(edge_cf, key_bytes);
             }
-            batch.delete_cf(edge_cf, key_bytes);
         }
-        self.db.write(batch)?;
+        
+        self.db.write(batch).map_err(|e| GraphError::StorageError(e.to_string()))?;
         Ok(())
     }
 
@@ -326,8 +423,9 @@ impl GraphStorageEngine for RocksdbGraphStorage {
     }
 
     async fn close(&self) -> GraphResult<()> {
-        self.db.flush_wal(true).map_err(|e| GraphError::Io(e.into()))?;
-        info!("RocksdbGraphStorage closed");
+        self.db.flush_wal(true)
+            .map_err(|e| GraphError::StorageError(format!("Failed to flush WAL: {}", e)))?;
+        info!("RocksdbStorage closed");
         Ok(())
     }
 }

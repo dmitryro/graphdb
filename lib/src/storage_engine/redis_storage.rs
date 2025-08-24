@@ -93,7 +93,7 @@ impl GraphStorageEngine for RedisStorage {
         "redis"
     }
 
-    fn is_running(&self) -> bool {
+    async fn is_running(&self) -> bool {
         true // Redis connection is always considered running
     }
 
