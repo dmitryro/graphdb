@@ -865,25 +865,28 @@ impl fmt::Display for StorageConfig {
 
 impl StorageConfig {
     pub fn load(path: &Path) -> Result<StorageConfig> {
+        // 1. Check if the configuration file exists. If not, create and save a default one.
         if !path.exists() {
-            info!("Config file not found at {:?}, returning default configuration.", path);
+            info!("Config file not found at {:?}, creating default configuration.", path);
             let mut default_config = StorageConfig::default();
             default_config.save().context("Failed to save default config.")?;
             return Ok(default_config);
         }
 
+        // 2. Read the file content.
         let config_content = fs::read_to_string(path)
             .context(format!("Failed to read storage config file: {}", path.display()))?;
         debug!("Raw YAML content from {:?}:\n{}", path, config_content);
 
-        // Try deserializing as StorageConfigWrapper first
+        // 3. Deserialize the configuration. Try the wrapper format first for backward compatibility,
+        // then fall back to direct deserialization if the first attempt fails.
         let mut config: StorageConfig = match serde_yaml::from_str::<StorageConfigWrapper>(&config_content) {
             Ok(wrapper) => {
-                debug!("Deserialized as StorageConfigWrapper: {:?}", wrapper.storage);
+                debug!("Successfully deserialized as StorageConfigWrapper.");
                 wrapper.storage
             }
             Err(e) => {
-                warn!("Failed to parse YAML as StorageConfigWrapper: {}. Falling back to direct StorageConfig deserialization.", e);
+                warn!("Failed to parse YAML as StorageConfigWrapper: {}. Attempting direct deserialization.", e);
                 serde_yaml::from_str(&config_content)
                     .context(format!(
                         "Failed to parse YAML as StorageConfig from file '{}'. Check file format.",
@@ -892,35 +895,44 @@ impl StorageConfig {
             }
         };
 
-        // Log the raw deserialized config for debugging
         debug!("Raw deserialized config: {:?}", config);
 
-        // Synchronize storage_engine_type with engine_specific_config
-        if let Some(engine_config) = &config.engine_specific_config {
+        // 4. Synchronize storage_engine_type with engine_specific_config.
+        if let Some(engine_config) = config.engine_specific_config.clone() {
+            // Check if top-level and engine-specific types are out of sync.
             if config.storage_engine_type != engine_config.storage_engine_type {
                 info!(
-                    "Top-level storage_engine_type ({:?}) does not match engine_specific_config ({:?}). Synchronizing to engine_specific_config.",
+                    "Top-level storage_engine_type ({:?}) does not match engine_specific_config ({:?}). Synchronizing to the engine-specific type.",
                     config.storage_engine_type, engine_config.storage_engine_type
                 );
                 config.storage_engine_type = engine_config.storage_engine_type;
-                // Ensure the path matches the engine_specific_config.storage_engine_type
-                let mut storage = engine_config.storage.clone();
-                storage.path = Some(PathBuf::from(format!(
-                    "{}/{}",
-                    config.data_directory.as_ref().map_or(DEFAULT_DATA_DIRECTORY.to_string(), |p| p.to_string_lossy().to_string()),
-                    engine_config.storage_engine_type.to_string().to_lowercase()
-                )));
-                config.engine_specific_config = Some(SelectedStorageConfig {
-                    storage_engine_type: engine_config.storage_engine_type,
-                    storage,
-                });
+            }
+            // Ensure the path in the engine-specific config is correctly set relative to the data directory.
+            let engine_path_name = config.storage_engine_type.to_string().to_lowercase();
+            let data_dir_path = config.data_directory.as_ref().map_or(
+                PathBuf::from(DEFAULT_DATA_DIRECTORY),
+                |p| p.clone()
+            );
+            
+            let engine_data_path = data_dir_path.join(engine_path_name);
+            
+            if engine_config.storage.path.is_none() || engine_config.storage.path != Some(engine_data_path.clone()) {
+                 info!(
+                    "Engine-specific path was not set or mismatched. Setting path to: {:?}",
+                    engine_data_path
+                );
+                
+                let mut updated_engine_config = engine_config.clone();
+                updated_engine_config.storage.path = Some(engine_data_path);
+                config.engine_specific_config = Some(updated_engine_config);
             }
         } else {
+            // If `engine_specific_config` is missing, create a default one based on the top-level type.
             info!("'engine_specific_config' was missing, setting to default for engine: {:?}", config.storage_engine_type);
             config.engine_specific_config = create_default_engine_specific_config(&config.storage_engine_type);
         }
 
-        // Ensure directories exist
+        // 5. Ensure required directories exist.
         if let Some(ref data_dir) = config.data_directory {
             fs::create_dir_all(data_dir)
                 .context(format!("Failed to create data directory {:?}", data_dir))?;
@@ -932,37 +944,19 @@ impl StorageConfig {
             info!("Ensured log directory exists: {:?}", log_dir);
         }
 
-        // Validate configuration
+        // 6. Final validation.
         let validated_config = ensure_storage_config_is_valid(config);
+        info!("Successfully loaded and validated storage configuration from {:?}", path);
 
         debug!(
-            "Validated config: default_port={}, cluster_range={}, data_directory={:?}, log_directory={:?}, config_root_directory={:?}, storage_engine_type={:?}, engine_specific_config={:?}, max_disk_space_gb={}, min_disk_space_gb={}, use_raft_for_scale={}",
+            "Final validated config: default_port={}, cluster_range={}, data_directory={:?}, log_directory={:?}, storage_engine_type={:?}, engine_specific_config={:?}",
             validated_config.default_port,
             validated_config.cluster_range,
             validated_config.data_directory,
             validated_config.log_directory,
-            validated_config.config_root_directory,
             validated_config.storage_engine_type,
             validated_config.engine_specific_config,
-            validated_config.max_disk_space_gb,
-            validated_config.min_disk_space_gb,
-            validated_config.use_raft_for_scale
         );
-
-        println!(
-            "[DEBUG] => Validated config: default_port={}, cluster_range={}, data_directory={:?}, log_directory={:?}, config_root_directory={:?}, storage_engine_type={:?}, engine_specific_config={:?}, max_disk_space_gb={}, min_disk_space_gb={}, use_raft_for_scale={}",
-            validated_config.default_port,
-            validated_config.cluster_range,
-            validated_config.data_directory,
-            validated_config.log_directory,
-            validated_config.config_root_directory,
-            validated_config.storage_engine_type,
-            validated_config.engine_specific_config,
-            validated_config.max_disk_space_gb,
-            validated_config.min_disk_space_gb,
-            validated_config.use_raft_for_scale
-        );
-        info!("Successfully loaded storage configuration from {:?}", path);
         Ok(validated_config)
     }
 
