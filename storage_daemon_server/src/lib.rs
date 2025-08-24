@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use tokio::sync::oneshot;
 use tokio::sync::mpsc::Sender;
 use tokio::signal;
+use tokio::time::{sleep, Duration};
 
 use lib::storage_engine::{GraphStorageEngine, StorageConfig, StorageEngineType, create_storage};
 use std::sync::{Arc, Mutex};
@@ -562,6 +563,7 @@ pub async fn start_storage_daemon_server_real(
     let storage = match create_storage(&storage_config).await {
         Ok(storage) => {
             info!("[Storage Daemon] Initialized storage backend: {}", settings.storage_engine_type);
+            debug!("[Storage Daemon] Sled initialization step 1: Creating storage");
             storage
         },
         Err(e) => {
@@ -569,9 +571,12 @@ pub async fn start_storage_daemon_server_real(
             return Err(anyhow!("Failed to create storage engine {}: {}", settings.storage_engine_type, e));
         },
     };
+    debug!("[Storage Daemon] Sled initialization step 2: Storage created");
 
     // Initialize Raft if enabled
+    let mut raft_handle = None;
     if settings.use_raft_for_scale {
+        debug!("[Storage Daemon] Sled initialization step 3: Initializing Raft");
         let raft_config = RaftConfig {
             cluster_name: "graphdb-cluster".to_string(),
             heartbeat_interval: 250,
@@ -589,29 +594,89 @@ pub async fn start_storage_daemon_server_real(
             ..Default::default()
         };
         let node_id = 1;
-        let _node = BasicNode { addr: format!("0.0.0.0:{}", port) };
+        let node = BasicNode { addr: format!("0.0.0.0:{}", port) };
         let network = MockRaftNetworkFactory;
         let raft_storage = InMemoryRaftStorage::new(storage.clone());
         let (log_store, state_machine) = Adaptor::new(raft_storage);
-        let _raft = Raft::new(node_id, Arc::new(raft_config.validate()?), network, log_store, state_machine).await?;
+        let raft = Raft::new(node_id, Arc::new(raft_config.validate()?), network, log_store, state_machine).await?;
+        raft_handle = Some(tokio::spawn(async move {
+            info!("[Storage Daemon] Raft cluster initialized, running event loop");
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await; // Simulate Raft loop
+        }));
         info!("[Storage Daemon] Initialized Raft cluster");
+        debug!("[Storage Daemon] Sled initialization step 4: Raft initialized");
     }
 
     // Bind to the port
-    let _listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await
         .with_context(|| format!("Failed to bind storage daemon to port {}", port))?;
     info!("[Storage Daemon] Successfully bound to port {}. Now listening for connections.", port);
 
-    // Placeholder for serving handlers
-    tokio::spawn(async move {
-        // Integrate with handlers.rs, e.g., handlers::serve(storage.clone(), listener).await;
+    // Set up registration and shutdown handling
+    // Fix Option 1: Use a shared state approach
+    let (shutdown_tx, mut shutdown_rx_task) = oneshot::channel();
+    let (registration_tx, mut registration_rx) = oneshot::channel::<()>();
+    let storage_clone = storage.clone();
+
+    let server_handle = tokio::spawn(async move {
+        let mut registration_complete = false;
+        
+        loop {
+            tokio::select! {
+                accept_result = listener.accept() => {
+                    match accept_result {
+                        Ok((stream, addr)) => {
+                            let storage = storage_clone.clone();
+                            tokio::spawn(async move {
+                                info!("[Storage Daemon] Accepted connection from {}", addr);
+                                // Handle storage requests (placeholder)
+                            });
+                        }
+                        Err(e) => {
+                            error!("[Storage Daemon] Failed to accept connection: {}", e);
+                        }
+                    }
+                }
+                _ = &mut registration_rx, if !registration_complete => {
+                    info!("[Storage Daemon] Registration confirmed. Now accepting shutdown signals.");
+                    registration_complete = true;
+                }
+                _ = &mut shutdown_rx_task => {
+                    info!("[Storage Daemon] Shutdown signal received.");
+                    
+                    if !registration_complete {
+                        info!("[Storage Daemon] Waiting for registration or 5s timeout.");
+                        tokio::select! {
+                            _ = &mut registration_rx => {
+                                info!("[Storage Daemon] Registration completed before shutdown.");
+                            }
+                            _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                                warn!("[Storage Daemon] Registration not confirmed within 5s. Proceeding with shutdown.");
+                            }
+                        }
+                    } else {
+                        info!("[Storage Daemon] Registration already complete.");
+                    }
+                    
+                    info!("[Storage Daemon] Exiting server loop.");
+                    break;
+                }
+            }
+        }
     });
 
-    // Set up shutdown handling
-    let (shutdown_tx, _shutdown_rx_task) = oneshot::channel();
+    // Ensure the server keeps running until shutdown
     tokio::spawn(async move {
         shutdown_rx.await.ok();
-        info!("[Storage Daemon] Shutdown signal received. Exiting.");
+        info!("[Storage Daemon] Shutdown signal received. Initiating cleanup.");
+        if let Some(raft_handle) = raft_handle {
+            raft_handle.abort();
+            info!("[Storage Daemon] Raft handle aborted.");
+        }
+        server_handle.abort();
+        info!("[Storage Daemon] Server handle aborted.");
+        // Signal registration completion to allow shutdown
+        let _ = registration_tx.send(());
     });
 
     Ok(StorageDaemon { storage, shutdown_tx })

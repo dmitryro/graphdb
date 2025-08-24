@@ -48,7 +48,7 @@ use crate::cli::config::{
     load_cli_config,
     daemon_api_storage_engine_type_to_string,
 };
-use crate::cli::handlers_utils::{format_engine_config, write_registry_fallback, execute_storage_query, convert_hashmap_to_selected_config};
+use crate::cli::handlers_utils::{format_engine_config, write_registry_fallback, execute_storage_query, convert_hashmap_to_selected_config, retry_operation};
 use daemon_api::start_daemon;
 pub use models::errors::GraphError;
 use lib::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
@@ -457,6 +457,7 @@ pub async fn ensure_storage_daemon_is_running(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn start_storage_interactive(
     port: Option<u16>,
     config_file: Option<PathBuf>,
@@ -480,8 +481,8 @@ pub async fn start_storage_interactive(
     };
     let cli_config = CliConfig::load(Some(command))
         .with_context(|| "Failed to load CLI configuration. Check file permissions or path.")?;
+    info!("SUCCESS: CLI config loaded: {:?}", cli_config);
     println!("SUCCESS: CLI config loaded.");
-    trace!("CLI config loaded: {:?}", cli_config);
 
     // --- STEP 2: DETERMINE CONFIG FILE PATH ---
     let get_config_path = |cli_config_file: Option<PathBuf>| {
@@ -498,14 +499,12 @@ pub async fn start_storage_interactive(
     };
     debug!("Determined config path: {:?}", config_path);
     println!("==> STARTING STORAGE - STEP 3");
-    
+
     // --- STEP 3: LOAD STORAGE CONFIGURATION ---
     let mut storage_config = if let Some(config) = new_config {
-        // New logic: If a config object is provided, use it directly.
         info!("Using provided StorageConfig object, ignoring config_file.");
         config
     } else {
-        // Original logic: If no config object is provided, load from file.
         match load_storage_config_from_yaml(Some(config_path.clone())) {
             Ok(config) => {
                 debug!("Loaded storage config from {:?}", config_path);
@@ -534,8 +533,8 @@ pub async fn start_storage_interactive(
     }
     info!("Loaded Storage Config: {:?}", storage_config);
     info!("Storage engine type from config: {:?}", storage_config.storage_engine_type);
-
     println!("==> STARTING STORAGE - STEP 3.1");
+
     // --- STEP 3.1: LOAD ENGINE-SPECIFIC CONFIG IF MISSING ---
     if storage_config.engine_specific_config.is_none() {
         let engine_specific_config_path = match daemon_api_storage_engine_type_to_string(&storage_config.storage_engine_type).to_lowercase().as_str() {
@@ -552,18 +551,14 @@ pub async fn start_storage_interactive(
                 debug!("Loading engine-specific config from {:?}", engine_config_path);
                 match load_storage_config_from_yaml(Some(engine_config_path.clone())) {
                     Ok(engine_config) => {
-                        // Handle data_directory override case
                         if let Some(data_directory) = engine_config.data_directory {
                             match engine_config.engine_specific_config {
                                 Some(mut engine_specific) => {
-                                    // Override path with data_directory and use other fields from engine_specific_config
                                     engine_specific.storage.path = Some(data_directory);
                                     storage_config.engine_specific_config = Some(engine_specific);
                                 }
                                 None => {
-                                    // Create new config with just the data_directory path
                                     storage_config.engine_specific_config = Some(SelectedStorageConfig {
-                                        // The fix: Add the missing storage_engine_type field.
                                         storage_engine_type: storage_config.storage_engine_type,
                                         storage: StorageConfigInner {
                                             path: Some(data_directory),
@@ -577,7 +572,6 @@ pub async fn start_storage_interactive(
                                 }
                             }
                         } else {
-                            // No data_directory, just use engine_specific_config as-is
                             storage_config.engine_specific_config = engine_config.engine_specific_config;
                         }
                         info!("Merged engine-specific config from {:?}", engine_config_path);
@@ -597,7 +591,7 @@ pub async fn start_storage_interactive(
             }
         }
     }
-    
+
     // --- STEP 3.2: HANDLE --permanent FLAG FOR STORAGE ENGINE TYPE ---
     let is_permanent = matches!(
         &cli_config.command,
@@ -609,7 +603,7 @@ pub async fn start_storage_interactive(
         info!("Updated storage config to use rocksdb; persistence will be handled by storage engine manager");
     }
     println!("==> STARTING STORAGE - STEP 4");
-    
+
     // --- STEP 4: DETERMINE PORT ---
     let selected_port = port.or_else(|| {
         match &cli_config.command {
@@ -621,9 +615,9 @@ pub async fn start_storage_interactive(
     }).unwrap_or(storage_config.default_port);
 
     info!("===> SELECTED PORT {}", selected_port);
-
     println!("==> STARTING STORAGE - STEP 5");
-    // --- STEP 5: START STORAGE DAEMON ---
+
+    // --- STEP 5: START STORAGE DAEMON WITH RETRY ---
     let ip = "127.0.0.1";
     let ip_addr: IpAddr = ip.parse().with_context(|| format!("Invalid IP address: {}", ip))?;
     let addr = SocketAddr::new(ip_addr, selected_port);
@@ -652,17 +646,13 @@ pub async fn start_storage_interactive(
     let engine_type = daemon_api_storage_engine_type_to_string(&storage_config.storage_engine_type);
     debug!("Converted engine_type: {}", engine_type);
     println!("==> STARTING STORAGE - STEP 5.2 {}", engine_type);
-    debug!("Calling start_daemon with port: {:?}", Some(selected_port));
 
-    // --- FIX: Map the server::StorageConfig to the lib::StorageConfig ---
+    // Map server::StorageConfig to lib::StorageConfig
     let lib_storage_config = {
         let engine_specific_config_map: Option<HashMap<String, serde_json::Value>> =
             if let Some(selected_config) = storage_config.engine_specific_config.clone() {
-                // Directly serialize the struct to serde_json::Value
                 let json_value = serde_json::to_value(&selected_config)
                     .context("Failed to serialize SelectedStorageConfig to JSON Value")?;
-                
-                // Convert the serde_json::Value object to a HashMap if it's an object
                 if let serde_json::Value::Object(map) = json_value {
                     Some(map.into_iter().collect())
                 } else {
@@ -672,17 +662,12 @@ pub async fn start_storage_interactive(
                 None
             };
 
-        // Safely unwrap the Option<PathBuf> fields, providing a default if None
         let config_root_directory = storage_config.config_root_directory.clone()
             .unwrap_or_else(|| PathBuf::from("./storage_daemon_server"));
-            
         let data_directory = storage_config.data_directory.clone()
             .unwrap_or_else(|| PathBuf::from("./data"));
-
-        // Correctly cast and unwrap max_open_files
         let max_open_files_i32: Option<i32> = Some(storage_config.max_open_files as i32);
-            
-        // Now, create the lib::StorageConfig with all required fields
+
         lib::StorageConfig {
             storage_engine_type: storage_config.storage_engine_type.clone(),
             engine_specific_config: engine_specific_config_map,
@@ -702,15 +687,66 @@ pub async fn start_storage_interactive(
     let daemon_config = map_cli_config_to_daemon_config(&storage_config)?;
     let daemon_config_string = serde_yaml::to_string(&daemon_config)
         .context("Failed to serialize daemon config to YAML")?;
-    
-    start_daemon(
-        Some(selected_port),
-        Some(daemon_config_string), // Correctly pass the serialized DaemonConfig string
-        vec![],
-        "storage",
-        Some(lib_storage_config), // Correctly pass the lib::StorageConfig object
-    ).await
-        .with_context(|| format!("Failed to start storage daemon on port {}", selected_port))?;
+
+    // Retry start_daemon with health check
+    let max_attempts = 3;
+    let retry_interval = Duration::from_millis(1000);
+    let health_check_timeout = Duration::from_secs(15);
+    let poll_interval = Duration::from_millis(500);
+    let mut pid = None;
+
+    for attempt in 1..=max_attempts {
+        debug!("Attempt {}/{} to start storage daemon on port {}", attempt, max_attempts, selected_port);
+        match start_daemon(
+            Some(selected_port),
+            Some(daemon_config_string.clone()),
+            vec![],
+            "storage",
+            Some(lib_storage_config.clone()),
+        ).await {
+            Ok(_) => {
+                // Early health check
+                let start_time = tokio::time::Instant::now();
+                while start_time.elapsed() < health_check_timeout {
+                    if tokio::net::TcpStream::connect(&addr).await.is_ok() {
+                        debug!("Storage daemon passed early health check on port {}", selected_port);
+                        match find_pid_by_port(selected_port).await {
+                            Some(p) if p > 0 => {
+                                pid = Some(p);
+                                info!("Storage daemon started with PID {} on port {}", p, selected_port);
+                                break;
+                            }
+                            _ => {
+                                debug!("No valid PID found for port {} during health check", selected_port);
+                            }
+                        }
+                    }
+                    debug!("Health check attempt for port {} (elapsed: {:?})", selected_port, start_time.elapsed());
+                    tokio::time::sleep(poll_interval).await;
+                }
+                if pid.is_some() {
+                    break;
+                } else {
+                    warn!("Storage daemon on port {} failed health check on attempt {}/{}", selected_port, attempt, max_attempts);
+                }
+            }
+            Err(e) => {
+                warn!("Storage daemon start attempt {}/{} failed on port {}: {}", attempt, max_attempts, selected_port, e);
+                if attempt < max_attempts {
+                    info!("Retrying storage daemon startup in {:?}", retry_interval);
+                    tokio::time::sleep(retry_interval).await;
+                }
+            }
+        }
+    }
+
+    let pid = match pid {
+        Some(p) => p,
+        None => {
+            error!("Failed to start storage daemon on port {} after {} attempts", selected_port, max_attempts);
+            return Err(anyhow!("Failed to start storage daemon on port {} after {} attempts", selected_port, max_attempts));
+        }
+    };
 
     println!("==> STARTING STORAGE - STEP 6");
     // --- STEP 6: INITIALIZE STORAGE ENGINE MANAGER ---
@@ -721,7 +757,7 @@ pub async fn start_storage_interactive(
         if let Err(e) = locked_manager.shutdown().await {
             warn!("Failed to shutdown existing StorageEngineManager: {}", e);
         }
-        drop(locked_manager); // Explicitly drop to release the mutex
+        drop(locked_manager);
         trace!("Released lock on existing storage engine manager");
     } else {
         trace!("GLOBAL_STORAGE_ENGINE_MANAGER not yet initialized, nothing to clear");
@@ -742,40 +778,22 @@ pub async fn start_storage_interactive(
             anyhow!("Failed to create StorageEngineManager: {}", e)
         })?;
 
-    // Unwrap Arc<StorageEngineManager> to get StorageEngineManager for from_manager
     let unwrapped_manager = Arc::try_unwrap(manager)
         .map_err(|_| anyhow!("Failed to unwrap Arc<StorageEngineManager>: multiple references exist"))?;
-    // FIX HERE: Do not wrap unwrapped_manager in an Arc again
     let async_manager = AsyncStorageEngineManager::from_manager(unwrapped_manager);
     GLOBAL_STORAGE_ENGINE_MANAGER.set(Arc::new(async_manager))
         .map_err(|_| anyhow!("Failed to set StorageEngineManager"))?;
     trace!("GLOBAL_STORAGE_ENGINE_MANAGER has been initialized");
     info!("Initialized StorageEngineManager with engine type: {:?}", storage_config.storage_engine_type);
-    trace!("StorageEngineManager initialized with config: {:?}", storage_config);
 
-    // Update DaemonMetadata with correct engine_type and data_dir from StorageEngineManager
+    println!("==> STARTING STORAGE - STEP 7");
+    // --- STEP 7: REGISTER DAEMON ---
     let manager = GLOBAL_STORAGE_ENGINE_MANAGER
         .get()
         .ok_or_else(|| anyhow!("StorageEngineManager not initialized"))?;
     let engine_type = manager.current_engine_type().await;
     let current_data_path = manager.get_current_engine_data_path().await;
     let engine_type_str = daemon_api_storage_engine_type_to_string(&engine_type);
-    println!("==> STARTING STORAGE - STEP 7");
-    
-    // --- STEP 7: REGISTER DAEMON ---
-    let pid = match find_pid_by_port(selected_port).await {
-        Some(p) if p > 0 => p,
-        _ => {
-            log::warn!("No valid PID found via lsof for port {}. Checking registry.", selected_port);
-            match GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(selected_port).await {
-                Ok(Some(metadata)) if metadata.service_type == "storage" => metadata.pid,
-                _ => {
-                    log::error!("Failed to find PID for Storage Daemon on port {}.", selected_port);
-                    return Err(anyhow!("Failed to find PID for Storage Daemon on port {}. Ensure the process is binding to the port.", selected_port));
-                }
-            }
-        }
-    };
 
     let metadata = DaemonMetadata {
         service_type: "storage".to_string(),
@@ -788,34 +806,10 @@ pub async fn start_storage_interactive(
         last_seen_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
     };
 
-    async fn retry_operation<F, Fut, T>(operation: F, max_attempts: u8, desc: &str) -> Result<T, anyhow::Error>
-    where
-        F: Fn() -> Fut,
-        Fut: std::future::Future<Output = Result<T, anyhow::Error>>,
-    {
-        for attempt in 0..max_attempts {
-            match operation().await {
-                Ok(result) => {
-                    debug!("Successfully completed {} on attempt {}", desc, attempt + 1);
-                    return Ok(result);
-                }
-                Err(e) => {
-                    error!("Failed to {} (attempt {}/{}): {}", desc, attempt + 1, max_attempts, e);
-                    if attempt + 1 >= max_attempts {
-                        return Err(e).context(format!("Failed to {} after {} attempts", desc, max_attempts));
-                    }
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                }
-            }
-        }
-        unreachable!()
-    }
-
     let fallback_path = PathBuf::from("/tmp/graphdb/daemon_registry_fallback.json");
     let fallback_dir = fallback_path.parent().ok_or_else(|| anyhow!("Invalid fallback path: {:?}", fallback_path))?;
 
     retry_operation(|| async {
-        // Fix: Use tokio::fs instead of std::fs, and remove .await from non-async function
         tokio::fs::create_dir_all(fallback_dir).await.map_err(anyhow::Error::from)
     }, 3, "create fallback directory").await?;
 
@@ -847,11 +841,8 @@ pub async fn start_storage_interactive(
     fs2::FileExt::unlock(&lock_file).with_context(|| format!("Failed to release lock on {:?}", lock_path))?;
     let _ = std::fs::remove_file(&lock_path);
 
-    // --- STEP 8: HEALTH CHECK ---
-    let health_check_timeout = Duration::from_secs(15);
-    let poll_interval = Duration::from_millis(500);
+    // --- STEP 8: FINAL HEALTH CHECK ---
     let start_time = tokio::time::Instant::now();
-
     while start_time.elapsed() < health_check_timeout {
         if tokio::net::TcpStream::connect(&addr).await.is_ok() {
             info!("Completed storage daemon health check on port {} (PID {}) with engine type {}", selected_port, pid, engine_type_str);
@@ -866,10 +857,11 @@ pub async fn start_storage_interactive(
             debug!("Completed storage daemon startup");
             return Ok(());
         }
+        debug!("Final health check attempt for port {} (elapsed: {:?}", selected_port, start_time.elapsed());
         tokio::time::sleep(poll_interval).await;
     }
 
-    error!("Storage daemon on port {} failed to become reachable within {} seconds", selected_port, health_check_timeout.as_secs());
+    error!("Storage daemon on port {} failed final health check after {} seconds", selected_port, health_check_timeout.as_secs());
     Err(anyhow!("Storage daemon failed to start on port {}", selected_port))
 }
 

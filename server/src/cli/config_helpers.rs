@@ -686,8 +686,6 @@ pub fn load_storage_config_from_yaml(config_file_path: Option<PathBuf>) -> Resul
 
     // Log the final validated configuration
     debug!("Final validated configuration: {:?}", config);
-    println!("FINAL CONFIGURATION ==> {:?}", config);
-
     Ok(config)
 }
 

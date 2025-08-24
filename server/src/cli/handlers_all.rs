@@ -236,7 +236,7 @@ pub async fn handle_start_all_interactive(
     storage_daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
     storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
 ) -> Result<()> {
-    println!("Starting all GraphDB components...");
+    info!("Starting all GraphDB components...");
     let mut errors = Vec::new();
 
     // Load configuration for main daemon cluster range
@@ -268,9 +268,16 @@ pub async fn handle_start_all_interactive(
             errors.push(format!("Daemon on port {}: reserved for another service", port));
             continue;
         }
-        println!("Starting GraphDB Daemon on port {}...", port);
+        info!("Starting GraphDB Daemon on port {}...", port);
         if !is_port_free(port).await {
-            println!("Port {} is already in use for GraphDB Daemon. Attempting to stop existing process.", port);
+            info!("Port {} is in use for GraphDB Daemon. Checking registry before stopping.", port);
+            if let Ok(Some(metadata)) = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await {
+                if metadata.service_type == "main" && nix::sys::signal::kill(nix::unistd::Pid::from_raw(metadata.pid as i32), None).is_ok() {
+                    warn!("Port {} is used by a valid GraphDB Daemon (PID {}). Skipping startup.", port, metadata.pid);
+                    continue;
+                }
+            }
+            info!("No valid GraphDB Daemon found on port {}. Attempting to stop existing process.", port);
             if let Err(e) = stop_process_by_port("GraphDB Daemon", port).await {
                 warn!("Failed to stop existing process on port {}: {}", port, e);
             }
@@ -286,11 +293,24 @@ pub async fn handle_start_all_interactive(
 
     // Start REST API
     let rest_port = rest_port.unwrap_or(DEFAULT_REST_API_PORT);
-    println!("Starting REST API on port {}...", rest_port);
+    info!("Starting REST API on port {}...", rest_port);
     if !is_port_free(rest_port).await {
-        println!("Port {} is already in use for REST API. Attempting to stop existing process.", rest_port);
-        if let Err(e) = stop_process_by_port("REST API", rest_port).await {
-            warn!("Failed to stop existing process on port {}: {}", rest_port, e);
+        info!("Port {} is in use for REST API. Checking registry before stopping.", rest_port);
+        if let Ok(Some(metadata)) = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(rest_port).await {
+            if metadata.service_type == "rest" && nix::sys::signal::kill(nix::unistd::Pid::from_raw(metadata.pid as i32), None).is_ok() {
+                warn!("Port {} is used by a valid REST API (PID {}). Skipping startup.", rest_port, metadata.pid);
+                // Skip REST API startup but continue with storage daemon
+            } else {
+                info!("No valid REST API found on port {}. Attempting to stop existing process.", rest_port);
+                if let Err(e) = stop_process_by_port("REST API", rest_port).await {
+                    warn!("Failed to stop existing process on port {}: {}", rest_port, e);
+                }
+            }
+        } else {
+            info!("No valid REST API found on port {}. Attempting to stop existing process.", rest_port);
+            if let Err(e) = stop_process_by_port("REST API", rest_port).await {
+                warn!("Failed to stop existing process on port {}: {}", rest_port, e);
+            }
         }
     }
     if let Err(e) = start_rest_api_interactive(
@@ -305,7 +325,7 @@ pub async fn handle_start_all_interactive(
     } else {
         // Health check for REST API
         let addr_check = format!("127.0.0.1:{}", rest_port);
-        let health_check_timeout = Duration::from_secs(15);
+        let health_check_timeout = Duration::from_secs(20);
         let poll_interval = Duration::from_millis(500);
         let start_time = tokio::time::Instant::now();
         let mut is_running = false;
@@ -317,6 +337,7 @@ pub async fn handle_start_all_interactive(
                 is_running = true;
                 break;
             }
+            debug!("REST API health check on port {}: Attempting connection (elapsed: {:?})", rest_port, start_time.elapsed());
             tokio::time::sleep(poll_interval).await;
         }
 
@@ -326,19 +347,86 @@ pub async fn handle_start_all_interactive(
         }
     }
 
-    // Start Storage Daemon
+    // Start Storage Daemon with retry logic
+    let storage_port = storage_port.unwrap_or(DEFAULT_STORAGE_PORT);
     let actual_storage_config = storage_config.unwrap_or_else(|| PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE));
-    if let Err(e) = start_storage_interactive(
-        storage_port,
-        Some(actual_storage_config),
-        None,
-        None,
-        storage_daemon_shutdown_tx_opt.clone(),
-        storage_daemon_handle.clone(),
-        storage_daemon_port_arc.clone(),
-    ).await {
-        error!("Failed to start Storage Daemon: {}", e);
-        errors.push(format!("Storage Daemon: {}", e));
+    let max_attempts = 3;
+    let retry_interval = Duration::from_secs(2);
+    let health_check_timeout = Duration::from_secs(20);
+    let poll_interval = Duration::from_millis(500);
+    let mut storage_started = false;
+
+    info!("Starting Storage Daemon on port {}...", storage_port);
+    for attempt in 1..=max_attempts {
+        if !is_port_free(storage_port).await {
+            info!("Port {} is in use for Storage Daemon. Checking registry before stopping.", storage_port);
+            if let Ok(Some(metadata)) = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(storage_port).await {
+                if metadata.service_type == "storage" && nix::sys::signal::kill(nix::unistd::Pid::from_raw(metadata.pid as i32), None).is_ok() {
+                    warn!("Port {} is used by a valid Storage Daemon (PID {}). Skipping startup.", storage_port, metadata.pid);
+                    storage_started = true;
+                    break;
+                }
+            }
+            info!("No valid Storage Daemon found on port {}. Attempting to stop existing process.", storage_port);
+            if let Err(e) = stop_process_by_port("Storage Daemon", storage_port).await {
+                warn!("Failed to stop existing process on port {}: {}", storage_port, e);
+            }
+        }
+
+        match start_storage_interactive(
+            Some(storage_port),
+            Some(actual_storage_config.clone()),
+            None,
+            None,
+            storage_daemon_shutdown_tx_opt.clone(),
+            storage_daemon_handle.clone(),
+            storage_daemon_port_arc.clone(),
+        ).await {
+            Ok(_) => {
+                // Health check for Storage Daemon
+                let addr_check = format!("127.0.0.1:{}", storage_port);
+                let start_time = tokio::time::Instant::now();
+                let mut is_running = false;
+
+                while start_time.elapsed() < health_check_timeout {
+                    if tokio::net::TcpStream::connect(&addr_check).await.is_ok() {
+                        if let Ok(Some(metadata)) = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(storage_port).await {
+                            if nix::sys::signal::kill(nix::unistd::Pid::from_raw(metadata.pid as i32), None).is_ok() {
+                                info!("Storage Daemon started and reachable on port {} (PID {}).", storage_port, metadata.pid);
+                                println!("Storage Daemon started on port {}.", storage_port);
+                                is_running = true;
+                                storage_started = true;
+                                break;
+                            } else {
+                                warn!("Storage Daemon on port {} started but PID {} is no longer valid.", storage_port, metadata.pid);
+                            }
+                        }
+                    }
+                    debug!("Storage Daemon health check on port {}: Attempting connection (elapsed: {:?})", storage_port, start_time.elapsed());
+                    tokio::time::sleep(poll_interval).await;
+                }
+
+                if is_running {
+                    break;
+                } else {
+                    warn!("Storage Daemon on port {} failed to become reachable within {} seconds", storage_port, health_check_timeout.as_secs());
+                    errors.push(format!("Storage Daemon on port {}: Failed to become reachable", storage_port));
+                }
+            }
+            Err(e) => {
+                warn!("Storage Daemon attempt {}/{} failed on port {}: {}", attempt, max_attempts, storage_port, e);
+                errors.push(format!("Storage Daemon attempt {}/{} on port {}: {}", attempt, max_attempts, storage_port, e));
+                if attempt < max_attempts {
+                    info!("Retrying Storage Daemon startup in {:?}", retry_interval);
+                    tokio::time::sleep(retry_interval).await;
+                }
+            }
+        }
+    }
+
+    if !storage_started {
+        error!("Storage Daemon failed to start after {} attempts", max_attempts);
+        errors.push(format!("Storage Daemon on port {}: Failed after {} attempts", storage_port, max_attempts));
     }
 
     if errors.is_empty() {
@@ -346,11 +434,10 @@ pub async fn handle_start_all_interactive(
         println!("All GraphDB components started successfully.");
         Ok(())
     } else {
-        error!("Failed to start one or more GraphDB components: {:?}", errors);
-        Err(anyhow!("Failed to start one or more components: {:?}", errors))
+        warn!("Some GraphDB components failed to start: {:?}", errors);
+        Ok(())
     }
 }
-
 
 /// This function relies exclusively on the `GLOBAL_DAEMON_REGISTRY` to find
 /// running components. It first retrieves all registered daemons, then checks

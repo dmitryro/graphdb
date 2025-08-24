@@ -303,9 +303,7 @@ r#"storage:
     }
 
     pub fn validate(self) -> Result<Self, GraphError> {
-        println!("DEBUG: Validating StorageConfig: {:?}", self);
         let available_engines = StorageEngineManager::available_engines();
-        println!("DEBUG: Available engines: {:?}", available_engines);
         if !available_engines.contains(&self.storage_engine_type) {
             println!("DEBUG: Invalid engine type: {:?}", self.storage_engine_type);
             return Err(GraphError::InvalidStorageEngine(format!(
@@ -331,7 +329,6 @@ r#"storage:
             println!("DEBUG: Invalid cluster_range: {}", self.cluster_range);
             return Err(GraphError::ConfigurationError("cluster_range must be non-empty".to_string()));
         }
-        println!("DEBUG: Validation passed for StorageConfig: {:?}", self);
         Ok(self)
     }
 }

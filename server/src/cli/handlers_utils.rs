@@ -4,6 +4,7 @@ use std::io::{self, Write};
 use std::collections::HashMap;
 use std::fs;
 use log::{info, error, warn, debug};
+use tokio::time::{sleep, Duration};
 use serde_json::{self, Value};
 use crate::cli::commands::{CommandType, ShowAction,  ConfigAction};
 use crate::cli::config::{StorageConfig, SelectedStorageConfig, daemon_api_storage_engine_type_to_string, DAEMON_REGISTRY_DB_PATH};
@@ -33,6 +34,29 @@ pub fn convert_hashmap_to_selected_config(
         .context("Failed to deserialize JSON to SelectedStorageConfig")?;
     
     Ok(selected_config)
+}
+
+pub async fn retry_operation<F, Fut, T>(operation: F, max_attempts: u8, desc: &str) -> Result<T>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T, anyhow::Error>>,
+{
+    for attempt in 0..max_attempts {
+        match operation().await {
+            Ok(result) => {
+                log::debug!("Successfully completed {} on attempt {}", desc, attempt + 1);
+                return Ok(result);
+            }
+            Err(e) => {
+                log::error!("Failed to {} (attempt {}/{}): {}", desc, attempt + 1, max_attempts, e);
+                if attempt + 1 >= max_attempts {
+                    return Err(e).context(format!("Failed to {} after {} attempts", desc, max_attempts));
+                }
+                sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
+    unreachable!()
 }
 
 /// Helper function to format engine-specific configuration details

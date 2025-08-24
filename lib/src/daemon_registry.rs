@@ -723,3 +723,4 @@ async fn emergency_cleanup_daemon_registry_internal(db_path: &PathBuf) -> Result
     info!("Finished emergency cleanup of daemon registry");
     Ok(())
 }
+

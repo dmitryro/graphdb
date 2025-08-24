@@ -231,7 +231,7 @@ impl SledStorage {
         // Check for processes using the database directory
         #[cfg(unix)]
         {
-            Self::kill_processes_using_path(path).await?;
+            //Self::kill_processes_using_path(path).await?;
         }
 
         // Try to break file locks using flock
