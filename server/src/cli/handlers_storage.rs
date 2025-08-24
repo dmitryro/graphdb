@@ -747,48 +747,6 @@ pub async fn start_storage_interactive(
             return Err(anyhow!("Failed to start storage daemon on port {} after {} attempts", selected_port, max_attempts));
         }
     };
-/*
-    println!("==> STARTING STORAGE - STEP 6");
-    // --- STEP 6: INITIALIZE STORAGE ENGINE MANAGER ---
-    trace!("Clearing GLOBAL_STORAGE_ENGINE_MANAGER before initialization");
-    if let Some(manager) = GLOBAL_STORAGE_ENGINE_MANAGER.get() {
-        let mutex = manager.get_manager();
-        let mut locked_manager = mutex.lock().await;
-        if let Err(e) = locked_manager.shutdown().await {
-            warn!("Failed to shutdown existing StorageEngineManager: {}", e);
-        }
-        drop(locked_manager);
-        trace!("Released lock on existing storage engine manager");
-    } else {
-        trace!("GLOBAL_STORAGE_ENGINE_MANAGER not yet initialized, nothing to clear");
-    }
-
-    trace!("Checking current GLOBAL_STORAGE_ENGINE_MANAGER state: {:?}", GLOBAL_STORAGE_ENGINE_MANAGER.get());
-    let manager = StorageEngineManager::new(storage_config.storage_engine_type.clone(), &config_path, is_permanent).await
-        .map_err(|e| {
-            error!("Failed to create StorageEngineManager with config path {:?}: {}", config_path, e);
-            if config_path.exists() {
-                match std::fs::read_to_string(&config_path) {
-                    Ok(content) => error!("Config file content: {}", content),
-                    Err(e) => error!("Config file exists but cannot be read at {:?}: {}", config_path, e),
-                }
-            } else {
-                error!("Config file does not exist at {:?}", config_path);
-            }
-            anyhow!("Failed to create StorageEngineManager: {}", e)
-        })?;
-
-    let unwrapped_manager = Arc::try_unwrap(manager)
-        .map_err(|_| anyhow!("Failed to unwrap Arc<StorageEngineManager>: multiple references exist"))?;
-    let async_manager = AsyncStorageEngineManager::from_manager(unwrapped_manager);
-    GLOBAL_STORAGE_ENGINE_MANAGER.set(Arc::new(async_manager))
-        .map_err(|_| anyhow!("Failed to set StorageEngineManager"))?;
-    trace!("GLOBAL_STORAGE_ENGINE_MANAGER has been initialized");
-    info!("Initialized StorageEngineManager with engine type: {:?}", storage_config.storage_engine_type);
-*/
-
-
-
 
     println!("==> STARTING STORAGE - STEP 6");
     // --- STEP 6: INITIALIZE STORAGE ENGINE MANAGER ---
@@ -1596,6 +1554,8 @@ async fn ensure_process_terminated(pid: u32) -> Result<()> {
 
 /// Handles the 'use storage' command for managing the storage daemon.
 /// Fix: The logic to convert the flat HashMap config into the nested SelectedStorageConfig
+/// Handles the 'use storage' command for managing the storage daemon.
+/// Fix: The logic to convert the flat HashMap config into the nested SelectedStorageConfig
 pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bool) -> Result<(), anyhow::Error> {
     let _guard = Arc::new(TokioMutex::new(())); // Simplified lock for intra-process synchronization
     info!("Acquired intra-process lock");
@@ -1604,6 +1564,18 @@ pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bo
     let start_time = Instant::now();
     info!("=== Starting handle_use_storage_command for engine: {:?}, permanent: {} ===", engine, permanent);
     println!("===> SEE WHAT PERMANENT IS {} SEE WHAT'S ENGINE engine: {:?}", permanent, engine);
+
+    // STEP 0: Capture all existing storage daemons BEFORE any shutdowns
+    let all_existing_storage_daemons = GLOBAL_DAEMON_REGISTRY
+        .get_all_daemon_metadata()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|daemon| daemon.service_type == "storage")
+        .collect::<Vec<DaemonMetadata>>();
+    
+    let existing_daemon_ports: Vec<u16> = all_existing_storage_daemons.iter().map(|d| d.port).collect();
+    info!("Captured existing storage daemons on ports: {:?}", existing_daemon_ports);
 
     // Perform Sled-specific process cleanup first to ensure a clean slate
     /*
@@ -1828,6 +1800,7 @@ pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bo
                     .map_err(|_| GraphError::ConfigurationError("Failed to unwrap Arc<StorageEngineManager>: multiple references exist".to_string()))?
             )))
             .context("Failed to set GLOBAL_STORAGE_ENGINE_MANAGER")?;
+        println!("===> StorageEngineManager initialized successfully.");
     } else {
         println!("===> Updating existing StorageEngineManager...");
         let async_manager = GLOBAL_STORAGE_ENGINE_MANAGER
@@ -1837,24 +1810,24 @@ pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bo
             .use_storage(expected_engine_type.clone(), permanent)
             .await
             .context("Failed to update StorageEngineManager with new engine")?;
+        println!("===> StorageEngineManager updated successfully.");
     }
 
 
     // Add this after Step 6 in handle_use_storage_command
 
-    println!("===> USE STORAGE HANDLER - STEP 6: Discovering and restarting storage daemon cluster...");
+    println!("===> USE STORAGE HANDLER - STEP 7: Discovering and restarting storage daemon cluster...");
 
-    // Step 7.1: Get all previously running storage daemon ports from registry
-    let previous_storage_daemons = GLOBAL_DAEMON_REGISTRY
-        .get_all_daemon_metadata()
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|daemon| daemon.service_type == "storage")
-        .collect::<Vec<DaemonMetadata>>();
+    // Use the ports we captured at the beginning, plus ensure config_port is included
+    let mut daemon_ports_to_restart = existing_daemon_ports.clone();
+    if !daemon_ports_to_restart.contains(&config_port) {
+        daemon_ports_to_restart.push(config_port);
+    }
+    daemon_ports_to_restart.sort();
+    daemon_ports_to_restart.dedup();
 
-    if previous_storage_daemons.is_empty() {
-        info!("No previous storage daemons found in registry, starting single daemon on port {}", config_port);
+    if daemon_ports_to_restart.is_empty() {
+        info!("No storage daemons to restart, starting single daemon on port {}", config_port);
         println!("===> No existing storage cluster found, starting single daemon...");
         
         // Start single storage daemon
@@ -1871,17 +1844,16 @@ pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bo
         println!("===> Storage daemon started successfully with {} engine on port {}", 
                  daemon_api_storage_engine_type_to_string(&expected_engine_type), config_port);
     } else {
-        let daemon_ports: Vec<u16> = previous_storage_daemons.iter().map(|d| d.port).collect();
-        info!("Found {} previous storage daemons on ports: {:?}", daemon_ports.len(), daemon_ports);
-        println!("===> Found existing storage cluster on ports: {:?}", daemon_ports);
-        println!("===> Restarting {} storage daemons with {} engine...", daemon_ports.len(), 
+        info!("Restarting {} storage daemons on ports: {:?} with new engine", daemon_ports_to_restart.len(), daemon_ports_to_restart);
+        println!("===> Found existing storage cluster on ports: {:?}", daemon_ports_to_restart);
+        println!("===> Restarting {} storage daemons with {} engine...", daemon_ports_to_restart.len(), 
                  daemon_api_storage_engine_type_to_string(&expected_engine_type));
 
-        // Step 7.2: Remove stale registry entries for all previous storage daemons
-        for daemon in &previous_storage_daemons {
-            debug!("Removing stale registry entry for storage daemon on port {}", daemon.port);
-            if let Err(e) = GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("storage", daemon.port).await {
-                warn!("Failed to remove stale registry entry for port {}: {}", daemon.port, e);
+        // Step 7.2: Remove stale registry entries for all storage daemons that we'll restart
+        for port in &daemon_ports_to_restart {
+            debug!("Removing stale registry entry for storage daemon on port {}", port);
+            if let Err(e) = GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("storage", *port).await {
+                warn!("Failed to remove stale registry entry for port {}: {}", port, e);
             }
         }
 
@@ -1891,9 +1863,9 @@ pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bo
         let mut successful_restarts = Vec::new();
         let mut failed_restarts = Vec::new();
 
-        for (index, port) in daemon_ports.iter().enumerate() {
+        for (index, port) in daemon_ports_to_restart.iter().enumerate() {
             println!("===> Restarting storage daemon {} of {} on port {}...", 
-                     index + 1, daemon_ports.len(), port);
+                     index + 1, daemon_ports_to_restart.len(), port);
 
             // Create port-specific configuration
             let mut port_specific_config = new_config.clone();
@@ -1926,7 +1898,7 @@ pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bo
             }
 
             // Brief delay between restarts to avoid resource contention
-            if index < daemon_ports.len() - 1 {
+            if index < daemon_ports_to_restart.len() - 1 {
                 tokio::time::sleep(Duration::from_millis(1000)).await;
             }
         }
