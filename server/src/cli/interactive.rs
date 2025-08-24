@@ -1284,6 +1284,7 @@ pub async fn handle_interactive_command(
             handlers::start_storage_interactive(
                 port,
                 config_file,
+                None,
                 cluster,
                 state.storage_daemon_shutdown_tx_opt.clone(),
                 state.storage_daemon_handle.clone(),

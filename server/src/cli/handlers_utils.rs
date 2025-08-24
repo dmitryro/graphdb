@@ -1,16 +1,19 @@
 use anyhow::{Result, Context, anyhow}; // Added `anyhow` macro import
 use std::path::{PathBuf};
 use std::io::{self, Write};
+use std::collections::HashMap;
 use std::fs;
 use log::{info, error, warn, debug};
+use tokio::time::{sleep, Duration};
+use serde_json::{self, Value};
 use crate::cli::commands::{CommandType, ShowAction,  ConfigAction};
-use crate::cli::config::{StorageConfig, daemon_api_storage_engine_type_to_string, DAEMON_REGISTRY_DB_PATH};
+use crate::cli::config::{StorageConfig, SelectedStorageConfig, daemon_api_storage_engine_type_to_string, DAEMON_REGISTRY_DB_PATH};
 use lib::storage_engine::config::{StorageEngineType};
 use crossterm::style::{self, Stylize};
 use crossterm::terminal::{Clear, ClearType, size as terminal_size};
 use crossterm::execute;
 use crossterm::cursor::MoveTo;
-use daemon_api::daemon_registry::{DaemonMetadata};
+use lib::daemon_registry::{DaemonMetadata};
 
 /// Helper to get the path to the current executable.
 pub fn get_current_exe_path() -> Result<PathBuf> {
@@ -18,82 +21,146 @@ pub fn get_current_exe_path() -> Result<PathBuf> {
         .context("Failed to get current executable path")
 }
 
-/// Helper function to format engine-specific configuration details
-pub fn format_engine_config(storage_config: &StorageConfig) -> Vec<String> {
-    let mut config_lines = Vec::new();
+// Helper function to convert HashMap<String, Value> to SelectedStorageConfig
+pub fn convert_hashmap_to_selected_config(
+    config_map: HashMap<String, Value>
+) -> Result<SelectedStorageConfig, anyhow::Error> {
+    // Wrap the config_map in a storage object since SelectedStorageConfig expects a storage field
+    let wrapped_config = serde_json::json!({
+        "storage": config_map
+    });
     
-    // Display the storage engine type prominently
-    config_lines.push(format!("Engine: {}", daemon_api_storage_engine_type_to_string(&storage_config.storage_engine_type)));
+    let selected_config: SelectedStorageConfig = serde_json::from_value(wrapped_config)
+        .context("Failed to deserialize JSON to SelectedStorageConfig")?;
     
-    // Display engine-specific configuration if available
-    if let Some(ref engine_config) = storage_config.engine_specific_config {
-        let storage_inner = &engine_config.storage;
-        
-        match storage_config.storage_engine_type {
-            StorageEngineType::RocksDB | StorageEngineType::Sled => {
-                // File-based storage engines
-                if let Some(ref path) = storage_inner.path {
-                    config_lines.push(format!("  Data Path: {}", path.display()));
+    Ok(selected_config)
+}
+
+pub async fn retry_operation<F, Fut, T>(operation: F, max_attempts: u8, desc: &str) -> Result<T>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T, anyhow::Error>>,
+{
+    for attempt in 0..max_attempts {
+        match operation().await {
+            Ok(result) => {
+                log::debug!("Successfully completed {} on attempt {}", desc, attempt + 1);
+                return Ok(result);
+            }
+            Err(e) => {
+                log::error!("Failed to {} (attempt {}/{}): {}", desc, attempt + 1, max_attempts, e);
+                if attempt + 1 >= max_attempts {
+                    return Err(e).context(format!("Failed to {} after {} attempts", desc, max_attempts));
                 }
-                if let Some(ref host) = storage_inner.host {
-                    config_lines.push(format!("  Host: {}", host));
+                sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
+    unreachable!()
+}
+
+/// Helper function to format engine-specific configuration details
+/// Formats the engine configuration into a vector of strings for display.
+pub fn format_engine_config(config: &StorageConfig) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    // Log the input config for debugging
+    debug!("Formatting engine config: {:?}", config);
+
+    // Display the storage engine type
+    let engine_type = config.storage_engine_type.to_string();
+    lines.push(format!("Engine: {}", engine_type));
+
+    // Display engine-specific configuration if available
+    if let Some(engine_config) = &config.engine_specific_config {
+        let storage_inner = &engine_config.storage;
+
+        match config.storage_engine_type {
+            StorageEngineType::RocksDB | StorageEngineType::Sled | StorageEngineType::TiKV => {
+                // File-based storage engines
+                if let Some(path) = &storage_inner.path {
+                    lines.push(format!("Data Path: {}", path.display()));
+                } else {
+                    lines.push("Data Path: Not specified".to_string());
+                }
+                if let Some(host) = &storage_inner.host {
+                    lines.push(format!("Host: {}", host));
+                } else {
+                    lines.push("Host: Not specified".to_string());
                 }
                 if let Some(port) = storage_inner.port {
-                    config_lines.push(format!("  Port: {}", port));
+                    lines.push(format!("Port: {}", port));
+                } else {
+                    lines.push("Port: Not specified".to_string());
                 }
             },
             StorageEngineType::PostgreSQL | StorageEngineType::MySQL => {
                 // Database storage engines
-                if let Some(ref host) = storage_inner.host {
-                    config_lines.push(format!("  Host: {}", host));
+                if let Some(host) = &storage_inner.host {
+                    lines.push(format!("Host: {}", host));
+                } else {
+                    lines.push("Host: Not specified".to_string());
                 }
                 if let Some(port) = storage_inner.port {
-                    config_lines.push(format!("  Port: {}", port));
+                    lines.push(format!("Port: {}", port));
+                } else {
+                    lines.push("Port: Not specified".to_string());
                 }
-                if let Some(ref database) = storage_inner.database {
-                    config_lines.push(format!("  Database: {}", database));
+                if let Some(database) = &storage_inner.database {
+                    lines.push(format!("Database: {}", database));
+                } else {
+                    lines.push("Database: Not specified".to_string());
                 }
-                if let Some(ref username) = storage_inner.username {
-                    config_lines.push(format!("  Username: {}", username));
+                if let Some(username) = &storage_inner.username {
+                    lines.push(format!("Username: {}", username));
+                } else {
+                    lines.push("Username: Not specified".to_string());
                 }
-                // Don't display password for security reasons
                 if storage_inner.password.is_some() {
-                    config_lines.push("  Password: [CONFIGURED]".to_string());
+                    lines.push("Password: [CONFIGURED]".to_string());
+                } else {
+                    lines.push("Password: Not specified".to_string());
                 }
             },
             StorageEngineType::Redis => {
                 // Redis storage engine
-                if let Some(ref host) = storage_inner.host {
-                    config_lines.push(format!("  Host: {}", host));
+                if let Some(host) = &storage_inner.host {
+                    lines.push(format!("Host: {}", host));
+                } else {
+                    lines.push("Host: Not specified".to_string());
                 }
                 if let Some(port) = storage_inner.port {
-                    config_lines.push(format!("  Port: {}", port));
+                    lines.push(format!("Port: {}", port));
+                } else {
+                    lines.push("Port: Not specified".to_string());
                 }
-                if let Some(ref database) = storage_inner.database {
-                    config_lines.push(format!("  Database: {}", database));
+                if let Some(database) = &storage_inner.database {
+                    lines.push(format!("Database: {}", database));
+                } else {
+                    lines.push("Database: Not specified".to_string());
                 }
                 if storage_inner.password.is_some() {
-                    config_lines.push("  Password: [CONFIGURED]".to_string());
+                    lines.push("Password: [CONFIGURED]".to_string());
+                } else {
+                    lines.push("Password: Not specified".to_string());
                 }
             },
             StorageEngineType::InMemory => {
-                // In-memory storage doesn't need additional config
-                config_lines.push("  Config: In-memory storage (no additional configuration)".to_string());
+                lines.push("Config: In-memory storage (no additional configuration)".to_string());
             }
         }
     } else {
-        config_lines.push("  Config: Using default configuration".to_string());
+        lines.push("Config: Using default configuration".to_string());
     }
-    
-    // Add general storage configuration
-    config_lines.push(format!("  Max Open Files: {}", storage_config.max_open_files));
-    config_lines.push(format!("  Max Disk Space: {} GB", storage_config.max_disk_space_gb));
-    config_lines.push(format!("  Min Disk Space: {} GB", storage_config.min_disk_space_gb));
-    config_lines.push(format!("  Use Raft: {}", storage_config.use_raft_for_scale));
-    
-    config_lines
-}
 
+    // Add general storage configuration
+    lines.push(format!("Max Open Files: {}", config.max_open_files));
+    lines.push(format!("Max Disk Space: {} GB", config.max_disk_space_gb));
+    lines.push(format!("Min Disk Space: {} GB", config.min_disk_space_gb));
+    lines.push(format!("Use Raft: {}", config.use_raft_for_scale));
+
+    lines
+}
 
 /// Prints a visually appealing welcome screen for the CLI.
 pub fn print_welcome_screen() {
@@ -216,6 +283,7 @@ pub fn storage_engine_type_to_str(engine: StorageEngineType) -> &'static str {
     match engine {
         StorageEngineType::Sled => "sled",
         StorageEngineType::RocksDB => "rocksdb",
+        StorageEngineType::TiKV => "tikv",
         StorageEngineType::InMemory => "inmemory",
         StorageEngineType::Redis => "redis",
         StorageEngineType::PostgreSQL => "postgresql",
@@ -228,6 +296,7 @@ pub fn parse_storage_engine(engine: &str) -> Result<StorageEngineType, String> {
     match engine.to_lowercase().as_str() {
         "sled" => Ok(StorageEngineType::Sled),
         "rocksdb" | "rocks-db" => Ok(StorageEngineType::RocksDB),
+        "tikv" => Ok(StorageEngineType::TiKV),
         "inmemory" | "in-memory" => Ok(StorageEngineType::InMemory),
         "redis" => Ok(StorageEngineType::Redis),
         "postgres" | "postgresql" | "postgre-sql" => Ok(StorageEngineType::PostgreSQL),
@@ -264,3 +333,4 @@ pub fn parse_show_command(args: &[String]) -> Result<CommandType, anyhow::Error>
         _ => Err(anyhow!("Unknown subcommand for 'show': {}", args[1])),
     }
 }
+

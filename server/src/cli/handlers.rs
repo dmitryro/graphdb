@@ -57,7 +57,7 @@ pub use crate::cli::handlers_queries::{handle_interactive_query, handle_unified_
                                        handle_exec_command, handle_query_command};
 
 use daemon_api::{stop_daemon, start_daemon};
-use daemon_api::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};                                    
+use lib::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};                                    
 
 /// Displays the Raft status for a storage daemon running on the specified port.
 pub async fn display_raft_status(port: Option<u16>) -> Result<()> {
@@ -131,6 +131,7 @@ pub async fn handle_start_command(
         let storage_result = start_storage_interactive(
             Some(actual_port),
             Some(actual_config_file),
+            None,
             None,
             rest_api_shutdown_tx_opt.clone(), // Reuse existing mutex to avoid registry conflicts
             rest_api_handle.clone(), // Reuse existing handle
@@ -214,6 +215,7 @@ pub async fn handle_start_command_interactive(
         let storage_result = start_storage_interactive(
             Some(actual_port),
             Some(actual_config_file),
+            None,
             None,
             rest_api_shutdown_tx_opt.clone(), // Reuse existing mutex to avoid registry conflicts
             rest_api_handle.clone(), // Reuse existing handle
@@ -636,6 +638,7 @@ pub async fn handle_restart_command_interactive(
             start_storage_interactive(
                 Some(actual_port),
                 config_file,
+                None,
                 cluster.or(storage_cluster),
                 storage_daemon_shutdown_tx_opt,
                 storage_daemon_handle,
@@ -698,7 +701,7 @@ pub async fn handle_reload_command(reload_args: ReloadArgs) -> Result<(), anyhow
                 if let Err(e) = stop_process_by_port("GraphDB Daemon", port).await {
                     warn!("Failed to stop daemon on port {}: {}", port, e);
                 }
-                match start_daemon(Some(port), None, reserved_ports.clone(), "main").await {
+                match start_daemon(Some(port), None, reserved_ports.clone(), "main", None).await {
                     Ok(_) => {
                         info!("GraphDB Daemon restarted on port {}.", port);
                         println!("GraphDB Daemon restarted on port {}.", port);
@@ -717,7 +720,7 @@ pub async fn handle_reload_command(reload_args: ReloadArgs) -> Result<(), anyhow
                 if let Err(e) = stop_process_by_port("REST API", port).await {
                     warn!("Failed to stop REST API on port {}: {}", port, e);
                 }
-                match start_daemon(Some(port), None, reserved_ports.clone(), "rest").await {
+                match start_daemon(Some(port), None, reserved_ports.clone(), "rest", None).await {
                     Ok(_) => {
                         info!("REST API server restarted on port {}.", port);
                         println!("REST API server restarted on port {}.", port);
@@ -733,7 +736,7 @@ pub async fn handle_reload_command(reload_args: ReloadArgs) -> Result<(), anyhow
                 if let Err(e) = stop_process_by_port("REST API", rest_port).await {
                     warn!("Failed to stop REST API on port {}: {}", rest_port, e);
                 }
-                match start_daemon(Some(rest_port), None, reserved_ports.clone(), "rest").await {
+                match start_daemon(Some(rest_port), None, reserved_ports.clone(), "rest", None).await {
                     Ok(_) => {
                         info!("REST API server started on port {}.", rest_port);
                         println!("REST API server started on port {}.", rest_port);
@@ -752,7 +755,7 @@ pub async fn handle_reload_command(reload_args: ReloadArgs) -> Result<(), anyhow
             if let Err(e) = stop_process_by_port("Storage Daemon", storage_port_to_restart).await {
                 warn!("Failed to stop Storage Daemon on port {}: {}", storage_port_to_restart, e);
             }
-            match start_daemon(Some(storage_port_to_restart), None, reserved_ports.clone(), "storage").await {
+            match start_daemon(Some(storage_port_to_restart), None, reserved_ports.clone(), "storage", None).await {
                 Ok(_) => {
                     info!("Standalone Storage Daemon restarted on port {}.", storage_port_to_restart);
                     println!("Standalone Storage Daemon restarted on port {}.", storage_port_to_restart);
@@ -773,7 +776,7 @@ pub async fn handle_reload_command(reload_args: ReloadArgs) -> Result<(), anyhow
                 if let Err(e) = stop_process_by_port("REST API", rest_port).await {
                     warn!("Failed to stop REST API on port {}: {}", rest_port, e);
                 }
-                match start_daemon(Some(rest_port), None, reserved_ports.clone(), "rest").await {
+                match start_daemon(Some(rest_port), None, reserved_ports.clone(), "rest", None).await {
                     Ok(_) => {
                         info!("REST API server started on port {}.", rest_port);
                         println!("REST API server started on port {}.", rest_port);
@@ -789,7 +792,7 @@ pub async fn handle_reload_command(reload_args: ReloadArgs) -> Result<(), anyhow
                     if let Err(e) = stop_process_by_port("REST API", port).await {
                         warn!("Failed to stop REST API on port {}: {}", port, e);
                     }
-                    match start_daemon(Some(port), None, reserved_ports.clone(), "rest").await {
+                    match start_daemon(Some(port), None, reserved_ports.clone(), "rest", None).await {
                         Ok(_) => {
                             info!("REST API server restarted on port {}.", port);
                             println!("REST API server restarted on port {}.", port);
@@ -812,7 +815,7 @@ pub async fn handle_reload_command(reload_args: ReloadArgs) -> Result<(), anyhow
             if let Err(e) = stop_process_by_port("Storage Daemon", storage_port_to_restart).await {
                 warn!("Failed to stop Storage Daemon on port {}: {}", storage_port_to_restart, e);
             }
-            match start_daemon(Some(storage_port_to_restart), None, reserved_ports.clone(), "storage").await {
+            match start_daemon(Some(storage_port_to_restart), None, reserved_ports.clone(), "storage", None).await {
                 Ok(_) => {
                     info!("Standalone Storage Daemon restarted on port {}.", storage_port_to_restart);
                     println!("Standalone Storage Daemon restarted on port {}.", storage_port_to_restart);
@@ -834,7 +837,7 @@ pub async fn handle_reload_command(reload_args: ReloadArgs) -> Result<(), anyhow
                 if let Err(e) = stop_process_by_port("GraphDB Daemon", actual_port).await {
                     warn!("Failed to stop daemon on port {}: {}", actual_port, e);
                 }
-                match start_daemon(Some(actual_port), None, reserved_ports.clone(), "main").await {
+                match start_daemon(Some(actual_port), None, reserved_ports.clone(), "main", None).await {
                     Ok(_) => {
                         info!("Daemon on port {} reloaded (stopped and restarted).", actual_port);
                         println!("Daemon on port {} reloaded (stopped and restarted).", actual_port);
@@ -864,7 +867,7 @@ pub async fn handle_reload_command(reload_args: ReloadArgs) -> Result<(), anyhow
                 if let Err(e) = stop_process_by_port("GraphDB Daemon", port).await {
                     warn!("Failed to stop daemon on port {}: {}", port, e);
                 }
-                match start_daemon(Some(port), None, reserved_ports.clone(), "main").await {
+                match start_daemon(Some(port), None, reserved_ports.clone(), "main", None).await {
                     Ok(_) => {
                         info!("GraphDB Daemon reloaded on port {}.", port);
                         println!("GraphDB Daemon reloaded on port {}.", port);

@@ -1,4 +1,3 @@
-
 use anyhow::{anyhow, Context, Result};
 use clap::ValueEnum;
 use std::path::PathBuf;
@@ -44,7 +43,7 @@ use crate::cli::config::{
     load_main_daemon_config,
     load_rest_config,
 };
-use daemon_api::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
+use lib::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
 use lib::storage_engine::config::StorageEngineType;
 
 /// Helper to run an external command with a timeout.
@@ -69,8 +68,32 @@ pub async fn check_process_status_by_pid(pid: Pid) -> bool {
     system.process(pid).is_some()
 }
 
+// Helper to get process ID by port provided
+pub async fn get_pid_for_port(port: u16) -> Result<u32, anyhow::Error> {
+    let output = Command::new("lsof")
+        .arg("-i")
+        .arg("-P")
+        .arg(format!(":{}", port))
+        .output()
+        .await
+        .context("Failed to execute lsof")?;  // ✅ await first, then context
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines().skip(1) {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        debug!("lsof output for port {}: {:?}", port, line);
+        if parts.len() > 1 {
+            if let Ok(pid) = parts[1].parse::<u32>() {
+                return Ok(pid);
+            }
+        }
+    }
+
+    Err(anyhow!("No process found listening on port {}", port))
+}
+
 // Helper function to check if a string is a valid cluster range (e.g., "8081-8084")
-fn is_valid_cluster_range(range: &str) -> bool {
+pub fn is_valid_cluster_range(range: &str) -> bool {
     range.contains('-') && range.split('-').all(|s| s.parse::<u16>().is_ok())
 }
 
@@ -519,6 +542,7 @@ pub async fn handle_internal_daemon_run(
             Some(daemon_listen_port),
             Some(storage_config_path),
             None,
+            None,
             storage_daemon_shutdown_tx_opt,
             storage_daemon_handle,
             storage_daemon_port_arc,
@@ -561,7 +585,7 @@ pub async fn start_daemon_with_port(p: u16, service_type: &str) -> Result<(), an
         return Ok(());
     }
 
-    start_daemon(Some(p), None, Vec::new(), service_type)
+    start_daemon(Some(p), None, Vec::new(), service_type, None)
         .await
         .map_err(|e| anyhow!("Failed to start daemon via daemon_api: {}", e))?;
 
@@ -631,7 +655,7 @@ pub async fn spawn_daemon_process(
     };
 
     debug!("Starting daemon: port={}, cluster_range={:?}, skip_ports={:?}, service_type={}", actual_port, effective_cluster, skip_ports, service_type);
-    start_daemon(Some(actual_port), effective_cluster, skip_ports, service_type)
+    start_daemon(Some(actual_port), effective_cluster, skip_ports, service_type, None)
         .await
         .map_err(|e| {
             error!("Failed to start daemon: port={}, error={}", actual_port, e);
@@ -825,7 +849,7 @@ pub async fn start_daemon_with_pid(
     
     let pid = child.id().context("Failed to get PID of spawned daemon process")?;
     
-    start_daemon(port, cluster.clone(), args_u16, service_type)
+    start_daemon(port, cluster.clone(), args_u16, service_type, None)
         .await
         .context("Failed to initialize daemon via daemon_api")?;
 

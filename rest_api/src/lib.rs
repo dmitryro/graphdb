@@ -138,7 +138,7 @@ async fn start_daemon_handler(
     println!("Attempting to start daemon on port {}...", port);
 
     let daemon_join_handle = tokio::spawn(async move {
-        start_daemon(Some(port), cluster_range, skip_ports, "rest").await
+        start_daemon(Some(port), cluster_range, skip_ports, "rest", None).await
     });
 
     handles.insert(port, daemon_join_handle);

@@ -34,7 +34,7 @@ use crate::cli::daemon_management::{
 
 // Import daemon API and registry
 use daemon_api::{start_daemon};
-use daemon_api::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
+use lib::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
 
 /// Displays detailed status for a specific GraphDB daemon or lists all running ones.
 /// Enhanced version of display_daemon_status with better formatting and deduplication
@@ -228,6 +228,7 @@ pub async fn start_daemon_instance_interactive(
         cluster,
         vec![DEFAULT_REST_API_PORT, DEFAULT_STORAGE_PORT],
         "main",
+        None,
     )
     .await
     {
@@ -439,7 +440,7 @@ pub async fn reload_daemon_interactive(port: Option<u16>) -> Result<()> {
     
     stop_process_by_port("GraphDB Daemon", actual_port).await?;
     
-    let daemon_result = start_daemon(Some(actual_port), None, vec![], "main").await;
+    let daemon_result = start_daemon(Some(actual_port), None, vec![], "main", None).await;
     match daemon_result {
         Ok(()) => println!("Daemon on port {} reloaded (stopped and restarted).", actual_port),
         Err(e) => eprintln!("Failed to restart daemon on port {}: {:?}", actual_port, e),

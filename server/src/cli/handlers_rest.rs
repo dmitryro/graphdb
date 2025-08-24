@@ -37,7 +37,7 @@ use crate::cli::handlers_utils::{
     write_registry_fallback, read_registry_fallback, execute_storage_query,
 };
 
-use daemon_api::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
+use lib::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
 use daemon_api::{start_daemon};
 
 /// A temporary struct to hold the combined REST configuration for display.
@@ -424,7 +424,7 @@ pub async fn start_rest_api_interactive(
     // Log registry state before starting daemon
     debug!("Registry state before starting REST API: {:?}", all_daemons);
 
-    start_daemon(Some(actual_port), None, vec![DEFAULT_DAEMON_PORT, DEFAULT_STORAGE_PORT], "rest")
+    start_daemon(Some(actual_port), None, vec![DEFAULT_DAEMON_PORT, DEFAULT_STORAGE_PORT], "rest", None)
         .await
         .map_err(|e| anyhow!("Failed to start REST API via daemon_api: {}", e))?;
 
