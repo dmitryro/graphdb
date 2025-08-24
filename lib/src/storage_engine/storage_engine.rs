@@ -1118,6 +1118,13 @@ impl StorageEngineManager {
     }
 
 
+    pub async fn reset_config(&mut self, config: StorageConfig) -> Result<(), GraphError> {
+        // Update the internal configuration state
+        self.config = config;
+        info!("StorageEngineManager configuration reset: {:?}", self.config);
+        Ok(())
+    }
+
     async fn shutdown_existing_manager() {
         if let Some(existing_manager) = GLOBAL_STORAGE_ENGINE_MANAGER.get() {
             trace!("Shutting down existing StorageEngineManager before initialization");

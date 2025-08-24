@@ -123,6 +123,86 @@ mod option_storage_engine_type_serde {
     }
 }
 
+// Default values for the StorageConfigInner fields to ensure proper deserialization
+fn default_path() -> Option<PathBuf> {
+    Some(PathBuf::from("/opt/graphdb/storage_data"))
+}
+
+fn default_host() -> Option<String> {
+    Some("127.0.0.1".to_string())
+}
+
+fn default_port() -> Option<u16> {
+    Some(8049)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StorageConfigInner {
+    // Shared fields for path-based engines (Sled, RocksDB)
+    #[serde(default = "default_path")]
+    pub path: Option<PathBuf>,
+    
+    // Shared fields for URI-based engines (PostgreSQL, MySQL, Redis)
+    #[serde(default = "default_host")]
+    pub host: Option<String>,
+    
+    // Port field for all engines that require it.
+    #[serde(default = "default_port")]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub database: Option<String>,
+}
+
+// The outer struct that holds the engine type and the configuration details.
+// This structure correctly represents your desired model.
+// The outer struct that holds the engine type and the configuration details.
+// This structure correctly represents your desired model.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SelectedStorageConfig {
+    pub storage_engine_type: StorageEngineType,
+    #[serde(flatten)] // This flattens the inner struct into the outer one during serialization/deserialization
+    pub storage: StorageConfigInner,
+}
+
+// This `impl` block provides a default instance of `SelectedStorageConfig`.
+// It's useful for scenarios where no configuration is provided, ensuring
+// the application can start with a sensible default.
+impl Default for SelectedStorageConfig {
+    fn default() -> Self {
+        // RocksDB is a more robust default.
+        // We now correctly instantiate the struct, setting the engine type and
+        // the default values for its corresponding fields in the inner struct.
+        Self {
+            storage_engine_type: StorageEngineType::RocksDB,
+            storage: StorageConfigInner {
+                path: default_path(),
+                port: default_port(),
+                host: None, // Set non-relevant fields to None
+                username: None,
+                password: None,
+                database: None,
+            },
+        }
+    }
+
+}
+
+impl SelectedStorageConfig {
+    pub fn load_from_yaml<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
+        let path_str = path.as_ref().to_string_lossy().to_string();
+        let message = format!("AND THIS WILL FAIL - SEE {}", path_str);
+        let content = fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read config file {:?}", path.as_ref()))?;
+        serde_yaml2::from_str(&content)
+            .with_context(|| format!("Failed to parse YAML from {:?}", path.as_ref()))
+    }
+}
+
+
 /// An enum representing the supported storage engine types.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]

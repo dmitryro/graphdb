@@ -8,6 +8,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::fs::{self, OpenOptions, File};
 use std::collections::HashMap;
 use tokio::fs::{remove_file};
+use tokio::fs as tokio_fs;
+use tokio::io::AsyncReadExt; // Add this import at the top of the file
 use std::io::ErrorKind;
 use fs2::FileExt;
 use chrono::Utc;
@@ -18,6 +20,7 @@ use futures::stream::StreamExt;
 use serde_json::Value;
 use serde_yaml2 as serde_yaml;
 use rocksdb::{DB, Options};
+use nix::sys::signal::{kill, Signal};
 use sysinfo::{System, Process, Pid};
 use std::time::Instant;
 use crate::cli::commands::{CommandType, Commands, StartAction, StorageAction, UseAction};
@@ -35,6 +38,8 @@ use crate::cli::config::{
     DEFAULT_STORAGE_CONFIG_PATH_SLED,
     DEFAULT_STORAGE_CONFIG_PATH_ROCKSDB,
     DEFAULT_STORAGE_CONFIG_PATH,
+    STORAGE_PID_FILE_NAME_PREFIX,
+    STORAGE_PID_FILE_DIR,
     DEFAULT_DATA_DIRECTORY,
     DEFAULT_STORAGE_PORT,
     CliTomlStorageConfig,
@@ -1572,18 +1577,24 @@ pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bo
     println!("===> USE STORAGE HANDLER - STEP 1");
     let cwd = std::env::current_dir()
         .map_err(|e| anyhow!("Failed to get current working directory: {}", e))?;
+
+    // CORRECTED: Using the existing and correct constant.
     let config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
     let absolute_config_path = cwd.join(&config_path);
     debug!("Attempting to load storage config from {:?}", absolute_config_path);
-    println!("===> USE STORAGE HANDLER - STEP 2");
+
+    // START: Loading indicator for configuration loading
+    println!("===> USE STORAGE HANDLER - STEP 2: Loading configuration...");
 
     let mut current_config: StorageConfig = match load_storage_config_from_yaml(Some(absolute_config_path.clone())) {
         Ok(config) => {
             info!("Successfully loaded existing storage config: {:?}", config);
+            println!("===> Configuration loaded successfully.");
             config
         },
         Err(e) => {
             warn!("Failed to load existing config from {:?}, using default values. Error: {}", absolute_config_path, e);
+            println!("===> Configuration file not found, using default settings.");
             StorageConfig::default()
         }
     };
@@ -1600,10 +1611,15 @@ pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bo
         current_config.min_disk_space_gb,
         current_config.use_raft_for_scale
     );
-    println!("===> USE STORAGE HANDLER - STEP 3");
+
+    // START: Loading indicator for engine-specific configuration
+    println!("===> USE STORAGE HANDLER - STEP 3: Loading engine-specific configuration...");
 
     let config_root_directory = match current_config.config_root_directory.as_ref() {
-        Some(path) => path,
+        Some(path) => {
+            println!("===> Using config root directory: {:?}", path);
+            path
+        },
         None => {
             return Err(anyhow!("'config_root_directory' is missing from the loaded configuration. Check your storage_config.yaml file."));
         }
@@ -1611,6 +1627,8 @@ pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bo
 
     let engine_specific_config_map = load_engine_specific_config(engine.clone(), config_root_directory)
         .context("Failed to load engine-specific config")?;
+
+    println!("===> Engine-specific configuration loaded successfully.");
 
     let mut new_config = current_config.clone();
     new_config.storage_engine_type = engine.clone();
@@ -1647,6 +1665,7 @@ pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bo
             let mut perms = fs::metadata(&sled_path)
                 .map_err(|e| anyhow!("Failed to get metadata for {:?}: {}", sled_path, e))?
                 .permissions();
+            use std::os::unix::fs::PermissionsExt;
             perms.set_mode(0o755);
             fs::set_permissions(&sled_path, perms)
                 .map_err(|e| anyhow!("Failed to set permissions for {:?}: {}", sled_path, e))?;
@@ -1662,57 +1681,73 @@ pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bo
     println!("===> Final new_config before saving: {:?}", new_config);
     if permanent {
         info!("Saving updated storage configuration using StorageConfig::save");
+        println!("===> Saving configuration to disk...");
         new_config.save().context("Failed to save updated StorageConfig")?;
         debug!("Successfully saved storage configuration to {:?}", absolute_config_path);
+        println!("===> Configuration saved successfully.");
     }
     println!("------------------------------> SEE IT <--------------------------------");
     println!("Reloaded storage config for daemon management: {:?}", new_config);
 
-    println!("===> USE STORAGE HANDLER - STEP 5: Stopping existing daemon");
+    // --- CRITICAL FIX: Robust Daemon Shutdown ---
+    // The previous approach could fail if the daemon didn't shut down immediately,
+    // causing the new daemon to fail due to a lock. This new logic ensures a full shutdown.
+    println!("===> USE STORAGE HANDLER - STEP 5: Attempting to stop existing daemon...");
 
-    const MAX_SHUTDOWN_RETRIES: u32 = 10;
+    const MAX_SHUTDOWN_RETRIES: u32 = 15; // Increased retries for stability
     const SHUTDOWN_RETRY_DELAY_MS: u64 = 250;
     let mut is_daemon_stopped = false;
     let mut last_pid: Option<u32> = None;
 
-    // Retry loop for stopping any existing daemon
+    // First, try to read the PID from the PID file if it exists.
+    let pid_file_path = PathBuf::from(STORAGE_PID_FILE_DIR).join(format!("{}{}.pid", STORAGE_PID_FILE_NAME_PREFIX, config_port));
+    if tokio_fs::File::open(&pid_file_path).await.is_ok() {
+        if let Ok(mut file) = tokio_fs::File::open(&pid_file_path).await {
+            let mut contents = String::new();
+            if file.read_to_string(&mut contents).await.is_ok() {
+                if let Ok(pid) = contents.trim().parse::<u32>() {
+                    last_pid = Some(pid);
+                }
+            }
+        }
+    }
+
+    // Now, try to stop the daemon, with a robust retry loop.
     for attempt in 0..MAX_SHUTDOWN_RETRIES {
         debug!("Attempting to stop daemon on port {} (Attempt {} of {})", config_port, attempt + 1, MAX_SHUTDOWN_RETRIES);
-        if let Err(e) = stop_storage_interactive(
+
+        // Attempt graceful shutdown via the interactive command
+        stop_storage_interactive(
             Some(config_port),
             Arc::new(TokioMutex::new(None)),
             Arc::new(TokioMutex::new(None)),
             Arc::new(TokioMutex::new(None)),
-        ).await {
-            warn!("Failed to stop storage daemon on attempt {}: {}", attempt + 1, e);
-            // Capture PID from error message if available
-            if let Some(pid_str) = e.to_string().split("PID ").nth(1) {
-                if let Some(pid) = pid_str.split_whitespace().next() {
-                    if let Ok(pid_num) = pid.parse::<u32>() {
-                        last_pid = Some(pid_num);
-                    }
-                }
+        ).await.ok(); // We ignore errors here as we'll handle failure by checking port status.
+
+        // Also, if we have a PID, send a TERM signal
+        if let Some(pid) = last_pid {
+            // Fixed: nix::unistd::Pid::from_raw returns a Pid directly, not a Result
+            let pid_nix = nix::unistd::Pid::from_raw(pid as i32);
+            if let Err(e) = kill(pid_nix, Signal::SIGTERM) {
+                warn!("Failed to send TERM signal to PID {}: {}", pid, e);
             }
         }
 
-        // Add a small delay to allow the process to terminate
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
+        // Check if the daemon is still running using the provided utility function
         if !is_storage_daemon_running(config_port).await {
             info!("Storage daemon on port {} is confirmed stopped.", config_port);
             is_daemon_stopped = true;
+            println!("===> Daemon stopped successfully.");
+            // Also, remove the PID file to ensure a clean slate.
+            if pid_file_path.exists() {
+                fs::remove_file(&pid_file_path).ok();
+            }
             break;
         }
 
         info!("Daemon still running on port {}, retrying stop in {}ms...", config_port, SHUTDOWN_RETRY_DELAY_MS);
+        println!("===> Daemon still running, retrying stop...");
         tokio::time::sleep(Duration::from_millis(SHUTDOWN_RETRY_DELAY_MS)).await;
-    }
-
-    // Ensure the last known daemon process is terminated
-    if let Some(pid) = last_pid {
-        if let Err(e) = ensure_process_terminated(pid).await {
-            warn!("Failed to ensure process {} is terminated: {}", pid, e);
-        }
     }
 
     if !is_daemon_stopped {
@@ -1721,8 +1756,10 @@ pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bo
     }
 
     println!("===> USE STORAGE HANDLER - STEP 5.5: Cleaning up lock files for {:?}", expected_engine_type);
+    println!("===> Cleaning up lock files...");
     force_cleanup_engine_lock(expected_engine_type.clone(), &new_config.data_directory).await
         .context("Failed to clean up engine lock file")?;
+    println!("===> Lock files cleaned successfully.");
 
     if engine == StorageEngineType::Sled {
         let lock_path = new_config.data_directory.as_ref()
@@ -1736,11 +1773,13 @@ pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bo
         SledStorage::force_unlock(&lock_path.parent().unwrap_or_else(|| Path::new("/opt/graphdb/storage_data/sled"))).await?;
     }
 
-    println!("===> USE STORAGE HANDLER - STEP 6: Initializing StorageEngineManager");
+    // START: Loading indicator for initializing the engine manager
+    println!("===> USE STORAGE HANDLER - STEP 6: Initializing StorageEngineManager...");
 
     // Initialize or update StorageEngineManager
     if GLOBAL_STORAGE_ENGINE_MANAGER.get().is_none() {
         debug!("StorageEngineManager not initialized, creating new instance");
+        println!("===> Creating new instance of StorageEngineManager...");
         let manager = StorageEngineManager::new(expected_engine_type.clone(), &absolute_config_path, permanent)
             .await
             .context("Failed to initialize StorageEngineManager")?;
@@ -1751,6 +1790,7 @@ pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bo
             )))
             .context("Failed to set GLOBAL_STORAGE_ENGINE_MANAGER")?;
     } else {
+        println!("===> Updating existing StorageEngineManager...");
         let async_manager = GLOBAL_STORAGE_ENGINE_MANAGER
             .get()
             .ok_or_else(|| GraphError::ConfigurationError("StorageEngineManager not accessible".to_string()))?;
@@ -1760,6 +1800,7 @@ pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bo
             .context("Failed to update StorageEngineManager with new engine")?;
     }
 
+    println!("===> StorageEngineManager initialized successfully.");
     info!("Successfully initialized storage engine {:?}", expected_engine_type);
     println!("Switched to storage engine {} (persisted: {})", daemon_api_storage_engine_type_to_string(&expected_engine_type), permanent);
     info!("=== Completed handle_use_storage_command for engine: {:?}, permanent: {}. Elapsed: {}ms ===", engine, permanent, start_time.elapsed().as_millis());
@@ -1768,149 +1809,21 @@ pub async fn handle_use_storage_command(engine: StorageEngineType, permanent: bo
     Ok(())
 }
 
-#[cfg(feature = "with-rocksdb")]
-async fn init_rocksdb(config: &StorageConfig) -> Result<Arc<dyn GraphStorageEngine + Send + Sync>, GraphError> {
-    use tokio::time::{self, Duration as TokioDuration};
-    println!("IT'S TIME TO INITIALIZE ROCKSDB");
-    info!("Initializing RocksDB engine with SurrealDB backend");
+// Helper function to display configuration
+pub fn display_config(config: &StorageConfig, config_path: &PathBuf) {
+    println!("Current Storage Configuration (from {:?}):", config_path);
+    println!("- storage_engine_type: {}", daemon_api_storage_engine_type_to_string(&config.storage_engine_type));
+    println!("- config_root_directory: {:?}", config.config_root_directory);
+    println!("- data_directory: {:?}", config.data_directory);
+    println!("- log_directory: {:?}", config.log_directory);
+    println!("- default_port: {}", config.default_port);
+    println!("- cluster_range: {}", config.cluster_range);
+    println!("- max_disk_space_gb: {}", config.max_disk_space_gb);
+    println!("- min_disk_space_gb: {}", config.min_disk_space_gb);
+    println!("- use_raft_for_scale: {}", config.use_raft_for_scale);
+    println!("- max_open_files: {}", config.max_open_files);
 
-    // Get the path for the RocksDB engine.
-    let engine_path = Self::get_engine_path(config, StorageEngineType::RocksDB)?;
-    
-    // Ensure the directory exists to avoid filesystem errors.
-    info!("Ensuring directory exists: {:?}", engine_path);
-    Self::ensure_directory_exists(&engine_path).await?;
-
-    let mut db_instance = None;
-    let mut attempt = 0;
-    let max_attempts = 10; // Increased attempts
-    let base_delay_ms = 200; // Increased base delay
-
-    while attempt < max_attempts {
-        debug!("Attempting to connect to SurrealDB RocksDB backend... (Attempt {} of {})", attempt + 1, max_attempts);
-        
-        match Surreal::new::<RocksDb>(engine_path.clone()).await {
-            Ok(db) => {
-                info!("Successfully connected to SurrealDB RocksDB backend on attempt {}.", attempt + 1);
-                db_instance = Some(db);
-                break; // Connection successful, exit the loop.
-            },
-            Err(e) => {
-                let error_string = e.to_string();
-                
-                // We're looking for a specific kind of lock error. These often contain keywords
-                // like "lock", "busy", or "occupied". The SurrealDB error message might not be
-                // exact, so we'll check for keywords.
-                if error_string.contains("lock") || error_string.contains("occupied") {
-                    warn!("Detected a potential RocksDB lock conflict. Attempting retry after a delay. Error: {}", error_string);
-                    let delay = TokioDuration::from_millis(base_delay_ms * 2u64.pow(attempt));
-                    info!("Retrying in {:?}...", delay);
-                    time::sleep(delay).await;
-                    attempt += 1;
-                } else {
-                    // For any other type of error, we should fail immediately as it's likely
-                    // a permanent issue (e.g., corrupt data, invalid config).
-                    error!("A non-retryable error occurred while connecting to RocksDB: {}", error_string);
-                    return Err(GraphError::StorageError(format!("Failed to connect to SurrealDB RocksDB backend: {}", error_string)));
-                }
-            }
-        }
-    }
-
-    // After the loop, check if we have a valid database instance.
-    let db = db_instance.ok_or_else(|| {
-        error!("Failed to connect to RocksDB after {} attempts.", max_attempts);
-        GraphError::StorageError(format!("Failed to open RocksDB after {} attempts due to persistent lock error.", max_attempts))
-    })?;
-    
-    db.use_ns("graphdb").use_db("graph").await
-        .map_err(|e| GraphError::StorageError(e.to_string()))?;
-    println!("SUCCESSFULLY INITIALIZED ROCKSDB");
-    Ok(Arc::new(SurrealdbGraphStorage { db, backend_type: StorageEngineType::RocksDB }))
-}
-
-/// Handles the 'show storage' command. This function
-/// displays the current storage configuration by reading it
-pub async fn handle_show_storage_command() -> Result<(), GraphError> {
-    // Determine the current working directory to resolve config paths.
-    let cwd = std::env::current_dir()
-        .map_err(|e| GraphError::ConfigurationError(format!("Failed to get current working directory: {}", e)))?;
-    debug!("Current working directory: {:?}", cwd);
-
-    // Determine the path to the config file.
-    let config_path = PathBuf::from(crate::cli::config::DEFAULT_STORAGE_CONFIG_PATH);
-    let absolute_config_path = cwd.join(&config_path);
-    debug!("Attempting to load storage config from {:?}", absolute_config_path);
-
-    // Load the config from the file.
-    let file_config = crate::cli::config::load_storage_config_from_yaml(Some(absolute_config_path.clone()))
-        .map_err(|e| GraphError::ConfigurationError(format!("Failed to load storage config from {:?}: {}", absolute_config_path, e)))?;
-    debug!("Loaded config from file: {:?}", file_config);
-
-    // Check if the daemon is running and determine the source of truth for the config.
-    let is_daemon_running = GLOBAL_STORAGE_ENGINE_MANAGER.get().is_some();
-    let mut config_to_display = file_config.clone();
-
-    if is_daemon_running {
-        // The daemon is running, so we should display its runtime configuration.
-        info!("Storage daemon is running. Fetching runtime configuration.");
-        let manager = GLOBAL_STORAGE_ENGINE_MANAGER
-            .get()
-            .ok_or_else(|| GraphError::ConfigurationError("StorageEngineManager not initialized".to_string()))?;
-
-        let runtime_config_raw = manager.get_manager().lock().await.get_runtime_config().await
-            .map_err(|e| GraphError::ConfigurationError(format!("Failed to get runtime config: {}", e)))?;
-        
-        // Convert the runtime config into a displayable format.
-        let runtime_config: StorageConfig = runtime_config_raw.into();
-        config_to_display = runtime_config;
-
-        // Get the registry and use it to enrich the displayed information.
-        let registry = GLOBAL_DAEMON_REGISTRY.get().await;
-        
-        // Now that we have the registry, we can call its asynchronous methods with `.await`.
-        if let Ok(Some(metadata)) = registry.get_daemon_metadata(config_to_display.default_port).await {
-            // The daemon is running and we have metadata.
-            config_to_display.data_directory = metadata.data_dir.or(config_to_display.data_directory);
-            println!("Storage Daemon Running on Port {}:", config_to_display.default_port);
-            println!("Daemon Status: Running");
-            println!("Daemon PID: {}", metadata.pid);
-            if let Some(engine_type_str) = &metadata.engine_type {
-                println!("Daemon Engine Type (Runtime): {}", engine_type_str);
-            }
-        } else {
-            // The daemon is running, but no metadata is available.
-            println!("Storage Daemon Running on Port {}:", config_to_display.default_port);
-            println!("Daemon Status: Running (No registry metadata available)");
-        }
-
-        // Issue a warning if the runtime engine type differs from the file configuration.
-        if config_to_display.storage_engine_type != file_config.storage_engine_type {
-            warn!(
-                "Daemon engine ({:?}) differs from config file ({:?}). Displaying runtime configuration.",
-                config_to_display.storage_engine_type, file_config.storage_engine_type
-            );
-        }
-    } else {
-        // The daemon is not running, so display the file configuration.
-        println!("Storage daemon is not running.");
-        println!("Displaying configuration from storage_config.yaml.");
-    }
-
-    // Display the final determined configuration.
-    println!("Current Storage Configuration (from {:?}):", absolute_config_path);
-    println!("- storage_engine_type: {}", daemon_api_storage_engine_type_to_string(&config_to_display.storage_engine_type));
-    println!("- config_root_directory: {:?}", config_to_display.config_root_directory);
-    println!("- data_directory: {:?}", config_to_display.data_directory);
-    println!("- log_directory: {:?}", config_to_display.log_directory);
-    println!("- default_port: {}", config_to_display.default_port);
-    println!("- cluster_range: {}", config_to_display.cluster_range);
-    println!("- max_disk_space_gb: {}", config_to_display.max_disk_space_gb);
-    println!("- min_disk_space_gb: {}", config_to_display.min_disk_space_gb);
-    println!("- use_raft_for_scale: {}", config_to_display.use_raft_for_scale);
-    println!("- max_open_files: {}", config_to_display.max_open_files);
-
-    if let Some(engine_specific) = &config_to_display.engine_specific_config {
+    if let Some(engine_specific) = &config.engine_specific_config {
         println!("- engine_specific_config:");
         if let Some(path) = &engine_specific.storage.path {
             println!("  - path: {:?}", path);
@@ -1933,9 +1846,71 @@ pub async fn handle_show_storage_command() -> Result<(), GraphError> {
     } else {
         println!("- engine_specific_config: Not available");
     }
+}
+
+/// Handles the 'show storage' command. This function
+/// displays the current storage configuration by reading it
+pub async fn handle_show_storage_command() -> Result<(), GraphError> {
+    // Determine the current working directory to resolve config paths
+    let cwd = std::env::current_dir()
+        .map_err(|e| GraphError::ConfigurationError(format!("Failed to get current working directory: {}", e)))?;
+    debug!("Current working directory: {:?}", cwd);
+
+    // Determine the path to the config file
+    let config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH);
+    let absolute_config_path = cwd.join(&config_path);
+    debug!("Attempting to load storage config from {:?}", absolute_config_path);
+
+    // Load the config from the file
+    let config = load_storage_config_from_yaml(Some(absolute_config_path.clone()))
+        .map_err(|e| GraphError::ConfigurationError(format!("Failed to load storage config from {:?}: {}", absolute_config_path, e)))?;
+    debug!("Loaded config from file: {:?}", config);
+
+    // Check if the daemon is running
+    let is_daemon_running = GLOBAL_STORAGE_ENGINE_MANAGER.get().is_some();
+
+    if is_daemon_running {
+        info!("Storage daemon is running. Fetching runtime configuration.");
+        let manager = GLOBAL_STORAGE_ENGINE_MANAGER
+            .get()
+            .ok_or_else(|| GraphError::ConfigurationError("StorageEngineManager not initialized".to_string()))?;
+
+        let runtime_config_raw = manager.get_manager().lock().await.get_runtime_config().await
+            .map_err(|e| GraphError::ConfigurationError(format!("Failed to get runtime config: {}", e)))?;
+        
+        let runtime_config: StorageConfig = runtime_config_raw.into();
+
+        // Issue a warning if the runtime engine type differs from the file configuration
+        if runtime_config.storage_engine_type != config.storage_engine_type {
+            warn!(
+                "Daemon engine ({:?}) differs from config file ({:?}). Displaying runtime configuration.",
+                runtime_config.storage_engine_type, config.storage_engine_type
+            );
+        }
+
+        // Display runtime configuration if daemon is running
+        println!("Storage Daemon Running on Port {}:", runtime_config.default_port);
+        let registry = GLOBAL_DAEMON_REGISTRY.get().await;
+        if let Ok(Some(metadata)) = registry.get_daemon_metadata(runtime_config.default_port).await {
+            println!("Daemon Status: Running");
+            println!("Daemon PID: {}", metadata.pid);
+            if let Some(engine_type_str) = &metadata.engine_type {
+                println!("Daemon Engine Type (Runtime): {}", engine_type_str);
+            }
+        } else {
+            println!("Daemon Status: Running (No registry metadata available)");
+        }
+        display_config(&runtime_config, &absolute_config_path);
+    } else {
+        // Daemon is not running, display file configuration
+        println!("Storage daemon is not running.");
+        println!("Displaying configuration from storage_config.yaml.");
+        display_config(&config, &absolute_config_path);
+    }
 
     Ok(())
 }
+
 
 /// Handles the interactive 'show storage' command.
 pub async fn handle_show_storage_command_interactive() -> Result<()> {
