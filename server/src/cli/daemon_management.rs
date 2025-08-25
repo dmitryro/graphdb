@@ -1783,6 +1783,23 @@ pub async fn find_all_running_rest_api_ports() -> Vec<u16> {
     running_ports
 }
 
+// Helper function to check if PID is still valid
+pub async fn check_pid_validity(pid: u32) -> bool {
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+    match kill(Pid::from_raw(pid as i32), None) {
+        Ok(_) => true,
+        Err(nix::Error::ESRCH) => {
+            debug!("PID {} is no longer valid (process does not exist)", pid);
+            false
+        }
+        Err(e) => {
+            warn!("Failed to check PID {} validity: {}", pid, e);
+            false
+        }
+    }
+}
+
 pub async fn is_pid_running(pid: u32) -> bool {
     let mut sys = sysinfo::System::new();
     let sysinfo_pid = sysinfo::Pid::from_u32(pid);

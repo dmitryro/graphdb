@@ -1,4 +1,7 @@
 use anyhow::{Result, Context, anyhow}; // Added `anyhow` macro import
+use std::sync::Arc;
+use tokio::sync::{oneshot, Mutex as TokioMutex};
+use tokio::task::JoinHandle;
 use std::path::{PathBuf};
 use std::io::{self, Write};
 use std::collections::HashMap;
@@ -61,7 +64,7 @@ where
 
 /// Helper function to format engine-specific configuration details
 /// Formats the engine configuration into a vector of strings for display.
-pub fn format_engine_config(config: &StorageConfig) -> Vec<String> {
+pub fn format_engine_config(config: &StorageConfig, daemon_port: u16) -> Vec<String> {
     let mut lines = Vec::new();
 
     // Log the input config for debugging
@@ -88,11 +91,8 @@ pub fn format_engine_config(config: &StorageConfig) -> Vec<String> {
                 } else {
                     lines.push("Host: Not specified".to_string());
                 }
-                if let Some(port) = storage_inner.port {
-                    lines.push(format!("Port: {}", port));
-                } else {
-                    lines.push("Port: Not specified".to_string());
-                }
+                // Use the provided daemon_port instead of storage_inner.port
+                lines.push(format!("Port: {}", daemon_port));
             },
             StorageEngineType::PostgreSQL | StorageEngineType::MySQL => {
                 // Database storage engines
@@ -101,11 +101,8 @@ pub fn format_engine_config(config: &StorageConfig) -> Vec<String> {
                 } else {
                     lines.push("Host: Not specified".to_string());
                 }
-                if let Some(port) = storage_inner.port {
-                    lines.push(format!("Port: {}", port));
-                } else {
-                    lines.push("Port: Not specified".to_string());
-                }
+                // Use the provided daemon_port instead of storage_inner.port
+                lines.push(format!("Port: {}", daemon_port));
                 if let Some(database) = &storage_inner.database {
                     lines.push(format!("Database: {}", database));
                 } else {
@@ -129,11 +126,8 @@ pub fn format_engine_config(config: &StorageConfig) -> Vec<String> {
                 } else {
                     lines.push("Host: Not specified".to_string());
                 }
-                if let Some(port) = storage_inner.port {
-                    lines.push(format!("Port: {}", port));
-                } else {
-                    lines.push("Port: Not specified".to_string());
-                }
+                // Use the provided daemon_port instead of storage_inner.port
+                lines.push(format!("Port: {}", daemon_port));
                 if let Some(database) = &storage_inner.database {
                     lines.push(format!("Database: {}", database));
                 } else {
@@ -333,4 +327,7 @@ pub fn parse_show_command(args: &[String]) -> Result<CommandType, anyhow::Error>
         _ => Err(anyhow!("Unknown subcommand for 'show': {}", args[1])),
     }
 }
+
+
+
 
