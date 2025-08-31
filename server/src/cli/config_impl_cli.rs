@@ -59,6 +59,7 @@ impl CliConfig {
                             username: None,
                             password: None,
                             database: None,
+                            pd_endpoints: None,
                         },
                     });
                     storage_config.save()

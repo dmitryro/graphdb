@@ -33,3 +33,5 @@ pub const DEFAULT_GRPC_TIMEOUT_SECONDS: u64 = 60;
 pub const DEFAULT_GRPC_RETRIES: u32 = 5;
 pub const DAEMON_NAME_STORAGE_DAEMON: &str = "storage";
 pub const LOCK_FILE_PATH: &str = "/tmp/graphdb_storage_lock";
+pub const MAX_SHUTDOWN_RETRIES: u32 = 15;
+pub const SHUTDOWN_RETRY_DELAY_MS: u64 = 250;

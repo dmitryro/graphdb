@@ -328,6 +328,37 @@ pub fn parse_show_command(args: &[String]) -> Result<CommandType, anyhow::Error>
     }
 }
 
+// Helper function to convert SelectedStorageConfig to HashMap<String, Value>
+pub fn selected_storage_config_to_hashmap(config: &SelectedStorageConfig) -> HashMap<String, Value> {
+    let mut map = HashMap::new();
+    map.insert(
+        "storage_engine_type".to_string(),
+        Value::String(config.storage_engine_type.to_string().to_lowercase()),
+    );
+    if let Some(path) = &config.storage.path {
+        map.insert("path".to_string(), Value::String(path.to_string_lossy().to_string()));
+    }
+    if let Some(host) = &config.storage.host {
+        map.insert("host".to_string(), Value::String(host.clone()));
+    }
+    if let Some(port) = config.storage.port {
+        map.insert("port".to_string(), Value::Number(port.into()));
+    }
+    if let Some(username) = &config.storage.username {
+        map.insert("username".to_string(), Value::String(username.clone()));
+    }
+    if let Some(password) = &config.storage.password {
+        map.insert("password".to_string(), Value::String(password.clone()));
+    }
+    if let Some(database) = &config.storage.database {
+        map.insert("database".to_string(), Value::String(database.clone()));
+    }
+    if let Some(pd_endpoints) = &config.storage.pd_endpoints {
+        map.insert("pd_endpoints".to_string(), Value::String(pd_endpoints.clone()));
+    }
+    map
+}
+
 
 
 

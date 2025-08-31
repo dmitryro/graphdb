@@ -5,7 +5,8 @@ storage:
   storage_engine_type: tikv
   # Path to local Sled data directory (required for local setup).
   path: /opt/graphdb/storage_data/tikv
-  # Optional remote connection fields (uncomment and configure if using a remote Sled server).
-  # host: 127.0.0.1
-  # port: 8087
-
+  pd_endpoints: "127.0.0.1:2379"
+  host: 127.0.0.1
+  port: 2380
+  username: "tikv" 
+  password: "tikv"

@@ -17,13 +17,14 @@ pub use crate::cli::config::StorageEngineType;
 pub fn parse_storage_engine(engine: &str) -> Result<StorageEngineType, String> {
     match engine.to_lowercase().as_str() {
         "sled" => Ok(StorageEngineType::Sled),
+        "tikv" => Ok(StorageEngineType::TiKV),
         "rocksdb" | "rocks-db" => Ok(StorageEngineType::RocksDB),
         "inmemory" | "in-memory" | "in_memory" => Ok(StorageEngineType::InMemory),
         "redis" => Ok(StorageEngineType::Redis),
         "postgres" | "postgresql" | "postgre-sql" | "postgres-sql" => Ok(StorageEngineType::PostgreSQL),
         "mysql" | "my-sql" | "my_sql" => Ok(StorageEngineType::MySQL),
         other => Err(format!(
-            "Invalid storage engine: '{}'. Supported values (examples): sled, rocksdb, rocks-db, inmemory, in-memory, redis, postgres, postgresql, postgre-sql, mysql, my-sql",
+            "Invalid storage engine: '{}'. Supported values (examples): sled, rocksdb, rocks-db, tikv, inmemory, in-memory, redis, postgres, postgresql, postgre-sql, mysql, my-sql",
             other
         )),
     }
@@ -734,7 +735,7 @@ pub enum RestartAction {
 
 #[derive(Subcommand, Debug, PartialEq, Clone)]
 pub enum UseAction {
-    /// Configure the storage engine (e.g., sled, rocksdb, inmemory, redis, postgresql, mysql).
+    /// Configure the storage engine (e.g., sled, rocksdb, tikv, inmemory, redis, postgresql, mysql).
     Storage {
         /// Storage engine to use.
         #[arg(value_parser = parse_storage_engine)]

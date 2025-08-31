@@ -155,6 +155,8 @@ pub struct StorageConfigInner {
     pub password: Option<String>,
     #[serde(default)]
     pub database: Option<String>,
+    #[serde(default)]
+    pub pd_endpoints: Option<String>,
 }
 
 // The outer struct that holds the engine type and the configuration details.
@@ -185,6 +187,7 @@ impl Default for SelectedStorageConfig {
                 username: None,
                 password: None,
                 database: None,
+                pd_endpoints: None,
             },
         }
     }
@@ -275,6 +278,8 @@ pub fn available_engines() -> Vec<StorageEngineType> {
     let mut engines = vec![StorageEngineType::Sled]; // Sled is always available
     #[cfg(feature = "rocksdb")]
     engines.push(StorageEngineType::RocksDB);
+    #[cfg(feature = "tikv")]
+    engines.push(StorageEngineType::TiKV);
     #[cfg(feature = "redis")]
     engines.push(StorageEngineType::Redis);
     #[cfg(feature = "postgresql")]
@@ -321,12 +326,15 @@ pub struct SledConfig {
     pub port: Option<u16>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TikvConfig {
     pub storage_engine_type: StorageEngineType,
     pub path: PathBuf,
     pub host: Option<String>,
     pub port: Option<u16>,
+    pub pd_endpoints: Option<String>, // Comma-separated PD endpoints (e.g., "127.0.0.1:2382")
+    pub username: Option<String>,
+    pub password: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
