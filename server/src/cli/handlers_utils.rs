@@ -1,4 +1,7 @@
 use anyhow::{Result, Context, anyhow}; // Added `anyhow` macro import
+use std::sync::Arc;
+use tokio::sync::{oneshot, Mutex as TokioMutex};
+use tokio::task::JoinHandle;
 use std::path::{PathBuf};
 use std::io::{self, Write};
 use std::collections::HashMap;
@@ -61,7 +64,7 @@ where
 
 /// Helper function to format engine-specific configuration details
 /// Formats the engine configuration into a vector of strings for display.
-pub fn format_engine_config(config: &StorageConfig) -> Vec<String> {
+pub fn format_engine_config(config: &StorageConfig, daemon_port: u16) -> Vec<String> {
     let mut lines = Vec::new();
 
     // Log the input config for debugging
@@ -88,11 +91,8 @@ pub fn format_engine_config(config: &StorageConfig) -> Vec<String> {
                 } else {
                     lines.push("Host: Not specified".to_string());
                 }
-                if let Some(port) = storage_inner.port {
-                    lines.push(format!("Port: {}", port));
-                } else {
-                    lines.push("Port: Not specified".to_string());
-                }
+                // Use the provided daemon_port instead of storage_inner.port
+                lines.push(format!("Port: {}", daemon_port));
             },
             StorageEngineType::PostgreSQL | StorageEngineType::MySQL => {
                 // Database storage engines
@@ -101,11 +101,8 @@ pub fn format_engine_config(config: &StorageConfig) -> Vec<String> {
                 } else {
                     lines.push("Host: Not specified".to_string());
                 }
-                if let Some(port) = storage_inner.port {
-                    lines.push(format!("Port: {}", port));
-                } else {
-                    lines.push("Port: Not specified".to_string());
-                }
+                // Use the provided daemon_port instead of storage_inner.port
+                lines.push(format!("Port: {}", daemon_port));
                 if let Some(database) = &storage_inner.database {
                     lines.push(format!("Database: {}", database));
                 } else {
@@ -129,11 +126,8 @@ pub fn format_engine_config(config: &StorageConfig) -> Vec<String> {
                 } else {
                     lines.push("Host: Not specified".to_string());
                 }
-                if let Some(port) = storage_inner.port {
-                    lines.push(format!("Port: {}", port));
-                } else {
-                    lines.push("Port: Not specified".to_string());
-                }
+                // Use the provided daemon_port instead of storage_inner.port
+                lines.push(format!("Port: {}", daemon_port));
                 if let Some(database) = &storage_inner.database {
                     lines.push(format!("Database: {}", database));
                 } else {
@@ -333,4 +327,38 @@ pub fn parse_show_command(args: &[String]) -> Result<CommandType, anyhow::Error>
         _ => Err(anyhow!("Unknown subcommand for 'show': {}", args[1])),
     }
 }
+
+// Helper function to convert SelectedStorageConfig to HashMap<String, Value>
+pub fn selected_storage_config_to_hashmap(config: &SelectedStorageConfig) -> HashMap<String, Value> {
+    let mut map = HashMap::new();
+    map.insert(
+        "storage_engine_type".to_string(),
+        Value::String(config.storage_engine_type.to_string().to_lowercase()),
+    );
+    if let Some(path) = &config.storage.path {
+        map.insert("path".to_string(), Value::String(path.to_string_lossy().to_string()));
+    }
+    if let Some(host) = &config.storage.host {
+        map.insert("host".to_string(), Value::String(host.clone()));
+    }
+    if let Some(port) = config.storage.port {
+        map.insert("port".to_string(), Value::Number(port.into()));
+    }
+    if let Some(username) = &config.storage.username {
+        map.insert("username".to_string(), Value::String(username.clone()));
+    }
+    if let Some(password) = &config.storage.password {
+        map.insert("password".to_string(), Value::String(password.clone()));
+    }
+    if let Some(database) = &config.storage.database {
+        map.insert("database".to_string(), Value::String(database.clone()));
+    }
+    if let Some(pd_endpoints) = &config.storage.pd_endpoints {
+        map.insert("pd_endpoints".to_string(), Value::String(pd_endpoints.clone()));
+    }
+    map
+}
+
+
+
 

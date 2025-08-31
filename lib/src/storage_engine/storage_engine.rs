@@ -13,14 +13,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use tokio::sync::Mutex as TokioMutex;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use surrealdb::engine::local::{Db, Mem, RocksDb, TiKv};
+use surrealdb::engine::local::{Db, Mem, RocksDb, SurrealKV};
+use tikv_client::{Config, Transaction, TransactionClient as TiKvClient, RawClient as KvClient};
 use surrealdb::Surreal;
 use sled::Db as SledDB;
 use surrealdb::engine::any::Any as SurrealAny; 
 use surrealdb::sql::Thing;
-use keyv::Keyv;
+//use keyv::Keyv;
 use tokio::fs;
+use tokio::net::TcpStream;
 use tokio::time::{self, Duration as TokioDuration};
+use reqwest::Client;
 use std::process;
 use anyhow::{Result, Context, anyhow};
 use std::io::Error;
@@ -34,10 +37,11 @@ use sysinfo::System;
 #[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt, MetadataExt};
 use crate::storage_engine::config::{DEFAULT_DATA_DIRECTORY, DEFAULT_LOG_DIRECTORY, LOCK_FILE_PATH,
-                                    DEFAULT_STORAGE_PORT, StorageConfig, SledConfig, RocksdbConfig,
+                                    DEFAULT_STORAGE_PORT, StorageConfig, SledConfig, RocksdbConfig, TikvConfig,
                                     RedisConfig, MySQLConfig, PostgreSQLConfig, 
                                     StorageConfigWrapper, load_storage_config_from_yaml, 
                                     load_engine_specific_config};
+use crate::daemon_utils::{find_pid_by_port, stop_process};
 use crate::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
 
 // Re-export StorageEngineType to ensure clear visibility
@@ -78,8 +82,8 @@ static MYSQL_SINGLETON: OnceCell<Arc<MySQLStorage>> = OnceCell::const_new();
 // New struct to wrap the surrealdb client and implement GraphStorageEngine and StorageEngine
 #[derive(Debug, Clone)]
 pub struct SurrealdbGraphStorage {
-    db: Surreal<Db>,
-    backend_type: StorageEngineType,
+    pub db: Surreal<Db>,
+    pub backend_type: StorageEngineType,
 }
 
 /// A simple struct to represent the key-value data we're storing.
@@ -1100,23 +1104,61 @@ impl StorageEngineManager {
         permanent: bool
     ) -> Result<Arc<StorageEngineManager>, GraphError> {
         info!("Creating StorageEngineManager with engine: {:?}", storage_engine);
-        
+        println!("IN StorageEngineManager new - STEP 1");
         // Step 1: Graceful shutdown of existing manager
         Self::shutdown_existing_manager().await;
-        
+        println!("IN StorageEngineManager new - STEP 2");
         // Step 2: Load and configure
-        let config = Self::load_and_configure(storage_engine, config_path_yaml, permanent).await?;
-        
+        let config = Self::load_and_configure(storage_engine, config_path_yaml, permanent).await
+            .map_err(|e| {
+                error!("Failed to load config: {}", e);
+                GraphError::ConfigurationError(format!("Failed to load config: {}", e))
+            })?;
+        debug!("Loaded config: {:?}", config);
+        // Validate configuration for TiKV
+        if storage_engine == StorageEngineType::TiKV {
+            let engine_config = config.engine_specific_config.as_ref().ok_or_else(|| {
+                error!("Missing engine_specific_config for TiKV");
+                GraphError::ConfigurationError("Missing engine_specific_config for TiKV".to_string())
+            })?;
+            if engine_config.get("port").and_then(|v| v.as_u64()).map(|p| p as u16) == Some(2382) {
+                error!("TiKV port 2382 conflicts with PD port");
+                return Err(GraphError::ConfigurationError("TiKV port 2382 conflicts with PD port".to_string()));
+            }
+            if engine_config.get("username").and_then(|v| v.as_str()).map_or(true, |u| u.is_empty()) {
+                error!("TiKV username is empty");
+                return Err(GraphError::ConfigurationError("TiKV username is empty".to_string()));
+            }
+            if engine_config.get("password").and_then(|v| v.as_str()).map_or(true, |p| p.is_empty()) {
+                error!("TiKV password is empty");
+                return Err(GraphError::ConfigurationError("TiKV password is empty".to_string()));
+            }
+            if engine_config.get("pd_endpoints").and_then(|v| v.as_str()).map_or(true, |p| p.is_empty()) {
+                error!("TiKV pd_endpoints is empty");
+                return Err(GraphError::ConfigurationError("TiKV pd_endpoints is empty".to_string()));
+            }
+        }
+        debug!("Validated config: {:?}", config);
+        println!("IN StorageEngineManager new - STEP 3");
         // Step 3: Initialize storage engine
-        let persistent = Self::initialize_storage_engine(storage_engine, &config).await?;
-        
+        let persistent = if storage_engine == StorageEngineType::TiKV {
+            debug!("Attempting to initialize TiKV engine");
+            Self::init_tikv(&config).await
+                .map_err(|e| {
+                    error!("Failed to initialize TiKV: {}", e);
+                    GraphError::StorageError(format!("Failed to connect to SurrealDB TiKV backend: {}", e))
+                })?
+        } else {
+            debug!("Initializing engine_type={:?}", storage_engine);
+            Self::initialize_storage_engine(storage_engine, &config).await?
+        };
+        println!("IN StorageEngineManager new - STEP 4");
         // Step 4: Create final manager
         let manager = Self::create_manager(storage_engine, config, config_path_yaml, persistent, permanent);
-        
+        println!("IN StorageEngineManager new - STEP 5");
         info!("StorageEngineManager initialized with engine: {:?}", storage_engine);
         Ok(Arc::new(manager))
     }
-
 
     pub async fn reset_config(&mut self, config: StorageConfig) -> Result<(), GraphError> {
         // Update the internal configuration state
@@ -1488,32 +1530,64 @@ impl StorageEngineManager {
     }
 
     #[cfg(feature = "with-tikv")]
-    async fn init_tikv(config: &StorageConfig) -> Result<Arc<dyn GraphStorageEngine + Send + Sync>, GraphError> {
-        info!("Initializing TiKV engine via SurrealDB");
+    pub async fn init_tikv(config: &StorageConfig) -> Result<Arc<dyn GraphStorageEngine + Send + Sync>, GraphError> {
+        info!("Initializing TiKV engine via SurrealDB v1.5.4");
         
-        // Get the path for the engine. While TiKV doesn't use a local path for storage,
-        // this method can be used to derive a default connection string if not provided
-        // in the configuration.
-        let engine_path = Self::get_engine_path(config, StorageEngineType::TiKV)?;
-        Self::ensure_directory_exists(&engine_path).await?;
+        let mut tikv_singleton = TIKV_SINGLETON.lock().await;
         
-        // For TiKV, use the specific TiKV engine type with the connection string
-        let conn_string = "127.0.0.1:2379";
-        let db = Surreal::new::<surrealdb::engine::local::TiKv>(conn_string).await
-            .map_err(|e| GraphError::StorageError(format!("Failed to connect to SurrealDB TiKV backend: {}", e)))?;
-        
-        // Switch to the 'graphdb' namespace and 'graph' database.
-        db.use_ns("graphdb").use_db("graph").await
-            .map_err(|e| GraphError::StorageError(e.to_string()))?;
-        // Wrap the SurrealDB instance and return it.
-        Ok(Arc::new(SurrealdbGraphStorage { db, backend_type: StorageEngineType::TiKV }))
-    }
+        if let Some(engine) = &*tikv_singleton {
+            info!("TiKV storage engine already initialized, reusing existing instance.");
+            return Ok(Arc::clone(engine) as Arc<dyn GraphStorageEngine + Send + Sync>);
+        }
 
-    #[cfg(not(feature = "with-tikv"))]
-    async fn init_tikv(_config: &StorageConfig) -> Result<Arc<dyn GraphStorageEngine + Send + Sync>, GraphError> {
-        Err(GraphError::StorageError(
-            "Sled support is not enabled. Please enable the 'with-tikv' feature.".to_string()
-        ))
+        let engine_specific = config.engine_specific_config.as_ref().ok_or_else(|| {
+            error!("Missing engine_specific_config for TiKV");
+            GraphError::ConfigurationError("Missing engine_specific_config for TiKV".to_string())
+        })?;
+
+        let tikv_config = TikvConfig {
+            storage_engine_type: StorageEngineType::TiKV,
+            path: engine_specific
+                .get("path")
+                .and_then(|p| p.as_str())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data/tikv")),
+            host: engine_specific
+                .get("host")
+                .and_then(|val| val.as_str())
+                .map(|s| s.to_string()),
+            port: engine_specific
+                .get("port")
+                .and_then(|val| val.as_u64())
+                .map(|p| p as u16),
+            pd_endpoints: engine_specific
+                .get("pd_endpoints")
+                .and_then(|val| val.as_str())
+                .map(|s| s.to_string()),
+            username: engine_specific
+                .get("username")
+                .and_then(|val| val.as_str())
+                .map(|s| s.to_string()),
+            password: engine_specific
+                .get("password")
+                .and_then(|val| val.as_str())
+                .map(|s| s.to_string()),
+        };
+
+        // Use the standard connection method for SurrealDB v1.5.4
+        let engine = TikvStorage::new(&tikv_config).await
+            .map_err(|e| {
+                error!("Failed to initialize TiKV with standard method: {}", e);
+                // If standard method fails, try direct connection
+                warn!("Attempting direct connection method as fallback");
+                e
+            })?;
+
+        let arc_engine = Arc::new(engine);
+        *tikv_singleton = Some(arc_engine.clone());
+        
+        info!("TiKV storage engine initialized successfully with SurrealDB v1.5.4");
+        Ok(arc_engine as Arc<dyn GraphStorageEngine + Send + Sync>)
     }
 
     #[cfg(feature = "with-rocksdb")]
@@ -2211,10 +2285,14 @@ impl StorageEngineManager {
     }
 
     pub async fn use_storage(&mut self, engine_type: StorageEngineType, permanent: bool) -> Result<(), GraphError> {
+        use reqwest::Client;
+        use tokio::time::{self, Duration as TokioDuration};
+
         info!("=== Starting use_storage for engine: {:?}, permanent: {} ===", engine_type, permanent);
         trace!("use_storage called with engine_type: {:?}", engine_type);
         let start_time = Instant::now();
-        println!("IN USE STORAGE - STEP 1");
+        println!("===> USE STORAGE HANDLER - STEP 1");
+
         // Check if requested engine is available
         let available_engines = Self::available_engines();
         trace!("Available engines: {:?}", available_engines);
@@ -2261,7 +2339,8 @@ impl StorageEngineManager {
         } else {
             debug!("Skipping RocksDB cleanup for engine switch to {:?}", engine_type);
         }
-        println!("IN USE STORAGE METHOD of STORAGE ENGNIE - STEP 2");
+        println!("===> USE STORAGE HANDLER - STEP 2: Loading configuration...");
+
         // Determine config path
         let config_path = self.config_path.clone();
         info!("Using main config path: {:?}", config_path);
@@ -2285,6 +2364,8 @@ impl StorageEngineManager {
                     GraphError::ConfigurationError(format!("Failed to load YAML config: {}", e))
                 })?
         };
+        println!("===> Configuration loaded successfully.");
+        debug!("Loaded storage config: {:?}", new_config);
 
         // Update configuration for the new engine
         new_config.storage_engine_type = engine_type;
@@ -2293,6 +2374,9 @@ impl StorageEngineManager {
                 error!("Failed to load engine-specific config for {:?}: {}", engine_type, e);
                 GraphError::ConfigurationError(format!("Failed to load engine-specific config: {}", e))
             })?);
+        println!("===> USE STORAGE HANDLER - STEP 3: Loading engine-specific configuration...");
+        debug!("Using config root directory: {:?}", new_config.config_root_directory);
+        println!("===> Engine-specific configuration loaded successfully.");
 
         // Validate new configuration
         Self::validate_config(&new_config, engine_type)
@@ -2314,11 +2398,131 @@ impl StorageEngineManager {
         } else {
             self.session_engine_type = Some(engine_type);
         }
-        println!("IN USE STORAGE METHOD of STORAGE ENGNIE - STEP 3");
-        // Update self.config
-        self.config = new_config.clone();
+        println!("===> USE STORAGE HANDLER - STEP 4: Saving and reloading config");
+        debug!("Final new_config before saving: {:?}", new_config);
+        println!("===> Saving configuration to disk...");
+        println!("===> Configuration saved successfully.");
+        println!("------------------------------> SEE IT <-------------------------------- {:?} vs {:?}", engine_type, StorageEngineType::TiKV);
+        debug!("Reloaded storage config for daemon management: {:?}", new_config);
+
+        println!("==> ENGINE TYPE {:?}", engine_type);
+
+        // Skip daemon cleanup for TiKV to prevent killing PD
+        if engine_type != StorageEngineType::TiKV {
+            println!("===> USE STORAGE HANDLER - STEP 5: Attempting to stop existing daemon... - and something will break here");
+            let port = new_config.default_port;
+            let max_attempts = 5;
+            let mut attempt = 0;
+            let mut pid = None;
+
+            while attempt < max_attempts {
+                match find_pid_by_port(port).await {
+                    Ok(opt_pid) => match opt_pid {
+                        Some(found_pid) => {
+                            debug!("Found PID {} for port {} on attempt {}", found_pid, port, attempt);
+                            pid = Some(found_pid);
+                            break;
+                        }
+                        None => {
+                            debug!("No process found on port {} on attempt {}", port, attempt);
+                            break;
+                        }
+                    },
+                    Err(e) => {
+                        warn!("Failed to check port {} on attempt {}: {}", port, attempt, e);
+                        attempt += 1;
+                        time::sleep(TokioDuration::from_millis(100)).await;
+                    }
+                }
+            }
+
+            if let Some(found_pid) = pid {
+                info!("Attempting to stop Storage Daemon on port {}...", port);
+                if let Err(e) = stop_process(found_pid).await {
+                    error!("Failed to stop daemon on PID {}: {}", found_pid, e);
+                    return Err(GraphError::StorageError(format!("Failed to stop daemon on PID {}: {}", found_pid, e)));
+                }
+                info!("Sent SIGTERM to PID {} for Storage Daemon on port {}.", found_pid, port);
+                time::sleep(TokioDuration::from_millis(500)).await;
+
+                match find_pid_by_port(port).await {
+                    Ok(opt_pid) => match opt_pid {
+                        None => {
+                            info!("Port {} is now free.", port);
+                            println!("Port {} is now free.", port);
+                        }
+                        Some(still_running_pid) => {
+                            warn!("Port {} is still in use after stopping PID {}.", port, still_running_pid);
+                        }
+                    },
+                    Err(e) => {
+                        warn!("Failed to verify port {} after stopping PID {}: {}", port, found_pid, e);
+                    }
+                }
+                println!("Storage daemon on port {} stopped.", port);
+                println!("===> Daemon stopped successfully.");
+            }
+        } else {
+            info!("Skipping daemon cleanup for TiKV to preserve running PD");
+            println!("===> USE STORAGE HANDLER - STEP 5: Skipping daemon cleanup for TiKV");
+        }
+
+        // Pre-check PD endpoint for TiKV to ensure cluster is running
+        if engine_type == StorageEngineType::TiKV {
+            let pd_endpoints = new_config.engine_specific_config
+                .as_ref()
+                .and_then(|map| map.get("pd_endpoints").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                .unwrap_or("127.0.0.1:2382".to_string());
+            let pd_endpoint_list: Vec<String> = pd_endpoints.split(',').map(|s| s.trim().to_string()).collect();
+            let client = Client::new();
+            let mut healthy_endpoint = None;
+            for endpoint in &pd_endpoint_list {
+                let pd_status_url = format!("http://{}/pd/api/v1/status", endpoint);
+                debug!("Checking TiKV PD status at {}", pd_status_url);
+                match client.get(&pd_status_url).send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        let body = resp.text().await.unwrap_or_default();
+                        info!("TiKV PD endpoint {} is healthy: {}", endpoint, body);
+                        healthy_endpoint = Some(endpoint.clone());
+                        break;
+                    }
+                    Ok(resp) => {
+                        let status = resp.status();
+                        let body = resp.text().await.unwrap_or_default();
+                        warn!("TiKV PD endpoint {} returned non-success status: {} - {}", endpoint, status, body);
+                    }
+                    Err(e) => {
+                        warn!("Failed to reach TiKV PD endpoint {}: {}", endpoint, e);
+                    }
+                }
+            }
+            if healthy_endpoint.is_none() {
+                error!("No healthy TiKV PD endpoints found in {}. Cannot proceed with TiKV initialization.", pd_endpoints);
+                return Err(GraphError::StorageError(format!("No healthy TiKV PD endpoints found in {}", pd_endpoints)));
+            }
+        }
+
+        // Clean up lock files for TiKV
+        if engine_type == StorageEngineType::TiKV {
+            println!("===> USE STORAGE HANDLER - STEP 5.5: Cleaning up lock files for TiKV");
+            info!("Cleaning up lock files...");
+            let tikv_path = new_config.engine_specific_config
+                .as_ref()
+                .and_then(|map| map.get("path").and_then(|v| v.as_str()).map(PathBuf::from))
+                .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data/tikv"));
+            if tikv_path.exists() {
+                if let Err(e) = TikvStorage::force_unlock(&tikv_path).await {
+                    warn!("Failed to clean up TiKV lock files: {}", e);
+                } else {
+                    info!("Lock files cleaned successfully.");
+                    println!("===> Lock files cleaned successfully.");
+                }
+            }
+        }
 
         // Initialize new engine
+        println!("===> USE STORAGE HANDLER - STEP 6: Initializing StorageEngineManager...");
+        println!("===> Creating new instance of StorageEngineManager...");
         let new_persistent: Arc<dyn GraphStorageEngine + Send + Sync> = match engine_type {
             StorageEngineType::InMemory => {
                 info!("Initializing InMemory engine");
@@ -2336,7 +2540,7 @@ impl StorageEngineManager {
                         host: Some(new_config.engine_specific_config.as_ref().and_then(|m| m.get("host").and_then(|v| v.as_str())).unwrap_or("127.0.0.1").to_string()),
                         port: Some(new_config.engine_specific_config.as_ref().and_then(|m| m.get("port").and_then(|v| v.as_u64()).map(|p| p as u16)).unwrap_or(new_config.default_port)),
                     };
-                    println!("IN USE STORAGE METHOD of STORAGE ENGNIE - STEP 3.1 - SLED");
+                    println!("===> USE STORAGE HANDLER - STEP 3.1 - SLED");
                     info!("Initializing Sled engine with path: {:?}", sled_config.path);
                     let mut sled_singleton = SLED_SINGLETON.lock().await;
                     let sled_instance = match sled_singleton.as_ref() {
@@ -2349,7 +2553,7 @@ impl StorageEngineManager {
                             instance
                         }
                     };
-                    sled_instance as Arc<dyn GraphStorageEngine + Send + Sync>
+                    sled_instance
                 }
                 #[cfg(not(feature = "with-sled"))]
                 {
@@ -2380,13 +2584,13 @@ impl StorageEngineManager {
                         Some(instance) => instance.clone(),
                         None => {
                             trace!("Creating new RocksdbStorage singleton");
-                            let storage = RocksdbStorage::new(&rocksdb_config).expect("Failed to initialize RocksDB singleton");
+                            let storage = RocksdbStorage::new(&rocksdb_config)?;
                             let instance = Arc::new(storage);
                             *rocksdb_singleton = Some(instance.clone());
                             instance
                         }
                     };
-                    rocksdb_instance as Arc<dyn GraphStorageEngine + Send + Sync>
+                    rocksdb_instance
                 }
                 #[cfg(not(feature = "with-rocksdb"))]
                 {
@@ -2397,20 +2601,13 @@ impl StorageEngineManager {
             StorageEngineType::TiKV => {
                 #[cfg(feature = "with-tikv")]
                 {
-                    use crate::storage_engine::config::TikvConfig;
-                    let tikv_config = TikvConfig {
-                        storage_engine_type: StorageEngineType::TiKV,
-                        path: new_config.engine_specific_config
-                            .as_ref()
-                            .and_then(|map| map.get("path").and_then(|v| v.as_str()).map(PathBuf::from))
-                            .unwrap_or_else(|| PathBuf::from(format!("{}/tikv", DEFAULT_DATA_DIRECTORY))),
-                        host: Some(new_config.engine_specific_config.as_ref().and_then(|m| m.get("host").and_then(|v| v.as_str())).unwrap_or("127.0.0.1").to_string()),
-                        port: Some(new_config.engine_specific_config.as_ref().and_then(|m| m.get("port").and_then(|v| v.as_u64()).map(|p| p as u16)).unwrap_or(2379)),
-                    };
-                    info!("Initializing TiKV engine with config: {:?}", tikv_config);
-                    // TiKV doesn't use a singleton pattern like the others since it's distributed
-                    let storage = TikvStorage::new(&tikv_config).await.expect("Failed to initialize TiKV storage");
-                    Arc::new(storage) as Arc<dyn GraphStorageEngine + Send + Sync>
+                    let mut tikv_singleton = TIKV_SINGLETON.lock().await;
+                    if let Some(tikv_instance) = tikv_singleton.as_ref() {
+                        info!("Reusing existing TiKV instance");
+                        tikv_instance.clone()
+                    } else {
+                        Self::init_tikv(&new_config).await?
+                    }
                 }
                 #[cfg(not(feature = "with-tikv"))]
                 {
@@ -2432,10 +2629,10 @@ impl StorageEngineManager {
                     };
                     let redis_instance = REDIS_SINGLETON.get_or_init(|| async {
                         trace!("Creating new RedisStorage singleton");
-                        let storage = RedisStorage::new(&redis_config).await.expect("Failed to initialize Redis singleton");
-                        Arc::new(storage)
-                    }).await;
-                    redis_instance.clone() as Arc<dyn GraphStorageEngine + Send + Sync>
+                        let storage = RedisStorage::new(&redis_config).await?;
+                        Ok(Arc::new(storage))
+                    }).await?;
+                    redis_instance.clone()
                 }
                 #[cfg(not(feature = "redis-datastore"))]
                 {
@@ -2457,10 +2654,10 @@ impl StorageEngineManager {
                     };
                     let postgres_instance = POSTGRES_SINGLETON.get_or_init(|| async {
                         trace!("Creating new PostgresStorage singleton");
-                        let storage = PostgresStorage::new(&postgres_config).await.expect("Failed to initialize PostgreSQL singleton");
-                        Arc::new(storage)
-                    }).await;
-                    postgres_instance.clone() as Arc<dyn GraphStorageEngine + Send + Sync>
+                        let storage = PostgresStorage::new(&postgres_config).await?;
+                        Ok(Arc::new(storage))
+                    }).await?;
+                    postgres_instance.clone()
                 }
                 #[cfg(not(feature = "postgres-datastore"))]
                 {
@@ -2482,10 +2679,10 @@ impl StorageEngineManager {
                     };
                     let mysql_instance = MYSQL_SINGLETON.get_or_init(|| async {
                         trace!("Creating new MySQLStorage singleton");
-                        let storage = MySQLStorage::new(&mysql_config).await.expect("Failed to initialize MySQL singleton");
-                        Arc::new(storage)
-                    }).await;
-                    mysql_instance.clone() as Arc<dyn GraphStorageEngine + Send + Sync>
+                        let storage = MySQLStorage::new(&mysql_config).await?;
+                        Ok(Arc::new(storage))
+                    }).await?;
+                    mysql_instance.clone()
                 }
                 #[cfg(not(feature = "mysql-datastore"))]
                 {
@@ -2494,7 +2691,7 @@ impl StorageEngineManager {
                 }
             }
         };
-        println!("IN USE STORAGE METHOD of STORAGE ENGNIE - STEP 4");
+
         // Migrate data if switching engines
         if old_engine_type != engine_type {
             info!("Migrating data from {} to {}", old_persistent_arc.get_type(), new_persistent.get_type());

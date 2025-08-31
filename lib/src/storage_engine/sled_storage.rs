@@ -15,17 +15,10 @@ use std::sync::{LazyLock, Mutex};
 use uuid::Uuid;
 use log::{info, warn, debug, error};
 use tokio::fs;
-use std::process::{Command, self};
-use std::time::{Duration, Instant};
+use std::time::{Duration};
 #[cfg(unix)]
-use std::os::unix::fs::{PermissionsExt, MetadataExt};
+use std::os::unix::fs::{PermissionsExt};
 use futures::executor;
-use std::thread::sleep;
-#[cfg(unix)]
-use nix::unistd::{Pid, getpid, getuid};
-use fs2::FileExt;
-#[cfg(unix)]
-use std::fs::File;
 use tokio::sync::Mutex as TokioMutex;
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
@@ -38,7 +31,7 @@ static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
         .expect("Failed to initialize Tokio runtime for run_sync")
 });
 
-// Helper function to run async operations synchronously in a synchronous context
+// Helper function to run async operations synchronously
 #[cfg(feature = "with-sled")]
 fn run_sync<F, T>(future: F) -> GraphResult<T>
 where
@@ -74,7 +67,7 @@ pub struct SledStorage {
 }
 
 impl SledStorage {
-    /// Creates a new SledStorage instance with a robust retry mechanism.
+    /// Creates a new SledStorage instance with robust lock handling.
     pub async fn new(config: &SledConfig) -> GraphResult<Self> {
         info!("Initializing Sled storage engine with config: {:?}", config);
         let path = &config.path;
@@ -88,23 +81,42 @@ impl SledStorage {
             })?;
             #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt;
                 let mut perms = std::fs::metadata(path)
                     .map_err(|e| GraphError::Io(e))?
                     .permissions();
-                let mode = 0o755;
-                perms.set_mode(mode);
+                perms.set_mode(0o755);
                 std::fs::set_permissions(path, perms).map_err(|e| GraphError::Io(e))?;
             }
         }
 
-        // Try to unlock the directory before attempting to open the database
-        debug!("Running force_unlock for Sled database at {:?}", path);
-        Self::force_unlock(path).await?;
+        // Passively remove lock file with retries
+        let lock_path = path.join("db.lck");
+        for attempt in 1..=3 {
+            if lock_path.exists() {
+                warn!("Found Sled lock file at {:?}", lock_path);
+                match std::fs::remove_file(&lock_path) {
+                    Ok(_) => {
+                        info!("Successfully removed Sled lock file on attempt {}", attempt);
+                        break;
+                    }
+                    Err(e) if attempt < 3 => {
+                        warn!("Failed to remove lock file on attempt {}: {}. Retrying.", attempt, e);
+                        tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+                    }
+                    Err(e) => {
+                        error!("Failed to remove lock file after 3 attempts: {}", e);
+                        return Err(GraphError::StorageError(format!("Failed to remove lock file: {}", e)));
+                    }
+                }
+            } else {
+                info!("No Sled lock file found at {:?}", lock_path);
+                break;
+            }
+        }
 
-        // Initialize Sled with a retry loop for lock contention
-        const MAX_RETRIES: u32 = 20;
-        const BASE_DELAY_MS: u64 = 500;
+        // Initialize Sled with extended retry loop
+        const MAX_RETRIES: u32 = 30;
+        const BASE_DELAY_MS: u64 = 1000;
         let mut attempt = 0;
         let mut db = None;
 
@@ -123,13 +135,11 @@ impl SledStorage {
                 }
                 Err(e) => {
                     error!("Failed to open Sled DB on attempt {}: {}. Error details: {:?}", attempt + 1, e, e);
-                    let lock_path = path.join("db.lck");
                     if e.to_string().contains("WouldBlock") {
                         warn!("Detected lock contention. Attempt {} of {}. Retrying after delay.", attempt + 1, MAX_RETRIES);
                         run_sync(log_lock_file_diagnostics(lock_path.clone()))?;
-                        run_sync(recover_sled(lock_path.clone()))?;
-                        Self::kill_processes(std::process::id()).await?;
-                        sleep(Duration::from_millis(BASE_DELAY_MS * (attempt as u64 + 1)));
+                        // Do not call kill_processes; rely on passive lock removal
+                        tokio::time::sleep(Duration::from_millis(BASE_DELAY_MS * (attempt as u64 + 1))).await;
                         attempt += 1;
                         continue;
                     } else if e.to_string().contains("corruption") {
@@ -160,7 +170,6 @@ impl SledStorage {
         }
 
         let db = db.ok_or_else(|| {
-            let lock_path = path.join("db.lck");
             error!("Failed to open Sled DB after {} attempts.", MAX_RETRIES);
             run_sync(log_lock_file_diagnostics(lock_path.clone())).unwrap_or_else(|e| {
                 error!("Failed to log lock file diagnostics: {}", e);
@@ -179,7 +188,7 @@ impl SledStorage {
             running: TokioMutex::new(true),
         };
 
-        // Register SIGTERM handler for graceful shutdown with extended delay
+        // Register SIGTERM handler for graceful shutdown
         #[cfg(unix)]
         {
             let path_clone = path.to_path_buf();
@@ -189,7 +198,6 @@ impl SledStorage {
                 let mut sigterm = signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
                 sigterm.recv().await;
                 info!("Received SIGTERM, initiating graceful shutdown for Sled instance at {:?}", path_clone);
-                // Extended delay to ensure cleanup
                 tokio::time::sleep(Duration::from_millis(3000)).await;
                 if let Err(e) = storage_clone.flush_async().await {
                     error!("Failed to flush Sled instance on SIGTERM: {}", e);
@@ -209,260 +217,39 @@ impl SledStorage {
         info!("SledStorage initialized successfully");
         Ok(storage)
     }
-
-    /// Aggressively attempts to break any existing locks on the Sled database.
+    
+    /// Safely removes any existing lock files without killing processes.
     pub async fn force_unlock(path: &Path) -> GraphResult<()> {
-        info!("Attempting to forcefully break locks on Sled database at {:?}", path);
+        info!("Attempting to safely remove locks on Sled database at {:?}", path);
 
-        let db_path = path.join("db");
         let lock_path = path.join("db.lck");
 
-        // Check and remove stale lock files
+        // Passively remove lock file with retry
         if lock_path.exists() {
             warn!("Found potential lock file at {:?}", lock_path);
             run_sync(log_lock_file_diagnostics(lock_path.clone()))?;
-            if let Err(e) = std::fs::remove_file(&lock_path) {
-                error!("Failed to remove lock file: {}", e);
-            } else {
-                info!("Successfully removed stale lock file");
-            }
-        }
-
-        // Check for processes using the database directory
-        #[cfg(unix)]
-        {
-            //Self::kill_processes_using_path(path).await?;
-        }
-
-        // Try to break file locks using flock
-        #[cfg(unix)]
-        {
-            Self::break_file_locks(&db_path)?;
-        }
-
-        // Verify database accessibility
-        if db_path.exists() {
-            match Self::verify_database_accessible(&db_path) {
-                Ok(false) => {
-                    warn!("Database appears to be locked, attempting recovery");
-                    Self::backup_and_recreate_database(path)?;
-                }
-                Ok(true) => {
-                    info!("Database appears to be accessible");
-                }
-                Err(e) => {
-                    warn!("Could not verify database accessibility: {}", e);
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    async fn kill_processes_using_path(path: &Path) -> GraphResult<()> {
-        info!("Checking for processes using database path: {:?}", path);
-
-        let output = Command::new("lsof")
-            .arg("+D")
-            .arg(path)
-            .output();
-
-        match output {
-            Ok(output) if output.status.success() => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if !stdout.trim().is_empty() {
-                    warn!("Found processes using database directory:\n{}", stdout);
-                    let current_pid = process::id();
-                    for line in stdout.lines().skip(1) {
-                        let parts: Vec<&str> = line.split_whitespace().collect();
-                        if parts.len() > 1 {
-                            if let Ok(pid) = parts[1].parse::<u32>() {
-                                if pid != current_pid {
-                                    warn!("Terminating process using database - PID: {}", pid);
-                                    Self::terminate_process(pid as i32);
-                                } else {
-                                    debug!("Skipping current process PID: {}", pid);
-                                }
-                            }
+            for attempt in 1..=3 {
+                match std::fs::remove_file(&lock_path) {
+                    Ok(_) => {
+                        info!("Successfully removed stale lock file on attempt {}", attempt);
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        warn!("Lock file removal blocked on attempt {}: {}", attempt, e);
+                        tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+                        if attempt == 3 {
+                            error!("Failed to remove lock file after 3 attempts: {}", e);
+                            return Err(GraphError::StorageError(format!("Failed to remove lock file: {}", e)));
                         }
-                    }
-                }
-            }
-            Ok(_) => {
-                debug!("lsof found no processes using the database directory");
-            }
-            Err(e) => {
-                debug!("lsof command failed (non-critical): {}", e);
-            }
-        }
-
-        // Also check for graphdb processes
-        Self::kill_processes(process::id()).await?;
-
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    pub async fn kill_processes(current_pid: u32) -> GraphResult<()> {
-        info!("Searching for all processes with 'graphdb' in their name/command");
-
-        let output = Command::new("ps")
-            .args(&["aux"])
-            .output();
-
-        match output {
-            Ok(output) if output.status.success() => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let mut killed_count = 0;
-
-                for line in stdout.lines() {
-                    if line.contains("graphdb") && !line.contains("PID") {
-                        let parts: Vec<&str> = line.split_whitespace().collect();
-                        if parts.len() > 1 {
-                            if let Ok(pid) = parts[1].parse::<u32>() {
-                                if pid != current_pid {
-                                    info!("Found graphdb process - PID: {}, Command: {}", pid, parts.get(10..).unwrap_or(&[]).join(" "));
-                                    Self::terminate_process(pid as i32);
-                                    killed_count += 1;
-                                } else {
-                                    debug!("Skipping current process in graphdb search: {}", pid);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if killed_count > 0 {
-                    info!("Terminated {} graphdb processes", killed_count);
-                    sleep(Duration::from_millis(2000));
-                } else {
-                    debug!("No other graphdb processes found to terminate");
-                }
-            }
-            Ok(_) => {
-                debug!("ps command executed but failed or returned no results");
-            }
-            Err(e) => {
-                warn!("ps command failed: {}", e);
-            }
-        }
-
-        let output = Command::new("pgrep")
-            .args(&["-f", "graphdb"])
-            .output();
-
-        match output {
-            Ok(output) if output.status.success() => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                for line in stdout.lines() {
-                    if let Ok(pid) = line.trim().parse::<u32>() {
-                        if pid != current_pid {
-                            info!("pgrep found additional graphdb process PID: {}", pid);
-                            Self::terminate_process(pid as i32);
-                        }
-                    }
-                }
-            }
-            Ok(_) => {
-                debug!("pgrep command executed but failed or found no processes");
-            }
-            Err(e) => {
-                debug!("pgrep command failed (non-critical): {}", e);
-            }
-        }
-
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    fn terminate_process(pid: i32) {
-        info!("Terminating process PID: {}", pid);
-
-        match Command::new("kill")
-            .arg("-TERM")
-            .arg(pid.to_string())
-            .status()
-        {
-            Ok(status) if status.success() => {
-                debug!("Sent SIGTERM to PID: {}", pid);
-            }
-            _ => {
-                warn!("Failed to send SIGTERM to PID: {}", pid);
-            }
-        }
-
-        sleep(Duration::from_millis(2000));
-
-        match Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .status()
-        {
-            Ok(status) if status.success() => {
-                warn!("Process {} still running, sending SIGKILL", pid);
-                let _ = Command::new("kill")
-                    .arg("-KILL")
-                    .arg(pid.to_string())
-                    .status();
-                sleep(Duration::from_millis(500));
-                match Command::new("kill")
-                    .arg("-0")
-                    .arg(pid.to_string())
-                    .status()
-                {
-                    Ok(status) if status.success() => {
-                        error!("Process {} refused to die even with SIGKILL", pid);
-                    }
-                    _ => {
-                        info!("Successfully terminated process {}", pid);
-                    }
-                }
-            }
-            _ => {
-                debug!("Process {} has exited gracefully", pid);
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    fn break_file_locks(db_path: &Path) -> GraphResult<()> {
-        use std::os::unix::io::AsRawFd;
-
-        debug!("Attempting to break file locks on {:?}", db_path);
-
-        if !db_path.exists() {
-            debug!("Database file doesn't exist, nothing to unlock");
-            return Ok(());
-        }
-
-        match File::options().read(true).write(true).open(db_path) {
-            Ok(file) => {
-                debug!("Successfully opened database file for lock breaking");
-
-                match file.try_lock_exclusive() {
-                    Ok(()) => {
-                        info!("Successfully acquired exclusive lock, releasing immediately");
-                        let _ = file.unlock();
                     }
                     Err(e) => {
-                        warn!("Could not acquire exclusive lock: {}", e);
-                        unsafe {
-                            let fd = file.as_raw_fd();
-                            let result = libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB);
-                            if result == 0 {
-                                info!("Successfully broke lock using raw flock");
-                                libc::flock(fd, libc::LOCK_UN);
-                            } else {
-                                warn!("Raw flock also failed, lock may be held by active process");
-                            }
-                        }
+                        error!("Failed to remove lock file: {}", e);
+                        return Err(GraphError::StorageError(format!("Failed to remove lock file: {}", e)));
                     }
                 }
             }
-            Err(e) => {
-                warn!("Could not open database file for lock breaking: {}", e);
-            }
+        } else {
+            info!("No lock file found at {:?}", lock_path);
         }
 
         Ok(())

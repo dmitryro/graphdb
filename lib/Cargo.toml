@@ -1,18 +1,20 @@
-# lib/Cargo.toml
-# Updated: 2025-07-01 - Corrected bincode and bcrypt dependency declarations.
-# Harmonized versions across workspace.
-
 [package]
 name = "lib"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
+# Updated SurrealDB with proper features
+surrealdb = { version = "2.3.7", features = ["kv-mem", "kv-rocksdb", "kv-surrealkv", "kv-tikv", "protocol-http"] }
+
+# Keep these TiKV-related dependencies for compatibility
+tikv-client = { version = "0.3.0", optional = true }
+#surrealdb-tikv-client = "0.3.0-surreal.3"
+
+# Rest of your dependencies remain the same...
 libc = "0.2.175"
 fs2 = "0.4.3"
-surrealdb = { version = "2.3.7", features = ["kv-mem", "kv-rocksdb", "kv-tikv"] } 
 keyv = { version = "0.2.1", optional = true}
-tikv-client = "0.3.0"
 futures = "0.3.31"
 ordered-float = "5.0.0"
 rand = "0.8.5"
@@ -31,6 +33,7 @@ env_logger = "0.11.8"
 serde_json = "1.0.140"
 tonic = "0.12.0"
 async-std = "1.13.0"
+reqwest = { version = "0.12.22", features = ["json", "blocking", "rustls-tls"] }
 sysinfo = { version = "0.36.1", features = ["default", "serde"] }
 chrono = { version = "0.4.39", features = ["serde"] }
 serde = { version = "1.0.219", features = ["derive"] }
@@ -40,7 +43,7 @@ diesel_json = "0.2.1"
 open-cypher = "0.1.1"
 nom = "8.0.0"
 sled = { version= "0.34.7", optional = true}
-typed-sled = { version = "0.2.3" }
+typed-sled = "0.2.3"
 bytes = "1.10.0"
 clap = { version = "4.5.29", features = ["derive"] }
 hashbrown = "0.15.2"
@@ -57,14 +60,14 @@ libloading = "0.8.6"
 r2d2 = "0.8.10"
 anyhow = "1.0.98"
 crossterm = "0.28.1"
-tokio-stream = "0.1.17"
+tokio-stream = { version = "0.1.17", optional = true }
 tokio-test = "0.4.4"
 mockall = "0.13.1"
 graphql-parser = "0.4.1"
 argon2 = "0.5.3"
 base64 = "0.22.1"
 bincode = { version = "2.0.1", features = ["serde"] }
-rocksdb = { version = "0.23.0", features = ["snappy", "lz4", "zstd", "zlib", "bzip2"], optional = true } # ADDED `optional = true`
+rocksdb = { version = "0.23.0", features = ["snappy", "lz4", "zstd", "zlib", "bzip2"], optional = true }
 uuid = { version = "1.3.1", features = ["serde", "v4", "v1", "rng"] }
 rmp-serde = "1.3.0"
 once_cell = "1.20.3"
@@ -89,17 +92,11 @@ mysql_async = "0.36.1"
 nix = { version = "0.29.0", features = ["process"]}
 dirs= "6.0.0"
 
-[dev-dependencies]
-tempfile = "3.20.0"
-serde_json = "1.0.140"
-tokio-test = "0.4.4"
-mockall = "0.13.1"
-
 [features]
-default = ["with-rocksdb", "with-sled", "with-tikv"] # Reset to an empty default to avoid the previous error.
+default = ["with-rocksdb", "with-sled", "with-tikv", "with-surrealkv",]
 sled-datastore = ["sled"]
-tikv-datasource = ["keyv"]
-rocksdb-datastore = ["rocksdb"] # This feature now correctly enables the optional rocksdb dependency.
+tikv-datasource = ["tikv-client", "tokio-stream"]
+rocksdb-datastore = ["rocksdb"]
 redis-datastore = ["redis"]
 postgres-datastore = ["sqlx"]
 mysql-datastore = ["mysql"]
@@ -107,5 +104,7 @@ in-memory-datastore = ["dashmap"]
 test-suite = []
 bench-suite = []
 with-rocksdb = ["rocksdb"]
-with-tikv = ["surrealdb/kv-tikv", "keyv"]
+with-tikv = ["tikv-client", "tikv-datasource"]
+with-surrealkv = ["surrealdb/kv-surrealkv"]
 with-sled = ["sled"]
+
