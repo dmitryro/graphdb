@@ -19,6 +19,7 @@ pub const DEFAULT_STORAGE_CONFIG_PATH_MYSQL: &str = "./storage_daemon_server/sto
 pub const DEFAULT_STORAGE_CONFIG_PATH_REDIS: &str = "./storage_daemon_server/storage_config_redis.yaml";
 pub const DEFAULT_REST_CONFIG_PATH_RELATIVE: &str = "./storage_daemon_server/rest_api_config.yaml";
 pub const DEFAULT_DAEMON_CONFIG_PATH_RELATIVE: &str = "./storage_daemon_server/daemon_config.yaml";
+pub const TIKV_DAEMON_ENGINE_TYPE_NAME: &str = "TiKV";
 pub const DEFAULT_MAIN_APP_CONFIG_PATH_RELATIVE: &str = "./storage_daemon_server/main_app_config.yaml";
 pub const PID_FILE_DIR: &str = "./storage_daemon_server/pids";
 pub const DAEMON_PID_FILE_NAME_PREFIX: &str = "graphdb-daemon-";
