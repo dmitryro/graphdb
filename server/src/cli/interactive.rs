@@ -8,6 +8,8 @@
 // UPDATED: 2025-08-08 - Updated `parse_command` to handle `StorageEngineType` variants `sled`, `rocksdb`, `inmemory`, `redis`, `postgresql`, `mysql` in `use storage` command, aligning with updated `StorageEngineType` enum.
 // UPDATED: 2025-08-08 - Fixed E0603 by ensuring `StorageEngineType` is imported from `crate::cli::commands`, which re-exports from `crate::cli::config`.
 // ADDED: 2025-08-09 - Added parsing for `save storage` and `save config`/`save configuration` in `parse_command`, mapping to `CommandType::SaveStorage` and `CommandType::SaveConfig`. Updated `handle_interactive_command` to handle `CommandType::SaveStorage` and `CommandType::SaveConfig` to fix E0004. Updated `use storage` parsing to handle `--permanent` flag, setting `permanent` boolean for `CommandType::UseStorage`.
+// ADDED: 2025-08-31 - Added parsing for `kv`, `exec`, `query`, and `unified` commands in `parse_command`, supporting flagless and flagged arguments (`--operation`, `--key`, `--value` for `kv`; `--command` for `exec`; `--query`, `--language` for `query` and `unified`). Updated `handle_interactive_command` to handle `CommandType::Kv`, `CommandType::Exec`, `CommandType::Query`, and `CommandType::Unified` by calling `handlers::handle_kv_command`, `handle_exec_command`, `handle_query_command`, and `handle_unified_query`. Added `query_engine` to `SharedState` and `run_cli_interactive`.
+// UPDATED: 2025-08-31 - Fixed E0308 by reordering arguments in `handle_kv_command`, `handle_exec_command`, `handle_query_command`, and `handle_unified_query` calls to place `query_engine` first. Fixed E0308 for `listen_port` by removing redundant `Some` wrapping in `parse_command`.
 
 use anyhow::{Result, Context, anyhow};
 use rustyline::error::ReadlineError;
@@ -26,7 +28,7 @@ use crate::cli::cli::CliArgs;
 use crate::cli::commands::{
     CommandType, DaemonCliCommand, RestCliCommand, StorageAction, StatusArgs, StopArgs,
     ReloadArgs, ReloadAction, StartAction, RestartArgs, RestartAction, HelpArgs, ShowAction,
-    ConfigAction,
+    ConfigAction, parse_kv_operation, KvAction,
 };
 use crate::cli::handlers;
 use crate::cli::help_display::{
@@ -35,6 +37,7 @@ use crate::cli::help_display::{
 };
 use crate::cli::handlers_utils::{parse_show_command};
 pub use lib::storage_engine::config::{StorageEngineType};
+use lib::query_exec_engine::query_exec_engine::QueryExecEngine;
 
 struct SharedState {
     daemon_handles: Arc<TokioMutex<HashMap<u16, (JoinHandle<()>, oneshot::Sender<()>)>>>,
@@ -44,6 +47,7 @@ struct SharedState {
     storage_daemon_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
     storage_daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
     storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
+    query_engine: Arc<QueryExecEngine>,
 }
 
 fn levenshtein_distance(s1: &str, s2: &str) -> usize {
@@ -88,6 +92,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
         "start", "stop", "status", "auth", "authenticate", "register",
         "version", "health", "reload", "restart", "clear", "help", "exit",
         "daemon", "rest", "storage", "use", "quit", "q", "clean", "save", "show",
+        "kv", "exec", "query", "unified",
     ];
 
     const FUZZY_MATCH_THRESHOLD: usize = 2;
@@ -282,7 +287,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                     }
                     "--daemon-port" => {
                         if i + 1 < remaining_args.len() {
-                            daemon_port = Some(remaining_args[i + 1].parse::<u16>().ok().unwrap_or_default());
+                            daemon_port = remaining_args[i + 1].parse::<u16>().ok();
                             i += 2;
                         } else {
                             eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
@@ -309,7 +314,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                     }
                     "--rest-port" => {
                         if i + 1 < remaining_args.len() {
-                            rest_port = Some(remaining_args[i + 1].parse::<u16>().ok().unwrap_or_default());
+                            rest_port = remaining_args[i + 1].parse::<u16>().ok();
                             i += 2;
                         } else {
                             eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
@@ -327,7 +332,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                     }
                     "--storage-port" => {
                         if i + 1 < remaining_args.len() {
-                            storage_port = Some(remaining_args[i + 1].parse::<u16>().ok().unwrap_or_default());
+                            storage_port = remaining_args[i + 1].parse::<u16>().ok();
                             i += 2;
                         } else {
                             eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
@@ -536,7 +541,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                 }
                                 "--listen-port" => {
                                     if i + 1 < remaining_args.len() {
-                                        listen_port = Some(remaining_args[i + 1].parse::<u16>().ok().unwrap_or_default());
+                                        listen_port = remaining_args[i + 1].parse::<u16>().ok();
                                         i += 2;
                                     } else {
                                         eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
@@ -545,7 +550,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                 }
                                 "--storage-port" => {
                                     if i + 1 < remaining_args.len() {
-                                        storage_port = Some(remaining_args[i + 1].parse::<u16>().ok().unwrap_or_default());
+                                        storage_port = remaining_args[i + 1].parse::<u16>().ok();
                                         i += 2;
                                     } else {
                                         eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
@@ -563,7 +568,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                 }
                                 "--daemon-port" => {
                                     if i + 1 < remaining_args.len() {
-                                        daemon_port = Some(remaining_args[i + 1].parse::<u16>().ok().unwrap_or_default());
+                                        daemon_port = remaining_args[i + 1].parse::<u16>().ok();
                                         i += 2;
                                     } else {
                                         eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
@@ -581,7 +586,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                 }
                                 "--rest-port" => {
                                     if i + 1 < remaining_args.len() {
-                                        rest_port = Some(remaining_args[i + 1].parse::<u16>().ok().unwrap_or_default());
+                                        rest_port = remaining_args[i + 1].parse::<u16>().ok();
                                         i += 2;
                                     } else {
                                         eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
@@ -645,7 +650,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                 }
                                 "--rest-port" => {
                                     if i + 1 < remaining_args.len() {
-                                        rest_port = Some(remaining_args[i + 1].parse::<u16>().ok().unwrap_or_default());
+                                        rest_port = remaining_args[i + 1].parse::<u16>().ok();
                                         i += 2;
                                     } else {
                                         eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
@@ -707,7 +712,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                 }
                                 "--storage-port" => {
                                     if i + 1 < remaining_args.len() {
-                                        storage_port = Some(remaining_args[i + 1].parse::<u16>().ok().unwrap_or_default());
+                                        storage_port = remaining_args[i + 1].parse::<u16>().ok();
                                         i += 2;
                                     } else {
                                         eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
@@ -759,7 +764,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                 }
                                 "--daemon-port" => {
                                     if i + 1 < remaining_args.len() {
-                                        daemon_port = Some(remaining_args[i + 1].parse::<u16>().ok().unwrap_or_default());
+                                        daemon_port = remaining_args[i + 1].parse::<u16>().ok();
                                         i += 2;
                                     } else {
                                         eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
@@ -935,7 +940,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                         }
                         "--daemon-port" => {
                             if i + 1 < remaining_args.len() {
-                                daemon_port = Some(remaining_args[i + 1].parse::<u16>().ok().unwrap_or_default());
+                                daemon_port = remaining_args[i + 1].parse::<u16>().ok();
                                 i += 2;
                             } else {
                                 eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
@@ -1042,7 +1047,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                         }
                         "--rest-port" => {
                             if i + 1 < remaining_args.len() {
-                                rest_port = Some(remaining_args[i + 1].parse::<u16>().ok().unwrap_or_default());
+                                rest_port = remaining_args[i + 1].parse::<u16>().ok();
                                 i += 2;
                             } else {
                                 eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
@@ -1167,7 +1172,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                         }
                         "--storage-port" => {
                             if i + 1 < remaining_args.len() {
-                                storage_port = Some(remaining_args[i + 1].parse::<u16>().ok().unwrap_or_default());
+                                storage_port = remaining_args[i + 1].parse::<u16>().ok();
                                 i += 2;
                             } else {
                                 eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
@@ -1195,6 +1200,243 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                     "version" => CommandType::Storage(StorageAction::Version),
                     "storage-query" => CommandType::Storage(StorageAction::StorageQuery),
                     _ => CommandType::Unknown,
+                }
+            }
+        },
+        // The updated match arm for "kv"
+"kv" => {
+    let mut key = None;
+    let mut value = None;
+    let mut operation = None;
+    let mut i = 0;
+    
+    // First, check for the operation which can be positional or flagged
+    if let Some(op_str) = remaining_args.get(0) {
+        if !op_str.starts_with('-') {
+            operation = Some(op_str.clone());
+            i += 1;
+        }
+    }
+    
+    // Now, parse the remaining arguments for flags and values
+    while i < remaining_args.len() {
+        match remaining_args[i].as_str() {
+            "--key" => {
+                if i + 1 < remaining_args.len() {
+                    key = Some(remaining_args[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("Warning: Flag '--key' requires a value.");
+                    return (CommandType::Unknown, remaining_args);
+                }
+            }
+            "--value" => {
+                if i + 1 < remaining_args.len() {
+                    value = Some(remaining_args[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("Warning: Flag '--value' requires a value.");
+                    return (CommandType::Unknown, remaining_args);
+                }
+            }
+            // Handle positional arguments after the operation
+            _ => {
+                if operation.is_some() {
+                    // Positional key
+                    if key.is_none() {
+                        key = Some(remaining_args[i].clone());
+                        i += 1;
+                    }
+                    // Positional value (only for "set")
+                    else if value.is_none() && operation.as_deref() == Some("set") {
+                        value = Some(remaining_args[i].clone());
+                        i += 1;
+                    } else {
+                        eprintln!("Warning: Unrecognized argument: {}", remaining_args[i]);
+                        return (CommandType::Unknown, remaining_args);
+                    }
+                } else {
+                    eprintln!("Warning: Unrecognized argument: {}", remaining_args[i]);
+                    return (CommandType::Unknown, remaining_args);
+                }
+            }
+        }
+    }
+    
+    // Validate and construct the command based on parsed values
+    if operation.is_none() {
+        eprintln!("Usage: kv <get|set|delete> <key> [<value>]");
+        return (CommandType::Unknown, remaining_args);
+    }
+    
+    let op_str = operation.unwrap();
+    let action = match op_str.to_lowercase().as_str() {
+        "get" => {
+            if let Some(k) = key {
+                KvAction::Get { key: k }
+            } else {
+                eprintln!("Missing key for 'kv get' command.");
+                return (CommandType::Unknown, remaining_args);
+            }
+        }
+        "set" => {
+            if let (Some(k), Some(v)) = (key, value) {
+                KvAction::Set { key: k, value: v }
+            } else {
+                eprintln!("Missing key or value for 'kv set' command.");
+                return (CommandType::Unknown, remaining_args);
+            }
+        }
+        "delete" => {
+            if let Some(k) = key {
+                KvAction::Delete { key: k }
+            } else {
+                eprintln!("Missing key for 'kv delete' command.");
+                return (CommandType::Unknown, remaining_args);
+            }
+        }
+        _ => {
+            eprintln!("Invalid KV operation: {}. Supported: get, set, delete", op_str);
+            return (CommandType::Unknown, remaining_args);
+        }
+    };
+    
+    CommandType::Kv { action }
+},
+
+
+
+
+        "exec" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: exec <command> or exec --command <command>");
+                CommandType::Unknown
+            } else {
+                let mut command = None;
+                let mut i = 0;
+
+                // Check for flagless syntax (e.g., exec <command>)
+                if !remaining_args[0].starts_with('-') {
+                    command = Some(remaining_args[0].clone());
+                    i = remaining_args.len(); // Skip flag parsing
+                }
+
+                // Parse flagged arguments
+                while i < remaining_args.len() {
+                    match remaining_args[i].to_lowercase().as_str() {
+                        "--command" => {
+                            if i + 1 < remaining_args.len() {
+                                command = Some(remaining_args[i + 1].clone());
+                                i += 2;
+                            } else {
+                                eprintln!("Warning: Flag '--command' requires a value.");
+                                i += 1;
+                            }
+                        }
+                        _ => {
+                            eprintln!("Warning: Unknown argument for 'exec': {}", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                }
+
+                if let Some(cmd) = command {
+                    CommandType::Exec { command: cmd }
+                } else {
+                    eprintln!("Missing command for 'exec' command. Usage: exec <command> or exec --command <command>");
+                    CommandType::Unknown
+                }
+            }
+        },
+        "query" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: query <query> or query --query <query>");
+                CommandType::Unknown
+            } else {
+                let mut query = None;
+                let mut i = 0;
+
+                // Check for flagless syntax (e.g., query <query>)
+                if !remaining_args[0].starts_with('-') {
+                    query = Some(remaining_args[0].clone());
+                    i = remaining_args.len(); // Skip flag parsing
+                }
+
+                // Parse flagged arguments
+                while i < remaining_args.len() {
+                    match remaining_args[i].to_lowercase().as_str() {
+                        "--query" => {
+                            if i + 1 < remaining_args.len() {
+                                query = Some(remaining_args[i + 1].clone());
+                                i += 2;
+                            } else {
+                                eprintln!("Warning: Flag '--query' requires a value.");
+                                i += 1;
+                            }
+                        }
+                        _ => {
+                            eprintln!("Warning: Unknown argument for 'query': {}", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                }
+
+                if let Some(q) = query {
+                    CommandType::Query { query: q }
+                } else {
+                    eprintln!("Missing query for 'query' command. Usage: query <query> or query --query <query>");
+                    CommandType::Unknown
+                }
+            }
+        },
+        "unified" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: unified <query> [--language <language>]");
+                CommandType::Unknown
+            } else {
+                let mut query = None;
+                let mut language = None;
+                let mut i = 0;
+
+                // Check for flagless syntax (e.g., unified <query>)
+                if !remaining_args[0].starts_with('-') {
+                    query = Some(remaining_args[0].clone());
+                    i = 1;
+                }
+
+                // Parse flagged arguments
+                while i < remaining_args.len() {
+                    match remaining_args[i].to_lowercase().as_str() {
+                        "--query" => {
+                            if i + 1 < remaining_args.len() {
+                                query = Some(remaining_args[i + 1].clone());
+                                i += 2;
+                            } else {
+                                eprintln!("Warning: Flag '--query' requires a value.");
+                                i += 1;
+                            }
+                        }
+                        "--language" => {
+                            if i + 1 < remaining_args.len() {
+                                language = Some(remaining_args[i + 1].clone());
+                                i += 2;
+                            } else {
+                                eprintln!("Warning: Flag '--language' requires a value.");
+                                i += 1;
+                            }
+                        }
+                        _ => {
+                            eprintln!("Warning: Unknown argument for 'unified': {}", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                }
+
+                if let Some(q) = query {
+                    CommandType::Unified { query: q, language }
+                } else {
+                    eprintln!("Missing query for 'unified' command. Usage: unified <query> [--language <language>]");
+                    CommandType::Unknown
                 }
             }
         },
@@ -1270,11 +1512,6 @@ pub async fn handle_interactive_command(
             )
             .await
         }
-        /*
-        CommandType::ShowStorage => {
-            handlers::show_storage().await;
-            Ok(())
-        }*/
         CommandType::StartStorage {
             port,
             config_file,
@@ -1402,8 +1639,6 @@ pub async fn handle_interactive_command(
                 state.storage_daemon_handle.clone(),
                 state.storage_daemon_port_arc.clone(),
             ).await?;
-            // The compiler expects this arm to return a Result, but the '?' returns '()'.
-            // Explicitly returning Ok(()) fixes the type mismatch.
             Ok(())
         }
         CommandType::UsePlugin { enable } => {
@@ -1523,9 +1758,7 @@ pub async fn handle_interactive_command(
             };
             handlers::handle_restart_command_interactive(
                 restart_args,
-                state
-
-.daemon_handles.clone(),
+                state.daemon_handles.clone(),
                 state.rest_api_shutdown_tx_opt.clone(),
                 state.rest_api_port_arc.clone(),
                 state.rest_api_handle.clone(),
@@ -1623,12 +1856,38 @@ pub async fn handle_interactive_command(
         CommandType::Exit => {
             Ok(())
         }
+        CommandType::Kv { action } => {
+            // Determine the operation, key, and value from the nested KvAction enum
+            let (operation, key, value) = match action {
+                KvAction::Get { key } => ("get".to_string(), key, None),
+                KvAction::Set { key, value } => ("set".to_string(), key, Some(value)),
+                KvAction::Delete { key } => ("delete".to_string(), key, None),
+            };
+
+            // Call the existing unified handler function with the extracted parameters
+            handlers::handle_kv_command(state.query_engine.clone(), operation, key, value).await?;
+            
+            Ok(())
+        }
+        CommandType::Exec { command } => {
+            handlers::handle_exec_command(state.query_engine.clone(), command).await?;
+            Ok(())
+        }
+        CommandType::Query { query } => {
+            handlers::handle_query_command(state.query_engine.clone(), query).await?;
+            Ok(())
+        }
+        CommandType::Unified { query, language } => {
+            handlers::handle_unified_query(state.query_engine.clone(), query, language).await?;
+            Ok(())
+        }
         CommandType::Unknown => {
             println!("Unknown command. Type 'help' for a list of commands.");
             Ok(())
         }
     }
 }
+
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run_cli_interactive(
@@ -1639,6 +1898,7 @@ pub async fn run_cli_interactive(
     storage_daemon_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
     storage_daemon_handle: Arc<TokioMutex<Option<tokio::task::JoinHandle<()>>>>,
     storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
+    query_engine: Arc<QueryExecEngine>,
 ) -> Result<()> {
     let mut rl = DefaultEditor::new()?;
     let history_path = "graphdb_cli_history.txt";
@@ -1654,6 +1914,7 @@ pub async fn run_cli_interactive(
         storage_daemon_shutdown_tx_opt,
         storage_daemon_handle,
         storage_daemon_port_arc,
+        query_engine,
     };
 
     loop {

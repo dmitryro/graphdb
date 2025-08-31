@@ -3,7 +3,11 @@
 // Corrected: 2025-08-10 - Removed .await from synchronous KV store methods and corrected argument types
 // ADDED: 2025-08-13 - Added handle_exec_command, handle_query_command, and handle_kv_command
 // FIXED: 2025-08-13 - Resolved E0277 by using {:?} formatter for QueryType
-// FIXED: 2025-08-13 - Removed duplicate handle_kv_command with KvAction to align with cli.rs
+// FIXED: 2025-08-13 - Removed duplicate handle_kv_command with Kv to align with cli.rs
+// ADDED: 2025-08-31 - Enhanced handle_exec_command to validate non-empty commands and execute via QueryExecEngine::execute_command
+// ADDED: 2025-08-31 - Updated handle_query_command to support Cypher, SQL, and GraphQL using parse_query_from_string and specific QueryExecEngine methods
+// ADDED: 2025-08-31 - Updated handle_kv_command to use parse_kv_operation, support flagless and flagged arguments, and align with cli.rs validation
+// FIXED: 2025-08-31 - Added error handling for empty inputs and invalid operations, matching cli.rs error messaging style
 
 use anyhow::{Result, Context, anyhow};
 use log::{info, debug, error};
@@ -11,7 +15,7 @@ use serde_json::Value;
 use std::sync::Arc;
 use lib::query_exec_engine::query_exec_engine::{QueryExecEngine};
 use lib::query_parser::{parse_query_from_string, QueryType};
-use super::commands::{KvAction, QueryArgs};
+use super::commands::{KvAction, QueryArgs, parse_kv_operation};
 
 // Note: `find_rest_api_port` and `GLOBAL_DAEMON_REGISTRY` are removed
 // because we are no longer acting as a REST API client. The logic
@@ -105,77 +109,118 @@ pub async fn handle_interactive_query(engine: Arc<QueryExecEngine>, query_string
 pub async fn handle_exec_command(engine: Arc<QueryExecEngine>, command: String) -> Result<()> {
     info!("Executing command '{}' on QueryExecEngine", command);
     println!("Executing command '{}'", command);
-    
-    // Placeholder for actual command execution logic
-    // This could involve a method on QueryExecEngine for executing arbitrary commands
+
+    // Validate command is not empty
+    if command.trim().is_empty() {
+        return Err(anyhow!("Exec command cannot be empty. Usage: exec --command <command>"));
+    }
+
+    // Execute the command on the storage engine
+    let result = engine
+        .execute_command(&command)
+        .await
+        .map_err(|e| anyhow!("Failed to execute command '{}': {}", command, e))?;
+
+    // Print the result
+    println!("Command Result: {}", result);
     Ok(())
 }
 
 /// Handles the `query` command to execute a query on the query engine.
 pub async fn handle_query_command(engine: Arc<QueryExecEngine>, query: String) -> Result<()> {
     info!("Executing query '{}' on QueryExecEngine", query);
-    execute_and_print(&engine, &query).await
+    println!("Executing query '{}'", query);
+
+    // Validate query is not empty
+    if query.trim().is_empty() {
+        return Err(anyhow!("Query cannot be empty. Usage: query --query <query>"));
+    }
+
+    // Parse the query to determine its type
+    let query_type = parse_query_from_string(&query)
+        .map_err(|e| anyhow!("Failed to parse query '{}': {}", query, e))?;
+
+    // Execute the query based on its type
+    let result = match query_type {
+        QueryType::Cypher => {
+            info!("Detected Cypher query");
+            engine
+                .execute_cypher(&query)
+                .await
+                .map_err(|e| anyhow!("Failed to execute Cypher query '{}': {}", query, e))?
+        }
+        QueryType::SQL => {
+            info!("Detected SQL query");
+            engine
+                .execute_sql(&query)
+                .await
+                .map_err(|e| anyhow!("Failed to execute SQL query '{}': {}", query, e))?
+        }
+        QueryType::GraphQL => {
+            info!("Detected GraphQL query");
+            engine
+                .execute_graphql(&query)
+                .await
+                .map_err(|e| anyhow!("Failed to execute GraphQL query '{}': {}", query, e))?
+        }
+    };
+
+    // Print the query result
+    println!("Query Result:\n{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
 }
 
 /// Handles the `kv` command for key-value operations on the query engine.
 pub async fn handle_kv_command(engine: Arc<QueryExecEngine>, operation: String, key: String, value: Option<String>) -> Result<()> {
-    match operation.to_lowercase().as_str() {
+    // Validate the operation using parse_kv_operation
+    let validated_op = parse_kv_operation(&operation)
+        .map_err(|e| anyhow!("Invalid KV operation: {}", e))?;
+
+    match validated_op.as_str() {
         "get" => {
             info!("Executing Key-Value GET for key: {}", key);
-            let kv_store = engine.get_kv_store();
-            let result = kv_store.get(&key);
+            let result = engine
+                .kv_get(&key)
+                .await
+                .map_err(|e| anyhow!("Failed to get key '{}': {}", key, e))?;
             match result {
-                Ok(Some(val)) => {
+                Some(val) => {
                     println!("Value for key '{}': {}", key, val);
                     Ok(())
                 }
-                Ok(None) => {
-                    println!("Key '{}' not found.", key);
+                None => {
+                    println!("Key '{}' not found", key);
                     Ok(())
-                }
-                Err(e) => {
-                    eprintln!("Error getting value for key '{}': {}", key, e);
-                    Err(anyhow!("Failed to get key: {}", e))
                 }
             }
         }
         "set" => {
-            let value = value.ok_or_else(|| anyhow!("Value is required for set operation"))?;
+            let value = value.ok_or_else(|| {
+                anyhow!("Missing value for 'kv set' command. Usage: kv set <key> <value> or kv set --key <key> --value <value>")
+            })?;
             info!("Executing Key-Value SET for key: {}, value: {}", key, value);
-            let kv_store = engine.get_kv_store();
-            
-            // Clone the key before moving it into the set method
-            let key_for_print = key.clone();
-            let result = kv_store.set(key, value);
-            
-            match result {
-                Ok(_) => {
-                    println!("Successfully set key '{}'", key_for_print);
-                    Ok(())
-                }
-                Err(e) => {
-                    eprintln!("Error setting key-value pair: {}", e);
-                    Err(anyhow!("Failed to set key-value pair: {}", e))
-                }
-            }
+            engine
+                .kv_set(&key, &value)
+                .await
+                .map_err(|e| anyhow!("Failed to set key '{}': {}", key, e))?;
+            println!("Successfully set key '{}' to '{}'", key, value);
+            Ok(())
         }
         "delete" => {
             info!("Executing Key-Value DELETE for key: {}", key);
-            let kv_store = engine.get_kv_store();
-            let result = kv_store.delete(&key);
-            match result {
-                Ok(_) => {
-                    println!("Successfully deleted key '{}'", key);
-                    Ok(())
-                }
-                Err(e) => {
-                    eprintln!("Error deleting key : {}", e);
-                    Err(anyhow!("Failed to delete key: {}", e))
-                }
+            let existed = engine
+                .kv_delete(&key)
+                .await
+                .map_err(|e| anyhow!("Failed to delete key '{}': {}", key, e))?;
+            if existed {
+                println!("Successfully deleted key '{}'", key);
+            } else {
+                println!("Key '{}' not found", key);
             }
+            Ok(())
         }
         _ => {
-            Err(anyhow!("Unsupported KV operation: {}. Supported operations: get, set, delete", operation))
+            Err(anyhow!("Unsupported KV operation: '{}'. Supported operations: get, set, delete", operation))
         }
     }
 }

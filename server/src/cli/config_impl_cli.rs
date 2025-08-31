@@ -528,3 +528,27 @@ impl From<&CliTomlStorageConfig> for EngineStorageConfig {
     }
 }
 
+impl From<CliTomlStorageConfig> for StorageConfig {
+    fn from(cli: CliTomlStorageConfig) -> Self {
+        StorageConfig {
+            config_root_directory: cli.config_root_directory,
+            data_directory: cli.data_directory.map(PathBuf::from),
+            log_directory: cli.log_directory.map(PathBuf::from),
+            default_port: cli.default_port.unwrap_or(9042),
+            cluster_range: cli.cluster_range.unwrap_or_else(|| "9042".to_string()),
+            max_disk_space_gb: cli.max_disk_space_gb.unwrap_or(1000),
+            min_disk_space_gb: cli.min_disk_space_gb.unwrap_or(10),
+            use_raft_for_scale: cli.use_raft_for_scale.unwrap_or(true),
+
+            // unwrap Option<StorageEngineType> or fallback to default
+            storage_engine_type: cli
+                .storage_engine_type
+                .unwrap_or(StorageEngineType::RocksDB),
+
+            // CliTomlStorageConfig does NOT have engine_specific_config
+            engine_specific_config: None,
+
+            max_open_files: cli.max_open_files.unwrap_or(1024),
+        }
+    }
+}
