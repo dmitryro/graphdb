@@ -39,6 +39,7 @@ impl Default for StorageConfigInner {
             username: None,
             password: None,
             database: None,
+            pd_endpoints: None,
         }
     }
 }
@@ -200,11 +201,11 @@ impl StorageConfig {
         Ok(validated_config)
     }
 
-    pub fn save(&self) -> Result<()> {
+    pub fn save(&self) -> Result<(), anyhow::Error> {
         let config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
         debug!("Saving configuration to {:?}", config_path);
 
-        let (engine_path, engine_host, engine_port) = match self.engine_specific_config.as_ref() {
+        let (engine_path, engine_host, engine_port, engine_username, engine_password, engine_pd_endpoints) = match self.engine_specific_config.as_ref() {
             Some(es) => (
                 es.storage.path.clone().unwrap_or_else(|| PathBuf::from(format!(
                     "{}/{}",
@@ -213,6 +214,9 @@ impl StorageConfig {
                 ))),
                 es.storage.host.clone().unwrap_or_else(|| "127.0.0.1".to_string()),
                 es.storage.port.unwrap_or(self.default_port),
+                es.storage.username.clone(),
+                es.storage.password.clone(),
+                es.storage.pd_endpoints.clone(),
             ),
             None => (
                 PathBuf::from(format!(
@@ -222,27 +226,33 @@ impl StorageConfig {
                 )),
                 "127.0.0.1".to_string(),
                 self.default_port,
+                None,
+                None,
+                None,
             ),
         };
 
         let yaml_string = format!(
-r#"storage:
-  config_root_directory: "{}"
-  data_directory: "{}"
-  log_directory: "{}"
-  default_port: {}
-  cluster_range: "{}"
-  max_disk_space_gb: {}
-  min_disk_space_gb: {}
-  use_raft_for_scale: {}
-  storage_engine_type: "{}"
-  engine_specific_config:
-    path: "{}"
-    host: "{}"
-    port: {}
-    storage_engine_type: "{}"
-  max_open_files: {}
-"#,
+    r#"storage:
+      config_root_directory: "{}"
+      data_directory: "{}"
+      log_directory: "{}"
+      default_port: {}
+      cluster_range: "{}"
+      max_disk_space_gb: {}
+      min_disk_space_gb: {}
+      use_raft_for_scale: {}
+      storage_engine_type: "{}"
+      engine_specific_config:
+        path: "{}"
+        host: "{}"
+        port: {}
+        storage_engine_type: "{}"
+        username: "{}"
+        password: "{}"
+        pd_endpoints: "{}"
+      max_open_files: {}
+    "#,
             self.config_root_directory.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "".to_string()),
             self.data_directory.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "".to_string()),
             self.log_directory.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "".to_string()),
@@ -256,6 +266,9 @@ r#"storage:
             engine_host,
             engine_port,
             self.storage_engine_type.to_string().to_lowercase(),
+            engine_username.unwrap_or_default(),
+            engine_password.unwrap_or_default(),
+            engine_pd_endpoints.unwrap_or_default(),
             self.max_open_files
         );
 
@@ -346,6 +359,7 @@ impl From<LibStorageConfig> for StorageConfig {
                 username: None,
                 password: None,
                 database: None,
+                pd_endpoints: None,
             };
 
             if let Some(path) = config_map.get("path").and_then(|v| v.as_str()) {
@@ -476,6 +490,7 @@ impl From<RawStorageConfig> for StorageConfig {
                 username: None,
                 password: None,
                 database: None,
+                pd_endpoints: None,
             };
             
             // Extract values from the HashMap and set them on StorageConfigInner
@@ -557,6 +572,7 @@ impl Default for SelectedStorageConfig {
                 username: None,
                 password: None,
                 database: None,
+                pd_endpoints: None,
             },
         }
     }

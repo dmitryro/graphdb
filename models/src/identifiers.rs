@@ -12,6 +12,12 @@ use crate::errors::{ValidationError, ValidationResult};
 #[serde(transparent)]
 pub struct SerializableUuid(pub Uuid);
 
+impl fmt::Display for SerializableUuid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 impl Encode for SerializableUuid {
     fn encode<E: bincode::enc::Encoder>(&self, encoder: &mut E) -> Result<(), bincode::error::EncodeError> {
         self.0.as_bytes().encode(encoder)

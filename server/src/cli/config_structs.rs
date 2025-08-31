@@ -61,6 +61,8 @@ pub struct StorageConfigInner {
     pub password: Option<String>,
     #[serde(default)]
     pub database: Option<String>,
+    #[serde(default)]
+    pub pd_endpoints: Option<String>, // Added for TiKV
 }
 
 // The outer struct that holds the engine type and the configuration details.
@@ -153,8 +155,14 @@ pub struct StorageConfigWrapper {
 
 
 #[derive(Debug, Deserialize, Serialize)]
-struct EngineSpecificConfigWrapper {
+pub struct EngineSpecificConfigWrapper {
     storage: EngineSpecificConfig,
+}
+
+// Helper struct for deserializing storage_config_tikv.yaml with storage wrapper
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TiKVConfigWrapper {
+    pub storage: SpecificEngineFileConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -182,19 +190,21 @@ pub struct EngineSpecificConfig {
 #[serde(deny_unknown_fields)]
 pub struct SpecificEngineFileConfig {
     #[serde(with = "storage_engine_type_serde", alias = "storage-engine-type")]
-    storage_engine_type: StorageEngineType,
+    pub storage_engine_type: StorageEngineType,
     #[serde(with = "option_path_buf_serde", default, alias = "path")]
-    path: Option<PathBuf>,
+    pub path: Option<PathBuf>,
     #[serde(default, alias = "host")]
-    host: Option<String>,
+    pub host: Option<String>,
     #[serde(default, alias = "port")]
-    port: Option<u16>,
+    pub port: Option<u16>,
     #[serde(default, alias = "database")]
-    database: Option<String>,
+    pub database: Option<String>,
     #[serde(default, alias = "username")]
-    username: Option<String>,
+    pub username: Option<String>,
     #[serde(default, alias = "password")]
-    password: Option<String>,
+    pub password: Option<String>,
+    #[serde(default, alias = "pd_endpoints")]
+    pub pd_endpoints: Option<String>,
 }
 
 // --- CLI Configuration ---

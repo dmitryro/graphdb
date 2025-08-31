@@ -38,8 +38,9 @@ pub mod sled_storage;
 pub use self::sled_storage::SledStorage;
 #[cfg(feature = "with-sled")]
 pub use storage_engine::{ AsyncStorageEngineManager, GraphStorageEngine, HybridStorageEngine, StorageEngine, 
-                         StorageEngineManager, emergency_cleanup_storage_engine_manager, init_storage_engine_manager, 
-                         GLOBAL_STORAGE_ENGINE_MANAGER, recover_sled, log_lock_file_diagnostics, lock_file_exists };
+                          SurrealdbGraphStorage,
+                          StorageEngineManager, emergency_cleanup_storage_engine_manager, init_storage_engine_manager, 
+                          GLOBAL_STORAGE_ENGINE_MANAGER, recover_sled, log_lock_file_diagnostics, lock_file_exists };
 pub use storage_utils::{serialize_vertex, deserialize_vertex, serialize_edge, deserialize_edge, create_edge_key};
 
 // Correctly re-export RocksdbStorage from its module under the feature flag

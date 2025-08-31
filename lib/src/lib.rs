@@ -17,6 +17,7 @@ pub mod transact_indexing;
 pub mod indexing_caching;
 pub mod daemon_registry;
 pub mod daemon_config;
+pub mod daemon_utils;
 pub mod util;
 pub use storage_engine::config::StorageEngineType;
 
@@ -61,6 +62,10 @@ pub use crate::daemon_config::{
     STORAGE_PID_FILE_NAME_PREFIX
 };
 
+pub use crate::daemon_utils::{
+    find_pid_by_port,
+    stop_process,
+};
 // Re-export from storage_engine/mod.rs (assuming it exists and re-exports these)
 pub use crate::storage_engine::{StorageEngine, GraphStorageEngine, SledStorage, log_lock_file_diagnostics};
 #[cfg(feature = "with-rocksdb")]

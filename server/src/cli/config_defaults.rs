@@ -30,6 +30,7 @@ pub fn default_engine_specific_config() -> Option<SelectedStorageConfig> {
             username: None,
             password: None,
             database: None,
+            pd_endpoints: None,
         },
     })
 }

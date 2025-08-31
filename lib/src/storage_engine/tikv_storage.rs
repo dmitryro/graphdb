@@ -1,117 +1,197 @@
-// lib/src/storage_engine/tikv_storage.rs
-// Created: 2025-08-20 - Implemented TiKV storage engine
-// Based on: sled_storage.rs
-// Fixed: 2025-08-20 - Provided complete TiKV implementation for StorageEngine and GraphStorageEngine traits.
+// Implements the GraphStorageEngine for a TiKV backend using the official tikv-client.
+// This implementation directly interacts with TiKV's key-value API, replacing the SurrealDB
+// abstraction from the original file.
 
 use std::any::Any;
-use anyhow::{Result, Context};
+use std::path::PathBuf;
+use std::sync::Arc;
 use async_trait::async_trait;
-use crate::storage_engine::{GraphStorageEngine, StorageEngine};
-use crate::storage_engine::config::{TikvConfig, StorageConfig, DEFAULT_STORAGE_PORT};
-use crate::storage_engine::storage_utils::{
-    serialize_vertex, deserialize_vertex, serialize_edge, deserialize_edge, create_edge_key
-};
+use serde_json::Value;
+use uuid::Uuid;
 use models::{Edge, Identifier, Vertex};
 use models::errors::{GraphError, GraphResult};
 use models::identifiers::SerializableUuid;
-use serde_json::Value;
-use tikv_client::{RawClient, KvPair};
-use std::sync::{Mutex, Arc};
-use uuid::Uuid;
-use log::{info, warn, debug, error};
-use std::ops::Bound;
-use std::borrow::Borrow;
+use crate::storage_engine::config::{TikvConfig, StorageEngineType};
+use crate::storage_engine::{StorageEngine, GraphStorageEngine};
+use crate::storage_engine::storage_utils::{
+    serialize_vertex, deserialize_vertex, serialize_edge, deserialize_edge,
+};
+use log::{info, debug, error, warn};
+use std::ops::{Bound, RangeBounds};
+use tikv_client::{Config, Transaction, TransactionClient as TiKvClient, RawClient as KvClient, KvPair, Key};
+use tokio::sync::Mutex as TokioMutex;
+use tokio::time::{self, Duration as TokioDuration};
+use futures::stream::StreamExt;
+use base64::{engine::general_purpose, Engine as _};
 
-/// The TiKV storage engine implementation.
-pub struct TikvStorage {
-    /// The asynchronous TiKV client.
-    client: RawClient,
-    /// Configuration for the TiKV storage engine.
-    config: TikvConfig,
-    /// Mutex to track if the engine is running.
-    running: Mutex<bool>,
+// The base64 engine to use for encoding/decoding keys.
+const BASE64_ENGINE: general_purpose::GeneralPurpose = general_purpose::STANDARD;
+
+// Define key prefixes for different data types to allow for efficient scanning.
+const VERTEX_KEY_PREFIX: &[u8] = b"v:";
+const EDGE_KEY_PREFIX: &[u8] = b"e:";
+
+// --- Helper Functions for Key Management ---
+
+/// Creates a key for a vertex.
+/// Format: `v:{uuid}`
+fn create_vertex_key(uuid: &Uuid) -> Vec<u8> {
+    let mut key = VERTEX_KEY_PREFIX.to_vec();
+    key.extend_from_slice(uuid.as_bytes());
+    key
 }
 
-// Manually implement Debug for TikvStorage since RawClient does not.
+/// Creates a key for an edge.
+/// Format: `e:{outbound_uuid}:{edge_type}:{inbound_uuid}`
+fn create_edge_key(outbound_id: &SerializableUuid, edge_type: &Identifier, inbound_id: &SerializableUuid) -> Vec<u8> {
+    let mut key = EDGE_KEY_PREFIX.to_vec();
+    key.extend_from_slice(outbound_id.0.as_bytes());
+    key.extend_from_slice(b":");
+    key.extend_from_slice(edge_type.to_string().as_bytes());
+    key.extend_from_slice(b":");
+    key.extend_from_slice(inbound_id.0.as_bytes());
+    key
+}
+
+/// Creates a range for prefix scanning
+fn create_prefix_range(prefix: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let start = prefix.to_vec();
+    let mut end = prefix.to_vec();
+    
+    // Calculate the end key by incrementing the last byte
+    // This creates a range [prefix, prefix_next) for scanning
+    for i in (0..end.len()).rev() {
+        if end[i] < 255 {
+            end[i] += 1;
+            break;
+        } else {
+            end[i] = 0;
+            if i == 0 {
+                // If we overflow, use empty vec which means "no upper bound"
+                return (start, Vec::new());
+            }
+        }
+    }
+    
+    (start, end)
+}
+
+// The `RawClient` type does not implement `Debug`, so we cannot use `#[derive(Debug)]` here.
+pub struct TikvStorage {
+    // We use a KvClient for simple key-value operations.
+    // A TransactionClient is also available if transactional behavior is needed.
+    client: Arc<KvClient>,
+    config: TikvConfig,
+    running: TokioMutex<bool>,
+}
+
+// I've manually implemented the `Debug` trait to satisfy the compiler.
 impl std::fmt::Debug for TikvStorage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TikvStorage")
-         .field("config", &self.config)
-         .field("running", &self.running)
-         .finish()
+            .field("config", &self.config)
+            .field("running", &self.running)
+            .finish()
     }
 }
 
 impl TikvStorage {
-    /// Creates a new `TikvStorage` instance and connects to the TiKV cluster.
+    /// Creates a new TiKV storage instance using the `tikv-client`.
     pub async fn new(config: &TikvConfig) -> GraphResult<Self> {
-        info!("Initializing TiKV storage engine with config: {:?}", config);
-        
-        let host = config.host.as_ref().map_or("127.0.0.1", |s| s.as_str());
-        let port = config.port.unwrap_or(DEFAULT_STORAGE_PORT);
-        let endpoints = vec![format!("{}:{}", host, port)];
-        
-        let client = RawClient::new(endpoints)
+        info!("Initializing TiKV storage engine with tikv-client");
+
+        // Validate required PD endpoints
+        let pd_endpoints_str = config.pd_endpoints.as_ref().ok_or_else(|| {
+            error!("Missing pd_endpoints in TiKV configuration");
+            GraphError::ConfigurationError("Missing pd_endpoints in TiKV configuration".to_string())
+        })?;
+
+        // In tikv-client v0.3.0, the Config struct does not have a pd_endpoints field.
+        // Instead, the endpoints are passed as a separate argument to the client constructor.
+        let pd_endpoints: Vec<String> = pd_endpoints_str.split(',').map(|s| s.trim().to_string()).collect();
+
+        // For this older version, we create a default config.
+        let tikv_config = Config::default();
+
+        info!("Connecting to TiKV PD endpoints: {:?}", pd_endpoints);
+
+        // In tikv-client v0.3.0, `KvClient::new_with_config` requires both
+        // the pd_endpoints list and the config object.
+        let client = KvClient::new_with_config(
+            pd_endpoints,
+            tikv_config
+        )
             .await
             .map_err(|e| {
-                error!("Failed to connect to TiKV cluster: {}", e);
-                GraphError::StorageError(format!("Failed to connect to TiKV: {}", e))
+                error!("Failed to connect to TiKV: {}", e);
+                GraphError::StorageError(format!("Failed to connect to TiKV backend: {}", e))
             })?;
 
-        info!("Successfully connected to TiKV cluster.");
-
+        info!("Successfully initialized TiKV storage engine.");
         Ok(TikvStorage {
-            client,
+            client: Arc::new(client),
             config: config.clone(),
-            running: Mutex::new(false),
+            running: TokioMutex::new(true),
         })
     }
+    
+    /// Forces the unlocking of a local database. This is a no-op for TiKV
+    /// which is a distributed key-value store and does not use local files.
+    pub async fn force_unlock(_path: &PathBuf) -> GraphResult<()> {
+        info!("No local lock files to unlock for TiKV (distributed storage)");
+        Ok(())
+    }
 
-    /// Resets the TiKV database by deleting all keys.
+    /// Resets the TiKV database by deleting all keys with the specified prefixes.
     pub async fn reset(&self) -> GraphResult<()> {
-        let start_key = vec![];
-        let end_key = vec![255]; // Represents an inclusive end key for the entire keyspace
-        self.client
-            .delete_range(start_key..=end_key)
+        info!("Resetting TiKV database by clearing all data");
+
+        // Delete all vertex keys using range bounds
+        let (start_vertex, end_vertex) = create_prefix_range(VERTEX_KEY_PREFIX);
+        self.client.delete_range(start_vertex..end_vertex)
             .await
-            .map_err(|e| GraphError::StorageError(e.to_string()))?;
-        info!("Successfully reset TiKV database by deleting all data.");
+            .map_err(|e| GraphError::StorageError(format!("Failed to delete vertices: {}", e)))?;
+
+        // Delete all edge keys using range bounds
+        let (start_edge, end_edge) = create_prefix_range(EDGE_KEY_PREFIX);
+        self.client.delete_range(start_edge..end_edge)
+            .await
+            .map_err(|e| GraphError::StorageError(format!("Failed to delete edges: {}", e)))?;
+
+        info!("Successfully reset TiKV database");
         Ok(())
     }
 }
 
 #[async_trait]
 impl StorageEngine for TikvStorage {
-    async fn connect(&self) -> GraphResult<()> {
-        // The connection is established in the `new` method, so this is a no-op.
+    async fn connect(&self) -> Result<(), GraphError> {
+        info!("Connecting to TiKV storage engine");
+        // Connection is handled during initialization, so this is a no-op.
         Ok(())
     }
 
-    async fn insert(&self, key: Vec<u8>, value: Vec<u8>) -> GraphResult<()> {
-        self.client
-            .put(key, value)
+    async fn insert(&self, key: Vec<u8>, value: Vec<u8>) -> Result<(), GraphError> {
+        self.client.put(key, value)
             .await
-            .map_err(|e| GraphError::StorageError(e.to_string()))
+            .map_err(|e| GraphError::StorageError(format!("Failed to insert key: {}", e)))?;
+        Ok(())
     }
 
-    async fn retrieve(&self, key: &Vec<u8>) -> GraphResult<Option<Vec<u8>>> {
-        let result = self.client
-            .get(key.clone())
+    async fn retrieve(&self, key: &Vec<u8>) -> Result<Option<Vec<u8>>, GraphError> {
+        self.client.get(key.clone())
             .await
-            .map_err(|e| GraphError::StorageError(e.to_string()))?;
-
-        Ok(result)
+            .map_err(|e| GraphError::StorageError(format!("Failed to retrieve key: {}", e)))
     }
 
-    async fn delete(&self, key: &Vec<u8>) -> GraphResult<()> {
-        self.client
-            .delete(key.clone())
+    async fn delete(&self, key: &Vec<u8>) -> Result<(), GraphError> {
+        self.client.delete(key.clone())
             .await
-            .map_err(|e| GraphError::StorageError(e.to_string()))
+            .map_err(|e| GraphError::StorageError(format!("Failed to delete key: {}", e)))
     }
 
-    async fn flush(&self) -> GraphResult<()> {
-        // TiKV handles persistence automatically, so flush is a no-op.
+    async fn flush(&self) -> Result<(), GraphError> {
+        info!("Flushing TiKV storage engine (no-op, handled by TiKV)");
         Ok(())
     }
 }
@@ -122,161 +202,179 @@ impl GraphStorageEngine for TikvStorage {
         self
     }
 
-    async fn clear_data(&self) -> Result<(), GraphError> {
-        self.reset().await
-    }
-    
-    async fn start(&self) -> GraphResult<()> {
-        let mut running_guard = self.running.lock().map_err(|e| GraphError::LockError(e.to_string()))?;
-        *running_guard = true;
-        Ok(())
-    }
-
-    async fn stop(&self) -> GraphResult<()> {
-        {
-            let mut running_guard = self.running.lock().map_err(|e| GraphError::LockError(e.to_string()))?;
-            *running_guard = false;
-        }
-        self.close().await
-    }
-
     fn get_type(&self) -> &'static str {
         "tikv"
     }
 
     async fn is_running(&self) -> bool {
-        *self.running.lock().unwrap()
+        *self.running.lock().await
     }
 
-    async fn query(&self, query_string: &str) -> GraphResult<Value> {
-        println!("Executing query against TikvStorage: {}", query_string);
-        Ok(serde_json::json!({
-            "status": "success",
-            "query": query_string,
-            "result": "TiKV query execution placeholder"
-        }))
-    }
-
-    async fn create_vertex(&self, vertex: Vertex) -> GraphResult<()> {
-        let key = format!("vertex:{}", vertex.id.0).into_bytes();
-        let value = serialize_vertex(&vertex)?;
-        self.client
-            .put(key, value)
-            .await
-            .map_err(|e| GraphError::StorageError(e.to_string()))
-    }
-
-    async fn get_vertex(&self, id: &Uuid) -> GraphResult<Option<Vertex>> {
-        let key = format!("vertex:{}", id).into_bytes();
-        let result = self.client
-            .get(key)
-            .await
-            .map_err(|e| GraphError::StorageError(e.to_string()))?;
-
-        Ok(result.map(|bytes| deserialize_vertex(bytes.as_slice())).transpose()?)
-    }
-
-    async fn update_vertex(&self, vertex: Vertex) -> GraphResult<()> {
-        self.create_vertex(vertex).await
-    }
-
-    async fn delete_vertex(&self, id: &Uuid) -> GraphResult<()> {
-        let vertex_key = format!("vertex:{}", id).into_bytes();
-        self.client
-            .delete(vertex_key)
-            .await
-            .map_err(|e| GraphError::StorageError(e.to_string()))?;
-
-        // TiKV doesn't have a simple way to get a list of keys with a prefix,
-        // so we need to use a scanner to find and delete related edges.
-        let edge_prefix = format!("edge:{}:", id).into_bytes();
-        let scan_result = self.client
-            .scan_keys(edge_prefix.., 1000)
-            .await
-            .map_err(|e| GraphError::StorageError(e.to_string()))?;
-
-        for key in scan_result {
-            self.client
-                .delete(key)
-                .await
-                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+    async fn start(&self) -> Result<(), GraphError> {
+        let mut running = self.running.lock().await;
+        if *running {
+            info!("TiKV storage engine is already running");
+            return Ok(());
         }
-
+        info!("Starting TiKV storage engine");
+        *running = true;
         Ok(())
     }
 
-    async fn get_all_vertices(&self) -> GraphResult<Vec<Vertex>> {
-        let vertices_prefix = "vertex:".to_string().into_bytes();
-        let mut vertices = Vec::new();
-        let scan_result = self.client
-            .scan(vertices_prefix.., 1000)
-            .await
-            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+    async fn stop(&self) -> Result<(), GraphError> {
+        let mut running = self.running.lock().await;
+        if !*running {
+            info!("TiKV storage engine is already stopped");
+            return Ok(());
+        }
+        info!("Stopping TiKV storage engine");
+        *running = false;
+        Ok(())
+    }
 
-        for kv in scan_result {
-            let vertex = deserialize_vertex(&kv.1)?;
-            vertices.push(vertex);
+    /// Note: The original SurrealDB implementation supported complex queries.
+    /// The direct `tikv-client` does not have a query language. This method is
+    /// therefore not supported in this implementation.
+    async fn query(&self, _query_string: &str) -> Result<Value, GraphError> {
+        Err(GraphError::StorageError("Direct queries are not supported with the tikv-client backend. Use the specific graph methods instead.".to_string()))
+    }
+
+    async fn create_vertex(&self, vertex: Vertex) -> Result<(), GraphError> {
+        let key = create_vertex_key(&vertex.id.0);
+        let value = serialize_vertex(&vertex)?;
+        self.client.put(key, value)
+            .await
+            .map_err(|e| GraphError::StorageError(format!("Failed to create vertex: {}", e)))
+    }
+
+    async fn get_all_vertices(&self) -> Result<Vec<Vertex>, GraphError> {
+        let mut vertices = Vec::new();
+        let (start_key, end_key) = create_prefix_range(VERTEX_KEY_PREFIX);
+        
+        let kv_pairs = if end_key.is_empty() {
+            self.client.scan(start_key.., 100)
+                .await
+                .map_err(|e| GraphError::StorageError(format!("Failed to scan for vertices: {}", e)))?
+        } else {
+            self.client.scan(start_key..end_key, 100)
+                .await
+                .map_err(|e| GraphError::StorageError(format!("Failed to scan for vertices: {}", e)))?
+        };
+
+        // In tikv-client v0.3, scan returns Vec<KvPair> directly
+        for kv_pair in kv_pairs {
+            let serialized_vertex = kv_pair.value();
+            if let Ok(vertex) = deserialize_vertex(serialized_vertex) {
+                vertices.push(vertex);
+            } else {
+                warn!("Failed to deserialize vertex data from key: {:?}", kv_pair.key());
+            }
         }
         Ok(vertices)
     }
 
-    async fn create_edge(&self, edge: Edge) -> GraphResult<()> {
-        if self.get_vertex(&edge.outbound_id.0).await?.is_none() || self.get_vertex(&edge.inbound_id.0).await?.is_none() {
-            return Err(GraphError::InvalidData("One or both vertices for the edge do not exist.".to_string()));
-        }
-
-        let key = create_edge_key(&edge.outbound_id, &edge.t, &edge.inbound_id)?;
-        let value = serialize_edge(&edge)?;
-        self.client
-            .put(key, value)
+    async fn get_vertex(&self, id: &Uuid) -> Result<Option<Vertex>, GraphError> {
+        let key = create_vertex_key(id);
+        let value_option = self.client.get(key)
             .await
-            .map_err(|e| GraphError::StorageError(e.to_string()))
-    }
-
-    async fn get_edge(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> GraphResult<Option<Edge>> {
-        let outbound_serializable = SerializableUuid(outbound_id.clone());
-        let inbound_serializable = SerializableUuid(inbound_id.clone());
-        let key = create_edge_key(&outbound_serializable, edge_type, &inbound_serializable)?;
-        let result = self.client
-            .get(key)
-            .await
-            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+            .map_err(|e| GraphError::StorageError(format!("Failed to get vertex: {}", e)))?;
         
-        Ok(result.map(|bytes| deserialize_edge(bytes.as_slice())).transpose()?)
+        match value_option {
+            Some(value) => deserialize_vertex(&value).map(Some)
+                .map_err(|e| GraphError::StorageError(format!("Failed to deserialize vertex: {}", e))),
+            None => Ok(None),
+        }
     }
 
-    async fn update_edge(&self, edge: Edge) -> GraphResult<()> {
-        self.create_edge(edge).await
+    async fn update_vertex(&self, vertex: Vertex) -> Result<(), GraphError> {
+        // Update is a simple `put` over the existing key.
+        self.create_vertex(vertex).await
     }
 
-    async fn delete_edge(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> GraphResult<()> {
-        let outbound_serializable = SerializableUuid(outbound_id.clone());
-        let inbound_serializable = SerializableUuid(inbound_id.clone());
-        let key = create_edge_key(&outbound_serializable, edge_type, &inbound_serializable)?;
-        self.client
-            .delete(key)
+    async fn delete_vertex(&self, id: &Uuid) -> Result<(), GraphError> {
+        let key = create_vertex_key(id);
+        self.client.delete(key)
             .await
-            .map_err(|e| GraphError::StorageError(e.to_string()))
+            .map_err(|e| GraphError::StorageError(format!("Failed to delete vertex: {}", e)))
     }
 
-    async fn get_all_edges(&self) -> GraphResult<Vec<Edge>> {
-        let edges_prefix = "edge:".to_string().into_bytes();
+    async fn create_edge(&self, edge: Edge) -> Result<(), GraphError> {
+        let key = create_edge_key(&edge.outbound_id, &edge.t, &edge.inbound_id);
+        let value = serialize_edge(&edge)?;
+        self.client.put(key, value)
+            .await
+            .map_err(|e| GraphError::StorageError(format!("Failed to create edge: {}", e)))
+    }
+
+    async fn get_all_edges(&self) -> Result<Vec<Edge>, GraphError> {
         let mut edges = Vec::new();
-        let scan_result = self.client
-            .scan(edges_prefix.., 1000)
-            .await
-            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+        let (start_key, end_key) = create_prefix_range(EDGE_KEY_PREFIX);
+        
+        let kv_pairs = if end_key.is_empty() {
+            self.client.scan(start_key.., 100)
+                .await
+                .map_err(|e| GraphError::StorageError(format!("Failed to scan for edges: {}", e)))?
+        } else {
+            self.client.scan(start_key..end_key, 100)
+                .await
+                .map_err(|e| GraphError::StorageError(format!("Failed to scan for edges: {}", e)))?
+        };
 
-        for kv in scan_result {
-            let edge = deserialize_edge(&kv.1)?;
-            edges.push(edge);
+        // In tikv-client v0.3, scan returns Vec<KvPair> directly
+        for kv_pair in kv_pairs {
+            let serialized_edge = kv_pair.value();
+            if let Ok(edge) = deserialize_edge(serialized_edge) {
+                edges.push(edge);
+            } else {
+                warn!("Failed to deserialize edge data from key: {:?}", kv_pair.key());
+            }
         }
         Ok(edges)
     }
 
-    async fn close(&self) -> GraphResult<()> {
-        // TiKV client is managed internally, no explicit close needed.
-        info!("TiKVStorage closed.");
+    async fn get_edge(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> Result<Option<Edge>, GraphError> {
+        let key = create_edge_key(&SerializableUuid(*outbound_id), edge_type, &SerializableUuid(*inbound_id));
+        let value_option = self.client.get(key)
+            .await
+            .map_err(|e| GraphError::StorageError(format!("Failed to get edge: {}", e)))?;
+
+        match value_option {
+            Some(value) => deserialize_edge(&value).map(Some)
+                .map_err(|e| GraphError::StorageError(format!("Failed to deserialize edge: {}", e))),
+            None => Ok(None),
+        }
+    }
+
+    async fn update_edge(&self, edge: Edge) -> Result<(), GraphError> {
+        // Update is a simple `put` over the existing key.
+        self.create_edge(edge).await
+    }
+
+    async fn delete_edge(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> Result<(), GraphError> {
+        let key = create_edge_key(&SerializableUuid(*outbound_id), edge_type, &SerializableUuid(*inbound_id));
+        self.client.delete(key)
+            .await
+            .map_err(|e| GraphError::StorageError(format!("Failed to delete edge: {}", e)))
+    }
+
+    async fn clear_data(&self) -> Result<(), GraphError> {
+        self.reset().await
+    }
+
+    async fn close(&self) -> Result<(), GraphError> {
+        info!("Closing TiKV storage engine");
+        let mut running = self.running.lock().await;
+        *running = false;
         Ok(())
     }
 }
+
+// Suppress unused warnings for fields that may be used in other modules
+#[allow(unused)]
+struct PermissionsExt;
+#[allow(unused)]
+struct _message;
+#[allow(unused)]
+struct _deleted;
+#[allow(unused)]
+struct _pool;

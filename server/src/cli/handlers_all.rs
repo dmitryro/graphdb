@@ -646,11 +646,18 @@ pub async fn display_full_status_summary(
                                storage_config.log_directory.is_some() &&
                                storage_config.config_root_directory.is_some();
             if config_loaded {
-                let mut engine_config_lines = format_engine_config(&storage_config);
-                engine_config_lines.retain(|line| !line.starts_with("Engine:"));
-                for config_line in engine_config_lines {
-                    println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", config_line);
-                }
+                // Print configuration details directly, avoiding format_engine_config
+                let data_path = storage_config.engine_specific_config
+                    .as_ref()
+                    .and_then(|c| c.storage.path.as_ref())
+                    .map_or("N/A".to_string(), |p| p.display().to_string());
+                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Data Path: {}", data_path));
+                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Host: {}", storage_config.engine_specific_config.as_ref().map_or("N/A", |c| c.storage.host.as_ref().map_or("N/A", |h| h.as_str()))));
+                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Port: {}", port)); // Use actual daemon port
+                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Max Open Files: {}", storage_config.max_open_files));
+                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Max Disk Space: {} GB", storage_config.max_disk_space_gb));
+                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Min Disk Space: {} GB", storage_config.min_disk_space_gb));
+                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Use Raft: {}", storage_config.use_raft_for_scale));
 
                 println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Data Directory: {}", storage_config.data_directory.as_ref().map_or("N/A".to_string(), |p| p.display().to_string())));
                 println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Log Directory: {}", storage_config.log_directory.as_ref().map_or("N/A".to_string(), |p| p.display().to_string())));
@@ -669,7 +676,6 @@ pub async fn display_full_status_summary(
                 } else {
                     println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Cluster Range: {} (Port {} is outside this range!)", cluster_range, port));
                 }
-
                 println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Use Raft for Scale: {}", storage_config.use_raft_for_scale));
             } else {
                 println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", "Configuration not loaded due to error");
