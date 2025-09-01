@@ -30,6 +30,16 @@ pub fn parse_storage_engine(engine: &str) -> Result<StorageEngineType, String> {
     }
 }
 
+/// Custom parser for KV operation to accept `get`, `set`, or `delete`.
+pub fn parse_kv_operation(operation: &str) -> Result<String, String> {
+    match operation.to_lowercase().as_str() {
+        "get" | "set" | "delete" => Ok(operation.to_string()),
+        other => Err(format!(
+            "Invalid KV operation: '{}'. Supported operations: get, set, delete",
+            other
+        )),
+    }
+}
 
 /// Enum representing the parsed command type in interactive mode.
 #[derive(Debug, PartialEq, Clone)]
@@ -120,6 +130,12 @@ pub enum CommandType {
     Help(HelpArgs),
     Exit,
     Unknown,
+
+    // Key-Value and Query Commands
+    Kv { action: KvAction },
+    Exec { command: String },
+    Query { query: String },
+    Unified { query: String, language: Option<String> },
 }
 
 #[derive(Debug, PartialEq, Clone, Args)]
@@ -262,7 +278,7 @@ pub enum Commands {
     /// An alias for the `query` command.
     #[clap(alias = "e")]
     Exec(QueryArgs),
-     /// Interact with the key-value store.
+    /// Interact with the key-value store.
     #[clap(alias = "k")]
     Kv {
         #[clap(subcommand)]
@@ -272,23 +288,24 @@ pub enum Commands {
 
 #[derive(Subcommand, Debug, PartialEq, Clone)]
 pub enum KvAction {
-    /// Get a value by its key from the storage engine.
+    /// Get a value by its key.
     Get {
-        /// The key to retrieve.
-        #[clap(name = "KEY")]
+        #[clap(name = "KEY", help = "The key to retrieve.")]
         key: String,
     },
-    /// Set a key-value pair in the storage engine.
+    /// Set a key-value pair.
     Set {
-        /// The key to set.
-        #[clap(name = "KEY")]
+        #[clap(name = "KEY", help = "The key to set.")]
         key: String,
-        /// The value to associate with the key.
-        #[clap(name = "VALUE")]
+        #[clap(name = "VALUE", help = "The value to associate with the key.")]
         value: String,
     },
+    /// Delete a key-value pair.
+    Delete {
+        #[clap(name = "KEY", help = "The key to delete.")]
+        key: String,
+    },
 }
-
 
 #[derive(Args, Debug, PartialEq, Clone)]
 pub struct ShowArgs {

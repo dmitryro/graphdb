@@ -1,259 +1,379 @@
 // lib/src/database.rs
-// Created: 2025-08-09 - Implemented database management
-// Fixed: 2025-08-13 - Replaced InMemoryStorage with InMemoryGraphStorage
-// Fixed: 2025-08-13 - Updated imports to align with storage_engine/mod.rs
-// Fixed: 2025-08-14 - Removed unresolved import `open_sled_db` and refactored its usage.
-// Fixed: 2025-08-14 - Cleaned up unused imports.
-// Fixed: 2025-08-16 - Resolved type mismatch by properly deserializing Sled and RocksDB configs.
-// Fixed: 2025-08-17 - Added host and port to SledConfig and RocksdbConfig initializers.
-// Fixed: 2025-08-17 - Corrected mismatched types for Option<String> and Option<u16> when building SledConfig and RocksdbConfig.
-// Fixed: 2025-08-19 - Corrected field access on `StorageConfigWrapper` and a variant name typo.
-// Fixed: 2025-08-19 - Changed `SledStorage` to `TikvStorage` in the TiKV arm of `load_engine`.
-// Fixed: 2025-08-19 - Corrected the `serde_json::from_value` calls in `load_engine` to properly handle `HashMap` to `Value` conversion.
-// Fixed: 2025-08-19 - Fixed HashMap to Map conversion using `serde_json::Map::from_iter()`.
-// Fixed: 2025-08-30 - Removed incorrect `SelectedStorageConfig` handling and used flat `HashMap` for `engine_specific_config`.
-// Fixed: 2025-08-30 - Fixed ownership errors by cloning `engine_specific_config` before mapping.
+// Updated: 2025-09-01 - Fixed E0308 by ensuring match arms return Arc<dyn GraphStorageEngine + Send + Sync>
+// and corrected load_engine return type to Arc<dyn GraphStorageEngine + Send + Sync>.
 
-use anyhow::Context;
+use anyhow::{anyhow, Result, Context};
 use async_trait::async_trait;
 use log::{error, info, warn};
 use models::errors::GraphError;
 use models::{Edge, Identifier, Vertex};
 use serde_json::{Value, Map};
-use std::fmt::Debug;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
-use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 
 use crate::storage_engine::config::{
-    StorageConfigWrapper, StorageEngineType, StorageConfig,
+    StorageConfig, SledConfig, RocksdbConfig, TikvConfig, StorageEngineType, StorageConfigWrapper
 };
 use crate::storage_engine::{
     SledStorage,
+    RocksdbStorage,
     TikvStorage,
+    HybridStorage,
+    InMemoryStorage,
 };
-pub use crate::storage_engine::{GraphStorageEngine, StorageEngine};
-pub use crate::storage_engine::config::{CliConfigToml, format_engine_config, load_storage_config_from_yaml};
-pub use crate::storage_engine::inmemory_storage::{InMemoryStorage as InMemoryGraphStorage};
-#[cfg(feature = "with-rocksdb")]
-pub use crate::storage_engine::rocksdb_storage::RocksdbStorage;
 #[cfg(feature = "redis-datastore")]
-pub use crate::storage_engine::redis_storage::RedisStorage;
+use crate::storage_engine::redis_storage::RedisStorage;
 #[cfg(feature = "postgres-datastore")]
-pub use crate::storage_engine::postgres_storage::PostgresStorage;
+use crate::storage_engine::postgres_storage::PostgresStorage;
 #[cfg(feature = "mysql-datastore")]
-pub use crate::storage_engine::mysql_storage::MySQLStorage;
-#[cfg(feature = "redis-datastore")]
-use redis::{Client, Connection};
-
-// We need these config types to create the storage engines.
-use crate::storage_engine::config::{SledConfig, RocksdbConfig, TikvConfig};
+use crate::storage_engine::mysql_storage::MySQLStorage;
+use crate::storage_engine::{GraphStorageEngine, StorageEngine};
 
 pub struct Database {
     storage: Arc<dyn GraphStorageEngine + Send + Sync>,
+    config: StorageConfig,
 }
 
 impl Database {
     pub async fn new(config: StorageConfig) -> Result<Self, GraphError> {
-        // Clone engine_specific_config to avoid partial move
-        let engine_specific_config = config.engine_specific_config.clone().map(|map| {
-            HashMap::from_iter(map.into_iter())
-        });
-
-        let mut new_config = config.clone();
-        new_config.engine_specific_config = engine_specific_config;
-
-        let storage: Arc<dyn GraphStorageEngine + Send + Sync> = match new_config.storage_engine_type {
+        let storage: Arc<dyn GraphStorageEngine + Send + Sync> = match config.storage_engine_type {
+            StorageEngineType::InMemory => {
+                Arc::new(InMemoryStorage::new(&config))
+            }
             StorageEngineType::Sled => {
                 #[cfg(feature = "with-sled")]
                 {
-                    // Deserialize the specific SledConfig from the flattened map
-                    #[derive(serde::Deserialize)]
-                    struct SledConfigMap {
-                        path: PathBuf,
-                        host: Option<String>,
-                        port: Option<u16>,
-                    }
-                    let sled_config_map: SledConfigMap = serde_json::from_value(
-                        serde_json::to_value(&new_config.engine_specific_config)
-                            .map_err(|e| GraphError::ConfigurationError(format!("Failed to serialize map: {}", e)))?
-                    ).map_err(|e| GraphError::ConfigurationError(format!("Failed to parse SledConfigMap: {}", e)))?;
-
-                    let sled_config = SledConfig {
-                        storage_engine_type: new_config.storage_engine_type.clone(),
-                        path: sled_config_map.path,
-                        host: sled_config_map.host,
-                        port: sled_config_map.port,
+                    let sled_config = if let Some(ref engine_config) = config.engine_specific_config {
+                        let config_value = serde_json::to_value(engine_config)
+                            .map_err(|e| GraphError::ConfigurationError(format!("Failed to serialize map: {}", e)))?;
+                        serde_json::from_value(config_value)
+                            .map_err(|e| GraphError::ConfigurationError(format!("Failed to parse SledConfig: {}", e)))?
+                    } else {
+                        SledConfig {
+                            storage_engine_type: config.storage_engine_type.clone(),
+                            path: config.data_directory.clone(),
+                            host: None,
+                            port: None,
+                        }
                     };
                     Arc::new(SledStorage::new(&sled_config).await?)
                 }
                 #[cfg(not(feature = "with-sled"))]
-                {
-                    return Err(GraphError::StorageError("Sled support is not enabled.".to_string()));
-                }
-            }
-            StorageEngineType::InMemory => {
-                Arc::new(InMemoryGraphStorage::new(&new_config))
+                return Err(GraphError::ConfigurationError("Sled feature not enabled".to_string()));
             }
             StorageEngineType::RocksDB => {
                 #[cfg(feature = "with-rocksdb")]
                 {
-                    // Deserialize the specific RocksdbConfig from the flattened map
-                    #[derive(serde::Deserialize)]
-                    struct RocksdbConfigMap {
-                        path: PathBuf,
-                        host: Option<String>,
-                        port: Option<u16>,
-                    }
-                    let rocksdb_config_map: RocksdbConfigMap = serde_json::from_value(
-                        serde_json::to_value(&new_config.engine_specific_config)
-                            .map_err(|e| GraphError::ConfigurationError(format!("Failed to serialize map: {}", e)))?
-                    ).map_err(|e| GraphError::ConfigurationError(format!("Failed to parse RocksdbConfigMap: {}", e)))?;
-
-                    let rocksdb_config = RocksdbConfig {
-                        storage_engine_type: new_config.storage_engine_type.clone(),
-                        path: rocksdb_config_map.path,
-                        host: rocksdb_config_map.host,
-                        port: rocksdb_config_map.port,
+                    let rocksdb_config = if let Some(ref engine_config) = config.engine_specific_config {
+                        let config_value = serde_json::to_value(engine_config)
+                            .map_err(|e| GraphError::ConfigurationError(format!("Failed to serialize map: {}", e)))?;
+                        serde_json::from_value(config_value)
+                            .map_err(|e| GraphError::ConfigurationError(format!("Failed to parse RocksdbConfig: {}", e)))?
+                    } else {
+                        RocksdbConfig {
+                            storage_engine_type: config.storage_engine_type.clone(),
+                            path: config.data_directory.clone(),
+                            host: None,
+                            port: None,
+                        }
                     };
                     Arc::new(RocksdbStorage::new(&rocksdb_config)?)
                 }
                 #[cfg(not(feature = "with-rocksdb"))]
-                {
-                    return Err(GraphError::StorageError("RocksDB support is not enabled.".to_string()));
-                }
+                return Err(GraphError::ConfigurationError("RocksDB feature not enabled".to_string()));
             }
             StorageEngineType::TiKV => {
                 #[cfg(feature = "with-tikv")]
                 {
-                    // Deserialize the specific TikvConfig from the flattened map
-                    #[derive(serde::Deserialize)]
-                    struct TikvConfigMap {
-                        path: PathBuf,
-                        host: Option<String>,
-                        port: Option<u16>,
-                        pd_endpoints: Option<String>,
-                        password: Option<String>,
-                        username: Option<String>,
-                    }
-                    let tikv_config_map: TikvConfigMap = serde_json::from_value(
-                        serde_json::to_value(&new_config.engine_specific_config)
-                            .map_err(|e| GraphError::ConfigurationError(format!("Failed to serialize map: {}", e)))?
-                    ).map_err(|e| GraphError::ConfigurationError(format!("Failed to parse TikvConfigMap: {}", e)))?;
-
-                    let tikv_config = TikvConfig {
-                        storage_engine_type: new_config.storage_engine_type.clone(),
-                        path: tikv_config_map.path,
-                        host: tikv_config_map.host,
-                        port: tikv_config_map.port,
-                        pd_endpoints: tikv_config_map.pd_endpoints,
-                        username: tikv_config_map.username,
-                        password: tikv_config_map.password,
+                    let tikv_config = if let Some(ref engine_config) = config.engine_specific_config {
+                        let config_value = serde_json::to_value(engine_config)
+                            .map_err(|e| GraphError::ConfigurationError(format!("Failed to serialize map: {}", e)))?;
+                        serde_json::from_value(config_value)
+                            .map_err(|e| GraphError::ConfigurationError(format!("Failed to parse TikvConfig: {}", e)))?
+                    } else {
+                        TikvConfig {
+                            storage_engine_type: config.storage_engine_type.clone(),
+                            path: config.data_directory.clone(),
+                            host: None,
+                            port: None,
+                            pd_endpoints: None,
+                            username: None,
+                            password: None,
+                        }
                     };
                     Arc::new(TikvStorage::new(&tikv_config).await?)
                 }
                 #[cfg(not(feature = "with-tikv"))]
-                {
-                    return Err(GraphError::StorageError("TiKV support is not enabled.".to_string()));
-                }
+                return Err(GraphError::ConfigurationError("TiKV feature not enabled".to_string()));
             }
             StorageEngineType::Redis => {
                 #[cfg(feature = "redis-datastore")]
                 {
-                    let connection_string = new_config.connection_string.as_ref()
+                    let connection_string = config.connection_string.as_ref()
                         .ok_or_else(|| GraphError::StorageError("Redis connection string is required".to_string()))?;
-                    let client = Client::open(connection_string.as_str())
-                        .map_err(|e| GraphError::StorageError(format!("Failed to create Redis client: {}", e)))?;
-                    let connection = client.get_connection()
-                        .map_err(|e| GraphError::StorageError(format!("Failed to connect to Redis: {}", e)))?;
-                    Arc::new(RedisStorage::new(connection)?)
+                    Arc::new(RedisStorage::new(connection_string)?)
                 }
                 #[cfg(not(feature = "redis-datastore"))]
-                {
-                    return Err(GraphError::StorageError("Redis support is not enabled.".to_string()));
-                }
+                return Err(GraphError::ConfigurationError("Redis feature not enabled".to_string()));
             }
             StorageEngineType::PostgreSQL => {
                 #[cfg(feature = "postgres-datastore")]
                 {
-                    let connection_string = new_config.connection_string.as_ref()
+                    let connection_string = config.connection_string.as_ref()
                         .ok_or_else(|| GraphError::StorageError("PostgreSQL connection string is required".to_string()))?;
                     Arc::new(PostgresStorage::new(connection_string)?)
                 }
                 #[cfg(not(feature = "postgres-datastore"))]
-                {
-                    return Err(GraphError::StorageError("PostgreSQL support is not enabled.".to_string()));
-                }
+                return Err(GraphError::ConfigurationError("PostgreSQL feature not enabled".to_string()));
             }
             StorageEngineType::MySQL => {
                 #[cfg(feature = "mysql-datastore")]
                 {
-                    let connection_string = new_config.connection_string.as_ref()
+                    let connection_string = config.connection_string.as_ref()
                         .ok_or_else(|| GraphError::StorageError("MySQL connection string is required".to_string()))?;
-                    Arc::new(MySQLStorage::new(connection_string).map_err(|e| GraphError::StorageError(format!("MySQL error: {}", e)))?)
+                    Arc::new(MySQLStorage::new(connection_string)?)
                 }
                 #[cfg(not(feature = "mysql-datastore"))]
+                return Err(GraphError::ConfigurationError("MySQL feature not enabled".to_string()));
+            }
+            StorageEngineType::Hybrid => {
+                #[cfg(any(feature = "with-sled", feature = "with-rocksdb", feature = "with-tikv"))]
                 {
-                    return Err(GraphError::StorageError("MySQL support is not enabled.".to_string()));
+                    let persistent = match config.engine_specific_config.as_ref()
+                        .and_then(|config| config.get("persistent_engine").and_then(|v| v.as_str()))
+                    {
+                        Some("sled") => {
+                            #[cfg(feature = "with-sled")]
+                            {
+                                let sled_config = SledConfig {
+                                    storage_engine_type: StorageEngineType::Sled,
+                                    path: config.data_directory.clone(),
+                                    host: None,
+                                    port: None,
+                                };
+                                Arc::new(SledStorage::new(&sled_config).await?)
+                                    as Arc<dyn GraphStorageEngine + Send + Sync>
+                            }
+                            #[cfg(not(feature = "with-sled"))]
+                            return Err(GraphError::ConfigurationError("Sled feature not enabled".to_string()));
+                        }
+                        Some("rocksdb") => {
+                            #[cfg(feature = "with-rocksdb")]
+                            {
+                                let rocksdb_config = RocksdbConfig {
+                                    storage_engine_type: StorageEngineType::RocksDB,
+                                    path: config.data_directory.clone(),
+                                    host: None,
+                                    port: None,
+                                };
+                                Arc::new(RocksdbStorage::new(&rocksdb_config)?)
+                                    as Arc<dyn GraphStorageEngine + Send + Sync>
+                            }
+                            #[cfg(not(feature = "with-rocksdb"))]
+                            return Err(GraphError::ConfigurationError("RocksDB feature not enabled".to_string()));
+                        }
+                        Some("tikv") => {
+                            #[cfg(feature = "with-tikv")]
+                            {
+                                let tikv_config = TikvConfig {
+                                    storage_engine_type: StorageEngineType::TiKV,
+                                    path: config.data_directory.clone(),
+                                    host: None,
+                                    port: None,
+                                    pd_endpoints: config.engine_specific_config.as_ref()
+                                        .and_then(|config| config.get("pd_endpoints").and_then(|v| v.as_str()))
+                                        .map(|s| s.to_string()),
+                                    username: None,
+                                    password: None,
+                                };
+                                Arc::new(TikvStorage::new(&tikv_config).await?)
+                                    as Arc<dyn GraphStorageEngine + Send + Sync>
+                            }
+                            #[cfg(not(feature = "with-tikv"))]
+                            return Err(GraphError::ConfigurationError("TiKV feature not enabled".to_string()));
+                        }
+                        _ => return Err(GraphError::ConfigurationError("Unsupported persistent engine for Hybrid".to_string())),
+                    };
+                    Arc::new(HybridStorage::new(persistent))
                 }
+                #[cfg(not(any(feature = "with-sled", feature = "with-rocksdb", feature = "with-tikv")))]
+                return Err(GraphError::ConfigurationError("No persistent storage engines enabled for Hybrid".to_string()));
             }
         };
-        Ok(Database { storage })
+        Ok(Database { storage, config })
     }
 
-    async fn load_engine(&self, config_wrapper: StorageConfigWrapper) -> Result<Arc<dyn GraphStorageEngine + Send + Sync>> {
-        let engine_type = config_wrapper.storage.storage_engine_type;
-        // Clone engine_specific_config to avoid partial move
-        let engine_specific_config = config_wrapper.storage.engine_specific_config.clone().map(|map| {
-            HashMap::from_iter(map.into_iter())
-        });
-
-        let mut new_config = config_wrapper.storage.clone();
-        new_config.engine_specific_config = engine_specific_config;
-
-        let persistent_engine: Arc<dyn GraphStorageEngine + Send + Sync> = match engine_type {
+    async fn load_engine(&self, config_wrapper: StorageConfigWrapper) -> Result<Arc<dyn GraphStorageEngine + Send + Sync>, anyhow::Error> {
+        let engine_type = config_wrapper.storage.storage_engine_type.clone();
+        let storage: Arc<dyn GraphStorageEngine + Send + Sync> = match engine_type {
+            StorageEngineType::InMemory => {
+                Arc::new(InMemoryStorage::new(&config_wrapper.storage))
+            }
             StorageEngineType::Sled => {
-                let sled_config: SledConfig = serde_json::from_value(
-                    serde_json::to_value(&new_config.engine_specific_config)
-                        .map_err(|e| anyhow!("Failed to serialize sled config: {}", e))?
-                ).context("Failed to deserialize sled config")?;
-                Arc::new(SledStorage::new(&sled_config).await?)
+                #[cfg(feature = "with-sled")]
+                {
+                    let sled_config = SledConfig {
+                        storage_engine_type: StorageEngineType::Sled,
+                        path: config_wrapper.storage.data_directory.clone(),
+                        host: None,
+                        port: None,
+                    };
+                    Arc::new(SledStorage::new(&sled_config).await?)
+                        as Arc<dyn GraphStorageEngine + Send + Sync>
+                }
+                #[cfg(not(feature = "with-sled"))]
+                return Err(anyhow!("Sled support is not enabled."));
             }
             StorageEngineType::RocksDB => {
-                let rocksdb_config: RocksdbConfig = serde_json::from_value(
-                    serde_json::to_value(&new_config.engine_specific_config)
-                        .map_err(|e| anyhow!("Failed to serialize rocksdb config: {}", e))?
-                ).context("Failed to deserialize Rocksdb config")?;
-                Arc::new(RocksdbStorage::new(&rocksdb_config)?)
+                #[cfg(feature = "with-rocksdb")]
+                {
+                    let rocksdb_config = RocksdbConfig {
+                        storage_engine_type: StorageEngineType::RocksDB,
+                        path: config_wrapper.storage.data_directory.clone(),
+                        host: None,
+                        port: None,
+                    };
+                    Arc::new(RocksdbStorage::new(&rocksdb_config)?)
+                        as Arc<dyn GraphStorageEngine + Send + Sync>
+                }
+                #[cfg(not(feature = "with-rocksdb"))]
+                return Err(anyhow!("RocksDB support is not enabled."));
             }
             StorageEngineType::TiKV => {
-                let tikv_config: TikvConfig = serde_json::from_value(
-                    serde_json::to_value(&new_config.engine_specific_config)
-                        .map_err(|e| anyhow!("Failed to serialize tikv config: {}", e))?
-                ).context("Failed to deserialize TiKV config")?;
-                Arc::new(TikvStorage::new(&tikv_config).await?)
+                #[cfg(feature = "with-tikv")]
+                {
+                    let tikv_config = TikvConfig {
+                        storage_engine_type: StorageEngineType::TiKV,
+                        path: config_wrapper.storage.data_directory.clone(),
+                        host: None,
+                        port: None,
+                        pd_endpoints: None,
+                        username: None,
+                        password: None,
+                    };
+                    Arc::new(TikvStorage::new(&tikv_config).await?)
+                        as Arc<dyn GraphStorageEngine + Send + Sync>
+                }
+                #[cfg(not(feature = "with-tikv"))]
+                return Err(anyhow!("TiKV support is not enabled."));
             }
-            _ => return Err(anyhow!("Unsupported storage engine type")),
+            StorageEngineType::Redis => {
+                #[cfg(feature = "redis-datastore")]
+                {
+                    let connection_string = config_wrapper.storage.connection_string.as_ref()
+                        .ok_or_else(|| anyhow!("Redis connection string is required"))?;
+                    Arc::new(RedisStorage::new(connection_string)?)
+                        as Arc<dyn GraphStorageEngine + Send + Sync>
+                }
+                #[cfg(not(feature = "redis-datastore"))]
+                return Err(anyhow!("Redis support is not enabled."));
+            }
+            StorageEngineType::PostgreSQL => {
+                #[cfg(feature = "postgres-datastore")]
+                {
+                    let connection_string = config_wrapper.storage.connection_string.as_ref()
+                        .ok_or_else(|| anyhow!("PostgreSQL connection string is required"))?;
+                    Arc::new(PostgresStorage::new(connection_string)?)
+                        as Arc<dyn GraphStorageEngine + Send + Sync>
+                }
+                #[cfg(not(feature = "postgres-datastore"))]
+                return Err(anyhow!("PostgreSQL support is not enabled."));
+            }
+            StorageEngineType::MySQL => {
+                #[cfg(feature = "mysql-datastore")]
+                {
+                    let connection_string = config_wrapper.storage.connection_string.as_ref()
+                        .ok_or_else(|| anyhow!("MySQL connection string is required"))?;
+                    Arc::new(MySQLStorage::new(connection_string)?)
+                        as Arc<dyn GraphStorageEngine + Send + Sync>
+                }
+                #[cfg(not(feature = "mysql-datastore"))]
+                return Err(anyhow!("MySQL support is not enabled."));
+            }
+            StorageEngineType::Hybrid => {
+                #[cfg(any(feature = "with-sled", feature = "with-rocksdb", feature = "with-tikv"))]
+                {
+                    let persistent = match config_wrapper.storage.engine_specific_config.as_ref()
+                        .and_then(|config| config.get("persistent_engine").and_then(|v| v.as_str()))
+                    {
+                        Some("sled") => {
+                            #[cfg(feature = "with-sled")]
+                            {
+                                let sled_config = SledConfig {
+                                    storage_engine_type: StorageEngineType::Sled,
+                                    path: config_wrapper.storage.data_directory.clone(),
+                                    host: None,
+                                    port: None,
+                                };
+                                Arc::new(SledStorage::new(&sled_config).await?)
+                                    as Arc<dyn GraphStorageEngine + Send + Sync>
+                            }
+                            #[cfg(not(feature = "with-sled"))]
+                            return Err(anyhow!("Sled support is not enabled."));
+                        }
+                        Some("rocksdb") => {
+                            #[cfg(feature = "with-rocksdb")]
+                            {
+                                let rocksdb_config = RocksdbConfig {
+                                    storage_engine_type: StorageEngineType::RocksDB,
+                                    path: config_wrapper.storage.data_directory.clone(),
+                                    host: None,
+                                    port: None,
+                                };
+                                Arc::new(RocksdbStorage::new(&rocksdb_config)?)
+                                    as Arc<dyn GraphStorageEngine + Send + Sync>
+                            }
+                            #[cfg(not(feature = "with-rocksdb"))]
+                            return Err(anyhow!("RocksDB support is not enabled."));
+                        }
+                        Some("tikv") => {
+                            #[cfg(feature = "with-tikv")]
+                            {
+                                let tikv_config = TikvConfig {
+                                    storage_engine_type: StorageEngineType::TiKV,
+                                    path: config_wrapper.storage.data_directory.clone(),
+                                    host: None,
+                                    port: None,
+                                    pd_endpoints: None,
+                                    username: None,
+                                    password: None,
+                                };
+                                Arc::new(TikvStorage::new(&tikv_config).await?)
+                                    as Arc<dyn GraphStorageEngine + Send + Sync>
+                            }
+                            #[cfg(not(feature = "with-tikv"))]
+                            return Err(anyhow!("TiKV support is not enabled."));
+                        }
+                        _ => return Err(anyhow!("Unsupported persistent engine for Hybrid")),
+                    };
+                    Arc::new(HybridStorage::new(persistent))
+                }
+                #[cfg(not(any(feature = "with-sled", feature = "with-rocksdb", feature = "with-tikv")))]
+                return Err(anyhow!("No persistent storage engines enabled for Hybrid"));
+            }
         };
-        Ok(persistent_engine)
+        Ok(storage)
     }
 
-    pub async fn start(&self) -> Result<(), GraphError> {
-        self.storage.start().await
+    pub fn get_storage_engine(&self) -> Arc<dyn StorageEngine + Send + Sync> {
+        Arc::clone(&self.storage) as Arc<dyn StorageEngine + Send + Sync>
     }
 
-    pub async fn stop(&self) -> Result<(), GraphError> {
-        self.storage.stop().await
+    pub fn get_storage_engine_type(&self) -> StorageEngineType {
+        self.config.storage_engine_type.clone()
     }
 
-    pub async fn is_running(&self) -> bool {
-        self.storage.is_running().await
-    }
-
-    pub async fn query(&self, query_string: &str) -> Result<Value, GraphError> {
-        self.storage.query(query_string).await
+    pub fn get_persistent_engine_type(&self) -> Option<String> {
+        if self.config.storage_engine_type == StorageEngineType::Hybrid {
+            self.config.engine_specific_config.as_ref()
+                .and_then(|config| config.get("persistent_engine"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        } else {
+            Some(self.config.storage_engine_type.to_string())
+        }
     }
 
     pub async fn create_vertex(&self, vertex: Vertex) -> Result<(), GraphError> {

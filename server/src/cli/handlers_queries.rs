@@ -3,19 +3,34 @@
 // Corrected: 2025-08-10 - Removed .await from synchronous KV store methods and corrected argument types
 // ADDED: 2025-08-13 - Added handle_exec_command, handle_query_command, and handle_kv_command
 // FIXED: 2025-08-13 - Resolved E0277 by using {:?} formatter for QueryType
-// FIXED: 2025-08-13 - Removed duplicate handle_kv_command with KvAction to align with cli.rs
+// FIXED: 2025-08-13 - Removed duplicate handle_kv_command with Kv to align with cli.rs
+// ADDED: 2025-08-31 - Enhanced handle_exec_command to validate non-empty commands and execute via QueryExecEngine::execute_command
+// ADDED: 2025-08-31 - Updated handle_query_command to support Cypher, SQL, and GraphQL using parse_query_from_string and specific QueryExecEngine methods
+// ADDED: 2025-08-31 - Updated handle_kv_command to use parse_kv_operation, support flagless and flagged arguments, and align with cli.rs validation
+// FIXED: 2025-08-31 - Added error handling for empty inputs and invalid operations, matching cli.rs error messaging style
 
-use anyhow::{Result, Context, anyhow};
-use log::{info, debug, error};
+use anyhow::{anyhow, Context, Result};
+use log::{debug, error, info, warn};
 use serde_json::Value;
+use std::future::Future;
+use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
-use lib::query_exec_engine::query_exec_engine::{QueryExecEngine};
+use std::fs;
+use tokio::sync::{oneshot, Mutex as TokioMutex};
+use tokio::task::JoinHandle;
+use tokio::time::{self, Duration as TokioDuration};
+use lib::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
+use lib::query_exec_engine::query_exec_engine::QueryExecEngine;
 use lib::query_parser::{parse_query_from_string, QueryType};
-use super::commands::{KvAction, QueryArgs};
-
-// Note: `find_rest_api_port` and `GLOBAL_DAEMON_REGISTRY` are removed
-// because we are no longer acting as a REST API client. The logic
-// now executes the query directly.
+use lib::storage_engine::config::StorageEngineType;
+use lib::storage_engine::TikvStorage;
+use lib::storage_engine::storage_engine::{AsyncStorageEngineManager, StorageEngineManager, GLOBAL_STORAGE_ENGINE_MANAGER};
+use super::commands::parse_kv_operation;
+use crate::cli::config::{DEFAULT_STORAGE_CONFIG_PATH_RELATIVE, MAX_SHUTDOWN_RETRIES, SHUTDOWN_RETRY_DELAY_MS, StorageConfig, load_storage_config_from_yaml};
+use crate::cli::handlers_storage::{start_storage_interactive, stop_storage_interactive};
+use crate::cli::daemon_management::is_storage_daemon_running;
+pub use models::errors::GraphError;
 
 /// Helper function to execute a query and print the result or error.
 async fn execute_and_print(engine: &Arc<QueryExecEngine>, query_string: &str) -> Result<()> {
@@ -105,77 +120,239 @@ pub async fn handle_interactive_query(engine: Arc<QueryExecEngine>, query_string
 pub async fn handle_exec_command(engine: Arc<QueryExecEngine>, command: String) -> Result<()> {
     info!("Executing command '{}' on QueryExecEngine", command);
     println!("Executing command '{}'", command);
-    
-    // Placeholder for actual command execution logic
-    // This could involve a method on QueryExecEngine for executing arbitrary commands
+
+    // Validate command is not empty
+    if command.trim().is_empty() {
+        return Err(anyhow!("Exec command cannot be empty. Usage: exec --command <command>"));
+    }
+
+    // Execute the command on the storage engine
+    let result = engine
+        .execute_command(&command)
+        .await
+        .map_err(|e| anyhow!("Failed to execute command '{}': {}", command, e))?;
+
+    // Print the result
+    println!("Command Result: {}", result);
     Ok(())
 }
 
 /// Handles the `query` command to execute a query on the query engine.
 pub async fn handle_query_command(engine: Arc<QueryExecEngine>, query: String) -> Result<()> {
     info!("Executing query '{}' on QueryExecEngine", query);
-    execute_and_print(&engine, &query).await
+    println!("Executing query '{}'", query);
+
+    // Validate query is not empty
+    if query.trim().is_empty() {
+        return Err(anyhow!("Query cannot be empty. Usage: query --query <query>"));
+    }
+
+    // Parse the query to determine its type
+    let query_type = parse_query_from_string(&query)
+        .map_err(|e| anyhow!("Failed to parse query '{}': {}", query, e))?;
+
+    // Execute the query based on its type
+    let result = match query_type {
+        QueryType::Cypher => {
+            info!("Detected Cypher query");
+            engine
+                .execute_cypher(&query)
+                .await
+                .map_err(|e| anyhow!("Failed to execute Cypher query '{}': {}", query, e))?
+        }
+        QueryType::SQL => {
+            info!("Detected SQL query");
+            engine
+                .execute_sql(&query)
+                .await
+                .map_err(|e| anyhow!("Failed to execute SQL query '{}': {}", query, e))?
+        }
+        QueryType::GraphQL => {
+            info!("Detected GraphQL query");
+            engine
+                .execute_graphql(&query)
+                .await
+                .map_err(|e| anyhow!("Failed to execute GraphQL query '{}': {}", query, e))?
+        }
+    };
+
+    // Print the query result
+    println!("Query Result:\n{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
 }
 
 /// Handles the `kv` command for key-value operations on the query engine.
 pub async fn handle_kv_command(engine: Arc<QueryExecEngine>, operation: String, key: String, value: Option<String>) -> Result<()> {
-    match operation.to_lowercase().as_str() {
+    // Validate the operation using parse_kv_operation
+    let validated_op = parse_kv_operation(&operation)
+        .map_err(|e| anyhow!("Invalid KV operation: {}", e))?;
+
+    match validated_op.as_str() {
         "get" => {
             info!("Executing Key-Value GET for key: {}", key);
-            let kv_store = engine.get_kv_store();
-            let result = kv_store.get(&key);
+            let result = engine
+                .kv_get(&key)
+                .await
+                .map_err(|e| anyhow!("Failed to get key '{}': {}", key, e))?;
             match result {
-                Ok(Some(val)) => {
+                Some(val) => {
                     println!("Value for key '{}': {}", key, val);
                     Ok(())
                 }
-                Ok(None) => {
-                    println!("Key '{}' not found.", key);
+                None => {
+                    println!("Key '{}' not found", key);
                     Ok(())
-                }
-                Err(e) => {
-                    eprintln!("Error getting value for key '{}': {}", key, e);
-                    Err(anyhow!("Failed to get key: {}", e))
                 }
             }
         }
         "set" => {
-            let value = value.ok_or_else(|| anyhow!("Value is required for set operation"))?;
+            let value = value.ok_or_else(|| {
+                anyhow!("Missing value for 'kv set' command. Usage: kv set <key> <value> or kv set --key <key> --value <value>")
+            })?;
             info!("Executing Key-Value SET for key: {}, value: {}", key, value);
-            let kv_store = engine.get_kv_store();
-            
-            // Clone the key before moving it into the set method
-            let key_for_print = key.clone();
-            let result = kv_store.set(key, value);
-            
-            match result {
-                Ok(_) => {
-                    println!("Successfully set key '{}'", key_for_print);
-                    Ok(())
-                }
-                Err(e) => {
-                    eprintln!("Error setting key-value pair: {}", e);
-                    Err(anyhow!("Failed to set key-value pair: {}", e))
-                }
-            }
+            engine
+                .kv_set(&key, &value)
+                .await
+                .map_err(|e| anyhow!("Failed to set key '{}': {}", key, e))?;
+            println!("Successfully set key '{}' to '{}'", key, value);
+            Ok(())
         }
         "delete" => {
             info!("Executing Key-Value DELETE for key: {}", key);
-            let kv_store = engine.get_kv_store();
-            let result = kv_store.delete(&key);
-            match result {
-                Ok(_) => {
-                    println!("Successfully deleted key '{}'", key);
-                    Ok(())
-                }
-                Err(e) => {
-                    eprintln!("Error deleting key : {}", e);
-                    Err(anyhow!("Failed to delete key: {}", e))
-                }
+            let existed = engine
+                .kv_delete(&key)
+                .await
+                .map_err(|e| anyhow!("Failed to delete key '{}': {}", key, e))?;
+            if existed {
+                println!("Successfully deleted key '{}'", key);
+            } else {
+                println!("Key '{}' not found", key);
             }
+            Ok(())
         }
         _ => {
-            Err(anyhow!("Unsupported KV operation: {}. Supported operations: get, set, delete", operation))
+            Err(anyhow!("Unsupported KV operation: '{}'. Supported operations: get, set, delete", operation))
         }
     }
+}
+
+/// This function ensures the `GLOBAL_STORAGE_ENGINE_MANAGER` is initialized
+/// before any query-related commands are executed.
+/// It loads the configuration and sets up the manager, but does not manage daemons.
+pub async fn initialize_storage_for_query(
+    start_storage_interactive: fn(
+        Option<u16>,
+        Option<PathBuf>,
+        Option<StorageConfig>,
+        Option<String>,
+        Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
+        Arc<TokioMutex<Option<JoinHandle<()>>>>,
+        Arc<TokioMutex<Option<u16>>>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), anyhow::Error>> + Send>>,
+    stop_storage_interactive: fn(
+        Option<u16>,
+        Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
+        Arc<TokioMutex<Option<JoinHandle<()>>>>,
+        Arc<TokioMutex<Option<u16>>>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), anyhow::Error>> + Send>>,
+) -> Result<(), anyhow::Error> {
+    if GLOBAL_STORAGE_ENGINE_MANAGER.get().is_some() {
+        debug!("StorageEngineManager is already initialized. Skipping initialization.");
+        return Ok(());
+    }
+
+    info!("Initializing StorageEngineManager for non-interactive command execution.");
+    println!("===> Initializing Storage Engine...");
+
+    let running_daemons: Vec<DaemonMetadata> = GLOBAL_DAEMON_REGISTRY
+        .get_all_daemon_metadata()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|d| d.service_type == "storage")
+        .collect();
+
+    // The key change: Check if a daemon is running and use it instead of stopping it.
+    if let Some(daemon) = running_daemons.first() {
+        info!("Found running storage daemon on port {}, connecting to it...", daemon.port);
+
+        // Clean up lock files from a potentially crashed previous session.
+        let engine_type = daemon.engine_type
+            .as_ref()
+            .and_then(|s| s.parse::<StorageEngineType>().ok())
+            .ok_or_else(|| anyhow!("Failed to parse engine type from running daemon: {}", daemon.engine_type.as_deref().unwrap_or("n/a")))?;
+        
+        let data_dir_path = PathBuf::from(daemon.config_path.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE)));
+        
+        match engine_type {
+            StorageEngineType::Sled => {
+                let lock_path = data_dir_path.join("db.lck");
+                if lock_path.exists() {
+                    info!("Removing Sled lock file at {:?}", lock_path);
+                    fs::remove_file(&lock_path).context(format!("Failed to remove Sled lock file at {:?}", lock_path))?;
+                }
+            },
+            StorageEngineType::TiKV => {
+                // For TiKV, force_unlock is a no-op but it's good practice to call it.
+                if let Err(e) = TikvStorage::force_unlock().await {
+                    warn!("Failed to clean up TiKV lock files at {:?}: {}", data_dir_path, e);
+                }
+            },
+            _ => {
+                debug!("No specific lock file cleanup implemented for engine type: {:?}", engine_type);
+            }
+        }
+        
+        let config_path = daemon.config_path.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE));
+
+        let manager = StorageEngineManager::new(engine_type.clone(), &config_path, false)
+            .await
+            .context("Failed to initialize StorageEngineManager")?;
+
+        GLOBAL_STORAGE_ENGINE_MANAGER
+            .set(Arc::new(AsyncStorageEngineManager::from_manager(
+                Arc::try_unwrap(manager)
+                    .map_err(|_| GraphError::ConfigurationError("Failed to unwrap Arc<StorageEngineManager>: multiple references exist".to_string()))?
+            )))
+            .context("Failed to set GLOBAL_STORAGE_ENGINE_MANAGER")?;
+
+        info!("Successfully initialized storage engine {:?}", engine_type);
+        println!("===> Storage Engine initialized successfully.");
+    } else {
+        // This is the fallback case: no daemon is running, so we start one.
+        info!("No running daemon found, starting a new storage daemon.");
+        println!("===> No running daemon found, starting a new storage daemon...");
+        let cwd = std::env::current_dir().context("Failed to get current working directory")?;
+        let config_path = cwd.join(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
+
+        let current_config: StorageConfig = match load_storage_config_from_yaml(Some(config_path.clone())) {
+            Ok(config) => {
+                info!("Successfully loaded existing storage config: {:?}", config);
+                config
+            },
+            Err(e) => {
+                warn!("Failed to load existing config from {:?}, using default values. Error: {}", config_path, e);
+                StorageConfig::default()
+            }
+        };
+
+        let storage_daemon_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>> = Arc::new(TokioMutex::new(None));
+        let storage_daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>> = Arc::new(TokioMutex::new(None));
+        let storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>> = Arc::new(TokioMutex::new(None));
+
+        start_storage_interactive(
+            Some(current_config.default_port),
+            Some(config_path),
+            Some(current_config),
+            None,
+            storage_daemon_shutdown_tx_opt,
+            storage_daemon_handle,
+            storage_daemon_port_arc,
+        ).await.context("Failed to start storage daemon")?;
+
+        info!("Successfully started a new storage daemon.");
+        println!("===> New storage daemon started successfully.");
+    }
+
+    Ok(())
 }
