@@ -106,38 +106,46 @@ impl TikvStorage {
             GraphError::ConfigurationError("Missing pd_endpoints in TiKV configuration".to_string())
         })?;
 
-        // In tikv-client v0.3.0, the Config struct does not have a pd_endpoints field.
-        // Instead, the endpoints are passed as a separate argument to the client constructor.
         let pd_endpoints: Vec<String> = pd_endpoints_str.split(',').map(|s| s.trim().to_string()).collect();
-
-        // For this older version, we create a default config.
-        let tikv_config = Config::default();
-
         info!("Connecting to TiKV PD endpoints: {:?}", pd_endpoints);
 
-        // In tikv-client v0.3.0, `KvClient::new_with_config` requires both
-        // the pd_endpoints list and the config object.
-        let client = KvClient::new_with_config(
-            pd_endpoints,
-            tikv_config
-        )
-            .await
-            .map_err(|e| {
-                error!("Failed to connect to TiKV: {}", e);
-                GraphError::StorageError(format!("Failed to connect to TiKV backend: {}", e))
-            })?;
+        // Add retry logic for connection
+        let max_attempts = 3;
+        let retry_interval = TokioDuration::from_secs(2);
+        let mut last_error = None;
 
-        info!("Successfully initialized TiKV storage engine.");
-        Ok(TikvStorage {
-            client: Arc::new(client),
-            config: config.clone(),
-            running: TokioMutex::new(true),
-        })
+        for attempt in 1..=max_attempts {
+            match KvClient::new_with_config(pd_endpoints.clone(), Config::default()).await {
+                Ok(client) => {
+                    info!("Successfully connected to TiKV on attempt {}", attempt);
+                    return Ok(TikvStorage {
+                        client: Arc::new(client),
+                        config: config.clone(),
+                        running: TokioMutex::new(true),
+                    });
+                }
+                Err(e) => {
+                    warn!("Failed to connect to TiKV on attempt {}: {}", attempt, e);
+                    last_error = Some(e);
+                    if attempt < max_attempts {
+                        info!("Retrying in {:?}", retry_interval);
+                        time::sleep(retry_interval).await;
+                    }
+                }
+            }
+        }
+
+        error!("Failed to connect to TiKV after {} attempts", max_attempts);
+        Err(GraphError::StorageError(format!(
+            "Failed to connect to TiKV backend after {} attempts: {}",
+            max_attempts,
+            last_error.unwrap()
+        )))
     }
     
     /// Forces the unlocking of a local database. This is a no-op for TiKV
     /// which is a distributed key-value store and does not use local files.
-    pub async fn force_unlock(_path: &PathBuf) -> GraphResult<()> {
+    pub async fn force_unlock() -> GraphResult<()> {
         info!("No local lock files to unlock for TiKV (distributed storage)");
         Ok(())
     }

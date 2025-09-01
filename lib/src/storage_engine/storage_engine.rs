@@ -2511,7 +2511,7 @@ impl StorageEngineManager {
                 .and_then(|map| map.get("path").and_then(|v| v.as_str()).map(PathBuf::from))
                 .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data/tikv"));
             if tikv_path.exists() {
-                if let Err(e) = TikvStorage::force_unlock(&tikv_path).await {
+                if let Err(e) = TikvStorage::force_unlock().await {
                     warn!("Failed to clean up TiKV lock files: {}", e);
                 } else {
                     info!("Lock files cleaned successfully.");

@@ -552,3 +552,32 @@ impl From<CliTomlStorageConfig> for StorageConfig {
         }
     }
 }
+
+impl StorageConfig {
+    /// Creates a new StorageConfig instance configured for an in-memory storage engine.
+    /// This is a common pattern for setting up test environments or temporary storage.
+    pub fn new_in_memory() -> Self {
+        Self {
+            // Set the storage engine type to Sled or RocksDB, which can be configured for
+            // in-memory or temporary paths. RocksDB can use an empty path for a temporary,
+            // non-persistent instance. We'll use RocksDB here as a common in-memory default.
+            storage_engine_type: StorageEngineType::RocksDB,
+            
+            // Set data_directory to None or a temporary path to ensure it's in-memory.
+            // RocksDB will create a temporary, non-persistent instance without a path.
+            data_directory: Some(PathBuf::from("")), 
+            
+            // Set other fields to sensible defaults
+            config_root_directory: None,
+            log_directory: None,
+            default_port: 0, // A dummy port as it won't be exposed
+            cluster_range: "".to_string(),
+            max_disk_space_gb: 1, // Small size for a temporary instance
+            min_disk_space_gb: 0,
+            use_raft_for_scale: false, // No raft for a single in-memory instance
+            engine_specific_config: None,
+            max_open_files: 1024,
+        }
+    }
+}
+

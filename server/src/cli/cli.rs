@@ -1,91 +1,49 @@
-// server/src/cli/cli.rs
-// Refactored: 2025-07-04 - Updated to use new storage engine names and removed obsolete imports.
-// Fixed: 2025-07-04 - Corrected argument types for handle_restart_command_interactive.
-// Fixed: 2025-07-04 - Corrected function name for run_cli_interactive.
-// Fixed: 2025-07-04 - Resolved Mutex type mismatches and argument wrapping for handlers.
-// Reverted: 2025-07-04 - Reverted to user-provided base code structure, re-applying necessary fixes.
-// Fixed: 2025-07-04 - Corrected argument count for run_cli_interactive calls.
-// FIXED: 2025-07-27 - Removed unused imports in interactive.rs.
-// FIXED: 2025-07-27 - Corrected type mismatch for storage_config in StartAction::All.
-// FIXED: 2025-07-27 - Corrected handle_reload_command call to use handle_reload_command_interactive.
-// FIXED: 2025-07-27 - Corrected type mismatch for storage_config by converting to PathBuf for StartAction::All.
-// FIXED: 2025-07-27 - Corrected argument passing for handle_start_all_interactive and handle_rest_command_interactive.
-// FIXED: 2025-07-27 - Corrected handle_reload_command_interactive argument count and types.
-// FIXED: 2025-07-27 - Corrected handle_internal_daemon_run import and call path.
-// UPDATED: 2025-07-28 - Synchronized with latest commands.rs and interactive.rs changes.
-// FIXED: 2025-07-28 - Removed unused FromArgMatches import from clap.
-// FIXED: 2025-07-29 - Added missing internal arguments to CliArgs struct and fixed handle_internal_daemon_run call.
-// FIXED: 2025-07-30 - Adjusted StartAction::Storage to use `--port` instead of `--storage-port` to resolve argument conflict with top-level 'start' command.
-// FIXED: 2025-07-30 - Removed redundant top-level storage_port, storage_cluster, and storage_config from Commands::Start.
-// RESTORED: 2025-07-30 - Restored missing internal flags in CliArgs and corrected handle_internal_daemon_run arguments.
-// RESTORED: 2025-07-30 - Reverted `handle_internal_daemon_run` call to 5 arguments and removed corresponding `CliArgs` fields.
-// FIXED: 2025-07-31 - Added missing fields `storage_port`, `storage_cluster` to StartAction::Storage initializer (line 271).
-// FIXED: 2025-07-31 - Added missing fields `daemon_port`, `daemon_cluster`, `rest_port`, `rest_cluster`, `storage_port`, `storage_cluster` to patterns and initializers for StartAction::Daemon, StartAction::Rest, StartAction::Storage (lines 325, 331, 339, 327, 333, 341).
-// FIXED: 2025-07-31 - Corrected `filter_command` to `command_filter` in Commands::Help block (line 404) to resolve E0425.
-// FIXED: 2025-08-05 - Modified effective_action logic to prioritize StartAction::All when non-storage-specific arguments (e.g., --cluster, --listen-port) are present alongside --storage-port, fixing incorrect `Cannot specify both --port and --storage-port` error.
-// FIXED: 2025-08-06 - Refactored to execute commands before entering interactive mode, addressing the request to not exit after `start` command.
-// FIXED: 2025-08-08 - Used `serde_yaml2` and `fs` as per user request. Updated to access `storage_engine_type` via `config.storage` and added `enable_plugins` to `CliConfigToml` in `config.rs`. Implemented `save` method for `CliConfigToml`.
-// UPDATED: 2025-08-08 - Modified `UseAction::Storage` to use custom `parse_storage_engine` for `engine` argument, supporting `sled`, `rocksdb`, `rocks-db`, `inmemory`, `in-memory`, `redis`, `postgres`, `postgresql`, `postgre-sql`, `mysql`, `my-sql`.
-// FIXED: 2025-08-08 - Corrected `Commands::Use` match in `run_single_command` to use struct variant syntax `Commands::Use { action }` to resolve E0164.
-// FIXED: 2025-08-08 - Corrected `rank_port` to `rest_port` in `StartAction::All` pattern to resolve E0026.
-// FIXED: 2025-08-08 - Removed mutable `storage_settings` in `UseAction::Storage` to fix warning.
-// ADDED: 2025-08-08 - Introduced `SelectedStorageConfig` for storage-specific YAMLs, overriding core `StorageSettings` fields, and updated logging to handle both with masked password.
-// FIXED: 2025-08-08 - Removed incorrect `cluster_range` reference in `SelectedStorageConfig` to resolve E0609.
-// FIXED: 2025-08-08 - Corrected `StorageSettings` field types to handle `Option<T>` for `config_root_directory`, `data_directory`, `log_directory`, `cluster_range` to resolve E0308.
-// FIXED: 2025-08-08 - Used `serde_yaml2` with `from_str` for YAML deserialization to resolve E0425 and E0432.
-// FIXED: 2025-08-08 - Ensured `StorageSettings` fields are accessed as `Option<T>` in logging to resolve E0308.
-// FIXED: 2025-08-08 - Updated `SelectedStorageConfig` to handle nested `storage` key in YAML files to fix RocksDB parsing error.
-// FIXED: 2025-08-08 - Ensured `host` and `username` are logged for all storage engines when available.
-// FIXED: 2025-08-08 - Corrected filename typo (`sorage` → `storage`) in config.rs constants.
-// ADDED: 2025-08-09 - Added `Save` subcommand with `Configuration` and `Storage` variants to support `save configuration` and `save storage` commands.
-// FIXED: 2025-08-09 - Removed `permanent` field from `Commands::Save` and `UseAction::Plugin` to fix `E0027` at `cli.rs:459`. Kept `config`/`configuration` aliases in `parse_storage_engine`.
-// ADDED: 2025-08-13 - Added `Exec`, `Query`, and `Kv` commands to support storage engine execution, querying, and key-value operations.
-// FIXED: 2025-08-31 - Ensured `Commands::Kv` uses new `operation`, `key`, `value` fields and maps to `CommandType::KvGet` and `CommandType::KvSet` for interactive mode compatibility.
-// FIXED: 2025-08-31 - Corrected `LibStorageConfig` initialization in `start_cli` to include all required fields using `map_cli_to_lib_storage_config`, resolving E0063 error at line 686.
-
 use clap::{Parser, Subcommand, CommandFactory};
 use anyhow::{Result, Context, anyhow};
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::Mutex;
-use tokio::sync::oneshot;
+use tokio::sync::{Mutex as TokioMutex, OnceCell, oneshot};
 use tokio::task::JoinHandle;
 use std::process;
 use std::env;
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use serde_yaml2;
+use serde_yaml2 as serde_yaml;
 use std::fs;
-use storage_daemon_server::StorageSettings;
+use storage_daemon_server::{StorageSettings, StorageSettingsWrapper};
+use log::{info, debug, warn};
+use models::errors::GraphError;
 
 // Import modules
 use crate::cli::commands::{
-    DaemonCliCommand, RestCliCommand, StorageAction, UseAction, SaveAction,
-    StatusArgs, StopArgs, ReloadArgs, RestartArgs,
-    ReloadAction, RestartAction, StartAction, StopAction, StatusAction,
-    HelpArgs, ShowAction, ConfigAction, parse_kv_operation,
+    parse_kv_operation, ConfigAction, DaemonCliCommand, HelpArgs, ReloadAction, RestartAction,
+    RestCliCommand, SaveAction, ShowAction, StartAction, StatusAction, StopAction, StorageAction,
+    StatusArgs, StopArgs, ReloadArgs, RestartArgs, UseAction
 };
 use crate::cli::config::{
-    self, DEFAULT_STORAGE_CONFIG_PATH_ROCKSDB, DEFAULT_STORAGE_CONFIG_PATH_SLED,
-    DEFAULT_STORAGE_CONFIG_PATH_POSTGRES, DEFAULT_STORAGE_CONFIG_PATH_MYSQL,
-    DEFAULT_STORAGE_CONFIG_PATH_TIKV,
-    DEFAULT_STORAGE_CONFIG_PATH_REDIS, SelectedStorageConfig, StorageConfigInner, 
-    load_storage_config_from_yaml, StorageConfig as CliStorageConfig, StorageEngineType,
+    self, load_storage_config_from_yaml, SelectedStorageConfig, StorageConfig as CliStorageConfig,
+    StorageConfigInner, StorageEngineType, DEFAULT_STORAGE_CONFIG_PATH_MYSQL,
+    DEFAULT_STORAGE_CONFIG_PATH_POSTGRES, DEFAULT_STORAGE_CONFIG_PATH_REDIS,
+    DEFAULT_STORAGE_CONFIG_PATH_ROCKSDB, DEFAULT_STORAGE_CONFIG_PATH_SLED,
+    DEFAULT_STORAGE_CONFIG_PATH_TIKV, DEFAULT_STORAGE_CONFIG_PATH_RELATIVE,
+    load_cli_config
 };
 use crate::cli::config as config_mod;
-use crate::cli::handlers as handlers_mod;
-use crate::cli::interactive as interactive_mod;
-use crate::cli::help_display as help_display_mod;
 use crate::cli::daemon_management;
-use crate::cli::handlers_utils::{parse_storage_engine};
-use lib::query_exec_engine::{QueryExecEngine};
+use crate::cli::handlers as handlers_mod;
+use crate::cli::handlers_storage::{ start_storage_interactive, stop_storage_interactive, };
+use crate::cli::handlers_utils::parse_storage_engine;
+use crate::cli::help_display as help_display_mod;
+use crate::cli::interactive as interactive_mod;
+use crate::cli::handlers_queries::initialize_storage_for_query;
 use lib::database::Database;
 use lib::query_parser::config::KeyValueStore;
 use lib::query_parser::{parse_query_from_string, QueryType};
-use lib::storage_engine::config::{StorageEngineType as LibStorageEngineType, StorageConfig as LibStorageConfig};
-use lib::storage_engine::storage_engine::{StorageEngineManager, GLOBAL_STORAGE_ENGINE_MANAGER};
-use storage_daemon_server::{StorageSettingsWrapper};
+use lib::query_exec_engine::QueryExecEngine;
+use lib::storage_engine::config::{StorageConfig as LibStorageConfig, StorageEngineType as LibStorageEngineType};
+use lib::storage_engine::storage_engine::{StorageEngineManager, AsyncStorageEngineManager, GLOBAL_STORAGE_ENGINE_MANAGER};
 
 /// GraphDB Command Line Interface
 #[derive(Parser, Debug)]
@@ -190,37 +148,137 @@ pub enum Commands {
     },
 }
 
+// Use a OnceCell to manage the singleton instance of the QueryExecEngine.
+static QUERY_ENGINE_SINGLETON: OnceCell<Arc<QueryExecEngine>> = OnceCell::const_new();
+
+
+
+// Correct Solution: Remove Sync requirement and fix parameter types
+
+fn start_wrapper(
+    port: Option<u16>,
+    config_path: Option<PathBuf>,
+    storage_config: Option<CliStorageConfig>, // This is the same as CliStorageConfig (alias)
+    engine_name: Option<String>,
+    shutdown_tx: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
+    handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
+    port_arc: Arc<TokioMutex<Option<u16>>>,
+) -> Pin<Box<dyn Future<Output = Result<(), anyhow::Error>> + Send>> {
+    // No conversion needed since CliStorageConfig is an alias to StorageConfig
+    Box::pin(start_storage_interactive(
+        port,
+        config_path,
+        storage_config, // Pass directly, no conversion needed
+        engine_name,
+        shutdown_tx,
+        handle,
+        port_arc,
+    ))
+}
+
+fn stop_wrapper(
+    port: Option<u16>,
+    shutdown_tx: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
+    handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
+    port_arc: Arc<TokioMutex<Option<u16>>>,
+) -> Pin<Box<dyn Future<Output = Result<(), anyhow::Error>> + Send>> {
+    Box::pin(stop_storage_interactive(
+        port,
+        shutdown_tx,
+        handle,
+        port_arc,
+    ))
+    // Removed the cast to Send + Sync - just return Send
+}
+
+pub async fn get_query_engine_singleton() -> Result<&'static Arc<QueryExecEngine>> {
+    initialize_storage_for_query(start_wrapper, stop_wrapper).await?;
+    
+    QUERY_ENGINE_SINGLETON.get_or_try_init(|| async {
+        let storage_config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
+        let cli_storage_config = if storage_config_path.exists() {
+            println!("Loading storage config from {}", storage_config_path.display());
+            load_storage_config_from_yaml(Some(storage_config_path.clone()))
+                .with_context(|| format!("Failed to load storage config from {}", storage_config_path.display()))?
+        } else {
+            println!("No storage configuration file found at {}. Defaulting to InMemory storage. Use 'use storage <engine_name>' and 'save storage' to persist your configuration.", storage_config_path.display());
+            CliStorageConfig::new_in_memory()
+        };
+        
+        let lib_storage_config = map_cli_to_lib_storage_config(cli_storage_config);
+        let database = Arc::new(
+            Database::new(lib_storage_config)
+                .await
+                .map_err(|e| anyhow!("Failed to create Database: {}", e))?,
+        );
+        let kv_store = Arc::new(KeyValueStore::new());
+        Ok(Arc::new(QueryExecEngine::new(database, kv_store)))
+    }).await
+}
+
 // Maps CliStorageConfig to LibStorageConfig
 pub fn map_cli_to_lib_storage_config(cli_config: CliStorageConfig) -> LibStorageConfig {
     let engine_specific_config = cli_config.engine_specific_config.as_ref().map(|selected| {
-        let mut map = std::collections::HashMap::new();
-        if let Some(port) = selected.storage.port {
-            map.insert("port".to_string(), serde_json::Value::Number(port.into()));
+        let mut map = HashMap::new();
+        
+        // Insert storage_engine_type (snake_case only)
+        map.insert(
+            "storage_engine_type".to_string(),
+            Value::String(selected.storage_engine_type.to_string().to_lowercase())
+        );
+        
+        // Normalize path to exclude port number
+        let engine_path_name = selected.storage_engine_type.to_string().to_lowercase();
+        let data_dir_path = cli_config.data_directory.as_ref().map_or(
+            PathBuf::from("/opt/graphdb/storage_data"),
+            |p| p.clone()
+        );
+        let engine_data_path = data_dir_path.join(&engine_path_name);
+        map.insert(
+            "path".to_string(),
+            Value::String(engine_data_path.to_string_lossy().to_string())
+        );
+        
+        // Insert other fields
+        if let Some(host) = &selected.storage.host {
+            map.insert("host".to_string(), Value::String(host.clone()));
         }
+        if let Some(port) = selected.storage.port {
+            map.insert("port".to_string(), Value::Number(port.into()));
+        }
+        if let Some(username) = &selected.storage.username {
+            map.insert("username".to_string(), Value::String(username.clone()));
+        }
+        if let Some(password) = &selected.storage.password {
+            map.insert("password".to_string(), Value::String(password.clone()));
+        }
+        if let Some(database) = &selected.storage.database {
+            map.insert("database".to_string(), Value::String(database.clone()));
+        }
+        if let Some(pd_endpoints) = &selected.storage.pd_endpoints {
+            map.insert("pd_endpoints".to_string(), Value::String(pd_endpoints.clone()));
+        }
+        
         map
     });
 
     LibStorageConfig {
         config_root_directory: cli_config
             .config_root_directory
-            .unwrap_or_else(|| std::path::PathBuf::from("/opt/graphdb/config")),
-
+            .unwrap_or_else(|| PathBuf::from("/opt/graphdb/config")),
         data_directory: cli_config
             .data_directory
-            .unwrap_or_else(|| std::path::PathBuf::from("/opt/graphdb/storage_data")),
-
+            .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data")),
         log_directory: cli_config
             .log_directory
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| "/opt/graphdb/logs".to_string()),
-
         default_port: cli_config.default_port,
-        cluster_range: cli_config.cluster_range.clone(),
+        cluster_range: cli_config.cluster_range,
         max_disk_space_gb: cli_config.max_disk_space_gb,
         min_disk_space_gb: cli_config.min_disk_space_gb,
         use_raft_for_scale: cli_config.use_raft_for_scale,
-
         storage_engine_type: match cli_config.storage_engine_type {
             StorageEngineType::RocksDB => LibStorageEngineType::RocksDB,
             StorageEngineType::TiKV => LibStorageEngineType::TiKV,
@@ -230,11 +288,8 @@ pub fn map_cli_to_lib_storage_config(cli_config: CliStorageConfig) -> LibStorage
             StorageEngineType::Redis => LibStorageEngineType::Redis,
             StorageEngineType::InMemory => LibStorageEngineType::InMemory,
         },
-
         engine_specific_config,
-
         max_open_files: Some(cli_config.max_open_files as i32),
-
         connection_string: match cli_config.storage_engine_type {
             StorageEngineType::PostgreSQL => Some("postgres://localhost:5432/graphdb".to_string()),
             StorageEngineType::MySQL => Some("mysql://localhost:3306/graphdb".to_string()),
@@ -244,43 +299,21 @@ pub fn map_cli_to_lib_storage_config(cli_config: CliStorageConfig) -> LibStorage
     }
 }
 
-// Re-usable function to handle all commands. This is called from both interactive and non-interactive modes.
+// Re-usable function to handle all commands.
 pub async fn run_single_command(
     command: Commands,
-    daemon_handles: Arc<Mutex<HashMap<u16, (JoinHandle<()>, oneshot::Sender<()>)>>>,
-    rest_api_shutdown_tx_opt: Arc<Mutex<Option<oneshot::Sender<()>>>>,
-    rest_api_port_arc: Arc<Mutex<Option<u16>>>,
-    rest_api_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
-    storage_daemon_shutdown_tx_opt: Arc<Mutex<Option<oneshot::Sender<()>>>>,
-    storage_daemon_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
-    storage_daemon_port_arc: Arc<Mutex<Option<u16>>>,
+    daemon_handles: Arc<TokioMutex<HashMap<u16, (JoinHandle<()>, oneshot::Sender<()>)>>>,
+    rest_api_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
+    rest_api_port_arc: Arc<TokioMutex<Option<u16>>>,
+    rest_api_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
+    storage_daemon_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
+    storage_daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
+    storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
 ) -> Result<()> {
-    // Initialize Database and KeyValueStore only for commands that need them
+    // Initialize query engine for commands that need it
     let query_engine = match command {
         Commands::Exec { .. } | Commands::Query { .. } | Commands::Kv { .. } => {
-            // Load storage engine
-            let storage_engine = GLOBAL_STORAGE_ENGINE_MANAGER
-                .get()
-                .ok_or_else(|| anyhow!("StorageEngineManager not initialized"))?
-                .get_persistent_engine();
-
-            // Load or create StorageConfig
-            let storage_config_path = PathBuf::from("/opt/graphdb/storage_data/config.yaml");
-            let cli_storage_config = load_storage_config_from_yaml(Some(storage_config_path))
-                .map_err(|e| anyhow!("Failed to load storage config: {}", e))?;
-
-            // Map CliStorageConfig to LibStorageConfig
-            let lib_storage_config = map_cli_to_lib_storage_config(cli_storage_config);
-
-            // Create Database instance
-            let database = Arc::new(Database::new(lib_storage_config).await
-                .map_err(|e| anyhow!("Failed to create Database: {}", e))?);
-
-            // Create KeyValueStore instance
-            let kv_store = Arc::new(KeyValueStore::new());
-
-            // Initialize QueryExecEngine
-            Some(Arc::new(QueryExecEngine::new(database, kv_store)))
+            Some(get_query_engine_singleton().await?)
         }
         _ => None,
     };
@@ -301,21 +334,38 @@ pub async fn run_single_command(
         } => {
             let effective_action = match action {
                 Some(StartAction::All {
-                    port, cluster, daemon_port, daemon_cluster,
-                    listen_port, rest_port, rest_cluster,
-                    storage_port, storage_cluster, storage_config
-                }) => {
-                    StartAction::All {
-                        port, cluster, daemon_port, daemon_cluster,
-                        listen_port, rest_port, rest_cluster,
-                        storage_port, storage_cluster,
-                        storage_config,
-                    }
+                    port,
+                    cluster,
+                    daemon_port,
+                    daemon_cluster,
+                    listen_port,
+                    rest_port,
+                    rest_cluster,
+                    storage_port,
+                    storage_cluster,
+                    storage_config,
+                }) => StartAction::All {
+                    port,
+                    cluster,
+                    daemon_port,
+                    daemon_cluster,
+                    listen_port,
+                    rest_port,
+                    rest_cluster,
+                    storage_port,
+                    storage_cluster,
+                    storage_config,
                 },
                 Some(other_action) => other_action,
                 None => {
-                    if top_port.is_some() || top_cluster.is_some() || top_daemon_port.is_some() || top_daemon_cluster.is_some() ||
-                        top_listen_port.is_some() || top_rest_port.is_some() || top_rest_cluster.is_some() {
+                    if top_port.is_some()
+                        || top_cluster.is_some()
+                        || top_daemon_port.is_some()
+                        || top_daemon_cluster.is_some()
+                        || top_listen_port.is_some()
+                        || top_rest_port.is_some()
+                        || top_rest_cluster.is_some()
+                    {
                         StartAction::All {
                             port: top_port,
                             cluster: top_cluster.clone(),
@@ -328,7 +378,10 @@ pub async fn run_single_command(
                             storage_cluster: top_storage_cluster,
                             storage_config: top_storage_config.clone(),
                         }
-                    } else if top_storage_port.is_some() || top_storage_cluster.is_some() || top_storage_config.is_some() {
+                    } else if top_storage_port.is_some()
+                        || top_storage_cluster.is_some()
+                        || top_storage_config.is_some()
+                    {
                         StartAction::Storage {
                             port: top_storage_port,
                             cluster: top_storage_cluster.clone(),
@@ -338,9 +391,16 @@ pub async fn run_single_command(
                         }
                     } else {
                         StartAction::All {
-                            port: None, cluster: None, daemon_port: None, daemon_cluster: None,
-                            listen_port: None, rest_port: None, rest_cluster: None,
-                            storage_port: None, storage_cluster: None, storage_config: None,
+                            port: None,
+                            cluster: None,
+                            daemon_port: None,
+                            daemon_cluster: None,
+                            listen_port: None,
+                            rest_port: None,
+                            rest_cluster: None,
+                            storage_port: None,
+                            storage_cluster: None,
+                            storage_config: None,
                         }
                     }
                 }
@@ -348,9 +408,16 @@ pub async fn run_single_command(
 
             match effective_action {
                 StartAction::All {
-                    port, cluster, daemon_port, daemon_cluster,
-                    listen_port, rest_port, rest_cluster,
-                    storage_port, storage_cluster, storage_config,
+                    port,
+                    cluster,
+                    daemon_port,
+                    daemon_cluster,
+                    listen_port,
+                    rest_port,
+                    rest_cluster,
+                    storage_port,
+                    storage_cluster,
+                    storage_config,
                 } => {
                     handlers_mod::handle_start_all_interactive(
                         port.or(daemon_port),
@@ -367,13 +434,25 @@ pub async fn run_single_command(
                         storage_daemon_shutdown_tx_opt.clone(),
                         storage_daemon_handle.clone(),
                         storage_daemon_port_arc.clone(),
-                    ).await?;
+                    )
+                    .await?;
                 }
-                StartAction::Daemon { port, cluster, daemon_port, daemon_cluster } => {
+                StartAction::Daemon {
+                    port,
+                    cluster,
+                    daemon_port,
+                    daemon_cluster,
+                } => {
                     handlers_mod::handle_daemon_command_interactive(
-                        DaemonCliCommand::Start { port, cluster, daemon_port, daemon_cluster },
+                        DaemonCliCommand::Start {
+                            port,
+                            cluster,
+                            daemon_port,
+                            daemon_cluster,
+                        },
                         daemon_handles.clone(),
-                    ).await?;
+                    )
+                    .await?;
                 }
                 StartAction::Rest { port: rest_start_port, cluster: rest_start_cluster, rest_port, rest_cluster } => {
                     handlers_mod::handle_rest_command_interactive(
@@ -383,13 +462,26 @@ pub async fn run_single_command(
                         rest_api_port_arc.clone(),
                     ).await?;
                 }
-                StartAction::Storage { port, config_file, cluster, storage_port, storage_cluster } => {
+                StartAction::Storage {
+                    port,
+                    config_file,
+                    cluster,
+                    storage_port,
+                    storage_cluster,
+                } => {
                     handlers_mod::handle_storage_command_interactive(
-                        StorageAction::Start { port, config_file, cluster, storage_port, storage_cluster },
+                        StorageAction::Start {
+                            port,
+                            config_file,
+                            cluster,
+                            storage_port,
+                            storage_cluster,
+                        },
                         storage_daemon_shutdown_tx_opt.clone(),
                         storage_daemon_handle.clone(),
                         storage_daemon_port_arc.clone(),
-                    ).await?;
+                    )
+                    .await?;
                 }
             }
         }
@@ -401,7 +493,8 @@ pub async fn run_single_command(
                 status_args,
                 rest_api_port_arc.clone(),
                 storage_daemon_port_arc.clone(),
-            ).await?;
+            )
+            .await?;
         }
         Commands::Use(action) => {
             match action {
@@ -409,7 +502,7 @@ pub async fn run_single_command(
                     handlers_mod::handle_use_storage_command(engine, permanent).await?;
                 }
                 UseAction::Plugin { enable } => {
-                    let mut config = config_mod::load_cli_config()?;
+                    let mut config = load_cli_config()?;
                     config.enable_plugins = enable;
                     config.save()?;
                     println!("Plugins {}", if enable { "enabled" } else { "disabled" });
@@ -418,7 +511,7 @@ pub async fn run_single_command(
             }
         }
         Commands::Save(action) => {
-            let mut config = config_mod::load_cli_config()?;
+            let mut config = load_cli_config()?;
             match action {
                 SaveAction::Configuration => {
                     config.save()?;
@@ -434,23 +527,39 @@ pub async fn run_single_command(
                             StorageEngineType::MySQL => DEFAULT_STORAGE_CONFIG_PATH_MYSQL,
                             StorageEngineType::Redis => DEFAULT_STORAGE_CONFIG_PATH_REDIS,
                             StorageEngineType::InMemory => {
-                                println!("Storage configuration not saved: InMemory (no persistent config required)");
+                                println!(
+                                    "Storage configuration not saved: InMemory (no persistent config required)"
+                                );
                                 return Ok(());
                             }
                         };
                         let storage_config_path = PathBuf::from("/opt/graphdb/storage_data/config.yaml");
                         let storage_settings = if storage_config_path.exists() {
-                            StorageSettings::load_from_yaml(&storage_config_path)
-                                .with_context(|| format!("Failed to load core config from {:?}", storage_config_path))?
+                            StorageSettings::load_from_yaml(&storage_config_path).with_context(|| {
+                                format!(
+                                    "Failed to load core config from {:?}",
+                                    storage_config_path
+                                )
+                            })?
                         } else {
                             StorageSettings::default()
                         };
 
                         let selected_config = if PathBuf::from(engine_config_file).exists() {
-                            SelectedStorageConfig::load_from_yaml(&PathBuf::from(engine_config_file))
-                                .with_context(|| format!("Failed to load config from {:?}", engine_config_file))?
+                            SelectedStorageConfig::load_from_yaml(&PathBuf::from(
+                                engine_config_file,
+                            ))
+                            .with_context(|| {
+                                format!(
+                                    "Failed to load config from {:?}",
+                                    engine_config_file
+                                )
+                            })?
                         } else {
-                            println!("Config file {:?} not found; using default storage-specific settings", engine_config_file);
+                            println!(
+                                "Config file {:?} not found; using default storage-specific settings",
+                                engine_config_file
+                            );
                             SelectedStorageConfig::default()
                         };
 
@@ -460,15 +569,21 @@ pub async fn run_single_command(
                             merged_settings.default_port = port;
                         }
 
-                        let storage_settings_wrapper = StorageSettingsWrapper { storage: merged_settings };
-                        let content = serde_yaml2::to_string(&storage_settings_wrapper)
+                        let storage_settings_wrapper =
+                            StorageSettingsWrapper { storage: merged_settings };
+                        let content = serde_yaml::to_string(&storage_settings_wrapper)
                             .with_context(|| "Failed to serialize storage settings")?;
                         if let Some(parent) = storage_config_path.parent() {
-                            fs::create_dir_all(parent)
-                                .with_context(|| format!("Failed to create config directory {:?}", parent))?;
+                            fs::create_dir_all(parent).with_context(|| {
+                                format!("Failed to create config directory {:?}", parent)
+                            })?;
                         }
-                        fs::write(&storage_config_path, content)
-                            .with_context(|| format!("Failed to write storage config to {:?}", storage_config_path))?;
+                        fs::write(&storage_config_path, content).with_context(|| {
+                            format!(
+                                "Failed to write storage config to {:?}",
+                                storage_config_path
+                            )
+                        })?;
                         println!("Storage configuration saved persistently");
                     } else {
                         println!("No storage engine configured; nothing to save");
@@ -477,9 +592,7 @@ pub async fn run_single_command(
             }
         }
         Commands::Reload(reload_args) => {
-            handlers_mod::handle_reload_command_interactive(
-                reload_args,
-            ).await?;
+            handlers_mod::handle_reload_command_interactive(reload_args).await?;
         }
         Commands::Restart(restart_args) => {
             handlers_mod::handle_restart_command_interactive(
@@ -491,13 +604,15 @@ pub async fn run_single_command(
                 storage_daemon_shutdown_tx_opt.clone(),
                 storage_daemon_handle.clone(),
                 storage_daemon_port_arc.clone(),
-            ).await?;
+            )
+            .await?;
         }
         Commands::Storage(storage_action) => {
             handlers_mod::handle_storage_command(storage_action).await?;
         }
         Commands::Daemon(daemon_cmd) => {
-            handlers_mod::handle_daemon_command_interactive(daemon_cmd, daemon_handles.clone()).await?;
+            handlers_mod::handle_daemon_command_interactive(daemon_cmd, daemon_handles.clone())
+                .await?;
         }
         Commands::Rest(rest_cmd) => {
             handlers_mod::handle_rest_command_interactive(
@@ -505,7 +620,8 @@ pub async fn run_single_command(
                 rest_api_shutdown_tx_opt.clone(),
                 rest_api_handle.clone(),
                 rest_api_port_arc.clone(),
-            ).await?;
+            )
+            .await?;
         }
         Commands::Interactive => {
             // Handled by the main flow of start_cli()
@@ -568,19 +684,19 @@ pub async fn run_single_command(
             }
         }
         Commands::Exec { command } => {
-            handlers_mod::handle_exec_command(query_engine.unwrap(), command).await?;
+            handlers_mod::handle_exec_command(query_engine.unwrap().clone(), command).await?;
         }
         Commands::Query { query } => {
-            handlers_mod::handle_query_command(query_engine.unwrap(), query).await?;
+            handlers_mod::handle_query_command(query_engine.unwrap().clone(), query).await?;
         }
         Commands::Kv { operation, key, value } => {
-            // Validate the operation using parse_kv_operation
             match parse_kv_operation(&operation) {
                 Ok(op) => {
                     match op.as_str() {
                         "get" => {
                             if let Some(key) = key {
-                                handlers_mod::handle_kv_command(query_engine.unwrap(), op, key, None).await?;
+                                handlers_mod::handle_kv_command(query_engine.unwrap().clone(), op, key, None)
+                                    .await?;
                             } else {
                                 return Err(anyhow!("Missing key for 'kv get' command. Usage: kv get <key> or kv get --key <key>"));
                             }
@@ -588,7 +704,8 @@ pub async fn run_single_command(
                         "set" => {
                             match (key, value) {
                                 (Some(key), Some(value)) => {
-                                    handlers_mod::handle_kv_command(query_engine.unwrap(), op, key, Some(value)).await?;
+                                    handlers_mod::handle_kv_command(query_engine.unwrap().clone(), op, key, Some(value))
+                                        .await?;
                                 }
                                 (Some(_), None) => {
                                     return Err(anyhow!("Missing value for 'kv set' command. Usage: kv set <key> <value> or kv set --key <key> --value <value>"));
@@ -600,7 +717,8 @@ pub async fn run_single_command(
                         }
                         "delete" => {
                             if let Some(key) = key {
-                                handlers_mod::handle_kv_command(query_engine.unwrap(), op, key, None).await?;
+                                handlers_mod::handle_kv_command(query_engine.unwrap().clone(), op, key, None)
+                                    .await?;
                             } else {
                                 return Err(anyhow!("Missing key for 'kv delete' command. Usage: kv delete <key> or kv delete --key <key>"));
                             }
@@ -620,6 +738,9 @@ pub async fn run_single_command(
 }
 
 /// Main entry point for CLI command handling.
+///
+/// This function now correctly prioritizes command-line arguments over
+/// configuration file settings, and refactors the logic for better readability.
 pub async fn start_cli() -> Result<()> {
     let args_vec: Vec<String> = env::args().collect();
     if args_vec.len() > 1 && args_vec[1].to_lowercase() == "help" {
@@ -634,12 +755,13 @@ pub async fn start_cli() -> Result<()> {
         process::exit(0);
     }
 
-    let args = CliArgs::parse();
+    // Parse command-line arguments first.
+    let mut args = CliArgs::parse();
 
+    // Handle internal daemon runs. This logic should be executed before
+    // attempting to load the configuration, as it's a special internal mode.
     if args.internal_rest_api_run || args.internal_storage_daemon_run || args.internal_daemon_run {
-        let converted_storage_engine = args.internal_storage_engine.map(|se_cli| {
-            se_cli.into()
-        });
+        let converted_storage_engine = args.internal_storage_engine.map(|se_cli| se_cli.into());
         return daemon_management::handle_internal_daemon_run(
             args.internal_rest_api_run,
             args.internal_storage_daemon_run,
@@ -648,33 +770,11 @@ pub async fn start_cli() -> Result<()> {
             converted_storage_engine,
         ).await;
     }
-    let config = match config_mod::load_cli_config() {
-        Ok(config) => config,
-        Err(e) => return Err(e),
-    };
 
-    if let Some(engine) = config.storage.storage_engine_type.clone() {
-        let storage_config_path = PathBuf::from("/opt/graphdb/storage_data/config.yaml");
-        if storage_config_path.exists() {
-            let storage_settings = StorageSettings::load_from_yaml(&storage_config_path)?;
-            let storage_settings_wrapper = StorageSettingsWrapper { storage: storage_settings };
-            let content = serde_yaml2::to_string(&storage_settings_wrapper)?;
-            if let Some(parent) = storage_config_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(&storage_config_path, content)?;
-        }
-    }
-    if config.enable_plugins {
-        println!("Experimental plugins enabled from config.");
-    }
+    // Note: The CLI configuration is no longer loaded eagerly.
+    // It will be loaded lazily by the individual command handlers as needed.
 
-    let args = CliArgs {
-        enable_plugins: config.enable_plugins,
-        internal_storage_engine: config.storage.storage_engine_type.clone(),
-        ..args
-    };
-
+    // Handle direct query execution.
     if let Some(query_string) = args.query {
         println!("Executing direct query: {}", query_string);
         match parse_query_from_string(&query_string) {
@@ -688,24 +788,18 @@ pub async fn start_cli() -> Result<()> {
         return Ok(());
     }
 
-    let daemon_handles: Arc<Mutex<HashMap<u16, (JoinHandle<()>, oneshot::Sender<()>)>>> = Arc::new(Mutex::new(HashMap::new()));
-    let rest_api_shutdown_tx_opt: Arc<Mutex<Option<oneshot::Sender<()>>>> = Arc::new(Mutex::new(None));
-    let rest_api_port_arc: Arc<Mutex<Option<u16>>> = Arc::new(Mutex::new(None));
-    let rest_api_handle: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::new(Mutex::new(None));
-    let storage_daemon_shutdown_tx_opt: Arc<Mutex<Option<oneshot::Sender<()>>>> = Arc::new(Mutex::new(None));
-    let storage_daemon_handle: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::new(Mutex::new(None));
-    let storage_daemon_port_arc: Arc<Mutex<Option<u16>>> = Arc::new(Mutex::new(None));
-    let storage_config = map_cli_to_lib_storage_config(config.storage.into());
-    let database: Arc<Database> = Arc::new(Database::new(storage_config).await?);
-    let kv_store: Arc<KeyValueStore> = Arc::new(KeyValueStore::new());
-    let query_engine: Arc<QueryExecEngine> = Arc::new(QueryExecEngine::new(database, kv_store));
-
     let should_enter_interactive_mode = args.cli || args.command.is_none();
 
+    let daemon_handles: Arc<TokioMutex<HashMap<u16, (JoinHandle<()>, oneshot::Sender<()>)>>> = Arc::new(TokioMutex::new(HashMap::new()));
+    let rest_api_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>> = Arc::new(TokioMutex::new(None));
+    let rest_api_port_arc: Arc<TokioMutex<Option<u16>>> = Arc::new(TokioMutex::new(None));
+    let rest_api_handle: Arc<TokioMutex<Option<JoinHandle<()>>>> = Arc::new(TokioMutex::new(None));
+    let storage_daemon_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>> = Arc::new(TokioMutex::new(None));
+    let storage_daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>> = Arc::new(TokioMutex::new(None));
+    let storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>> = Arc::new(TokioMutex::new(None));
+
+    // Execute a single command if one was provided.
     if let Some(command) = args.command {
-        if args.enable_plugins {
-            println!("Experimental plugins are enabled.");
-        }
         run_single_command(
             command,
             daemon_handles.clone(),
@@ -717,27 +811,24 @@ pub async fn start_cli() -> Result<()> {
             storage_daemon_port_arc.clone(),
         ).await?;
 
+        // If not in interactive mode, exit after running the command.
         if !should_enter_interactive_mode {
             return Ok(());
         }
     }
 
+    // Enter interactive mode if the conditions are met.
     if should_enter_interactive_mode {
-        if args.enable_plugins {
-            println!("Experimental plugins is enabled.");
-        }
         interactive_mod::run_cli_interactive(
-            daemon_handles,
-            rest_api_shutdown_tx_opt,
-            rest_api_port_arc,
-            rest_api_handle,
-            storage_daemon_shutdown_tx_opt,
-            storage_daemon_handle,
-            storage_daemon_port_arc,
-            query_engine,
+            daemon_handles.clone(),
+            rest_api_shutdown_tx_opt.clone(),
+            rest_api_port_arc.clone(),
+            rest_api_handle.clone(),
+            storage_daemon_shutdown_tx_opt.clone(),
+            storage_daemon_handle.clone(),
+            storage_daemon_port_arc.clone(),
+            get_query_engine_singleton().await?.clone(),
         ).await?;
-    } else if args.enable_plugins {
-        println!("Experimental plugins is enabled.");
     }
 
     Ok(())

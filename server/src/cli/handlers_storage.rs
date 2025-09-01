@@ -412,6 +412,7 @@ pub async fn start_storage_interactive(
             "postgres" => Some(PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_POSTGRES)),
             "mysql" => Some(PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_MYSQL)),
             "redis" => Some(PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_REDIS)),
+            "tikv" => Some(PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_TIKV)),
             _ => None,
         };
 
@@ -485,8 +486,7 @@ pub async fn start_storage_interactive(
         .unwrap_or(storage_config.default_port)
     });
 
-
-    // In STEP 4, after determining selected_port
+    // Set engine-specific config with normalized path
     if storage_config.engine_specific_config.is_none() {
         storage_config.engine_specific_config = Some(SelectedStorageConfig {
             storage_engine_type: storage_config.storage_engine_type,
@@ -503,7 +503,20 @@ pub async fn start_storage_interactive(
     }
     if let Some(ref mut engine_config) = storage_config.engine_specific_config {
         engine_config.storage.port = Some(selected_port);
-        engine_config.storage.path = Some(PathBuf::from(format!("/opt/graphdb/storage_data/{}/{}", storage_config.storage_engine_type.to_string().to_lowercase(), selected_port)));
+        // Normalize path to exclude port number
+        let engine_path_name = storage_config.storage_engine_type.to_string().to_lowercase();
+        let data_dir_path = storage_config.data_directory.as_ref().map_or(
+            PathBuf::from("/opt/graphdb/storage_data"),
+            |p| p.clone()
+        );
+        let engine_data_path = data_dir_path.join(&engine_path_name);
+        engine_config.storage.path = Some(engine_data_path);
+        // Ensure pd_endpoints for TiKV
+        if storage_config.storage_engine_type == StorageEngineType::TiKV {
+            engine_config.storage.pd_endpoints = Some("127.0.0.1:2379".to_string());
+            engine_config.storage.username = Some("tikv".to_string());
+            engine_config.storage.password = Some("tikv".to_string());
+        }
     }
     storage_config.save().context("Failed to save port-specific StorageConfig")?;
 
@@ -530,7 +543,7 @@ pub async fn start_storage_interactive(
     info!("===> SELECTED PORT {}", selected_port);
     println!("==> STARTING STORAGE - STEP 5");
 
-    // --- STEP 5: VALIDATE PORT AND CHECK SLED LOCK ---
+    // --- STEP 5: VALIDATE PORT AND CLEANUP ---
     let all_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
     let is_graphdb_process = all_daemons.iter().any(|d| d.port == selected_port && d.service_type == "storage");
 
@@ -567,8 +580,27 @@ pub async fn start_storage_interactive(
         info!("No storage process found running on port {}", selected_port);
     }
 
-    // Validate Sled lock file without killing processes
-    if storage_config.storage_engine_type == StorageEngineType::Sled {
+    // TiKV-specific cleanup (avoid killing PD process)
+    if storage_config.storage_engine_type == StorageEngineType::TiKV {
+        let pd_endpoints = storage_config.engine_specific_config
+            .as_ref()
+            .and_then(|c| c.storage.pd_endpoints.clone())
+            .unwrap_or("127.0.0.1:2379".to_string());
+        let pd_port = pd_endpoints.split(':').last().and_then(|p| p.parse::<u16>().ok());
+        if let Some(pd_port) = pd_port {
+            if check_process_status_by_port("TiKV PD", pd_port).await {
+                info!("TiKV PD process detected on port {}. Skipping termination to avoid disrupting cluster.", pd_port);
+            }
+        }
+        if let Err(e) = TikvStorage::force_unlock().await {
+            warn!("Failed to force unlock TiKV: {}", e);
+        } else {
+            info!("Successfully performed TiKV force unlock");
+        }
+    }
+
+    // Sled-specific cleanup
+    else if storage_config.storage_engine_type == StorageEngineType::Sled {
         let sled_path = storage_config.engine_specific_config
             .as_ref()
             .map(|c| c.storage.path.clone())
@@ -612,36 +644,60 @@ pub async fn start_storage_interactive(
     let lib_storage_config = {
         let engine_specific_config_map: Option<HashMap<String, serde_json::Value>> =
             if let Some(selected_config) = storage_config.engine_specific_config.clone() {
-                let json_value = serde_json::to_value(&selected_config)
-                    .context("Failed to serialize SelectedStorageConfig to JSON Value")?;
-                if let serde_json::Value::Object(map) = json_value {
-                    Some(map.into_iter().collect())
-                } else {
-                    None
+                let mut map = HashMap::new();
+                map.insert(
+                    "storage_engine_type".to_string(),
+                    Value::String(selected_config.storage_engine_type.to_string().to_lowercase())
+                );
+                let engine_path_name = selected_config.storage_engine_type.to_string().to_lowercase();
+                let data_dir_path = storage_config.data_directory.as_ref().map_or(
+                    PathBuf::from("/opt/graphdb/storage_data"),
+                    |p| p.clone()
+                );
+                let engine_data_path = data_dir_path.join(&engine_path_name);
+                map.insert(
+                    "path".to_string(),
+                    Value::String(engine_data_path.to_string_lossy().to_string())
+                );
+                if let Some(host) = selected_config.storage.host {
+                    map.insert("host".to_string(), Value::String(host));
                 }
+                if let Some(port) = selected_config.storage.port {
+                    map.insert("port".to_string(), Value::Number(port.into()));
+                }
+                if let Some(username) = selected_config.storage.username {
+                    map.insert("username".to_string(), Value::String(username));
+                }
+                if let Some(password) = selected_config.storage.password {
+                    map.insert("password".to_string(), Value::String(password));
+                }
+                if let Some(database) = selected_config.storage.database {
+                    map.insert("database".to_string(), Value::String(database));
+                }
+                if let Some(pd_endpoints) = selected_config.storage.pd_endpoints {
+                    map.insert("pd_endpoints".to_string(), Value::String(pd_endpoints));
+                }
+                Some(map)
             } else {
                 None
             };
-
-        let config_root_directory = storage_config.config_root_directory.clone()
-            .unwrap_or_else(|| PathBuf::from("./storage_daemon_server"));
-        let data_directory = storage_config.data_directory.clone()
-            .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data"));
-        let max_open_files_i32: Option<i32> = Some(storage_config.max_open_files as i32);
 
         EngineStorageConfig {
             storage_engine_type: storage_config.storage_engine_type.clone(),
             engine_specific_config: engine_specific_config_map,
             default_port: storage_config.default_port,
-            config_root_directory,
+            config_root_directory: storage_config.config_root_directory.clone()
+                .unwrap_or_else(|| PathBuf::from("./storage_daemon_server")),
             cluster_range: storage_config.cluster_range.clone(),
-            data_directory,
-            log_directory: storage_config.log_directory.clone().unwrap_or_else(|| PathBuf::from("/opt/graphdb/logs")).to_string_lossy().into_owned(),
+            data_directory: storage_config.data_directory.clone()
+                .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data")),
+            log_directory: storage_config.log_directory.clone()
+                .unwrap_or_else(|| PathBuf::from("/opt/graphdb/logs")).to_string_lossy().into_owned(),
             max_disk_space_gb: storage_config.max_disk_space_gb,
             min_disk_space_gb: storage_config.min_disk_space_gb,
             use_raft_for_scale: storage_config.use_raft_for_scale,
             connection_string: None,
-            max_open_files: max_open_files_i32,
+            max_open_files: Some(storage_config.max_open_files as i32),
         }
     };
 
@@ -652,7 +708,7 @@ pub async fn start_storage_interactive(
     // --- STEP 5.3: START DAEMON WITH RETRY ---
     let max_attempts = 3;
     let retry_interval = Duration::from_millis(1000);
-    let health_check_timeout = Duration::from_secs(20); // Increased timeout for stability
+    let health_check_timeout = Duration::from_secs(20);
     let poll_interval = Duration::from_millis(500);
     let mut pid = None;
 
@@ -1842,7 +1898,7 @@ pub async fn handle_use_storage_command(
             .and_then(|config| config.storage.path.clone())
             .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data/tikv"));
         if tikv_path.exists() {
-            if let Err(e) = TikvStorage::force_unlock(&tikv_path).await {
+            if let Err(e) = TikvStorage::force_unlock().await {
                 warn!("Failed to clean up TiKV lock files: {}", e);
             } else {
                 info!("Lock files cleaned successfully.");

@@ -10,13 +10,27 @@
 // FIXED: 2025-08-31 - Added error handling for empty inputs and invalid operations, matching cli.rs error messaging style
 
 use anyhow::{Result, Context, anyhow};
-use log::{info, debug, error};
+use log::{info, debug, error, warn};
 use serde_json::Value;
+use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::fs;
+use tokio::sync::{oneshot, Mutex as TokioMutex};
+use tokio::task::JoinHandle;
+use tokio::time::{self, Duration as TokioDuration};
+use lib::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
 use lib::query_exec_engine::query_exec_engine::{QueryExecEngine};
 use lib::query_parser::{parse_query_from_string, QueryType};
+use lib::storage_engine::config::{StorageEngineType,};
+use lib::storage_engine::{TikvStorage,};
+use lib::storage_engine::storage_engine::{AsyncStorageEngineManager, StorageEngineManager, GLOBAL_STORAGE_ENGINE_MANAGER};
 use super::commands::{KvAction, QueryArgs, parse_kv_operation};
-
+use crate::cli::config::{DEFAULT_STORAGE_CONFIG_PATH_RELATIVE, MAX_SHUTDOWN_RETRIES, SHUTDOWN_RETRY_DELAY_MS, StorageConfig, 
+                         load_storage_config_from_yaml};
+use crate::cli::handlers_storage::{ start_storage_interactive, stop_storage_interactive };
+use crate::cli::daemon_management::{is_storage_daemon_running,};
+pub use models::errors::GraphError;
 // Note: `find_rest_api_port` and `GLOBAL_DAEMON_REGISTRY` are removed
 // because we are no longer acting as a REST API client. The logic
 // now executes the query directly.
@@ -173,6 +187,7 @@ pub async fn handle_query_command(engine: Arc<QueryExecEngine>, query: String) -
 /// Handles the `kv` command for key-value operations on the query engine.
 pub async fn handle_kv_command(engine: Arc<QueryExecEngine>, operation: String, key: String, value: Option<String>) -> Result<()> {
     // Validate the operation using parse_kv_operation
+    println!("==> Time to do some kv queries {:?} - {:?}", key, value);
     let validated_op = parse_kv_operation(&operation)
         .map_err(|e| anyhow!("Invalid KV operation: {}", e))?;
 
@@ -224,3 +239,156 @@ pub async fn handle_kv_command(engine: Arc<QueryExecEngine>, operation: String, 
         }
     }
 }
+
+/// This function ensures the `GLOBAL_STORAGE_ENGINE_MANAGER` is initialized
+/// before any query-related commands are executed.
+/// It loads the configuration and sets up the manager, but does not manage daemons.
+pub async fn initialize_storage_for_query(
+    start_storage_interactive: fn(
+        Option<u16>,
+        Option<PathBuf>,
+        Option<StorageConfig>,
+        Option<String>,
+        Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
+        Arc<TokioMutex<Option<JoinHandle<()>>>>,
+        Arc<TokioMutex<Option<u16>>>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), anyhow::Error>> + Send>>,
+    stop_storage_interactive: fn(
+        Option<u16>,
+        Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
+        Arc<TokioMutex<Option<JoinHandle<()>>>>,
+        Arc<TokioMutex<Option<u16>>>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), anyhow::Error>> + Send>>,
+) -> Result<(), anyhow::Error> {
+    if GLOBAL_STORAGE_ENGINE_MANAGER.get().is_some() {
+        debug!("StorageEngineManager is already initialized. Skipping initialization.");
+        return Ok(());
+    }
+
+    info!("Initializing StorageEngineManager for non-interactive command execution.");
+    println!("===> Initializing Storage Engine...");
+
+    let running_daemons: Vec<DaemonMetadata> = GLOBAL_DAEMON_REGISTRY
+        .get_all_daemon_metadata()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|d| d.service_type == "storage")
+        .collect();
+
+    let mut successfully_stopped_ports: Vec<u16> = Vec::new();
+    for daemon in &running_daemons {
+        info!("Found running daemon on port {}, attempting to stop it...", daemon.port);
+        let mut is_daemon_stopped = false;
+        for attempt in 0..MAX_SHUTDOWN_RETRIES {
+            debug!("Attempting to stop storage daemon on port {} (Attempt {} of {})", daemon.port, attempt + 1, MAX_SHUTDOWN_RETRIES);
+            stop_storage_interactive(
+                Some(daemon.port),
+                Arc::new(TokioMutex::new(None)),
+                Arc::new(TokioMutex::new(None)),
+                Arc::new(TokioMutex::new(None)),
+            ).await.ok();
+            if !is_storage_daemon_running(daemon.port).await {
+                info!("Storage daemon on port {} is confirmed stopped.", daemon.port);
+                is_daemon_stopped = true;
+                break;
+            }
+            tokio::time::sleep(TokioDuration::from_millis(SHUTDOWN_RETRY_DELAY_MS)).await;
+        }
+
+        if is_daemon_stopped {
+            successfully_stopped_ports.push(daemon.port);
+        } else {
+            return Err(anyhow!("Failed to stop existing storage daemon on port {}.", daemon.port));
+        }
+    }
+    
+    for daemon in &running_daemons {
+        if successfully_stopped_ports.contains(&daemon.port) {
+            let engine_type = daemon.engine_type
+                .as_ref()
+                .and_then(|s| s.parse::<StorageEngineType>().ok())
+                .ok_or_else(|| anyhow!("Failed to parse engine type from running daemon: {}", daemon.engine_type.as_deref().unwrap_or("n/a")))?;
+            
+            let data_dir_path = PathBuf::from(daemon.config_path.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE)));
+            
+            match engine_type {
+                StorageEngineType::Sled => {
+                    let lock_path = data_dir_path.join("db.lck");
+                    if lock_path.exists() {
+                        info!("Removing Sled lock file at {:?}", lock_path);
+                        fs::remove_file(&lock_path).context(format!("Failed to remove Sled lock file at {:?}", lock_path))?;
+                    }
+                },
+                StorageEngineType::TiKV => {
+                    if let Err(e) = TikvStorage::force_unlock().await {
+                        warn!("Failed to clean up TiKV lock files at {:?}: {}", data_dir_path, e);
+                    }
+                },
+                _ => {
+                    debug!("No specific lock file cleanup implemented for engine type: {:?}", engine_type);
+                }
+            }
+        }
+    }
+    
+    if let Some(daemon) = running_daemons.first() {
+        let expected_engine_type = daemon.engine_type
+            .as_ref()
+            .and_then(|s| s.parse::<StorageEngineType>().ok())
+            .ok_or_else(|| anyhow!("Failed to parse engine type from running daemon: {}", daemon.engine_type.as_deref().unwrap_or("n/a")))?;
+
+        let config_path = daemon.config_path.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE));
+
+        let manager = StorageEngineManager::new(expected_engine_type.clone(), &config_path, false)
+            .await
+            .context("Failed to initialize StorageEngineManager")?;
+
+        GLOBAL_STORAGE_ENGINE_MANAGER
+            .set(Arc::new(AsyncStorageEngineManager::from_manager(
+                Arc::try_unwrap(manager)
+                    .map_err(|_| GraphError::ConfigurationError("Failed to unwrap Arc<StorageEngineManager>: multiple references exist".to_string()))?
+            )))
+            .context("Failed to set GLOBAL_STORAGE_ENGINE_MANAGER")?;
+
+        info!("Successfully initialized storage engine {:?}", expected_engine_type);
+        println!("===> Storage Engine initialized successfully.");
+    } else {
+        info!("No running daemon found, starting a new storage daemon.");
+        println!("===> No running daemon found, starting a new storage daemon...");
+        let cwd = std::env::current_dir().context("Failed to get current working directory")?;
+        let config_path = cwd.join(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
+
+        let current_config: StorageConfig = match load_storage_config_from_yaml(Some(config_path.clone())) {
+            Ok(config) => {
+                info!("Successfully loaded existing storage config: {:?}", config);
+                config
+            },
+            Err(e) => {
+                warn!("Failed to load existing config from {:?}, using default values. Error: {}", config_path, e);
+                StorageConfig::default()
+            }
+        };
+
+        let storage_daemon_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>> = Arc::new(TokioMutex::new(None));
+        let storage_daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>> = Arc::new(TokioMutex::new(None));
+        let storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>> = Arc::new(TokioMutex::new(None));
+
+        start_storage_interactive(
+            Some(current_config.default_port),
+            Some(config_path),
+            Some(current_config),
+            None,
+            storage_daemon_shutdown_tx_opt,
+            storage_daemon_handle,
+            storage_daemon_port_arc,
+        ).await.context("Failed to start storage daemon")?;
+
+        info!("Successfully started a new storage daemon.");
+        println!("===> New storage daemon started successfully.");
+    }
+
+    Ok(())
+}
+
+

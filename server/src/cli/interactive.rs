@@ -1204,109 +1204,105 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
             }
         },
         // The updated match arm for "kv"
-"kv" => {
-    let mut key = None;
-    let mut value = None;
-    let mut operation = None;
-    let mut i = 0;
-    
-    // First, check for the operation which can be positional or flagged
-    if let Some(op_str) = remaining_args.get(0) {
-        if !op_str.starts_with('-') {
-            operation = Some(op_str.clone());
-            i += 1;
-        }
-    }
-    
-    // Now, parse the remaining arguments for flags and values
-    while i < remaining_args.len() {
-        match remaining_args[i].as_str() {
-            "--key" => {
-                if i + 1 < remaining_args.len() {
-                    key = Some(remaining_args[i + 1].clone());
-                    i += 2;
-                } else {
-                    eprintln!("Warning: Flag '--key' requires a value.");
-                    return (CommandType::Unknown, remaining_args);
+        "kv" => {
+            let mut key = None;
+            let mut value = None;
+            let mut operation = None;
+            let mut i = 0;
+            
+            // First, check for the operation which can be positional or flagged
+            if let Some(op_str) = remaining_args.get(0) {
+                if !op_str.starts_with('-') {
+                    operation = Some(op_str.clone());
+                    i += 1;
                 }
             }
-            "--value" => {
-                if i + 1 < remaining_args.len() {
-                    value = Some(remaining_args[i + 1].clone());
-                    i += 2;
-                } else {
-                    eprintln!("Warning: Flag '--value' requires a value.");
-                    return (CommandType::Unknown, remaining_args);
-                }
-            }
-            // Handle positional arguments after the operation
-            _ => {
-                if operation.is_some() {
-                    // Positional key
-                    if key.is_none() {
-                        key = Some(remaining_args[i].clone());
-                        i += 1;
+            
+            // Now, parse the remaining arguments for flags and values
+            while i < remaining_args.len() {
+                match remaining_args[i].as_str() {
+                    "--key" => {
+                        if i + 1 < remaining_args.len() {
+                            key = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '--key' requires a value.");
+                            return (CommandType::Unknown, remaining_args);
+                        }
                     }
-                    // Positional value (only for "set")
-                    else if value.is_none() && operation.as_deref() == Some("set") {
-                        value = Some(remaining_args[i].clone());
-                        i += 1;
+                    "--value" => {
+                        if i + 1 < remaining_args.len() {
+                            value = Some(remaining_args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("Warning: Flag '--value' requires a value.");
+                            return (CommandType::Unknown, remaining_args);
+                        }
+                    }
+                    // Handle positional arguments after the operation
+                    _ => {
+                        if operation.is_some() {
+                            // Positional key
+                            if key.is_none() {
+                                key = Some(remaining_args[i].clone());
+                                i += 1;
+                            }
+                            // Positional value (only for "set")
+                            else if value.is_none() && operation.as_deref() == Some("set") {
+                                value = Some(remaining_args[i].clone());
+                                i += 1;
+                            } else {
+                                eprintln!("Warning: Unrecognized argument: {}", remaining_args[i]);
+                                return (CommandType::Unknown, remaining_args);
+                            }
+                        } else {
+                            eprintln!("Warning: Unrecognized argument: {}", remaining_args[i]);
+                            return (CommandType::Unknown, remaining_args);
+                        }
+                    }
+                }
+            }
+            
+            // Validate and construct the command based on parsed values
+            if operation.is_none() {
+                eprintln!("Usage: kv <get|set|delete> <key> [<value>]");
+                return (CommandType::Unknown, remaining_args);
+            }
+            
+            let op_str = operation.unwrap();
+            let action = match op_str.to_lowercase().as_str() {
+                "get" => {
+                    if let Some(k) = key {
+                        KvAction::Get { key: k }
                     } else {
-                        eprintln!("Warning: Unrecognized argument: {}", remaining_args[i]);
+                        eprintln!("Missing key for 'kv get' command.");
                         return (CommandType::Unknown, remaining_args);
                     }
-                } else {
-                    eprintln!("Warning: Unrecognized argument: {}", remaining_args[i]);
+                }
+                "set" => {
+                    if let (Some(k), Some(v)) = (key, value) {
+                        KvAction::Set { key: k, value: v }
+                    } else {
+                        eprintln!("Missing key or value for 'kv set' command.");
+                        return (CommandType::Unknown, remaining_args);
+                    }
+                }
+                "delete" => {
+                    if let Some(k) = key {
+                        KvAction::Delete { key: k }
+                    } else {
+                        eprintln!("Missing key for 'kv delete' command.");
+                        return (CommandType::Unknown, remaining_args);
+                    }
+                }
+                _ => {
+                    eprintln!("Invalid KV operation: {}. Supported: get, set, delete", op_str);
                     return (CommandType::Unknown, remaining_args);
                 }
-            }
-        }
-    }
-    
-    // Validate and construct the command based on parsed values
-    if operation.is_none() {
-        eprintln!("Usage: kv <get|set|delete> <key> [<value>]");
-        return (CommandType::Unknown, remaining_args);
-    }
-    
-    let op_str = operation.unwrap();
-    let action = match op_str.to_lowercase().as_str() {
-        "get" => {
-            if let Some(k) = key {
-                KvAction::Get { key: k }
-            } else {
-                eprintln!("Missing key for 'kv get' command.");
-                return (CommandType::Unknown, remaining_args);
-            }
-        }
-        "set" => {
-            if let (Some(k), Some(v)) = (key, value) {
-                KvAction::Set { key: k, value: v }
-            } else {
-                eprintln!("Missing key or value for 'kv set' command.");
-                return (CommandType::Unknown, remaining_args);
-            }
-        }
-        "delete" => {
-            if let Some(k) = key {
-                KvAction::Delete { key: k }
-            } else {
-                eprintln!("Missing key for 'kv delete' command.");
-                return (CommandType::Unknown, remaining_args);
-            }
-        }
-        _ => {
-            eprintln!("Invalid KV operation: {}. Supported: get, set, delete", op_str);
-            return (CommandType::Unknown, remaining_args);
-        }
-    };
-    
-    CommandType::Kv { action }
-},
-
-
-
-
+            };
+            
+            CommandType::Kv { action }
+        },
         "exec" => {
             if remaining_args.is_empty() {
                 eprintln!("Usage: exec <command> or exec --command <command>");
