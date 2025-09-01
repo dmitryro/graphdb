@@ -1,6 +1,6 @@
 // lib/src/query_parser/cypher_parser.rs
-// Re-engineered: 2025-08-10 - Rewritten parser logic to use a more modular and robust
-// structure, resolving E0618 type errors and improving readability.
+// Updated: 2025-09-01 - Fixed E0382 by cloning `key` before into_bytes() in execute_cypher
+// to avoid borrow-after-move errors in SetKeyValue, GetKeyValue, and DeleteKeyValue.
 
 use nom::{
     branch::alt,
@@ -10,8 +10,7 @@ use nom::{
     multi::separated_list0,
     sequence::{delimited, preceded, tuple},
     IResult,
-    error::Error,
-    Parser, // <- required so we can call `.parse(input)` on combinators
+    Parser,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -22,7 +21,7 @@ use models::{Vertex, Edge};
 use models::errors::{GraphError, GraphResult};
 use models::properties::SerializableFloat;
 use crate::database::Database;
-use crate::query_parser::config::KeyValueStore;
+use crate::storage_engine::StorageEngine;
 
 // Enum to represent parsed Cypher queries
 #[derive(Debug, PartialEq)]
@@ -66,7 +65,6 @@ pub fn is_cypher(query: &str) -> bool {
 }
 
 // Parse a Cypher identifier (e.g., variable name or label)
-// NOTE: removed ':' from allowed characters to avoid clashing with label separator `:`
 fn parse_identifier(input: &str) -> IResult<&str, &str> {
     take_while1(|c: char| c.is_alphanumeric() || c == '_').parse(input)
 }
@@ -136,7 +134,6 @@ fn parse_node(input: &str) -> IResult<&str, (Option<String>, Option<String>, Has
 }
 
 // Parse a relationship pattern like `-[:KNOWS]->`
-// note: this accepts only the `[:TYPE]` or `-[:TYPE]->` simple form; expand if you need var names etc.
 fn parse_relationship(input: &str) -> IResult<&str, String> {
     let (input, (_, _, rel_type, _, _)) = tuple((
         char('-'),
@@ -299,7 +296,6 @@ pub fn parse_cypher(query: &str) -> Result<CypherQuery, String> {
 
     match parser.parse(query) {
         Ok((remaining, parsed_query)) => {
-            // optional: ensure there's no leftover non-whitespace
             if !remaining.trim().is_empty() {
                 Err(format!("Failed to fully consume input, remaining: {:?}", remaining))
             } else {
@@ -327,11 +323,11 @@ fn to_property_value(value: Value) -> GraphResult<models::PropertyValue> {
     }
 }
 
-// Execute a parsed Cypher query against the database and key-value store
+// Execute a parsed Cypher query against the database and storage engine
 pub async fn execute_cypher(
     query: CypherQuery,
     db: &Database,
-    kv_store: Arc<KeyValueStore>,
+    storage: Arc<dyn StorageEngine + Send + Sync>,
 ) -> GraphResult<Value> {
     match query {
         CypherQuery::CreateNode { label, properties } => {
@@ -389,16 +385,24 @@ pub async fn execute_cypher(
             Ok(json!({ "deleted": id }))
         }
         CypherQuery::SetKeyValue { key, value } => {
-            kv_store.set(key.clone(), value.clone())?;
+            let kv_key = key.clone().into_bytes();
+            storage.insert(kv_key, value.as_bytes().to_vec()).await?;
+            storage.flush().await?;
             Ok(json!({ "key": key, "value": value }))
         }
         CypherQuery::GetKeyValue { key } => {
-            let value = kv_store.get(&key)?;
-            Ok(json!({ "key": key, "value": value }))
+            let kv_key = key.clone().into_bytes();
+            let value = storage.retrieve(&kv_key).await?;
+            Ok(json!({ "key": key, "value": value.map(|v| String::from_utf8_lossy(&v).to_string()) }))
         }
         CypherQuery::DeleteKeyValue { key } => {
-            let deleted = kv_store.delete(&key)?;
-            Ok(json!({ "key": key, "deleted": deleted }))
+            let kv_key = key.clone().into_bytes();
+            let existed = storage.retrieve(&kv_key).await?.is_some();
+            if existed {
+                storage.delete(&kv_key).await?;
+                storage.flush().await?;
+            }
+            Ok(json!({ "key": key, "deleted": existed }))
         }
     }
 }

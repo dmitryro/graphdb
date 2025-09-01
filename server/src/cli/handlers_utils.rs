@@ -79,7 +79,7 @@ pub fn format_engine_config(config: &StorageConfig, daemon_port: u16) -> Vec<Str
         let storage_inner = &engine_config.storage;
 
         match config.storage_engine_type {
-            StorageEngineType::RocksDB | StorageEngineType::Sled | StorageEngineType::TiKV => {
+            StorageEngineType::RocksDB | StorageEngineType::Sled | StorageEngineType::TiKV | StorageEngineType::Hybrid => {
                 // File-based storage engines
                 if let Some(path) = &storage_inner.path {
                     lines.push(format!("Data Path: {}", path.display()));
@@ -275,6 +275,7 @@ pub async fn execute_storage_query() {
 // Helper function to convert StorageEngineType to string
 pub fn storage_engine_type_to_str(engine: StorageEngineType) -> &'static str {
     match engine {
+        StorageEngineType::Hybrid => "hybrid",
         StorageEngineType::Sled => "sled",
         StorageEngineType::RocksDB => "rocksdb",
         StorageEngineType::TiKV => "tikv",
@@ -288,6 +289,7 @@ pub fn storage_engine_type_to_str(engine: StorageEngineType) -> &'static str {
 // Custom parser for storage engine to handle hyphenated and non-hyphenated aliases
 pub fn parse_storage_engine(engine: &str) -> Result<StorageEngineType, String> {
     match engine.to_lowercase().as_str() {
+        "hybrid" => Ok(StorageEngineType::Hybrid),
         "sled" => Ok(StorageEngineType::Sled),
         "rocksdb" | "rocks-db" => Ok(StorageEngineType::RocksDB),
         "tikv" => Ok(StorageEngineType::TiKV),

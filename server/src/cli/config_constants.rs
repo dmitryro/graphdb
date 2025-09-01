@@ -11,6 +11,7 @@ pub const DEFAULT_DATA_DIRECTORY: &str = "/opt/graphdb/storage_data";
 pub const DEFAULT_LOG_DIRECTORY: &str = "/opt/graphdb/logs";
 pub const DEFAULT_STORAGE_CONFIG_PATH: &str = "./storage_daemon_server/storage_config.yaml";
 pub const DEFAULT_STORAGE_CONFIG_PATH_RELATIVE: &str = "./storage_daemon_server/storage_config.yaml";
+pub const DEFAULT_STORAGE_CONFIG_PATH_HYBRID: &str = "./storage_daemon_server/storage_config_hybrid.yaml";
 pub const DEFAULT_STORAGE_CONFIG_PATH_ROCKSDB: &str = "./storage_daemon_server/storage_config_rocksdb.yaml";
 pub const DEFAULT_STORAGE_CONFIG_PATH_TIKV:  &str = "./storage_daemon_server/storage_config_tikv.yaml";
 pub const DEFAULT_STORAGE_CONFIG_PATH_SLED: &str = "./storage_daemon_server/storage_config_sled.yaml";

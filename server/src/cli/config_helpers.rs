@@ -152,6 +152,7 @@ pub fn save_rest_config(config: &RestApiConfig) -> Result<()> {
 // Helper function to convert StorageEngineType to String
 pub fn daemon_api_storage_engine_type_to_string(engine_type: &StorageEngineType) -> String {
     match engine_type {
+        StorageEngineType::Hybrid => "hybrid".to_string(),
         StorageEngineType::Sled => "sled".to_string(),
         StorageEngineType::RocksDB => "rocksdb".to_string(),
         StorageEngineType::TiKV => "tikv".to_string(),
@@ -165,6 +166,7 @@ pub fn daemon_api_storage_engine_type_to_string(engine_type: &StorageEngineType)
 // Helper function to map StorageEngineType to YAML file path
 pub fn get_engine_config_path(engine_type: &StorageEngineType) -> Option<PathBuf> {
     match engine_type {
+        StorageEngineType::Hybrid => Some(PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_HYBRID)),
         StorageEngineType::RocksDB => Some(PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_ROCKSDB)),
         StorageEngineType::Sled => Some(PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_SLED)),
         StorageEngineType::TiKV => Some(PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_TIKV)),
@@ -464,6 +466,18 @@ pub fn create_default_engine_specific_config(engine_type: &StorageEngineType) ->
     let engine_path = data_dir.join(engine_type.to_string().to_lowercase());
     
     match engine_type {
+        StorageEngineType::Hybrid => Some(SelectedStorageConfig {
+            storage_engine_type: StorageEngineType::Hybrid,
+            storage: StorageConfigInner {
+                path: Some(engine_path),
+                host: Some("127.0.0.1".to_string()),
+                port: Some(8049),
+                username: None,
+                password: None,
+                database: None,
+                pd_endpoints: None,
+            }
+        }),
         StorageEngineType::RocksDB => Some(SelectedStorageConfig {
             storage_engine_type: StorageEngineType::RocksDB,
             storage: StorageConfigInner {

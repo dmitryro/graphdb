@@ -28,6 +28,7 @@ use crate::cli::config::{
     DEFAULT_STORAGE_CONFIG_PATH_POSTGRES, DEFAULT_STORAGE_CONFIG_PATH_REDIS,
     DEFAULT_STORAGE_CONFIG_PATH_ROCKSDB, DEFAULT_STORAGE_CONFIG_PATH_SLED,
     DEFAULT_STORAGE_CONFIG_PATH_TIKV, DEFAULT_STORAGE_CONFIG_PATH_RELATIVE,
+    DEFAULT_STORAGE_CONFIG_PATH_HYBRID,
     load_cli_config
 };
 use crate::cli::config as config_mod;
@@ -146,29 +147,38 @@ pub enum Commands {
         #[arg(name = "VALUE", help = "Value for the key-value operation (required for set)", required_if_eq("operation", "set"))]
         value: Option<String>,
     },
+    Set {
+        #[arg(name = "KEY", help = "Key to set")]
+        key: String,
+        #[arg(name = "VALUE", help = "Value to set")]
+        value: String,
+    },
+    Get {
+        #[arg(name = "KEY", help = "Key to retrieve")]
+        key: String,
+    },
+    Delete {
+        #[arg(name = "KEY", help = "Key to delete")]
+        key: String,
+    },
 }
 
 // Use a OnceCell to manage the singleton instance of the QueryExecEngine.
 static QUERY_ENGINE_SINGLETON: OnceCell<Arc<QueryExecEngine>> = OnceCell::const_new();
 
-
-
-// Correct Solution: Remove Sync requirement and fix parameter types
-
 fn start_wrapper(
     port: Option<u16>,
     config_path: Option<PathBuf>,
-    storage_config: Option<CliStorageConfig>, // This is the same as CliStorageConfig (alias)
+    storage_config: Option<CliStorageConfig>,
     engine_name: Option<String>,
     shutdown_tx: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
     handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
     port_arc: Arc<TokioMutex<Option<u16>>>,
 ) -> Pin<Box<dyn Future<Output = Result<(), anyhow::Error>> + Send>> {
-    // No conversion needed since CliStorageConfig is an alias to StorageConfig
     Box::pin(start_storage_interactive(
         port,
         config_path,
-        storage_config, // Pass directly, no conversion needed
+        storage_config,
         engine_name,
         shutdown_tx,
         handle,
@@ -188,7 +198,6 @@ fn stop_wrapper(
         handle,
         port_arc,
     ))
-    // Removed the cast to Send + Sync - just return Send
 }
 
 pub async fn get_query_engine_singleton() -> Result<&'static Arc<QueryExecEngine>> {
@@ -211,8 +220,7 @@ pub async fn get_query_engine_singleton() -> Result<&'static Arc<QueryExecEngine
                 .await
                 .map_err(|e| anyhow!("Failed to create Database: {}", e))?,
         );
-        let kv_store = Arc::new(KeyValueStore::new());
-        Ok(Arc::new(QueryExecEngine::new(database, kv_store)))
+        Ok(Arc::new(QueryExecEngine::new(database)))
     }).await
 }
 
@@ -221,13 +229,11 @@ pub fn map_cli_to_lib_storage_config(cli_config: CliStorageConfig) -> LibStorage
     let engine_specific_config = cli_config.engine_specific_config.as_ref().map(|selected| {
         let mut map = HashMap::new();
         
-        // Insert storage_engine_type (snake_case only)
         map.insert(
             "storage_engine_type".to_string(),
             Value::String(selected.storage_engine_type.to_string().to_lowercase())
         );
         
-        // Normalize path to exclude port number
         let engine_path_name = selected.storage_engine_type.to_string().to_lowercase();
         let data_dir_path = cli_config.data_directory.as_ref().map_or(
             PathBuf::from("/opt/graphdb/storage_data"),
@@ -239,7 +245,6 @@ pub fn map_cli_to_lib_storage_config(cli_config: CliStorageConfig) -> LibStorage
             Value::String(engine_data_path.to_string_lossy().to_string())
         );
         
-        // Insert other fields
         if let Some(host) = &selected.storage.host {
             map.insert("host".to_string(), Value::String(host.clone()));
         }
@@ -280,6 +285,7 @@ pub fn map_cli_to_lib_storage_config(cli_config: CliStorageConfig) -> LibStorage
         min_disk_space_gb: cli_config.min_disk_space_gb,
         use_raft_for_scale: cli_config.use_raft_for_scale,
         storage_engine_type: match cli_config.storage_engine_type {
+            StorageEngineType::Hybrid => LibStorageEngineType::Hybrid,
             StorageEngineType::RocksDB => LibStorageEngineType::RocksDB,
             StorageEngineType::TiKV => LibStorageEngineType::TiKV,
             StorageEngineType::Sled => LibStorageEngineType::Sled,
@@ -312,7 +318,8 @@ pub async fn run_single_command(
 ) -> Result<()> {
     // Initialize query engine for commands that need it
     let query_engine = match command {
-        Commands::Exec { .. } | Commands::Query { .. } | Commands::Kv { .. } => {
+        Commands::Exec { .. } | Commands::Query { .. } | Commands::Kv { .. } |
+        Commands::Set { .. } | Commands::Get { .. } | Commands::Delete { .. } => {
             Some(get_query_engine_singleton().await?)
         }
         _ => None,
@@ -520,6 +527,7 @@ pub async fn run_single_command(
                 SaveAction::Storage => {
                     if let Some(engine) = config.storage.storage_engine_type.clone() {
                         let engine_config_file = match engine {
+                            StorageEngineType::Hybrid => DEFAULT_STORAGE_CONFIG_PATH_HYBRID,
                             StorageEngineType::RocksDB => DEFAULT_STORAGE_CONFIG_PATH_ROCKSDB,
                             StorageEngineType::Sled => DEFAULT_STORAGE_CONFIG_PATH_SLED,
                             StorageEngineType::TiKV => DEFAULT_STORAGE_CONFIG_PATH_TIKV,
@@ -733,14 +741,23 @@ pub async fn run_single_command(
                 }
             }
         }
+        Commands::Set { key, value } => {
+            handlers_mod::handle_kv_command(query_engine.unwrap().clone(), "set".to_string(), key, Some(value))
+                .await?;
+        }
+        Commands::Get { key } => {
+            handlers_mod::handle_kv_command(query_engine.unwrap().clone(), "get".to_string(), key, None)
+                .await?;
+        }
+        Commands::Delete { key } => {
+            handlers_mod::handle_kv_command(query_engine.unwrap().clone(), "delete".to_string(), key, None)
+                .await?;
+        }
     }
     Ok(())
 }
 
 /// Main entry point for CLI command handling.
-///
-/// This function now correctly prioritizes command-line arguments over
-/// configuration file settings, and refactors the logic for better readability.
 pub async fn start_cli() -> Result<()> {
     let args_vec: Vec<String> = env::args().collect();
     if args_vec.len() > 1 && args_vec[1].to_lowercase() == "help" {
@@ -755,11 +772,8 @@ pub async fn start_cli() -> Result<()> {
         process::exit(0);
     }
 
-    // Parse command-line arguments first.
     let mut args = CliArgs::parse();
 
-    // Handle internal daemon runs. This logic should be executed before
-    // attempting to load the configuration, as it's a special internal mode.
     if args.internal_rest_api_run || args.internal_storage_daemon_run || args.internal_daemon_run {
         let converted_storage_engine = args.internal_storage_engine.map(|se_cli| se_cli.into());
         return daemon_management::handle_internal_daemon_run(
@@ -769,23 +783,6 @@ pub async fn start_cli() -> Result<()> {
             args.internal_storage_config_path,
             converted_storage_engine,
         ).await;
-    }
-
-    // Note: The CLI configuration is no longer loaded eagerly.
-    // It will be loaded lazily by the individual command handlers as needed.
-
-    // Handle direct query execution.
-    if let Some(query_string) = args.query {
-        println!("Executing direct query: {}", query_string);
-        match parse_query_from_string(&query_string) {
-            Ok(parsed_query) => match parsed_query {
-                QueryType::Cypher => println!("  -> Identified as Cypher query."),
-                QueryType::SQL => println!("  -> Identified as SQL query."),
-                QueryType::GraphQL => println!("  -> Identified as GraphQL query."),
-            },
-            Err(e) => eprintln!("Error parsing query: {}", e),
-        }
-        return Ok(());
     }
 
     let should_enter_interactive_mode = args.cli || args.command.is_none();
@@ -798,7 +795,6 @@ pub async fn start_cli() -> Result<()> {
     let storage_daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>> = Arc::new(TokioMutex::new(None));
     let storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>> = Arc::new(TokioMutex::new(None));
 
-    // Execute a single command if one was provided.
     if let Some(command) = args.command {
         run_single_command(
             command,
@@ -811,13 +807,11 @@ pub async fn start_cli() -> Result<()> {
             storage_daemon_port_arc.clone(),
         ).await?;
 
-        // If not in interactive mode, exit after running the command.
         if !should_enter_interactive_mode {
             return Ok(());
         }
     }
 
-    // Enter interactive mode if the conditions are met.
     if should_enter_interactive_mode {
         interactive_mod::run_cli_interactive(
             daemon_handles.clone(),
