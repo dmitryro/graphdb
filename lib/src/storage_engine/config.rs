@@ -23,6 +23,7 @@ pub const DEFAULT_DATA_DIRECTORY: &str = "/opt/graphdb/storage_data";
 pub const DEFAULT_LOG_DIRECTORY: &str = "/opt/graphdb/logs";
 pub const DEFAULT_STORAGE_CONFIG_PATH: &str = "./storage_daemon_server/storage_config.yaml";
 pub const DEFAULT_STORAGE_CONFIG_PATH_RELATIVE: &str = "./storage_daemon_server/storage_config.yaml";
+pub const DEFAULT_STORAGE_CONFIG_PATH_HYBRID: &str = "./storage_daemon_server/storage_config_hybrid.yaml";
 pub const DEFAULT_STORAGE_CONFIG_PATH_ROCKSDB: &str = "./storage_daemon_server/storage_config_rocksdb.yaml";
 pub const DEFAULT_STORAGE_CONFIG_PATH_SLED: &str = "./storage_daemon_server/storage_config_sled.yaml";
 pub const DEFAULT_STORAGE_CONFIG_PATH_TIKV: &str = "./storage_daemon_server/storage_config_tikv.yaml";
@@ -210,6 +211,7 @@ impl SelectedStorageConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StorageEngineType {
+    Hybrid,
     Sled,
     RocksDB,
     InMemory,
@@ -225,6 +227,7 @@ impl FromStr for StorageEngineType {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         trace!("Parsing storage engine type: {}", s);
         match s.to_lowercase().as_str() {
+            "hybrid" => Ok(StorageEngineType::Hybrid),
             "sled" => Ok(StorageEngineType::Sled),
             "rocksdb" | "rocks-db" => Ok(StorageEngineType::RocksDB),
             "inmemory" | "in-memory" => Ok(StorageEngineType::InMemory),
@@ -243,6 +246,7 @@ impl FromStr for StorageEngineType {
 impl fmt::Display for StorageEngineType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            StorageEngineType::Hybrid => write!(f, "hybrid"),
             StorageEngineType::Sled => write!(f, "sled"),
             StorageEngineType::RocksDB => write!(f, "rocksdb"),
             StorageEngineType::TiKV => write!(f, "tikv"),
@@ -261,6 +265,7 @@ impl<'de> Deserialize<'de> for StorageEngineType {
     {
         let s = String::deserialize(deserializer)?;
         match s.as_str() {
+            "hybrid" => Ok(StorageEngineType::Hybrid),
             "inmemory" => Ok(StorageEngineType::InMemory),
             "sled" => Ok(StorageEngineType::Sled),
             "rocksdb" => Ok(StorageEngineType::RocksDB),
@@ -280,6 +285,8 @@ pub fn available_engines() -> Vec<StorageEngineType> {
     engines.push(StorageEngineType::RocksDB);
     #[cfg(feature = "tikv")]
     engines.push(StorageEngineType::TiKV);
+    #[cfg(any(feature = "sled", feature = "rocksdb", feature = "tikv"))]
+    engines.push(StorageEngineType::Hybrid);
     #[cfg(feature = "redis")]
     engines.push(StorageEngineType::Redis);
     #[cfg(feature = "postgresql")]
@@ -295,6 +302,7 @@ pub fn available_engines() -> Vec<StorageEngineType> {
 // Helper function to convert StorageEngineType to String
 pub fn daemon_api_storage_engine_type_to_string(engine_type: &StorageEngineType) -> String {
     match engine_type {
+        StorageEngineType::Hybrid => "hybrid".to_string(),
         StorageEngineType::Sled => "sled".to_string(),
         StorageEngineType::RocksDB => "rocksdb".to_string(),
         StorageEngineType::InMemory => "inmemory".to_string(),
@@ -308,6 +316,14 @@ pub fn daemon_api_storage_engine_type_to_string(engine_type: &StorageEngineType)
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct EngineTypeOnly {
     pub storage_engine_type: StorageEngineType,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct HybridConfig {
+    pub storage_engine_type: StorageEngineType,
+    pub path: PathBuf,
+    pub host: Option<String>,
+    pub port: Option<u16>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -1032,6 +1048,7 @@ fn create_default_yaml_config(yaml_path: &PathBuf, engine_type: StorageEngineTyp
         StorageEngineType::MySQL => DEFAULT_DATA_DIRECTORY.to_string(),
         StorageEngineType::InMemory => DEFAULT_DATA_DIRECTORY.to_string(),
         StorageEngineType::TiKV => format!("{}/tikv", DEFAULT_DATA_DIRECTORY),
+        StorageEngineType::Hybrid => format!("{}/hybrid", DEFAULT_DATA_DIRECTORY),
     };
     
     let engine_port = match engine_type {

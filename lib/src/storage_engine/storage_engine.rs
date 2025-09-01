@@ -60,6 +60,8 @@ use crate::storage_engine::redis_storage::RedisStorage;
 use crate::storage_engine::postgres_storage::PostgresStorage;
 #[cfg(feature = "mysql-datastore")]
 use crate::storage_engine::mysql_storage::MySQLStorage;
+#[cfg(any(feature = "sled", feature = "rocksdb", feature = "tikv"))]
+use crate::storage_engine::hybrid_storage::HybridStorage;
 
 pub static CLEANUP_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 pub static GLOBAL_STORAGE_ENGINE_MANAGER: OnceCell<Arc<AsyncStorageEngineManager>> = OnceCell::const_new();
@@ -873,224 +875,9 @@ pub trait GraphStorageEngine: StorageEngine + Send + Sync + Debug + 'static {
     async fn close(&self) -> Result<(), GraphError>;
 }
 
-// HybridStorageEngine implementation
-#[derive(Debug)]
-pub struct HybridStorageEngine {
-    inmemory: Arc<InMemoryGraphStorage>,
-    persistent: Arc<dyn GraphStorageEngine + Send + Sync>,
-    running: Arc<TokioMutex<bool>>,
-    engine_type: StorageEngineType,
-}
-
-#[async_trait]
-impl StorageEngine for HybridStorageEngine {
-    /// Connects both the in-memory and persistent storage engines.
-    async fn connect(&self) -> Result<(), GraphError> {
-        self.inmemory.connect().await?;
-        let persistent_arc = Arc::clone(&self.persistent);
-        persistent_arc.connect().await?;
-        Ok(())
-    }
-
-    /// Inserts a key-value pair into both the in-memory and persistent engines.
-    async fn insert(&self, key: Vec<u8>, value: Vec<u8>) -> Result<(), GraphError> {
-        // Clone the key and value to insert into the in-memory engine first.
-        // We do this because the persistent engine insert consumes the Vec<u8>
-        self.inmemory.insert(key.clone(), value.clone()).await?;
-        let persistent_arc = Arc::clone(&self.persistent);
-        // Insert into the persistent engine. This will consume the original Vec<u8>s.
-        persistent_arc.insert(key, value).await?;
-        Ok(())
-    }
-
-    /// Retrieves a value for a given key, first checking the in-memory cache.
-    /// If not found, it retrieves from the persistent store and populates the cache.
-    async fn retrieve(&self, key: &Vec<u8>) -> Result<Option<Vec<u8>>, GraphError> {
-        // First, check the in-memory cache for the value.
-        if let Some(value) = self.inmemory.retrieve(key).await? {
-            Ok(Some(value))
-        } else {
-            // If not in cache, retrieve from the persistent store.
-            let persistent_arc = Arc::clone(&self.persistent);
-            let result = persistent_arc.retrieve(key).await?;
-            // If the value was found in the persistent store, insert it back into the in-memory cache.
-            if let Some(ref value) = result {
-                self.inmemory.insert(key.clone(), value.clone()).await?;
-            }
-            Ok(result)
-        }
-    }
-
-    /// Deletes a key-value pair from both the in-memory and persistent engines.
-    async fn delete(&self, key: &Vec<u8>) -> Result<(), GraphError> {
-        self.inmemory.delete(key).await?;
-        let persistent_arc = Arc::clone(&self.persistent);
-        persistent_arc.delete(key).await?;
-        Ok(())
-    }
-
-    /// Flushes data from the in-memory cache to the persistent store.
-    async fn flush(&self) -> Result<(), GraphError> {
-        self.inmemory.flush().await?;
-        let persistent_arc = Arc::clone(&self.persistent);
-        persistent_arc.flush().await?;
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl GraphStorageEngine for HybridStorageEngine {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    async fn start(&self) -> Result<(), GraphError> {
-        self.inmemory.start().await?;
-        let persistent_arc = Arc::clone(&self.persistent);
-        persistent_arc.start().await?;
-        *self.running.lock().await = true;
-        Ok(())
-    }
-
-    async fn stop(&self) -> Result<(), GraphError> {
-        self.inmemory.stop().await?;
-        let persistent_arc = Arc::clone(&self.persistent);
-        persistent_arc.stop().await?;
-        *self.running.lock().await = false;
-        Ok(())
-    }
-
-    fn get_type(&self) -> &'static str {
-        match self.engine_type {
-            StorageEngineType::Sled => "sled",
-            StorageEngineType::RocksDB => "rocksdb",
-            StorageEngineType::TiKV => "tikv",
-            StorageEngineType::InMemory => "inmemory",
-            StorageEngineType::Redis => "redis",
-            StorageEngineType::PostgreSQL => "postgresql",
-            StorageEngineType::MySQL => "mysql",
-        }
-    }
-
-    async fn is_running(&self) -> bool {
-        *self.running.lock().await
-    }
-
-    async fn query(&self, query_string: &str) -> Result<Value, GraphError> {
-        let persistent_arc = Arc::clone(&self.persistent);
-        persistent_arc.query(query_string).await
-    }
-
-    async fn create_vertex(&self, vertex: Vertex) -> Result<(), GraphError> {
-        self.inmemory.create_vertex(vertex.clone()).await?;
-        let persistent_arc = Arc::clone(&self.persistent);
-        persistent_arc.create_vertex(vertex).await
-    }
-
-    async fn get_vertex(&self, id: &Uuid) -> Result<Option<Vertex>, GraphError> {
-        if let Some(vertex) = self.inmemory.get_vertex(id).await? {
-            Ok(Some(vertex))
-        } else {
-            let persistent_arc = Arc::clone(&self.persistent);
-            let result = persistent_arc.get_vertex(id).await?;
-            if let Some(ref vertex) = result {
-                self.inmemory.create_vertex(vertex.clone()).await?;
-            }
-            Ok(result)
-        }
-    }
-
-    async fn update_vertex(&self, vertex: Vertex) -> Result<(), GraphError> {
-        self.inmemory.update_vertex(vertex.clone()).await?;
-        let persistent_arc = Arc::clone(&self.persistent);
-        persistent_arc.update_vertex(vertex).await
-    }
-
-    async fn delete_vertex(&self, id: &Uuid) -> Result<(), GraphError> {
-        self.inmemory.delete_vertex(id).await?;
-        let persistent_arc = Arc::clone(&self.persistent);
-        persistent_arc.delete_vertex(id).await
-    }
-
-    async fn get_all_vertices(&self) -> Result<Vec<Vertex>, GraphError> {
-        let inmemory_results = self.inmemory.get_all_vertices().await?;
-        if !inmemory_results.is_empty() {
-            Ok(inmemory_results)
-        } else {
-            let persistent_arc = Arc::clone(&self.persistent);
-            let persistent_results = persistent_arc.get_all_vertices().await?;
-            for vertex in persistent_results.iter() {
-                self.inmemory.create_vertex(vertex.clone()).await?;
-            }
-            Ok(persistent_results)
-        }
-    }
-
-    async fn create_edge(&self, edge: Edge) -> Result<(), GraphError> {
-        self.inmemory.create_edge(edge.clone()).await?;
-        let persistent_arc = Arc::clone(&self.persistent);
-        persistent_arc.create_edge(edge).await
-    }
-
-    async fn get_edge(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> Result<Option<Edge>, GraphError> {
-        if let Some(edge) = self.inmemory.get_edge(outbound_id, edge_type, inbound_id).await? {
-            Ok(Some(edge))
-        } else {
-            let persistent_arc = Arc::clone(&self.persistent);
-            let result = persistent_arc.get_edge(outbound_id, edge_type, inbound_id).await?;
-            if let Some(ref edge) = result {
-                self.inmemory.create_edge(edge.clone()).await?;
-            }
-            Ok(result)
-        }
-    }
-
-    async fn update_edge(&self, edge: Edge) -> Result<(), GraphError> {
-        self.inmemory.update_edge(edge.clone()).await?;
-        let persistent_arc = Arc::clone(&self.persistent);
-        persistent_arc.update_edge(edge).await
-    }
-
-    async fn delete_edge(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> Result<(), GraphError> {
-        self.inmemory.delete_edge(outbound_id, edge_type, inbound_id).await?;
-        let persistent_arc = Arc::clone(&self.persistent);
-        persistent_arc.delete_edge(outbound_id, edge_type, inbound_id).await
-    }
-
-    async fn get_all_edges(&self) -> Result<Vec<Edge>, GraphError> {
-        let inmemory_results = self.inmemory.get_all_edges().await?;
-        if !inmemory_results.is_empty() {
-            Ok(inmemory_results)
-        } else {
-            let persistent_arc = Arc::clone(&self.persistent);
-            let persistent_results = persistent_arc.get_all_edges().await?;
-            for edge in persistent_results.iter() {
-                self.inmemory.create_edge(edge.clone()).await?;
-            }
-            Ok(persistent_results)
-        }
-    }
-
-    async fn close(&self) -> Result<(), GraphError> {
-        self.inmemory.close().await?;
-        let persistent_arc = Arc::clone(&self.persistent);
-        persistent_arc.close().await?;
-        info!("HybridStorageEngine closed");
-        Ok(())
-    }
-
-    async fn clear_data(&self) -> Result<(), GraphError> {
-        self.inmemory.clear_data().await?;
-        let persistent_arc = Arc::clone(&self.persistent);
-        persistent_arc.clear_data().await?;
-        info!("HybridStorageEngine data cleared");
-        Ok(())
-    }
-}
-
 #[derive(Debug)]
 pub struct StorageEngineManager {
-    pub engine: Arc<TokioMutex<HybridStorageEngine>>,
+    pub engine: Arc<TokioMutex<HybridStorage>>,
     persistent_engine: Arc<dyn GraphStorageEngine + Send + Sync>,
     session_engine_type: Option<StorageEngineType>,
     config: StorageConfig,
@@ -1334,6 +1121,7 @@ impl StorageEngineManager {
         info!("Initializing storage engine: {:?}", engine_type);
         
         match engine_type {
+            StorageEngineType::Hybrid => Self::init_hybrid(config),
             StorageEngineType::InMemory => Self::init_inmemory(config),
             StorageEngineType::Sled => Self::init_sled(config).await,
             StorageEngineType::RocksDB => Self::init_rocksdb(config).await,
@@ -1342,6 +1130,11 @@ impl StorageEngineManager {
             StorageEngineType::MySQL => Self::init_mysql(config).await,
             StorageEngineType::TiKV => Self::init_tikv(config).await,
         }
+    }
+
+    fn init_hybrid(config: &StorageConfig) -> Result<Arc<dyn GraphStorageEngine + Send + Sync>, GraphError> {
+        info!("Initializing Hybrid engine");
+        Ok(Arc::new(InMemoryGraphStorage::new(config)))
     }
 
     fn init_inmemory(config: &StorageConfig) -> Result<Arc<dyn GraphStorageEngine + Send + Sync>, GraphError> {
@@ -1831,7 +1624,7 @@ impl StorageEngineManager {
         persistent: Arc<dyn GraphStorageEngine + Send + Sync>,
         permanent: bool,
     ) -> StorageEngineManager {
-        let engine = Arc::new(TokioMutex::new(HybridStorageEngine {
+        let engine = Arc::new(TokioMutex::new(HybridStorage {
             inmemory: Arc::new(InMemoryGraphStorage::new(&config)),
             persistent: persistent.clone(),
             running: Arc::new(TokioMutex::new(false)),
@@ -1922,7 +1715,7 @@ impl StorageEngineManager {
         debug!("Full config: {:?}", config);
         
         match engine_type {
-            StorageEngineType::Sled | StorageEngineType::RocksDB | StorageEngineType::TiKV => {
+            StorageEngineType::Sled | StorageEngineType::RocksDB | StorageEngineType::TiKV | StorageEngineType::Hybrid => {
                 let path = config.engine_specific_config
                     .as_ref()
                     .and_then(|map| {
@@ -2050,6 +1843,15 @@ impl StorageEngineManager {
         info!("Closing connections for engine type: {:?}", engine_type);
 
         match engine_type {
+            StorageEngineType::Hybrid => {
+                if let Some(hybrid_storage) = self.persistent_engine.as_any().downcast_ref::<HybridStorage>() {
+                    hybrid_storage.close().await
+                        .map_err(|e| GraphError::StorageError(format!("Failed to close Hybrid storage: {}", e)))?;
+                    info!("Hybrid storage connections closed");
+                } else {
+                    warn!("Failed to downcast persistent_engine to HybridStorage");
+                }
+            }
             StorageEngineType::Sled => {
                 #[cfg(feature = "with-sled")]
                 {
@@ -2085,11 +1887,17 @@ impl StorageEngineManager {
             StorageEngineType::TiKV => {
                 #[cfg(feature = "with-tikv")]
                 {
-
+                    if let Some(tikv_storage) = self.persistent_engine.as_any().downcast_ref::<TikvStorage>() {
+                        tikv_storage.close().await
+                            .map_err(|e| GraphError::StorageError(format!("Failed to close TiKV storage: {}", e)))?;
+                        info!("TiKV storage connections closed");
+                    } else {
+                        warn!("Failed to downcast persistent_engine to TikvStorage");
+                    }
                 }
                 #[cfg(not(feature = "with-tikv"))]
                 {
-                    warn!("Sled support is not enabled, skipping close");
+                    warn!("TiKV support is not enabled, skipping close");
                 }
             }
             StorageEngineType::Redis => {
@@ -2153,7 +1961,7 @@ impl StorageEngineManager {
 
         let engine = self.engine.lock().await;
         (*engine).close().await
-            .map_err(|e| GraphError::StorageError(format!("Failed to close HybridStorageEngine: {}", e)))?;
+            .map_err(|e| GraphError::StorageError(format!("Failed to close HybridStorage: {}", e)))?;
         Ok(())
     }
 
@@ -2238,6 +2046,7 @@ impl StorageEngineManager {
     fn get_engine_config_path(&self, engine_type: StorageEngineType) -> PathBuf {
         let parent = self.config_path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
         match engine_type {
+            StorageEngineType::Hybrid => parent.join("storage_config_hybrid.yaml"),
             StorageEngineType::Sled => parent.join("storage_config_sled.yaml"),
             StorageEngineType::RocksDB => parent.join("storage_config_rocksdb.yaml"),
             StorageEngineType::InMemory => parent.join("storage_config_inmemory.yaml"),
@@ -2271,6 +2080,8 @@ impl StorageEngineManager {
         let mut engines = vec![StorageEngineType::InMemory];
         #[cfg(feature = "with-sled")]
         engines.push(StorageEngineType::Sled);
+        #[cfg(any(feature = "with-sled", feature = "with-rocksdb", feature = "with-tikv"))]
+        engines.push(StorageEngineType::Hybrid);
         #[cfg(feature = "with-rocksdb")]
         engines.push(StorageEngineType::RocksDB);
         #[cfg(feature = "with-tikv")]
@@ -2511,7 +2322,7 @@ impl StorageEngineManager {
                 .and_then(|map| map.get("path").and_then(|v| v.as_str()).map(PathBuf::from))
                 .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data/tikv"));
             if tikv_path.exists() {
-                if let Err(e) = TikvStorage::force_unlock(&tikv_path).await {
+                if let Err(e) = TikvStorage::force_unlock().await {
                     warn!("Failed to clean up TiKV lock files: {}", e);
                 } else {
                     info!("Lock files cleaned successfully.");
@@ -2527,6 +2338,103 @@ impl StorageEngineManager {
             StorageEngineType::InMemory => {
                 info!("Initializing InMemory engine");
                 Arc::new(InMemoryGraphStorage::new(&new_config))
+            }
+            StorageEngineType::Hybrid => {
+                debug!("Attempting to create Hybrid storage");
+                #[cfg(any(feature = "with-sled", feature = "with-rocksdb", feature = "with-tikv"))]
+                {
+                    let persistent_engine = self.config.engine_specific_config.as_ref()
+                        .and_then(|config| config.get("persistent_engine").and_then(|v| v.as_str()))
+                        .ok_or_else(|| GraphError::ConfigurationError("Persistent engine not specified for Hybrid storage".to_string()))?;
+
+                    let persistent: Arc<dyn GraphStorageEngine + Send + Sync> = match persistent_engine {
+                        "sled" => {
+                            #[cfg(feature = "with-sled")]
+                            {
+                                let sled_config = SledConfig {
+                                    storage_engine_type: StorageEngineType::Sled,
+                                    path: self.config.data_directory.clone(),
+                                    host: None,
+                                    port: None,
+                                };
+                                match SledStorage::new(&sled_config).await {
+                                    Ok(storage) => {
+                                        info!("Created Sled storage for Hybrid");
+                                        Arc::new(storage)
+                                    },
+                                    Err(e) => {
+                                        error!("Failed to create Sled storage for Hybrid: {}", e);
+                                        return Err(e);
+                                    }
+                                }
+                            }
+                            #[cfg(not(feature = "with-sled"))]
+                            return Err(GraphError::ConfigurationError("Sled support is not enabled for Hybrid.".to_string()));
+                        }
+                        "rocksdb" => {
+                            #[cfg(feature = "with-rocksdb")]
+                            {
+                                let rocksdb_config = RocksdbConfig {
+                                    storage_engine_type: StorageEngineType::RocksDB,
+                                    path: self.config.data_directory.clone(),
+                                    host: None,
+                                    port: None,
+                                };
+                                match RocksdbStorage::new(&rocksdb_config) {
+                                    Ok(storage) => {
+                                        info!("Created RocksDB storage for Hybrid");
+                                        Arc::new(storage)
+                                    },
+                                    Err(e) => {
+                                        error!("Failed to create RocksDB storage for Hybrid: {}", e);
+                                        return Err(e);
+                                    }
+                                }
+                            }
+                            #[cfg(not(feature = "with-rocksdb"))]
+                            return Err(GraphError::ConfigurationError("RocksDB support is not enabled for Hybrid.".to_string()));
+                        }
+                        "tikv" => {
+                            #[cfg(feature = "with-tikv")]
+                            {
+                                let tikv_config = TikvConfig {
+                                    storage_engine_type: StorageEngineType::TiKV,
+                                    path: self.config.data_directory.clone(),
+                                    host: None,
+                                    port: None,
+                                    pd_endpoints: self.config.engine_specific_config.as_ref()
+                                        .and_then(|config| config.get("pd_endpoints").and_then(|v| v.as_str()))
+                                        .map(|s| s.to_string()),
+                                    username: None,
+                                    password: None,
+                                };
+                                match TikvStorage::new(&tikv_config).await {
+                                    Ok(storage) => {
+                                        info!("Created TiKV storage for Hybrid");
+                                        Arc::new(storage)
+                                    },
+                                    Err(e) => {
+                                        error!("Failed to create TiKV storage for Hybrid: {}", e);
+                                        return Err(e);
+                                    }
+                                }
+                            }
+                            #[cfg(not(feature = "with-tikv"))]
+                            return Err(GraphError::ConfigurationError("TiKV support is not enabled for Hybrid.".to_string()));
+                        }
+                        _ => {
+                            error!("Unsupported persistent engine for Hybrid: {}", persistent_engine);
+                            return Err(GraphError::ConfigurationError(format!("Unsupported persistent engine for Hybrid: {}", persistent_engine)));
+                        }
+                    };
+                    info!("Created Hybrid storage with persistent engine: {}", persistent_engine);
+                    Arc::new(HybridStorage::new(persistent))
+                }
+                #[cfg(not(any(feature = "with-sled", feature = "with-rocksdb", feature = "with-tikv")))]
+                {
+                    error!("No persistent storage engines enabled for Hybrid");
+                    Err(GraphError::ConfigurationError("No persistent storage engines enabled for Hybrid. Enable 'with-sled', 'with-rocksdb', or 'with-tikv'.".to_string()))
+                }
             }
             StorageEngineType::Sled => {
                 #[cfg(feature = "with-sled")]
@@ -2707,7 +2615,7 @@ impl StorageEngineManager {
         }
 
         // Update the engine
-        self.engine = Arc::new(TokioMutex::new(HybridStorageEngine {
+        self.engine = Arc::new(TokioMutex::new(HybridStorage {
             inmemory: Arc::new(InMemoryGraphStorage::new(&new_config)),
             persistent: new_persistent.clone(),
             running: Arc::new(TokioMutex::new(false)),
