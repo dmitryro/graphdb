@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use anyhow::{Result, Context, anyhow, Error};
 use serde::{Deserialize, Serialize, Deserializer};
 use std::path::{Path, PathBuf};
@@ -9,6 +10,7 @@ use std::fs;
 use std::fmt::{self, Display, Formatter, Result as FmtResult};
 use std::collections::HashMap;
 use log::{info, debug, warn, error, trace};
+use openraft_memstore::MemStore;    // from the openraft-memstore crate
 
 // --- Constants ---
 pub const DAEMON_REGISTRY_DB_PATH: &str = "./daemon_registry_db";
@@ -158,6 +160,13 @@ pub struct StorageConfigInner {
     pub database: Option<String>,
     #[serde(default)]
     pub pd_endpoints: Option<String>,
+}
+
+#[derive(Clone, Debug, Copy, Default, Eq, PartialEq, Ord, PartialOrd)]
+pub struct TypeConfig;
+
+pub struct MemStoreForTypeConfig {
+    pub inner: Arc<MemStore>,
 }
 
 // The outer struct that holds the engine type and the configuration details.

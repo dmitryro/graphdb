@@ -1,19 +1,11 @@
-// lib/src/storage_engine/inmemory_storage.rs
-// Created: 2025-07-04 - Implemented in-memory storage engine
-// Fixed: 2025-08-14 - Corrected import path for `SerializableUuid`.
-// Fixed: 2025-08-15 - Resolved E0308 mismatched types error in `is_running` function.
-// Added: 2025-08-13 - Added `close` method to GraphStorageEngine implementation
-// Fixed: 2025-08-19 - Resolved trait bound mismatch for StorageEngine methods.
-
 use std::any::Any;
 use async_trait::async_trait;
 use crate::storage_engine::{GraphStorageEngine, StorageConfig, StorageEngine};
 use models::{Edge, Identifier, Vertex};
 use models::errors::{GraphError, GraphResult};
-use models::identifiers::SerializableUuid;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use tokio::sync::Mutex; // Use Tokio's Mutex
 use uuid::Uuid;
 use log::info;
 
@@ -22,7 +14,7 @@ pub struct InMemoryStorage {
     config: StorageConfig,
     vertices: Mutex<HashMap<Uuid, Vertex>>,
     edges: Mutex<HashMap<(Uuid, Identifier, Uuid), Edge>>,
-    kv_store: Mutex<HashMap<Vec<u8>, Vec<u8>>>, // New field for generic key-value storage
+    kv_store: Mutex<HashMap<Vec<u8>, Vec<u8>>>,
     running: Mutex<bool>,
 }
 
@@ -37,16 +29,25 @@ impl InMemoryStorage {
         }
     }
 
+    pub fn kv_store(&self) -> &Mutex<HashMap<Vec<u8>, Vec<u8>>> {
+        &self.kv_store
+    }
+
     pub fn reset(&mut self) -> GraphResult<()> {
-        let mut vertices = self.vertices.lock().map_err(|e| GraphError::LockError(e.to_string()))?;
-        let mut edges = self.edges.lock().map_err(|e| GraphError::LockError(e.to_string()))?;
-        let mut kv_store = self.kv_store.lock().map_err(|e| GraphError::LockError(e.to_string()))?;
+        let mut vertices = self.vertices.blocking_lock(); // Use blocking_lock for sync context
+        let mut edges = self.edges.blocking_lock();
+        let mut kv_store = self.kv_store.blocking_lock();
 
         vertices.clear();
         edges.clear();
         kv_store.clear();
 
         Ok(())
+    }
+
+    // Public method to access kv_store
+    pub fn kv_store_lock(&self) -> GraphResult<tokio::sync::MutexGuard<HashMap<Vec<u8>, Vec<u8>>>> {
+        Ok(self.kv_store.blocking_lock())
     }
 }
 
@@ -57,18 +58,18 @@ impl StorageEngine for InMemoryStorage {
     }
 
     async fn insert(&self, key: Vec<u8>, value: Vec<u8>) -> GraphResult<()> {
-        let mut kv_store = self.kv_store.lock().map_err(|e| GraphError::LockError(e.to_string()))?;
+        let mut kv_store = self.kv_store.lock().await;
         kv_store.insert(key, value);
         Ok(())
     }
 
     async fn retrieve(&self, key: &Vec<u8>) -> GraphResult<Option<Vec<u8>>> {
-        let kv_store = self.kv_store.lock().map_err(|e| GraphError::LockError(e.to_string()))?;
+        let kv_store = self.kv_store.lock().await;
         Ok(kv_store.get(key).cloned())
     }
 
     async fn delete(&self, key: &Vec<u8>) -> GraphResult<()> {
-        let mut kv_store = self.kv_store.lock().map_err(|e| GraphError::LockError(e.to_string()))?;
+        let mut kv_store = self.kv_store.lock().await;
         kv_store.remove(key);
         Ok(())
     }
@@ -85,8 +86,8 @@ impl GraphStorageEngine for InMemoryStorage {
     }
 
     async fn clear_data(&self) -> Result<(), GraphError> {
-        let mut vertices = self.vertices.lock().map_err(|e| GraphError::LockError(e.to_string()))?;
-        let mut edges = self.edges.lock().map_err(|e| GraphError::LockError(e.to_string()))?;
+        let mut vertices = self.vertices.lock().await;
+        let mut edges = self.edges.lock().await;
         
         vertices.clear();
         edges.clear();
@@ -95,13 +96,13 @@ impl GraphStorageEngine for InMemoryStorage {
     }
     
     async fn start(&self) -> GraphResult<()> {
-        let mut running = self.running.lock().map_err(|e| GraphError::LockError(e.to_string()))?;
+        let mut running = self.running.lock().await;
         *running = true;
         Ok(())
     }
 
     async fn stop(&self) -> GraphResult<()> {
-        let mut running = self.running.lock().map_err(|e| GraphError::LockError(e.to_string()))?;
+        let mut running = self.running.lock().await;
         *running = false;
         Ok(())
     }
@@ -111,7 +112,7 @@ impl GraphStorageEngine for InMemoryStorage {
     }
 
     async fn is_running(&self) -> bool {
-        *self.running.lock().unwrap()
+        *self.running.lock().await
     }
 
     async fn query(&self, query_string: &str) -> GraphResult<Value> {
@@ -124,41 +125,41 @@ impl GraphStorageEngine for InMemoryStorage {
     }
 
     async fn create_vertex(&self, vertex: Vertex) -> GraphResult<()> {
-        let mut vertices = self.vertices.lock().map_err(|e| GraphError::LockError(e.to_string()))?;
+        let mut vertices = self.vertices.lock().await;
         vertices.insert(vertex.id.0, vertex);
         Ok(())
     }
 
     async fn get_vertex(&self, id: &Uuid) -> GraphResult<Option<Vertex>> {
-        let vertices = self.vertices.lock().map_err(|e| GraphError::LockError(e.to_string()))?;
+        let vertices = self.vertices.lock().await;
         Ok(vertices.get(id).cloned())
     }
 
     async fn update_vertex(&self, vertex: Vertex) -> GraphResult<()> {
-        let mut vertices = self.vertices.lock().map_err(|e| GraphError::LockError(e.to_string()))?;
+        let mut vertices = self.vertices.lock().await;
         vertices.insert(vertex.id.0, vertex);
         Ok(())
     }
 
     async fn delete_vertex(&self, id: &Uuid) -> GraphResult<()> {
-        let mut vertices = self.vertices.lock().map_err(|e| GraphError::LockError(e.to_string()))?;
+        let mut vertices = self.vertices.lock().await;
         vertices.remove(id);
         Ok(())
     }
 
     async fn get_all_vertices(&self) -> GraphResult<Vec<Vertex>> {
-        let vertices = self.vertices.lock().map_err(|e| GraphError::LockError(e.to_string()))?;
+        let vertices = self.vertices.lock().await;
         Ok(vertices.values().cloned().collect())
     }
 
     async fn create_edge(&self, edge: Edge) -> GraphResult<()> {
-        let mut edges = self.edges.lock().map_err(|e| GraphError::LockError(e.to_string()))?;
+        let mut edges = self.edges.lock().await;
         edges.insert((edge.outbound_id.0, edge.t.clone(), edge.inbound_id.0), edge);
         Ok(())
     }
 
     async fn get_edge(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> GraphResult<Option<Edge>> {
-        let edges = self.edges.lock().map_err(|e| GraphError::LockError(e.to_string()))?;
+        let edges = self.edges.lock().await;
         Ok(edges.get(&(outbound_id.clone(), edge_type.clone(), inbound_id.clone())).cloned())
     }
 
@@ -167,13 +168,13 @@ impl GraphStorageEngine for InMemoryStorage {
     }
 
     async fn delete_edge(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> GraphResult<()> {
-        let mut edges = self.edges.lock().map_err(|e| GraphError::LockError(e.to_string()))?;
+        let mut edges = self.edges.lock().await;
         edges.remove(&(outbound_id.clone(), edge_type.clone(), inbound_id.clone()));
         Ok(())
     }
 
     async fn get_all_edges(&self) -> GraphResult<Vec<Edge>> {
-        let edges = self.edges.lock().map_err(|e| GraphError::LockError(e.to_string()))?;
+        let edges = self.edges.lock().await;
         Ok(edges.values().cloned().collect())
     }
 

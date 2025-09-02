@@ -1,25 +1,24 @@
 use std::any::Any;
-use std::collections::HashMap;
+use std::pin::Pin;
+use std::collections::{HashMap, BTreeSet};
 use async_trait::async_trait;
 use models::errors::GraphError;
 use uuid::Uuid;
 use models::{Edge, Identifier, Vertex};
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, Mutex as TokioMutex};
 use std::fmt::Debug;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use tokio::sync::Mutex as TokioMutex;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use surrealdb::engine::local::{Db, Mem, RocksDb, SurrealKV};
+use surrealdb::engine::local::{Db, Mem, RocksDb};
 use tikv_client::{Config, Transaction, TransactionClient as TiKvClient, RawClient as KvClient};
 use surrealdb::Surreal;
 use sled::Db as SledDB;
-use surrealdb::engine::any::Any as SurrealAny; 
+use surrealdb::engine::any::Any as SurrealAny;
 use surrealdb::sql::Thing;
-//use keyv::Keyv;
 use tokio::fs;
 use tokio::net::TcpStream;
 use tokio::time::{self, Duration as TokioDuration};
@@ -36,15 +35,33 @@ use nix::unistd::{Pid, getpid, getuid};
 use sysinfo::System;
 #[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt, MetadataExt};
+use openraft::{
+    Raft, Config as RaftConfig, error::RaftError, NodeId,
+    raft::{AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse, VoteRequest, VoteResponse},
+    network::{RaftNetworkFactory, RaftNetwork, RPCOption},
+    error::{InstallSnapshotError, CheckIsLeaderError, ForwardToLeader},
+    storage::Adaptor, LogId, LeaderId, StoredMembership, RaftTypeConfig, storage::RaftStateMachine, storage::RaftSnapshotBuilder,
+    OptionalSend, OptionalSync,
+};
+use futures::future::Future; 
+// Try to import RPCError from different possible locations
+use openraft::error::RPCError;
+use openraft_memstore::MemStore;    // from the openraft-memstore crate
+use openraft_memstore::TypeConfig as RaftMemStoreTypeConfig;
+// If the above doesn't work, try:
+// use openraft::network::RPCError;
+// Or if it's named differently:
+// use openraft::error::NetworkError as RPCError;
+
 use crate::storage_engine::config::{DEFAULT_DATA_DIRECTORY, DEFAULT_LOG_DIRECTORY, LOCK_FILE_PATH,
-                                    DEFAULT_STORAGE_PORT, StorageConfig, SledConfig, RocksdbConfig, TikvConfig,
-                                    RedisConfig, MySQLConfig, PostgreSQLConfig, 
-                                    StorageConfigWrapper, load_storage_config_from_yaml, 
-                                    load_engine_specific_config};
+                                 DEFAULT_STORAGE_PORT, StorageConfig, SledConfig, RocksdbConfig, TikvConfig,
+                                 RedisConfig, MySQLConfig, PostgreSQLConfig, TypeConfig,
+                                 StorageConfigWrapper, load_storage_config_from_yaml,
+                                 load_engine_specific_config};
 use crate::daemon_utils::{find_pid_by_port, stop_process};
 use crate::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
-
-// Re-export StorageEngineType to ensure clear visibility
+use crate::storage_engine::inmemory_storage::{InMemoryStorage};
+use crate::storage_engine::raft_storage::{RaftStorage};
 pub use crate::storage_engine::config::StorageEngineType;
 
 pub use crate::storage_engine::inmemory_storage::InMemoryStorage as InMemoryGraphStorage;
@@ -66,8 +83,6 @@ use crate::storage_engine::hybrid_storage::HybridStorage;
 pub static CLEANUP_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 pub static GLOBAL_STORAGE_ENGINE_MANAGER: OnceCell<Arc<AsyncStorageEngineManager>> = OnceCell::const_new();
 
-// Singleton instances for each persistent engine type
-//static SLED_SINGLETON: OnceCell<Arc<SledStorage>> = OnceCell::const_new();
 #[cfg(feature = "with-sled")]
 static SLED_SINGLETON: TokioMutex<Option<Arc<SledStorage>>> = TokioMutex::const_new(None);
 #[cfg(feature = "with-rocksdb")]
@@ -80,6 +95,117 @@ static REDIS_SINGLETON: OnceCell<Arc<RedisStorage>> = OnceCell::const_new();
 static POSTGRES_SINGLETON: OnceCell<Arc<PostgresStorage>> = OnceCell::const_new();
 #[cfg(feature = "mysql-datastore")]
 static MYSQL_SINGLETON: OnceCell<Arc<MySQLStorage>> = OnceCell::const_new();
+
+// The NodeId must be `u64` as per the `openraft` crate's definition.
+type NodeIdType = u64;
+
+// Define Raft application's request and response types.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AppRequest {
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AppResponse {
+    pub message: String,
+}
+
+impl RaftTypeConfig for TypeConfig {
+    type D = AppRequest;
+    type R = AppResponse;
+    type NodeId = NodeIdType;
+    type Node = NodeIdType; // Simplified to use NodeIdType directly
+    type Entry = openraft::Entry<Self>;
+    type SnapshotData = std::io::Cursor<Vec<u8>>;
+    type AsyncRuntime = openraft::TokioRuntime;
+    type Responder = openraft::raft::responder::OneshotResponder<Self>;
+}
+
+#[derive(Debug, Default)]
+pub struct ApplicationStateMachine {
+    last_applied: Option<LogId<NodeIdType>>,
+    data: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ExampleNetwork;
+
+impl RaftNetwork<RaftMemStoreTypeConfig> for ExampleNetwork {
+    fn append_entries(
+        &mut self,
+        rpc: AppendEntriesRequest<RaftMemStoreTypeConfig>,
+        _option: RPCOption,
+    ) -> impl Future<
+        Output = Result<
+            AppendEntriesResponse<<RaftMemStoreTypeConfig as openraft::RaftTypeConfig>::NodeId>,
+            RPCError<
+                <RaftMemStoreTypeConfig as openraft::RaftTypeConfig>::NodeId,
+                <RaftMemStoreTypeConfig as openraft::RaftTypeConfig>::Node,
+                RaftError<<RaftMemStoreTypeConfig as openraft::RaftTypeConfig>::NodeId>,
+            >,
+        >,
+    > + Send {
+        async move {
+            let _ = rpc;
+            todo!("Implement append_entries")
+        }
+    }
+
+    fn vote(
+        &mut self,
+        rpc: VoteRequest<<RaftMemStoreTypeConfig as openraft::RaftTypeConfig>::NodeId>,
+        _option: RPCOption,
+    ) -> impl Future<
+        Output = Result<
+            VoteResponse<<RaftMemStoreTypeConfig as openraft::RaftTypeConfig>::NodeId>,
+            RPCError<
+                <RaftMemStoreTypeConfig as openraft::RaftTypeConfig>::NodeId,
+                <RaftMemStoreTypeConfig as openraft::RaftTypeConfig>::Node,
+                RaftError<<RaftMemStoreTypeConfig as openraft::RaftTypeConfig>::NodeId>,
+            >,
+        >,
+    > + Send {
+        async move {
+            let _ = rpc;
+            todo!("Implement vote")
+        }
+    }
+
+    fn install_snapshot(
+        &mut self,
+        rpc: InstallSnapshotRequest<RaftMemStoreTypeConfig>,
+        _option: RPCOption,
+    ) -> impl Future<
+        Output = Result<
+            InstallSnapshotResponse<<RaftMemStoreTypeConfig as openraft::RaftTypeConfig>::NodeId>,
+            RPCError<
+                <RaftMemStoreTypeConfig as openraft::RaftTypeConfig>::NodeId,
+                <RaftMemStoreTypeConfig as openraft::RaftTypeConfig>::Node,
+                RaftError<
+                    <RaftMemStoreTypeConfig as openraft::RaftTypeConfig>::NodeId,
+                    InstallSnapshotError,
+                >,
+            >,
+        >,
+    > + Send {
+        async move {
+            let _ = rpc;
+            todo!("Implement install_snapshot")
+        }
+    }
+}
+
+impl RaftNetworkFactory<RaftMemStoreTypeConfig> for ExampleNetwork {
+    type Network = ExampleNetwork;
+
+    fn new_client(
+        &mut self,
+        _target: <RaftMemStoreTypeConfig as openraft::RaftTypeConfig>::NodeId,
+        _node: &(),
+    ) -> impl Future<Output = Self::Network> + Send {
+        async move { ExampleNetwork::default() }
+    }
+}
 
 // New struct to wrap the surrealdb client and implement GraphStorageEngine and StorageEngine
 #[derive(Debug, Clone)]
@@ -882,6 +1008,9 @@ pub struct StorageEngineManager {
     session_engine_type: Option<StorageEngineType>,
     config: StorageConfig,
     config_path: PathBuf,
+    // The key of a HashMap must be a concrete type that implements the `Eq` and `Hash` traits.
+    // Assuming NodeId is a concrete type (e.g., a struct or integer) and not a trait.
+    raft_instances: Arc<TokioMutex<HashMap<u64, Arc<dyn Any + Send + Sync>>>>,
 }
 
 impl StorageEngineManager {
@@ -940,11 +1069,68 @@ impl StorageEngineManager {
             Self::initialize_storage_engine(storage_engine, &config).await?
         };
         println!("IN StorageEngineManager new - STEP 4");
-        // Step 4: Create final manager
-        let manager = Self::create_manager(storage_engine, config, config_path_yaml, persistent, permanent);
+        // Step 4: Initialize Raft instances if clustering is enabled
+        let raft_instances = Arc::new(TokioMutex::new(HashMap::new()));
+        if config.use_raft_for_scale {
+            Self::initialize_raft_instances(&config, &raft_instances).await?;
+        }
         println!("IN StorageEngineManager new - STEP 5");
+        // Step 5: Create final manager
+        let manager = Self::create_manager(storage_engine, config, config_path_yaml, persistent, permanent, raft_instances);
+        println!("IN StorageEngineManager new - STEP 6");
         info!("StorageEngineManager initialized with engine: {:?}", storage_engine);
         Ok(Arc::new(manager))
+    }
+
+    pub async fn initialize_raft_instances(
+        config: &StorageConfig,
+        raft_instances: &Arc<TokioMutex<HashMap<NodeIdType, Arc<dyn Any + Send + Sync>>>>,
+    ) -> Result<(), GraphError> {
+        info!("Initializing Raft instances for clustering");
+        let mut instances = raft_instances.lock().await;
+
+        // Example node ID
+        let node_id: NodeIdType = 1;
+
+        // Raft runtime configuration
+        let raft_config = Arc::new(RaftConfig {
+            cluster_name: "graphdb-cluster".to_string(),
+            ..Default::default()
+        });
+
+        // RaftStorage wrapper
+        let raft_graph_store = RaftStorage::new(config);
+
+        // Create the OpenRaft adaptor for log & state machine
+        // Note: MemStore::new_async() already returns Arc<MemStore>
+        let store: Arc<MemStore> = MemStore::new_async().await;
+        let (log_store, state_machine) =
+            Adaptor::<RaftMemStoreTypeConfig, Arc<MemStore>>::new(store.clone());
+
+        let raft_network: ExampleNetwork = ExampleNetwork::default();
+
+        let raft_node = Raft::<RaftMemStoreTypeConfig>::new(
+            node_id,
+            raft_config.clone(),
+            raft_network,
+            log_store,
+            state_machine,
+        )
+        .await
+        .map_err(|e| GraphError::StorageError(format!("Failed to create Raft instance: {}", e)))?;
+
+        // Store the node in the shared map
+        instances.insert(node_id, Arc::new(raft_node) as Arc<dyn Any + Send + Sync>);
+
+        info!("Initialized Raft node with ID: {}", node_id);
+        Ok(())
+    }
+
+    pub async fn get_raft_instance(&self, node_id: u64) -> Result<Arc<dyn Any + Send + Sync>, GraphError> {
+        let instances = self.raft_instances.lock().await;
+        instances.get(&node_id)
+            .cloned()
+            .ok_or_else(|| GraphError::StorageError(format!("No Raft instance found for node_id {}", node_id)))
     }
 
     pub async fn reset_config(&mut self, config: StorageConfig) -> Result<(), GraphError> {
@@ -1623,6 +1809,7 @@ impl StorageEngineManager {
         config_path_yaml: &Path,
         persistent: Arc<dyn GraphStorageEngine + Send + Sync>,
         permanent: bool,
+        raft_instances: Arc<TokioMutex<HashMap<u64, Arc<dyn Any + Send + Sync>>>>,
     ) -> StorageEngineManager {
         let engine = Arc::new(TokioMutex::new(HybridStorage {
             inmemory: Arc::new(InMemoryGraphStorage::new(&config)),
@@ -1637,6 +1824,7 @@ impl StorageEngineManager {
             session_engine_type: if permanent { None } else { Some(engine_type) },
             config,
             config_path: config_path_yaml.to_path_buf(),
+            raft_instances,
         }
     }
 

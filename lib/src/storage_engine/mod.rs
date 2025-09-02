@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 // Declare submodules
 pub mod config;
 pub mod inmemory_storage;
+pub mod raft_storage;
 pub mod storage_utils;
 pub mod storage_engine;
 #[cfg(feature = "with-rocksdb")]
