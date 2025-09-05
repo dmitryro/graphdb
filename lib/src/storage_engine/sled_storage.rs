@@ -1,467 +1,658 @@
-// lib/src/storage_engine/sled_storage.rs
-// Created: 2025-08-09 - Initial SledStorage implementation
-// Updated: 2025-09-01 - Added kv_pairs tree, integrated OpenRaft leadership check, handled Raft enabled/disabled cases, fixed db_path logic, improved lock handling and error messages
-// Corrected: 2025-09-02 - Fixed compilation errors related to `Self` and corrupted trait implementation
-
-use std::any::Any;
-use async_trait::async_trait;
-use crate::storage_engine::{GraphStorageEngine, StorageEngine};
-use crate::storage_engine::config::{SledConfig, StorageConfig, StorageConfigWrapper, default_data_directory, default_log_directory,
-                                     DEFAULT_DATA_DIRECTORY, DEFAULT_STORAGE_CONFIG_PATH};
-#[cfg(feature = "with-sled")]
-use crate::storage_engine::{recover_sled, log_lock_file_diagnostics, lock_file_exists};
-use crate::storage_engine::storage_utils::{serialize_vertex, deserialize_vertex, serialize_edge, deserialize_edge, create_edge_key};
-use models::{Edge, Identifier, Vertex};
-use models::errors::{GraphError, GraphResult};
-use models::identifiers::SerializableUuid;
-use serde_json::Value;
-use sled::{Db, Tree, IVec, Config};
-use std::path::{PathBuf, Path};
-use std::sync::{LazyLock, Mutex};
-use uuid::Uuid;
-use log::{info, warn, debug, error};
+use std::sync::Arc;
 use tokio::fs;
-use std::time::{Duration};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 #[cfg(unix)]
-use std::os::unix::fs::{PermissionsExt};
-use futures::executor;
+use std::os::unix::fs::PermissionsExt;
 use tokio::sync::Mutex as TokioMutex;
+use tokio::time::{timeout, Duration};
+use log::{info, debug, warn, error};
+use anyhow::Context;
+use crate::storage_engine::config::{
+    SledConfig, SledStorage, SledDaemonPool, load_storage_config_from_yaml, 
+    load_engine_specific_config, DEFAULT_DATA_DIRECTORY, SelectedStorageConfig,
+    StorageConfigInner, DEFAULT_STORAGE_CONFIG_PATH, DEFAULT_STORAGE_CONFIG_PATH_RELATIVE,
+    DEFAULT_STORAGE_PORT, is_port_in_cluster_range, parse_cluster_range, 
+    StorageConfig, StorageEngineType
+};
+use crate::storage_engine::storage_utils::{serialize_vertex, deserialize_vertex, serialize_edge, deserialize_edge, create_edge_key};
+use models::{Vertex, Edge, Identifier};
+use models::errors::{GraphError, GraphResult};
+use uuid::Uuid;
+use async_trait::async_trait;
+use crate::storage_engine::storage_engine::{StorageEngine, GraphStorageEngine};
+use serde_json::Value;
+use std::any::Any;
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
-use openraft::{Raft, NodeId, Config as RaftConfig}; // Assuming openraft is used
-
-// Define key prefixes for key-value pairs, similar to tikv_storage.rs
-const KV_KEY_PREFIX: &[u8] = b"kv:";
-
-// Static Tokio runtime initialized once for fallback
-#[cfg(feature = "with-sled")]
-static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
-    debug!("Initializing Tokio runtime for run_sync fallback");
-    tokio::runtime::Runtime::new()
-        .expect("Failed to initialize Tokio runtime for run_sync")
-});
-
-/// Helper function to run async operations synchronously.
-/// It tries to use an existing Tokio runtime handle, if available,
-/// otherwise it falls back to a static, lazily-initialized runtime.
-#[cfg(feature = "with-sled")]
-fn run_sync<F, T>(future: F) -> GraphResult<T>
-where
-    F: std::future::Future<Output = Result<T, GraphError>> + Send + 'static,
-    T: Send + 'static,
-{
-    debug!("Running async operation synchronously");
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            debug!("Using existing Tokio runtime handle");
-            handle.block_on(future)
-        }
-        Err(_) => {
-            debug!("No existing runtime found; using fallback runtime");
-            RUNTIME.block_on(future)
-        }
-    }
-}
-
-/// Creates a key for a key-value pair.
-/// Format: `kv:{key}`
-pub fn create_kv_key(key: &str) -> Vec<u8> {
-    let mut kv_key = KV_KEY_PREFIX.to_vec();
-    kv_key.extend_from_slice(key.as_bytes());
-    kv_key
-}
-
-// Raft leadership check using openraft
-#[cfg(feature = "with-sled")]
-async fn is_raft_leader(port: Option<u16>, _use_raft: bool) -> GraphResult<bool> {
-    // Temporarily disable Raft check since use_raft_for_scale is not available
-    debug!("Raft leadership check disabled; assuming leadership for port {:?}", port);
-    Ok(true)
-    // TODO: Implement actual Raft leadership check
-    /*
-    if !use_raft {
-        debug!("Raft is disabled; allowing direct database access");
-        return Ok(true);
-    }
-
-    debug!("Checking Raft leadership for port {:?}", port);
-    // Assuming StorageEngineManager provides access to the Raft instance
-    let node_id = port.unwrap_or(8049) as u64; // Changed NodeId to u64
-    // Placeholder: Replace with actual Raft instance retrieval
-    let raft = crate::storage_engine::GLOBAL_STORAGE_ENGINE_MANAGER
-        .get() // Assuming get() returns Option<Arc<AsyncStorageEngineManager>>
-        .ok_or_else(|| GraphError::StorageError("Failed to get storage engine manager".to_string()))?
-        .get_raft_instance(node_id) // Replace with actual method to get Raft instance
-        .ok_or_else(|| GraphError::StorageError("Failed to get Raft instance".to_string()))?;
-    
-    let metrics = raft.metrics().await;
-    Ok(metrics.current_leader == Some(node_id))
-    */
-}
-
-#[derive(Debug)]
-pub struct SledStorage {
-    db: Db,
-    vertices: Tree,
-    edges: Tree,
-    kv_pairs: Tree,
-    config: SledConfig,
-    running: TokioMutex<bool>,
-}
+use futures::future::join_all;
+use std::process;
+use crate::daemon_registry::GLOBAL_DAEMON_REGISTRY;
 
 impl SledStorage {
-    /// Creates a new SledStorage instance with robust lock handling and Raft coordination.
-    pub async fn new(config: &SledConfig) -> GraphResult<SledStorage> {
-        info!("Initializing Sled storage engine with config: {:?}", config);
-
-        // Validate port against cluster range
-        if let Some(port) = config.port {
-            let cluster_range = 8049..=8083; // As per graphdb-cli status
-            if !cluster_range.contains(&port) {
-                warn!("Port {} is outside cluster range {:?}", port, cluster_range);
-            }
-        }
-
-        // Check Raft leadership or allow access if Raft is disabled
-        if !is_raft_leader(config.port, false).await? { // Set use_raft to false as placeholder
-            error!("This instance (port {:?}) is not the Raft leader.", config.port);
-            return Err(GraphError::StorageError(format!(
-                "This instance (port {:?}) is not the Raft leader. Only the leader can access /opt/graphdb/storage_data/sled. Use the leader instance (likely port 8049) or stop other Storage Daemon instances (PIDs: 25656, 25709, 25765; ports: 2380, 8049, 8051).",
-                config.port
-            )));
-        }
-
-        // Use shared database path to preserve content consistency
-        let db_path = config.path.clone();
-        info!("Using Sled database path: {:?}", db_path);
-
-        // Ensure the directory exists with correct permissions
-        if !db_path.exists() {
-            debug!("Creating Sled data directory at {:?}", db_path);
-            std::fs::create_dir_all(&db_path).map_err(|e| {
-                error!("Failed to create Sled data directory at {:?}: {}", db_path, e);
-                GraphError::Io(e)
-            })?;
-            #[cfg(unix)]
-            {
-                let mut perms = std::fs::metadata(&db_path)
-                    .map_err(|e| GraphError::Io(e))?
-                    .permissions();
-                perms.set_mode(0o755);
-                std::fs::set_permissions(&db_path, perms).map_err(|e| GraphError::Io(e))?;
-            }
-        }
-
-        // Passively remove lock file with retries
-        let lock_path = db_path.join("db.lck");
-        for attempt in 1..=3 {
-            if lock_path.exists() {
-                warn!("Found Sled lock file at {:?}", lock_path);
-                run_sync(log_lock_file_diagnostics(lock_path.clone()))?;
-                match std::fs::remove_file(&lock_path) {
-                    Ok(_) => {
-                        info!("Successfully removed Sled lock file on attempt {}", attempt);
-                        break;
-                    }
-                    Err(e) if attempt < 3 => {
-                        warn!("Failed to remove lock file on attempt {}: {}. Retrying.", attempt, e);
-                        tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
-                    }
-                    Err(e) => {
-                        error!("Failed to remove lock file after 3 attempts: {}", e);
-                        return Err(GraphError::StorageError(format!(
-                            "Failed to remove lock file at {:?}: {}. Another process may be holding the lock (PIDs: 25656, 25709, 25765; ports: 2380, 8049, 8051).",
-                            lock_path, e
-                        )));
-                    }
-                }
+    pub async fn new(config: &SledConfig) -> Result<Self, GraphError> {
+        // Step 1: Determine config file path (not storage directory)
+        let main_config_path = {
+            let project_config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
+            let default_config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH);
+            if project_config_path.exists() {
+                debug!("Using project config path: {:?}", project_config_path);
+                project_config_path
             } else {
-                info!("No Sled lock file found at {:?}", lock_path);
-                break;
+                debug!("Using default config path: {:?}", default_config_path);
+                default_config_path
             }
-        }
-
-        // Initialize Sled with extended retry loop and timeout
-        const MAX_RETRIES: u32 = 30;
-        const BASE_DELAY_MS: u64 = 1000;
-        const TIMEOUT_SECS: u64 = 60;
-        let start_time = std::time::Instant::now();
-        let mut attempt = 0;
-        let mut db = None;
-
-        while attempt < MAX_RETRIES && start_time.elapsed().as_secs() < TIMEOUT_SECS {
-            info!("Attempt {} of {} to open Sled DB at {:?}", attempt + 1, MAX_RETRIES, db_path);
-            match Config::new()
-                .path(&db_path)
-                .use_compression(false)
-                .flush_every_ms(None)
-                .open()
-            {
-                Ok(db_instance) => {
-                    info!("Successfully opened Sled DB at {:?}", db_path);
-                    db = Some(db_instance);
-                    break;
-                }
-                Err(e) => {
-                    error!("Failed to open Sled DB on attempt {}: {}. Error details: {:?}", attempt + 1, e, e);
-                    if e.to_string().contains("WouldBlock") {
-                        warn!("Detected lock contention. Attempt {} of {}. Retrying after delay.", attempt + 1, MAX_RETRIES);
-                        run_sync(log_lock_file_diagnostics(lock_path.clone()))?;
-                        tokio::time::sleep(Duration::from_millis(BASE_DELAY_MS * (attempt as u64 + 1))).await;
-                        attempt += 1;
-                        continue;
-                    } else if e.to_string().contains("corruption") {
-                        warn!("Detected Sled database corruption at {:?}", db_path);
-                        SledStorage::backup_and_recreate_database(&db_path)?;
-                        match Config::new()
-                            .path(&db_path)
-                            .use_compression(false)
-                            .flush_every_ms(None)
-                            .open()
-                        {
-                            Ok(db_instance) => {
-                                info!("Successfully opened Sled DB after recovery at {:?}", db_path);
-                                db = Some(db_instance);
-                                break;
-                            }
-                            Err(e) => {
-                                error!("Failed to open Sled DB after recovery: {}", e);
-                                return Err(GraphError::StorageError(format!("Failed to open Sled DB after recovery: {}", e)));
-                            }
-                        }
-                    } else {
-                        error!("Unhandled Sled open error: {}", e);
-                        return Err(GraphError::StorageError(format!("Unhandled Sled open error: {}", e)));
-                    }
-                }
-            }
-        }
-
-        let db = db.ok_or_else(|| {
-            error!("Failed to open Sled DB after {} attempts or {} seconds.", MAX_RETRIES, TIMEOUT_SECS);
-            run_sync(log_lock_file_diagnostics(lock_path.clone())).unwrap_or_else(|e| {
-                error!("Failed to log lock file diagnostics: {}", e);
-            });
-            GraphError::StorageError(format!(
-                "Failed to open Sled DB at {:?} after {} attempts or {} seconds due to lock contention. Ensure only one Storage Daemon instance accesses this path (PIDs: 25656, 25709, 25765; ports: 2380, 8049, 8051) or verify Raft leadership configuration.",
-                db_path, MAX_RETRIES, TIMEOUT_SECS
-            ))
-        })?;
-
-        let vertices = db.open_tree("vertices").map_err(|e| GraphError::StorageError(e.to_string()))?;
-        let edges = db.open_tree("edges").map_err(|e| GraphError::StorageError(e.to_string()))?;
-        let kv_pairs = db.open_tree("kv_pairs").map_err(|e| GraphError::StorageError(e.to_string()))?;
-
-        let storage = SledStorage {
-            db,
-            vertices,
-            edges,
-            kv_pairs,
-            config: config.clone(),
-            running: TokioMutex::new(true),
         };
 
-        // Register SIGTERM handler for graceful shutdown
-        #[cfg(unix)]
-        {
-            let path_clone = db_path.to_path_buf();
-            let storage_clone = storage.db.clone();
-            let lock_path = path_clone.join("db.lck");
-            tokio::spawn(async move {
-                let mut sigterm = signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
-                sigterm.recv().await;
-                info!("Received SIGTERM, initiating graceful shutdown for Sled instance at {:?}", path_clone);
-                tokio::time::sleep(Duration::from_millis(3000)).await;
-                if let Err(e) = storage_clone.flush_async().await {
-                    error!("Failed to flush Sled instance on SIGTERM: {}", e);
+        // Step 2: Load or create storage configuration
+        let mut storage_config = if main_config_path.exists() {
+            debug!("Reading main configuration from file: {:?}", main_config_path);
+            load_storage_config_from_yaml(Some(&main_config_path)).await
+                .context(format!("Failed to load storage config from {:?}", main_config_path))?
+        } else {
+            debug!("No main config file found, creating default at {:?}", main_config_path);
+            let default_config = StorageConfig {
+                config_root_directory: PathBuf::from("./storage_daemon_server"),
+                data_directory: PathBuf::from(DEFAULT_DATA_DIRECTORY),
+                log_directory: String::from("/opt/graphdb/logs"),
+                default_port: 8049,
+                cluster_range: String::from("8049"),
+                max_disk_space_gb: 1000,
+                min_disk_space_gb: 10,
+                use_raft_for_scale: false,
+                storage_engine_type: StorageEngineType::Sled,
+                connection_string: None,
+                engine_specific_config: Some(HashMap::from([
+                    ("path".to_string(), Value::String(config.path.to_string_lossy().into_owned())),
+                    ("host".to_string(), Value::String(config.host.clone().unwrap_or("127.0.0.1".to_string()))),
+                    ("port".to_string(), Value::Number(config.port.unwrap_or(8049).into())),
+                    ("temporary".to_string(), Value::Bool(config.temporary)),
+                    ("use_compression".to_string(), Value::Bool(config.use_compression)),
+                    ("cache_capacity".to_string(), Value::Number(config.cache_capacity.unwrap_or(1024 * 1024 * 1024).into())),
+                    ("storage_engine_type".to_string(), Value::String("sled".to_string())),
+                ])),
+                max_open_files: Some(1024),
+            };
+            // Create parent directory and save default config
+            if let Some(parent) = main_config_path.parent() {
+                debug!("Creating parent directory: {:?}", parent);
+                if let Err(e) = fs::create_dir_all(parent).await {
+                    error!("Failed to create parent directory {:?}: {}", parent, e);
+                    return Err(GraphError::StorageError(format!("Failed to create parent directory for config: {}", e)));
                 }
-                if lock_path.exists() {
-                    if let Err(e) = std::fs::remove_file(&lock_path) {
-                        error!("Failed to remove lock file on SIGTERM: {}", e);
-                    } else {
-                        info!("Removed lock file on SIGTERM: {:?}", lock_path);
-                    }
-                }
-                info!("Sled instance closed gracefully");
-                std::process::exit(0);
-            });
+            }
+            if let Err(e) = default_config.save().await {
+                error!("Failed to save default config to {:?}: {}", main_config_path, e);
+                return Err(GraphError::StorageError(format!("Failed to save default config: {}", e)));
+            }
+            debug!("Default config saved to {:?}", main_config_path);
+            default_config
+        };
+
+        // Step 3: Validate storage directory (config.path)
+        let storage_path = &config.path;
+        if !storage_path.exists() {
+            debug!("Creating storage directory: {:?}", storage_path);
+            if let Err(e) = fs::create_dir_all(storage_path).await {
+                error!("Failed to create storage directory {:?}: {}", storage_path, e);
+                return Err(GraphError::StorageError(format!("Failed to create storage directory: {}", e)));
+            }
         }
 
-        info!("SledStorage initialized successfully");
-        Ok(storage)
+        // Step 4: Update engine-specific config if missing or incomplete
+        if storage_config.engine_specific_config.is_none() || storage_config.engine_specific_config.as_ref().unwrap().is_empty() {
+            debug!("Setting default engine-specific config for Sled");
+            storage_config.engine_specific_config = Some(HashMap::from([
+                ("path".to_string(), Value::String(storage_path.to_string_lossy().into_owned())),
+                ("host".to_string(), Value::String(config.host.clone().unwrap_or("127.0.0.1".to_string()))),
+                ("port".to_string(), Value::Number(config.port.unwrap_or(storage_config.default_port).into())),
+                ("temporary".to_string(), Value::Bool(config.temporary)),
+                ("use_compression".to_string(), Value::Bool(config.use_compression)),
+                ("cache_capacity".to_string(), Value::Number(config.cache_capacity.unwrap_or(1024 * 1024 * 1024).into())),
+                ("storage_engine_type".to_string(), Value::String("sled".to_string())),
+            ]));
+        }
+
+        // Step 5: Initialize daemon pool
+        let mut daemon_pool = SledDaemonPool::new();
+        daemon_pool
+            .initialize_cluster(&storage_config, config)
+            .await
+            .map_err(|e| GraphError::StorageError(format!("Failed to initialize SledDaemonPool: {}", e)))?;
+
+        let pool = Arc::new(TokioMutex::new(daemon_pool));
+
+        info!(
+            "Successfully initialized SledStorage with config path: {:?}, storage path: {:?}", 
+            main_config_path, storage_path
+        );
+        Ok(SledStorage { pool })
     }
 
-    /// Safely removes any existing lock files and checks for active processes.
+    // ... (rest of the file remains unchanged, included for completeness)
+    pub async fn set_key(&self, key: &str, value: &str) -> GraphResult<()> {
+        let pool = self.pool.lock().await;
+        let daemon = pool.leader_daemon().await?;
+        debug!("Setting key '{}' to value '{}' in Sled database at {:?}", key, value, daemon.db_path());
+        daemon.kv_pairs
+            .insert(key.as_bytes(), value.as_bytes())
+            .map_err(|e| {
+                error!("Failed to set key '{}': {}", key, e);
+                GraphError::StorageError(format!("Failed to set key '{}': {}", key, e))
+            })?;
+        daemon.db.flush_async().await.map_err(|e| {
+            error!("Failed to flush Sled database after setting key '{}': {}", key, e);
+            GraphError::StorageError(format!("Failed to flush Sled database after setting key '{}': {}", key, e))
+        })?;
+        debug!("Successfully set key '{}' and flushed database", key);
+        Ok(())
+    }
+
+    pub async fn get_key(&self, key: &str) -> GraphResult<Option<String>> {
+        let pool = self.pool.lock().await;
+        let daemon = pool.leader_daemon().await?;
+        debug!("Retrieving key '{}' from Sled database at {:?}", key, daemon.db_path());
+        let value = daemon.kv_pairs
+            .get(key.as_bytes())
+            .map_err(|e| {
+                error!("Failed to get key '{}': {}", key, e);
+                GraphError::StorageError(format!("Failed to get key '{}': {}", key, e))
+            })?
+            .map(|v| String::from_utf8_lossy(&v).to_string());
+        debug!("Retrieved value for key '{}': {:?}", key, value);
+        Ok(value)
+    }
+
     pub async fn force_unlock(path: &Path) -> GraphResult<()> {
-        info!("Attempting to safely remove locks on Sled database at {:?}", path);
+        info!("Attempting to force unlock Sled database at {:?}", path);
+        let lock_path = path.join("db");
 
-        let lock_path = path.join("db.lck");
-
-        // Passively remove lock file with retry
+        debug!("Checking for lock file at {:?}", lock_path);
         if lock_path.exists() {
             warn!("Found potential lock file at {:?}", lock_path);
-            run_sync(log_lock_file_diagnostics(lock_path.clone()))?;
-            for attempt in 1..=3 {
-                match std::fs::remove_file(&lock_path) {
-                    Ok(_) => {
-                        info!("Successfully removed stale lock file on attempt {}", attempt);
-                        break;
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        warn!("Lock file removal blocked on attempt {}: {}", attempt, e);
-                        tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
-                        if attempt == 3 {
-                            error!("Failed to remove lock file after 3 attempts: {}", e);
-                            return Err(GraphError::StorageError(format!(
-                                "Failed to remove lock file at {:?}: {}. Another process may be holding the lock (PIDs: 25656, 25709, 25765; ports: 2380, 8049, 8051). Stop these processes or verify Raft leadership.",
-                                lock_path, e
-                            )));
+            #[cfg(unix)]
+            {
+                const MAX_RETRIES: u32 = 3;
+                const BASE_DELAY_MS: u64 = 1000;
+                let mut attempt = 0;
+
+                while attempt < MAX_RETRIES {
+                    match timeout(Duration::from_secs(2), tokio::process::Command::new("lsof")
+                        .arg("-t")
+                        .arg(lock_path.to_str().ok_or_else(|| {
+                            GraphError::StorageError("Invalid lock file path".to_string())
+                        })?)
+                        .output())
+                        .await
+                    {
+                        Ok(Ok(output)) => {
+                            let lsof_output = String::from_utf8_lossy(&output.stdout).to_string();
+                            info!("lsof output for {:?}: {}", lock_path, lsof_output);
+                            let pids: Vec<u32> = lsof_output
+                                .lines()
+                                .filter_map(|pid| pid.trim().parse().ok())
+                                .collect();
+                            info!("PIDs holding lock on {:?}: {:?}", lock_path, pids);
+                            let current_pid = std::process::id();
+
+                            for pid in pids {
+                                if pid != current_pid {
+                                    let proc_info = timeout(Duration::from_secs(2), tokio::process::Command::new("ps")
+                                        .arg("-p")
+                                        .arg(pid.to_string())
+                                        .arg("-o")
+                                        .arg("pid,comm,args")
+                                        .output())
+                                        .await
+                                        .map_err(|_| GraphError::StorageError("Timeout getting process info".to_string()))?
+                                        .map_err(|e| GraphError::StorageError(format!("Failed to get process info for PID {}: {}", pid, e)))?;
+                                    let proc_info_str = String::from_utf8_lossy(&proc_info.stdout);
+                                    warn!("Process {} is holding lock file {:?}:\n{}", pid, lock_path, proc_info_str);
+
+                                    if let Err(e) = timeout(Duration::from_secs(2), tokio::process::Command::new("kill")
+                                        .arg("-TERM")
+                                        .arg(pid.to_string())
+                                        .status())
+                                        .await
+                                        .map_err(|_| GraphError::StorageError("Timeout sending SIGTERM".to_string()))?
+                                    {
+                                        warn!("Failed to send SIGTERM to process {}: {}", pid, e);
+                                    }
+                                    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+                                    let is_running = timeout(Duration::from_secs(2), tokio::process::Command::new("ps")
+                                        .arg("-p")
+                                        .arg(pid.to_string())
+                                        .status())
+                                        .await
+                                        .map_err(|_| GraphError::StorageError("Timeout checking process status".to_string()))?
+                                        .map(|status| status.success())
+                                        .unwrap_or(false);
+
+                                    if is_running {
+                                        warn!("Process {} still running after SIGTERM, attempting SIGKILL", pid);
+                                        if let Err(e) = timeout(Duration::from_secs(2), tokio::process::Command::new("kill")
+                                            .arg("-KILL")
+                                            .arg(pid.to_string())
+                                            .status())
+                                            .await
+                                            .map_err(|_| GraphError::StorageError("Timeout sending SIGKILL".to_string()))?
+                                        {
+                                            warn!("Failed to send SIGKILL to process {}: {}", pid, e);
+                                        }
+                                        tokio::time::sleep(Duration::from_millis(500)).await;
+                                    }
+                                }
+                            }
+
+                            if let Err(e) = timeout(Duration::from_secs(2), fs::remove_file(&lock_path)).await {
+                                warn!("Failed to remove lock file at {:?} on attempt {}: {:?}", lock_path, attempt + 1, e);
+                                attempt += 1;
+                                tokio::time::sleep(Duration::from_millis(BASE_DELAY_MS * (attempt as u64 + 1))).await;
+                                continue;
+                            }
+                            info!("Successfully removed lock file at {:?}", lock_path);
+                            break;
+                        }
+                        Ok(Err(e)) => {
+                            warn!("Failed to run lsof on {:?} on attempt {}: {}", lock_path, attempt + 1, e);
+                            attempt += 1;
+                            tokio::time::sleep(Duration::from_millis(BASE_DELAY_MS * (attempt as u64 + 1))).await;
+                            continue;
+                        }
+                        Err(_) => {
+                            warn!("Timeout running lsof on {:?} on attempt {}", lock_path, attempt + 1);
+                            attempt += 1;
+                            tokio::time::sleep(Duration::from_millis(BASE_DELAY_MS * (attempt as u64 + 1))).await;
+                            continue;
                         }
                     }
-                    Err(e) => {
-                        error!("Failed to remove lock file: {}", e);
-                        return Err(GraphError::StorageError(format!("Failed to remove lock file at {:?}: {}", lock_path, e)));
-                    }
                 }
+
+                if attempt >= MAX_RETRIES {
+                    error!("Failed to unlock {:?} after {} attempts", lock_path, MAX_RETRIES);
+                    return Err(GraphError::StorageError(format!("Failed to unlock {:?} after {} attempts", lock_path, MAX_RETRIES)));
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                if let Err(e) = timeout(Duration::from_secs(2), fs::remove_file(&lock_path)).await {
+                    error!("Failed to remove lock file at {:?}: {:?}", lock_path, e);
+                    return Err(GraphError::StorageError(format!("Failed to remove lock file at {:?}", lock_path)));
+                }
+                info!("Successfully removed lock file at {:?}", lock_path);
             }
         } else {
             info!("No lock file found at {:?}", lock_path);
         }
-
         Ok(())
     }
 
-    fn verify_database_accessible(db_path: &Path) -> GraphResult<bool> {
-        match std::fs::File::open(db_path) {
-            Ok(_) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
-            Err(_) => Ok(true),
-        }
-    }
-
-    fn backup_and_recreate_database(path: &Path) -> GraphResult<()> {
-        warn!("Attempting to backup and recreate potentially corrupted database");
-
-        let backup_path = path.with_extension("backup");
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let backup_path = backup_path.with_extension(format!("backup.{}", timestamp));
-
-        if let Err(e) = std::fs::rename(path, &backup_path) {
-            error!("Failed to backup database directory: {}", e);
-            warn!("Attempting to remove locked database directory entirely");
-            if let Err(e2) = std::fs::remove_dir_all(path) {
-                return Err(GraphError::StorageError(format!(
-                    "Failed to backup or remove locked database: backup error: {}, remove error: {}",
-                    e, e2
-                )));
-            }
-        } else {
-            info!("Successfully backed up database to {:?}", backup_path);
-        }
-
-        std::fs::create_dir_all(path).map_err(|e| GraphError::Io(e))?;
-
-        Ok(())
-    }
-
-    /// Nuclear option: completely destroy and recreate the database
-    pub async fn force_reset(config: &SledConfig) -> GraphResult<SledStorage> {
+    pub async fn force_reset(config: &SledConfig) -> GraphResult<Self> {
         warn!("FORCE RESET: Completely destroying and recreating database at {:?}", config.path);
         if config.path.exists() {
-            std::fs::remove_dir_all(&config.path).map_err(|e| {
-                GraphError::StorageError(format!("Failed to remove database directory: {}", e))
-            })?;
+            if let Err(e) = timeout(Duration::from_secs(10), tokio::fs::remove_dir_all(&config.path)).await {
+                error!("Timeout or error removing database directory at {:?}: {:?}", config.path, e);
+                return Err(GraphError::StorageError(format!("Failed to remove database directory: {:?}", e)));
+            }
         }
-        SledStorage::new(config).await
+        timeout(Duration::from_secs(30), SledStorage::new(config)).await
+            .map_err(|_| GraphError::StorageError("Timeout initializing SledStorage after reset".to_string()))?
     }
 
-    pub fn reset(&mut self) -> GraphResult<()> {
-        self.vertices.clear().map_err(|e| GraphError::StorageError(e.to_string()))?;
-        self.edges.clear().map_err(|e| GraphError::StorageError(e.to_string()))?;
-        self.db.flush().map_err(|e| GraphError::Io(e.into()))?;
-        Ok(())
+    pub async fn close(&self) -> GraphResult<()> {
+        let pool = self.pool.lock().await;
+        info!("Closing SledStorage pool");
+        let futures = pool.daemons.values().map(|daemon| async {
+            let db_path = daemon.db_path();
+            match timeout(Duration::from_secs(10), daemon.db.flush_async()).await {
+                Ok(Ok(bytes_flushed)) => {
+                    info!("Flushed {} bytes during close at {:?}", bytes_flushed, db_path);
+                    Ok(())
+                }
+                Ok(Err(e)) => {
+                    error!("Failed to flush daemon at {:?}: {}", db_path, e);
+                    Err(GraphError::StorageError(e.to_string()))
+                }
+                Err(_) => {
+                    error!("Timeout flushing daemon at {:?}", db_path);
+                    Err(GraphError::StorageError(format!("Timeout flushing daemon at {:?}", db_path)))
+                }
+            }
+        });
+        let results = join_all(futures).await;
+        let errors: Vec<_> = results.into_iter().filter_map(|r| r.err()).collect();
+        if !errors.is_empty() {
+            error!("Errors during close: {:?}", errors);
+            return Err(GraphError::StorageError(format!("Close errors: {:?}", errors)));
+        }
+
+        match timeout(Duration::from_secs(10), pool.close(None)).await {
+            Ok(Ok(_)) => {
+                info!("Successfully closed SledStorage pool");
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                error!("Failed to close SledStorage pool: {}", e);
+                Err(e)
+            }
+            Err(_) => {
+                error!("Timeout closing SledStorage pool");
+                Err(GraphError::StorageError("Timeout closing SledStorage pool".to_string()))
+            }
+        }
     }
 }
 
-// StorageEngine implementation
 #[async_trait]
 impl StorageEngine for SledStorage {
-    async fn connect(&self) -> GraphResult<()> {
+    async fn connect(&self) -> Result<(), GraphError> {
+        info!("Connecting to SledStorage");
         Ok(())
     }
 
     async fn insert(&self, key: Vec<u8>, value: Vec<u8>) -> GraphResult<()> {
-        debug!("Inserting key: {:?}", String::from_utf8_lossy(&key));
-        self.kv_pairs.insert(key, value).map_err(|e| GraphError::StorageError(e.to_string()))?;
-        self.db.flush_async().await.map_err(|e| GraphError::Io(e.into()))?;
-        debug!("Successfully inserted key-value pair");
+        let pool = self.pool.lock().await;
+        let daemon = pool.leader_daemon().await?;
+        let db_path = daemon.db_path();
+        info!("Inserting key {:?} into kv_pairs at path {:?}", key, db_path);
+        timeout(Duration::from_secs(5), daemon.insert(&key, &value)).await
+            .map_err(|_| GraphError::StorageError("Timeout during insert".to_string()))??;
+        let bytes_flushed = timeout(Duration::from_secs(10), daemon.db.flush_async()).await
+            .map_err(|_| GraphError::StorageError("Timeout flushing after insert".to_string()))?
+            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+        info!("Flushed {} bytes after insert at {:?}", bytes_flushed, db_path);
+        let keys: Vec<_> = daemon.kv_pairs
+            .iter()
+            .keys()
+            .filter_map(|k| k.ok())
+            .map(|k| String::from_utf8_lossy(&k).to_string())
+            .collect();
+        info!("Current keys in kv_pairs at {:?}: {:?}", db_path, keys);
         Ok(())
     }
 
     async fn retrieve(&self, key: &Vec<u8>) -> GraphResult<Option<Vec<u8>>> {
-        debug!("Retrieving key: {:?}", String::from_utf8_lossy(key));
-        let result = self.kv_pairs.get(key).map_err(|e| GraphError::StorageError(e.to_string()))?;
-        if let Some(ref v) = result {
-            debug!("Retrieved value: {:?}", String::from_utf8_lossy(v));
-        } else {
-            debug!("No value found for key");
-        }
-        Ok(result.map(|ivec| ivec.to_vec()))
+        let pool = self.pool.lock().await;
+        let daemon = pool.leader_daemon().await?;
+        let db_path = daemon.db_path();
+        info!("Retrieving key {:?} from kv_pairs at path {:?}", key, db_path);
+        let value = timeout(Duration::from_secs(5), daemon.retrieve(key)).await
+            .map_err(|_| GraphError::StorageError("Timeout during retrieve".to_string()))??;
+        let keys: Vec<_> = daemon.kv_pairs
+            .iter()
+            .keys()
+            .filter_map(|k| k.ok())
+            .map(|k| String::from_utf8_lossy(&k).to_string())
+            .collect();
+        info!("Current keys in kv_pairs at {:?}: {:?}", db_path, keys);
+        Ok(value)
     }
 
     async fn delete(&self, key: &Vec<u8>) -> GraphResult<()> {
-        debug!("Deleting key: {:?}", String::from_utf8_lossy(key));
-        self.kv_pairs.remove(key).map_err(|e| GraphError::StorageError(e.to_string()))?;
-        self.db.flush_async().await.map_err(|e| GraphError::Io(e.into()))?;
-        debug!("Successfully deleted key");
+        let pool = self.pool.lock().await;
+        let daemon = pool.leader_daemon().await?;
+        let db_path = daemon.db_path();
+        info!("Deleting key {:?} from kv_pairs at path {:?}", key, db_path);
+        timeout(Duration::from_secs(5), daemon.delete(key)).await
+            .map_err(|_| GraphError::StorageError("Timeout during delete".to_string()))??;
+        let bytes_flushed = timeout(Duration::from_secs(10), daemon.db.flush_async()).await
+            .map_err(|_| GraphError::StorageError("Timeout flushing after delete".to_string()))?
+            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+        info!("Flushed {} bytes after delete at {:?}", bytes_flushed, db_path);
+        let keys: Vec<_> = daemon.kv_pairs
+            .iter()
+            .keys()
+            .filter_map(|k| k.ok())
+            .map(|k| String::from_utf8_lossy(&k).to_string())
+            .collect();
+        info!("Current keys in kv_pairs at {:?}: {:?}", db_path, keys);
         Ok(())
     }
 
-    async fn flush(&self) -> GraphResult<()> {
-        info!("Flushing Sled storage engine");
-        self.db.flush_async().await.map_err(|e| GraphError::Io(e.into()))?;
+    async fn flush(&self) -> Result<(), GraphError> {
+        let pool = self.pool.lock().await;
+        let futures = pool.daemons.values().map(|daemon| async {
+            let db_path = daemon.db_path();
+            info!("Flushing daemon at path {:?}", db_path);
+            match timeout(Duration::from_secs(10), daemon.db.flush_async()).await {
+                Ok(Ok(bytes_flushed)) => {
+                    info!("Flushed {} bytes to disk at {:?}", bytes_flushed, db_path);
+                    Ok(())
+                }
+                Ok(Err(e)) => {
+                    error!("Failed to flush daemon at {:?}: {}", db_path, e);
+                    Err(GraphError::StorageError(e.to_string()))
+                }
+                Err(_) => {
+                    error!("Timeout flushing daemon at {:?}", db_path);
+                    Err(GraphError::StorageError(format!("Timeout flushing daemon at {:?}", db_path)))
+                }
+            }
+        });
+        let results = join_all(futures).await;
+        let errors: Vec<_> = results.into_iter().filter_map(|r| r.err()).collect();
+        if !errors.is_empty() {
+            error!("Errors during flush: {:?}", errors);
+            return Err(GraphError::StorageError(format!("Flush errors: {:?}", errors)));
+        }
+        info!("Successfully flushed all daemons");
         Ok(())
     }
 }
 
 #[async_trait]
 impl GraphStorageEngine for SledStorage {
-    async fn clear_data(&self) -> Result<(), GraphError> {
-        self.vertices.clear().map_err(|e| GraphError::StorageError(e.to_string()))?;
-        self.edges.clear().map_err(|e| GraphError::StorageError(e.to_string()))?;
-        self.kv_pairs.clear().map_err(|e| GraphError::StorageError(e.to_string()))?;
-        self.db.flush_async().await.map_err(|e| GraphError::Io(e.into()))?;
+    async fn create_vertex(&self, vertex: Vertex) -> GraphResult<()> {
+        let pool = self.pool.lock().await;
+        let daemon = pool.leader_daemon().await?;
+        let db_path = daemon.db_path();
+        info!("Creating vertex at path {:?}", db_path);
+        timeout(Duration::from_secs(5), pool.create_vertex(vertex, None)).await
+            .map_err(|_| GraphError::StorageError("Timeout during create_vertex".to_string()))??;
+        let bytes_flushed = timeout(Duration::from_secs(10), daemon.db.flush_async()).await
+            .map_err(|_| GraphError::StorageError("Timeout flushing after create_vertex".to_string()))?
+            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+        info!("Flushed {} bytes after creating vertex at {:?}", bytes_flushed, db_path);
+        let vertex_keys: Vec<_> = daemon.vertices
+            .iter()
+            .keys()
+            .filter_map(|k| k.ok())
+            .map(|k| String::from_utf8_lossy(&k).to_string())
+            .collect();
+        info!("Current vertex keys at {:?}: {:?}", db_path, vertex_keys);
         Ok(())
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
+    async fn get_vertex(&self, id: &Uuid) -> GraphResult<Option<Vertex>> {
+        let pool = self.pool.lock().await;
+        let daemon = pool.leader_daemon().await?;
+        let db_path = daemon.db_path();
+        info!("Retrieving vertex with id {} from path {:?}", id, db_path);
+        let vertex = timeout(Duration::from_secs(5), pool.get_vertex(id, None)).await
+            .map_err(|_| GraphError::StorageError("Timeout during get_vertex".to_string()))??;
+        let vertex_keys: Vec<_> = daemon.vertices
+            .iter()
+            .keys()
+            .filter_map(|k| k.ok())
+            .map(|k| String::from_utf8_lossy(&k).to_string())
+            .collect();
+        info!("Current vertex keys at {:?}: {:?}", db_path, vertex_keys);
+        Ok(vertex)
     }
 
-    async fn start(&self) -> GraphResult<()> {
-        let mut running_guard = self.running.lock().await;
-        if *running_guard {
-            info!("Sled storage engine is already running");
-            return Ok(());
-        }
-        info!("Starting Sled storage engine");
-        *running_guard = true;
+    async fn update_vertex(&self, vertex: Vertex) -> GraphResult<()> {
+        let pool = self.pool.lock().await;
+        let daemon = pool.leader_daemon().await?;
+        let db_path = daemon.db_path();
+        info!("Updating vertex at path {:?}", db_path);
+        timeout(Duration::from_secs(5), pool.update_vertex(vertex, None)).await
+            .map_err(|_| GraphError::StorageError("Timeout during update_vertex".to_string()))??;
+        let bytes_flushed = timeout(Duration::from_secs(10), daemon.db.flush_async()).await
+            .map_err(|_| GraphError::StorageError("Timeout flushing after update_vertex".to_string()))?
+            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+        info!("Flushed {} bytes after updating vertex at {:?}", bytes_flushed, db_path);
+        let vertex_keys: Vec<_> = daemon.vertices
+            .iter()
+            .keys()
+            .filter_map(|k| k.ok())
+            .map(|k| String::from_utf8_lossy(&k).to_string())
+            .collect();
+        info!("Current vertex keys at {:?}: {:?}", db_path, vertex_keys);
         Ok(())
     }
 
-    async fn stop(&self) -> GraphResult<()> {
-        {
-            let mut running_guard = self.running.lock().await;
-            if !*running_guard {
-                info!("Sled storage engine is already stopped");
-                return Ok(());
+    async fn delete_vertex(&self, id: &Uuid) -> GraphResult<()> {
+        let pool = self.pool.lock().await;
+        let daemon = pool.leader_daemon().await?;
+        let db_path = daemon.db_path();
+        info!("Deleting vertex with id {} from path {:?}", id, db_path);
+        timeout(Duration::from_secs(5), pool.delete_vertex(id, None)).await
+            .map_err(|_| GraphError::StorageError("Timeout during delete_vertex".to_string()))??;
+        let bytes_flushed = timeout(Duration::from_secs(10), daemon.db.flush_async()).await
+            .map_err(|_| GraphError::StorageError("Timeout flushing after delete_vertex".to_string()))?
+            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+        info!("Flushed {} bytes after deleting vertex at {:?}", bytes_flushed, db_path);
+        let vertex_keys: Vec<_> = daemon.vertices
+            .iter()
+            .keys()
+            .filter_map(|k| k.ok())
+            .map(|k| String::from_utf8_lossy(&k).to_string())
+            .collect();
+        info!("Current vertex keys at {:?}: {:?}", db_path, vertex_keys);
+        Ok(())
+    }
+
+    async fn create_edge(&self, edge: Edge) -> GraphResult<()> {
+        let pool = self.pool.lock().await;
+        let daemon = pool.leader_daemon().await?;
+        let db_path = daemon.db_path();
+        info!("Creating edge at path {:?}", db_path);
+        timeout(Duration::from_secs(5), pool.create_edge(edge, None)).await
+            .map_err(|_| GraphError::StorageError("Timeout during create_edge".to_string()))??;
+        let bytes_flushed = timeout(Duration::from_secs(10), daemon.db.flush_async()).await
+            .map_err(|_| GraphError::StorageError("Timeout flushing after create_edge".to_string()))?
+            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+        info!("Flushed {} bytes after creating edge at {:?}", bytes_flushed, db_path);
+        let edge_keys: Vec<_> = daemon.edges
+            .iter()
+            .keys()
+            .filter_map(|k| k.ok())
+            .map(|k| String::from_utf8_lossy(&k).to_string())
+            .collect();
+        info!("Current edge keys at {:?}: {:?}", db_path, edge_keys);
+        Ok(())
+    }
+
+    async fn get_edge(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> GraphResult<Option<Edge>> {
+        let pool = self.pool.lock().await;
+        let daemon = pool.leader_daemon().await?;
+        let db_path = daemon.db_path();
+        info!("Retrieving edge ({}, {}, {}) from path {:?}", outbound_id, edge_type, inbound_id, db_path);
+        let edge = timeout(Duration::from_secs(5), pool.get_edge(outbound_id, edge_type, inbound_id, None)).await
+            .map_err(|_| GraphError::StorageError("Timeout during get_edge".to_string()))??;
+        let edge_keys: Vec<_> = daemon.edges
+            .iter()
+            .keys()
+            .filter_map(|k| k.ok())
+            .map(|k| String::from_utf8_lossy(&k).to_string())
+            .collect();
+        info!("Current edge keys at {:?}: {:?}", db_path, edge_keys);
+        Ok(edge)
+    }
+
+    async fn update_edge(&self, edge: Edge) -> GraphResult<()> {
+        let pool = self.pool.lock().await;
+        let daemon = pool.leader_daemon().await?;
+        let db_path = daemon.db_path();
+        info!("Updating edge at path {:?}", db_path);
+        timeout(Duration::from_secs(5), pool.update_edge(edge, None)).await
+            .map_err(|_| GraphError::StorageError("Timeout during update_edge".to_string()))??;
+        let bytes_flushed = timeout(Duration::from_secs(10), daemon.db.flush_async()).await
+            .map_err(|_| GraphError::StorageError("Timeout flushing after update_edge".to_string()))?
+            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+        info!("Flushed {} bytes after updating edge at {:?}", bytes_flushed, db_path);
+        let edge_keys: Vec<_> = daemon.edges
+            .iter()
+            .keys()
+            .filter_map(|k| k.ok())
+            .map(|k| String::from_utf8_lossy(&k).to_string())
+            .collect();
+        info!("Current edge keys at {:?}: {:?}", db_path, edge_keys);
+        Ok(())
+    }
+
+    async fn delete_edge(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> GraphResult<()> {
+        let pool = self.pool.lock().await;
+        let daemon = pool.leader_daemon().await?;
+        let db_path = daemon.db_path();
+        info!("Deleting edge ({}, {}, {}) from path {:?}", outbound_id, edge_type, inbound_id, db_path);
+        timeout(Duration::from_secs(5), pool.delete_edge(outbound_id, edge_type, inbound_id, None)).await
+            .map_err(|_| GraphError::StorageError("Timeout during delete_edge".to_string()))??;
+        let bytes_flushed = timeout(Duration::from_secs(10), daemon.db.flush_async()).await
+            .map_err(|_| GraphError::StorageError("Timeout flushing after delete_edge".to_string()))?
+            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+        info!("Flushed {} bytes after deleting edge at {:?}", bytes_flushed, db_path);
+        let edge_keys: Vec<_> = daemon.edges
+            .iter()
+            .keys()
+            .filter_map(|k| k.ok())
+            .map(|k| String::from_utf8_lossy(&k).to_string())
+            .collect();
+        info!("Current edge keys at {:?}: {:?}", db_path, edge_keys);
+        Ok(())
+    }
+
+    async fn close(&self) -> GraphResult<()> {
+        let pool = self.pool.lock().await;
+        info!("Closing SledStorage pool");
+        let futures = pool.daemons.values().map(|daemon| async {
+            let db_path = daemon.db_path();
+            match timeout(Duration::from_secs(10), daemon.db.flush_async()).await {
+                Ok(Ok(bytes_flushed)) => {
+                    info!("Flushed {} bytes during close at {:?}", bytes_flushed, db_path);
+                    Ok(())
+                }
+                Ok(Err(e)) => {
+                    error!("Failed to flush daemon at {:?}: {}", db_path, e);
+                    Err(GraphError::StorageError(e.to_string()))
+                }
+                Err(_) => {
+                    error!("Timeout flushing daemon at {:?}", db_path);
+                    Err(GraphError::StorageError(format!("Timeout flushing daemon at {:?}", db_path)))
+                }
             }
-            info!("Stopping Sled storage engine");
-            *running_guard = false;
+        });
+        let results = join_all(futures).await;
+        let errors: Vec<_> = results.into_iter().filter_map(|r| r.err()).collect();
+        if !errors.is_empty() {
+            error!("Errors during close: {:?}", errors);
+            return Err(GraphError::StorageError(format!("Close errors: {:?}", errors)));
         }
+
+        match timeout(Duration::from_secs(10), pool.close(None)).await {
+            Ok(Ok(_)) => {
+                info!("Successfully closed SledStorage pool");
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                error!("Failed to close SledStorage pool: {}", e);
+                Err(e)
+            }
+            Err(_) => {
+                error!("Timeout closing SledStorage pool");
+                Err(GraphError::StorageError("Timeout closing SledStorage pool".to_string()))
+            }
+        }
+    }
+
+    async fn start(&self) -> Result<(), GraphError> {
+        info!("Starting SledStorage");
+        Ok(())
+    }
+
+    async fn stop(&self) -> Result<(), GraphError> {
+        info!("Stopping SledStorage");
         self.close().await
     }
 
@@ -470,132 +661,135 @@ impl GraphStorageEngine for SledStorage {
     }
 
     async fn is_running(&self) -> bool {
-        let running_guard = self.running.lock().await;
-        *running_guard
+        let pool = self.pool.lock().await;
+        let daemon_count = pool.daemons.len();
+        info!("Checking running status for {} daemons", daemon_count);
+        let futures = pool.daemons.values().map(|daemon| async {
+            timeout(Duration::from_secs(2), daemon.is_running()).await
+                .map_err(|_| false)
+                .unwrap_or(false)
+        });
+        let results = join_all(futures).await;
+        let is_running = results.iter().any(|&r| r);
+        info!("SledStorage running status: {}, daemon states: {:?}", is_running, results);
+        is_running
     }
 
-    async fn query(&self, query_string: &str) -> GraphResult<Value> {
-        debug!("Executing query against SledStorage: {}", query_string);
-        Ok(serde_json::json!({
-            "status": "success",
-            "query": query_string,
-            "result": "Sled query execution placeholder"
-        }))
+    async fn query(&self, _query_string: &str) -> Result<Value, GraphError> {
+        info!("Executing query on SledStorage (returning null as not implemented)");
+        Ok(Value::Null)
     }
 
-    async fn create_vertex(&self, vertex: Vertex) -> GraphResult<()> {
-        let key = vertex.id.0.as_bytes().to_vec();
-        let value = serialize_vertex(&vertex)?;
-        debug!("Creating vertex with key: {:?}", String::from_utf8_lossy(&key));
-        self.vertices.insert(key, value).map_err(|e| GraphError::StorageError(e.to_string()))?;
-        self.db.flush_async().await.map_err(|e| GraphError::Io(e.into()))?;
-        debug!("Successfully created vertex");
-        Ok(())
-    }
-
-    async fn get_vertex(&self, id: &Uuid) -> GraphResult<Option<Vertex>> {
-        let key = id.as_bytes().to_vec();
-        debug!("Retrieving vertex with key: {:?}", String::from_utf8_lossy(&key));
-        let result = self.vertices.get(&key).map_err(|e| GraphError::StorageError(e.to_string()))?;
-        if let Some(ref v) = result {
-            debug!("Vertex found: {:?}", String::from_utf8_lossy(v));
-        } else {
-            debug!("No vertex found for key");
-        }
-        Ok(result.map(|bytes| deserialize_vertex(&bytes)).transpose()?)
-    }
-
-    async fn update_vertex(&self, vertex: Vertex) -> GraphResult<()> {
-        self.delete_vertex(&vertex.id.into()).await?;
-        self.create_vertex(vertex).await
-    }
-
-    async fn delete_vertex(&self, id: &Uuid) -> GraphResult<()> {
-        let key = id.as_bytes().to_vec();
-        debug!("Deleting vertex with key: {:?}", String::from_utf8_lossy(&key));
-        self.vertices.remove(&key).map_err(|e| GraphError::StorageError(e.to_string()))?;
-
-        let mut batch = sled::Batch::default();
-        let prefix = id.as_bytes();
-        for item in self.edges.iter().keys() {
-            let key = item.map_err(|e| GraphError::StorageError(e.to_string()))?;
-            if key.starts_with(prefix) {
-                batch.remove(key);
-            }
-        }
-        self.edges.apply_batch(batch).map_err(|e| GraphError::StorageError(e.to_string()))?;
-        self.db.flush_async().await.map_err(|e| GraphError::Io(e.into()))?;
-        debug!("Successfully deleted vertex");
-        Ok(())
-    }
-
-    async fn get_all_vertices(&self) -> GraphResult<Vec<Vertex>> {
+    async fn get_all_vertices(&self) -> Result<Vec<Vertex>, GraphError> {
+        let pool = self.pool.lock().await;
+        let daemon = pool.leader_daemon().await?;
+        let db_path = daemon.db_path();
+        info!("Retrieving all vertices from path {:?}", db_path);
         let mut vertices = Vec::new();
-        for item in self.vertices.iter() {
-            let (_key, value) = item.map_err(|e| GraphError::StorageError(e.to_string()))?;
-            let vertex = deserialize_vertex(&value)?;
-            vertices.push(vertex);
+        for result in daemon.vertices.iter() {
+            let (_k, v) = result.map_err(|e| GraphError::StorageError(e.to_string()))?;
+            vertices.push(deserialize_vertex(&v)?);
         }
-        debug!("Retrieved {} vertices", vertices.len());
+        info!("Retrieved {} vertices from path {:?}", vertices.len(), db_path);
         Ok(vertices)
     }
 
-    async fn create_edge(&self, edge: Edge) -> GraphResult<()> {
-        if self.get_vertex(&edge.outbound_id.into()).await?.is_none() || self.get_vertex(&edge.inbound_id.into()).await?.is_none() {
-            return Err(GraphError::InvalidData("One or both vertices for the edge do not exist.".to_string()));
-        }
-
-        let key = create_edge_key(&edge.outbound_id.into(), &edge.t, &edge.inbound_id.into())?;
-        let value = serialize_edge(&edge)?;
-        debug!("Creating edge with key: {:?}", String::from_utf8_lossy(&key));
-        self.edges.insert(key, value).map_err(|e| GraphError::StorageError(e.to_string()))?;
-        self.db.flush_async().await.map_err(|e| GraphError::Io(e.into()))?;
-        debug!("Successfully created edge");
-        Ok(())
-    }
-
-    async fn get_edge(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> GraphResult<Option<Edge>> {
-        let key = create_edge_key(&(*outbound_id).into(), edge_type, &(*inbound_id).into())?;
-        debug!("Retrieving edge with key: {:?}", String::from_utf8_lossy(&key));
-        let result = self.edges.get(&key).map_err(|e| GraphError::StorageError(e.to_string()))?;
-        if let Some(ref v) = result {
-            debug!("Edge found: {:?}", String::from_utf8_lossy(v));
-        } else {
-            debug!("No edge found for key");
-        }
-        Ok(result.map(|bytes| deserialize_edge(&bytes)).transpose()?)
-    }
-
-    async fn update_edge(&self, edge: Edge) -> GraphResult<()> {
-        self.create_edge(edge).await
-    }
-
-    async fn delete_edge(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> GraphResult<()> {
-        let key = create_edge_key(&(*outbound_id).into(), edge_type, &(*inbound_id).into())?;
-        debug!("Deleting edge with key: {:?}", String::from_utf8_lossy(&key));
-        self.edges.remove(key).map_err(|e| GraphError::StorageError(e.to_string()))?;
-        self.db.flush_async().await.map_err(|e| GraphError::Io(e.into()))?;
-        debug!("Successfully deleted edge");
-        Ok(())
-    }
-
-    async fn get_all_edges(&self) -> GraphResult<Vec<Edge>> {
+    async fn get_all_edges(&self) -> Result<Vec<Edge>, GraphError> {
+        let pool = self.pool.lock().await;
+        let daemon = pool.leader_daemon().await?;
+        let db_path = daemon.db_path();
+        info!("Retrieving all edges from path {:?}", db_path);
         let mut edges = Vec::new();
-        for item in self.edges.iter() {
-            let (_key, value) = item.map_err(|e| GraphError::StorageError(e.to_string()))?;
-            let edge = deserialize_edge(&value)?;
-            edges.push(edge);
+        for result in daemon.edges.iter() {
+            let (_k, v) = result.map_err(|e| GraphError::StorageError(e.to_string()))?;
+            edges.push(deserialize_edge(&v)?);
         }
-        debug!("Retrieved {} edges", edges.len());
+        info!("Retrieved {} edges from path {:?}", edges.len(), db_path);
         Ok(edges)
     }
 
-    async fn close(&self) -> GraphResult<()> {
-        info!("Closing Sled storage engine");
-        self.db.flush_async().await.map_err(|e| GraphError::Io(e.into()))?;
-        let mut running_guard = self.running.lock().await;
-        *running_guard = false;
-        info!("SledStorage closed and flushed.");
+    async fn clear_data(&self) -> Result<(), GraphError> {
+        let pool = self.pool.lock().await;
+        let daemon = pool.leader_daemon().await?;
+        let db_path = daemon.db_path();
+        info!("Clearing all data from path {:?}", db_path);
+        timeout(Duration::from_secs(5), async {
+            daemon.vertices.clear().map_err(|e| GraphError::StorageError(e.to_string()))?;
+            daemon.edges.clear().map_err(|e| GraphError::StorageError(e.to_string()))?;
+            daemon.kv_pairs.clear().map_err(|e| GraphError::StorageError(e.to_string()))?;
+            Ok::<(), GraphError>(())
+        }).await
+            .map_err(|_| GraphError::StorageError("Timeout during clear_data".to_string()))??;
+        let bytes_flushed = timeout(Duration::from_secs(10), daemon.db.flush_async()).await
+            .map_err(|_| GraphError::StorageError("Timeout flushing after clear_data".to_string()))?
+            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+        info!("Flushed {} bytes after clearing data at {:?}", bytes_flushed, db_path);
         Ok(())
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+// Helper function to select an available port from cluster_range
+pub async fn select_available_port(storage_config: &StorageConfig, preferred_port: u16) -> GraphResult<u16> {
+    let cluster_ports = parse_cluster_range(&storage_config.cluster_range)?;
+    let current_pid = process::id();
+    
+    // Validate preferred_port against cluster_range
+    if !cluster_ports.contains(&preferred_port) {
+        warn!("Preferred port {} is outside cluster range {:?}", preferred_port, storage_config.cluster_range);
+        // Try to find an available port in cluster range
+        for port in cluster_ports {
+            if GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await?.is_none() {
+                debug!("Selected available port {} from cluster range", port);
+                return Ok(port);
+            }
+            if let Some(daemon_metadata) = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await? {
+                if daemon_metadata.pid == current_pid {
+                    debug!("Port {} is CLI-owned (PID {}). Reusing it.", port, current_pid);
+                    return Ok(port);
+                }
+            }
+        }
+        error!("No available ports in cluster range {:?}", storage_config.cluster_range);
+        return Err(GraphError::StorageError(format!(
+            "No available ports in cluster range {:?}", storage_config.cluster_range
+        )));
+    }
+    
+    // Check if preferred_port is available or CLI-owned
+    if let Some(daemon_metadata) = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(preferred_port).await? {
+        if daemon_metadata.pid == current_pid {
+            debug!("Preferred port {} is CLI-owned (PID {}). Reusing it.", preferred_port, current_pid);
+            return Ok(preferred_port);
+        } else {
+            warn!("Preferred port {} is in use by PID {}", preferred_port, daemon_metadata.pid);
+        }
+    } else {
+        debug!("Preferred port {} is available.", preferred_port);
+        return Ok(preferred_port);
+    }
+    
+    // Try other ports in cluster_range
+    for port in cluster_ports {
+        if port == preferred_port {
+            continue; // Already checked
+        }
+        if let Some(daemon_metadata) = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await? {
+            if daemon_metadata.pid == current_pid {
+                debug!("Port {} is CLI-owned (PID {}). Reusing it.", port, current_pid);
+                return Ok(port);
+            }
+        } else {
+            debug!("Selected available port {} from cluster range", port);
+            return Ok(port);
+        }
+    }
+    
+    error!("No available ports in cluster range {:?}", storage_config.cluster_range);
+    Err(GraphError::StorageError(format!(
+        "No available ports in cluster range {:?}", storage_config.cluster_range
+    )))
 }

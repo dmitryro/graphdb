@@ -260,7 +260,7 @@ pub async fn start_daemon(
             Some(config)
         } else {
             info!("Loading storage configuration from file: {}", storage_config_yaml);
-            let config_result = load_storage_config_from_yaml(Some(&PathBuf::from(storage_config_yaml)))
+            let config_result = load_storage_config_from_yaml(Some(&PathBuf::from(storage_config_yaml))).await
                 .map_err(|e| anyhow::Error::new(e).context(format!("Failed to load storage config from {}", storage_config_yaml)))?;
             Some(config_result)
         }

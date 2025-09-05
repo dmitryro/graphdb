@@ -1,7 +1,3 @@
-// lib/src/database.rs
-// Updated: 2025-09-01 - Fixed E0308 by ensuring match arms return Arc<dyn GraphStorageEngine + Send + Sync>
-// and corrected load_engine return type to Arc<dyn GraphStorageEngine + Send + Sync>.
-
 use anyhow::{anyhow, Result, Context};
 use async_trait::async_trait;
 use log::{error, info, warn};
@@ -56,6 +52,9 @@ impl Database {
                             path: config.data_directory.clone(),
                             host: None,
                             port: None,
+                            cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
+                            temporary: false,
+                            use_compression: false,
                         }
                     };
                     Arc::new(SledStorage::new(&sled_config).await?)
@@ -152,6 +151,9 @@ impl Database {
                                     path: config.data_directory.clone(),
                                     host: None,
                                     port: None,
+                                    cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
+                                    temporary: false,
+                                    use_compression: false,
                                 };
                                 Arc::new(SledStorage::new(&sled_config).await?)
                                     as Arc<dyn GraphStorageEngine + Send + Sync>
@@ -219,6 +221,9 @@ impl Database {
                         path: config_wrapper.storage.data_directory.clone(),
                         host: None,
                         port: None,
+                        cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
+                        temporary: false,
+                        use_compression: false,
                     };
                     Arc::new(SledStorage::new(&sled_config).await?)
                         as Arc<dyn GraphStorageEngine + Send + Sync>
@@ -306,6 +311,9 @@ impl Database {
                                     path: config_wrapper.storage.data_directory.clone(),
                                     host: None,
                                     port: None,
+                                    cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
+                                    temporary: false,
+                                    use_compression: false,
                                 };
                                 Arc::new(SledStorage::new(&sled_config).await?)
                                     as Arc<dyn GraphStorageEngine + Send + Sync>
@@ -415,4 +423,9 @@ impl Database {
     pub async fn get_all_edges(&self) -> Result<Vec<Edge>, GraphError> {
         self.storage.get_all_edges().await
     }
+
+    pub async fn close(&self) -> Result<(), GraphError> {
+        self.storage.close().await
+    }
+
 }

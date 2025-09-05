@@ -19,12 +19,6 @@ pub use lib::storage_engine::config::{StorageEngineType, StorageConfig as LibSto
 use lib::query_exec_engine::query_exec_engine::{QueryExecEngine};
 
 
-// Define a struct to mirror the YAML configuration
-#[derive(Debug, Deserialize)]
-struct EngineConfig {
-    storage: HashMap<String, Value>,
-}
-
 pub fn deserialize_engine_config<'de, D>(deserializer: D) -> Result<Option<SelectedStorageConfig>, D::Error>
 where
     D: Deserializer<'de>,
@@ -178,6 +172,31 @@ pub fn get_engine_config_path(engine_type: &StorageEngineType) -> Option<PathBuf
     }
 }
 
+// Function to create default engine-specific configuration
+pub fn create_default_selected_storage_config(engine_type: &StorageEngineType) -> SelectedStorageConfig {
+    let engine_path_name = engine_type.to_string().to_lowercase();
+    let default_path = PathBuf::from(DEFAULT_DATA_DIRECTORY).join(&engine_path_name);
+
+    let storage_config_inner = StorageConfigInner {
+        path: Some(default_path),
+        host: Some("127.0.0.1".to_string()),
+        port: Some(DEFAULT_STORAGE_PORT), // Use 8049 from config_constants.rs for all engines
+        username: None,
+        password: None,
+        database: None,
+        pd_endpoints: if *engine_type == StorageEngineType::TiKV {
+            Some("127.0.0.1:2379".to_string())
+        } else {
+            None
+        },
+    };
+
+    SelectedStorageConfig {
+        storage_engine_type: engine_type.clone(),
+        storage: storage_config_inner,
+    }
+}
+
 // --- Config Loading Functions ---
 pub fn load_main_daemon_config(config_file_path: Option<&str>) -> Result<MainDaemonConfig> {
     let default_config_path = PathBuf::from(DEFAULT_MAIN_APP_CONFIG_PATH_RELATIVE);
@@ -217,7 +236,7 @@ pub fn load_main_daemon_config(config_file_path: Option<&str>) -> Result<MainDae
     }
 }
 
-fn hashmap_to_engine_specific_config(
+pub fn hashmap_to_engine_specific_config(
     engine_type: StorageEngineType,
     map: HashMap<String, Value>,
 ) -> Result<SelectedStorageConfig, GraphError> {
@@ -285,7 +304,6 @@ pub fn load_engine_specific_config(
     );
     trace!("Constructed engine config path: {:?}", engine_config_path);
 
-    // Initialize the default engine-specific config map
     let mut engine_specific_config: HashMap<String, Value> = HashMap::new();
 
     if engine_config_path.exists() {
@@ -302,7 +320,6 @@ pub fn load_engine_specific_config(
         );
         trace!("Successfully read content from engine config file.");
 
-        // Deserialize the YAML content directly into our custom struct
         let config: EngineConfig = serde_yaml::from_str(&content).map_err(|e| {
             error!(
                 "Failed to deserialize engine-specific YAML from {:?}: {}",
@@ -314,7 +331,6 @@ pub fn load_engine_specific_config(
             ))
         })?;
 
-        // Validate and insert values from the deserialized struct
         let mut storage_map = config.storage;
 
         if let Some(storage_engine_type_value) = storage_map.remove("storage_engine_type") {
@@ -329,7 +345,6 @@ pub fn load_engine_specific_config(
             engine_specific_config.insert("storage_engine_type".to_string(), Value::String(storage_engine_type.to_string().to_lowercase()));
         }
 
-        // Insert remaining fields from the storage map
         for (key, value) in storage_map {
             engine_specific_config.insert(key, value);
         }
@@ -347,7 +362,6 @@ pub fn load_engine_specific_config(
         trace!("Engine config file does not exist. Proceeding with default values.");
     }
 
-    // Ensure required fields for Sled and RocksDB
     if matches!(engine_type, StorageEngineType::RocksDB | StorageEngineType::Sled) {
         if !engine_specific_config.contains_key("path") || engine_specific_config.get("path").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
             let default_path = format!("{}/{}", "/opt/graphdb/storage_data", engine_type.to_string().to_lowercase());
@@ -358,13 +372,8 @@ pub fn load_engine_specific_config(
             debug!("No 'host' in engine-specific config for {:?}, using default: 127.0.0.1", engine_type);
             engine_specific_config.insert("host".to_string(), Value::String("127.0.0.1".to_string()));
         }
-        if !engine_specific_config.contains_key("port") {
-            let default_port = 8049;
-            debug!("No 'port' in engine-specific config for {:?}, using default: {}", engine_type, default_port);
-            engine_specific_config.insert("port".to_string(), Value::Number(default_port.into()));
-        }
+        // Do not set a default port to preserve the port from the YAML file
     }
-    // Ensure required fields for TiKV
     if matches!(engine_type, StorageEngineType::TiKV) {
         if !engine_specific_config.contains_key("pd_endpoints") || engine_specific_config.get("pd_endpoints").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
             let default_pd_endpoints = "127.0.0.1:2379";
@@ -382,7 +391,6 @@ pub fn load_engine_specific_config(
         }
     }
 
-    // Ensure storage_engine_type is set
     let storage_type_value = serde_json::to_value(engine_type.to_string().to_lowercase())
         .map_err(|e| GraphError::ConfigurationError(format!("Failed to serialize StorageEngineType: {}", e)))?;
     engine_specific_config.insert("storage_engine_type".to_string(), storage_type_value);
@@ -393,7 +401,6 @@ pub fn load_engine_specific_config(
     );
     Ok(engine_specific_config)
 }
-
 
 pub fn load_cli_config() -> Result<CliConfigToml> {
     let default_config_path = PathBuf::from("/opt/graphdb/config.toml");

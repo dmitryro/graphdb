@@ -12,12 +12,12 @@ use tokio::task::JoinHandle;
 use tokio::sync::{oneshot, Mutex as TokioMutex};
 use tokio::net::TcpStream;
 use tokio::process::{Command as TokioCommand, Child};
-use tokio::time::{self, Duration as TokioDuration};
+use tokio::time::{self, Duration as TokioDuration, sleep, timeout};
 use tokio::io::{AsyncWriteExt, AsyncBufReadExt, BufReader, ErrorKind};
 use log::{info, error, warn, debug};
 use chrono::Utc;
 use nix::unistd::Pid as NixPid;
-use nix::sys::signal::{kill, Signal};
+use nix::sys::signal::{self, kill, Signal};
 use daemon_api::{start_daemon, stop_daemon, stop_port_daemon, DaemonError};
 use rest_api::start_server as start_rest_server;
 use storage_daemon_server::run_storage_daemon as start_storage_server;
@@ -177,20 +177,24 @@ pub async fn check_process_status_by_port(
 }
 
 /// Stops a process running on the specified port.
-/// This version is now more robust against race conditions where the process
-/// is killed but a subsequent check fails.
+/// This version is robust against race conditions where the process
+/// is killed but a subsequent check fails, and avoids thread joins.
 pub async fn stop_process_by_port(
     process_name: &str,
     port: u16
 ) -> Result<(), anyhow::Error> {
     println!("Attempting to stop {} on port {}...", process_name, port);
+    info!("Attempting to stop {} on port {}", process_name, port);
+
+    // Determine service type
     let service_type_str = if process_name.contains("Storage") { "storage" }
         else if process_name.contains("REST") { "rest" }
         else { "main" };
     let service_type = ServiceType::from_str(service_type_str, true)
         .map_err(|e| anyhow!("Invalid service type: {}", e))?;
-    
-    let metadata = match tokio::time::timeout(
+
+    // Check daemon registry for metadata
+    let metadata = match timeout(
         Duration::from_secs(2),
         GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port),
     ).await {
@@ -205,57 +209,111 @@ pub async fn stop_process_by_port(
             None
         }
     };
-    
-    let mut pid_to_stop: Option<u32> = metadata.map(|meta| meta.pid);
-    if pid_to_stop.is_none() {
-        pid_to_stop = find_pid_by_port(port).await;
+
+    // Get PID from metadata or find_pid_by_port
+    let pid_to_stop = match metadata.map(|meta| meta.pid) {
+        Some(pid) => Some(pid),
+        None => find_pid_by_port(port).await, // This is already async, no closure needed
+    };
+
+    // Skip termination for TiKV PD port (2379) unless explicitly required
+    if port == 2379 && !process_name.contains("TiKV") {
+        info!("Skipping termination for TiKV PD port {} (process: {})", port, process_name);
+        println!("Skipping termination for TiKV PD port {} (process: {}).", port, process_name);
+        return Ok(());
     }
 
     if let Some(pid) = pid_to_stop {
         let nix_pid = NixPid::from_raw(pid as i32);
-        
-        if let Err(e) = kill(nix_pid, Signal::SIGTERM) {
-            error!("Failed to send SIGTERM to PID {}: {}", pid, e);
-        } else {
-            println!("Sent SIGTERM to PID {} for {} on port {}.", pid, process_name, port);
-            let start_time = Instant::now();
-            let wait_timeout = Duration::from_secs(5);
-            let poll_interval = Duration::from_millis(200);
-            while start_time.elapsed() < wait_timeout {
-                if is_port_free(port).await {
-                    break;
-                }
-                tokio::time::sleep(poll_interval).await;
-            }
+        info!("Found PID {} for {} on port {}", pid, process_name, port);
 
-            if is_process_running(pid).await {
-                warn!("Process {} (PID {}) on port {} still running after SIGTERM. Sending SIGKILL.", process_name, pid, port);
-                if let Err(e) = kill(nix_pid, Signal::SIGKILL) {
-                    error!("Failed to send SIGKILL to PID {}: {}", pid, e);
-                } else {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    if is_process_running(pid).await {
-                        return Err(anyhow!("Failed to stop {} (PID {}) on port {}.", process_name, pid, port));
+        // Send SIGTERM
+        match signal::kill(nix_pid, Signal::SIGTERM) {
+            Ok(_) => {
+                println!("Sent SIGTERM to PID {} for {} on port {}.", pid, process_name, port);
+                info!("Sent SIGTERM to PID {} for {} on port {}", pid, process_name, port);
+            }
+            Err(nix::Error::ESRCH) => {
+                info!("Process with PID {} on port {} already terminated", pid, port);
+                println!("Process with PID {} on port {} already terminated.", pid, port);
+                // Proceed to cleanup
+            }
+            Err(e) => {
+                error!("Failed to send SIGTERM to PID {}: {}", pid, e);
+                return Err(anyhow!("Failed to send SIGTERM to PID {}: {}", pid, e));
+            }
+        }
+
+        // Poll for port to become free
+        let wait_timeout = Duration::from_secs(5);
+        let poll_interval = Duration::from_millis(200);
+        let start_time = Instant::now();
+        while start_time.elapsed() < wait_timeout {
+            if is_port_free(port).await {
+                info!("Port {} is now free after SIGTERM for PID {}", port, pid);
+                println!("Port {} is now free.", port);
+                break;
+            }
+            debug!("Port {} still in use for PID {} after {}ms", port, pid, start_time.elapsed().as_millis());
+            sleep(poll_interval).await;
+        }
+
+        // If port is still in use, send SIGKILL
+        if !is_port_free(port).await {
+            warn!("Process {} (PID {}) on port {} still running after SIGTERM. Sending SIGKILL.", process_name, pid, port);
+            match signal::kill(nix_pid, Signal::SIGKILL) {
+                Ok(_) => {
+                    info!("Sent SIGKILL to PID {} for {} on port {}", pid, process_name, port);
+                    // Poll again after SIGKILL
+                    let sigkill_timeout = Duration::from_secs(2);
+                    let sigkill_start = Instant::now();
+                    while sigkill_start.elapsed() < sigkill_timeout {
+                        if is_port_free(port).await {
+                            info!("Port {} is now free after SIGKILL for PID {}", port, pid);
+                            println!("Port {} is now free.", port);
+                            break;
+                        }
+                        debug!("Port {} still in use after SIGKILL for PID {} after {}ms", port, pid, sigkill_start.elapsed().as_millis());
+                        sleep(poll_interval).await;
                     }
+                }
+                Err(nix::Error::ESRCH) => {
+                    info!("Process with PID {} on port {} already terminated during SIGKILL attempt", pid, port);
+                    println!("Process with PID {} on port {} already terminated.", pid, port);
+                }
+                Err(e) => {
+                    error!("Failed to send SIGKILL to PID {}: {}", pid, e);
+                    return Err(anyhow!("Failed to send SIGKILL to PID {}: {}", pid, e));
                 }
             }
         }
+
+        // Final check
+        if !is_port_free(port).await {
+            return Err(anyhow!("Failed to stop {} (PID {}) on port {} after SIGTERM and SIGKILL.", process_name, pid, port));
+        }
     } else {
+        info!("No process found for {} on port {}.", process_name, port);
         println!("No process found for {} on port {}.", process_name, port);
     }
 
-    if let Err(e) = tokio::time::timeout(
-        Duration::from_secs(2),
-        GLOBAL_DAEMON_REGISTRY.unregister_daemon(port),
-    ).await {
-        error!("Failed to unregister daemon for port {}: {:?}", port, e);
+    // Unregister daemon and remove PID file
+    match timeout(Duration::from_secs(2), GLOBAL_DAEMON_REGISTRY.unregister_daemon(port)).await {
+        Ok(Ok(_)) => info!("Successfully unregistered daemon for port {}", port),
+        Ok(Err(e)) => error!("Failed to unregister daemon for port {}: {}", port, e),
+        Err(_) => error!("Timeout unregistering daemon for port {}", port),
+    };
+
+    if let Err(e) = remove_pid_file(port, &service_type).await {
+        warn!("Failed to remove PID file for port {}: {}", port, e);
     }
-    remove_pid_file(port, &service_type).await?;
 
     if is_port_free(port).await {
-        println!("Port {} is now free.", port);
+        info!("{} on port {} stopped successfully.", process_name, port);
+        println!("{} on port {} stopped.", process_name, port);
         Ok(())
     } else {
+        error!("Port {} remained in use after termination attempts.", port);
         Err(anyhow!("Port {} remained in use after termination attempts.", port))
     }
 }

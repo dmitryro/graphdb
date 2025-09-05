@@ -31,15 +31,16 @@ pub mod postgres_storage;
 pub mod mysql_storage;
 #[cfg(any(feature = "with-sled", feature = "with-rocksdb", feature = "with-tikv"))]
 pub mod hybrid_storage;
-
+#[cfg(feature = "with-sled")]
+pub mod sled_storage_daemon_pool;
 // Re-export key items
-pub use config::{CliConfigToml, StorageConfig, StorageEngineType, RocksdbConfig, SledConfig, TikvConfig, HybridConfig,
+pub use config::{ CliConfigToml, StorageConfig, StorageEngineType, RocksdbConfig, SledConfig, TikvConfig, HybridConfig,
                  format_engine_config, load_storage_config_from_yaml};
 pub use inmemory_storage::{InMemoryStorage as InMemoryGraphStorage};
 #[cfg(feature = "with-sled")]
 pub mod sled_storage;
 #[cfg(feature = "with-sled")]
-pub use self::sled_storage::SledStorage;
+pub use crate::storage_engine::config::{ SledStorage, SledDaemonPool };
 #[cfg(feature = "with-sled")]
 pub use storage_engine::{ AsyncStorageEngineManager, GraphStorageEngine, StorageEngine, 
                           SurrealdbGraphStorage,
@@ -122,6 +123,9 @@ pub async fn create_storage(config: &StorageConfig) -> Result<Arc<dyn GraphStora
                                         path: config.data_directory.clone(),
                                         host: None,
                                         port: None,
+                                        cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
+                                        temporary: false,
+                                        use_compression: false,
                                     }).unwrap()))
                                     .ok_or_else(|| anyhow!("Sled configuration is missing for Hybrid."))?
                             ).map_err(|e| anyhow!("Failed to deserialize Sled config for Hybrid: {}", e))?;

@@ -1,20 +1,20 @@
 storage:
-      config_root_directory: "./storage_daemon_server"
+      config_root_directory: "/Users/dmitryroitman/Devel/graph-db-new-new/./storage_daemon_server"
       data_directory: "/opt/graphdb/storage_data"
       log_directory: "/opt/graphdb/logs"
-      default_port: 8050
-      cluster_range: "2380-8049"
+      default_port: 8049
+      cluster_range: "8049"
       max_disk_space_gb: 1000
       min_disk_space_gb: 10
-      use_raft_for_scale: false
+      use_raft_for_scale: true
       storage_engine_type: "sled"
       engine_specific_config:
-        storage_engine_type: "sled"
         path: "/opt/graphdb/storage_data/sled"
         host: "127.0.0.1"
-        port: 8051
+        port: 8049
+        storage_engine_type: "sled"
         username: ""
         password: ""
         pd_endpoints: ""
-      max_open_files: 1024
+      max_open_files: 100
     
