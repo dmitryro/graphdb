@@ -31,7 +31,6 @@ use crate::daemon_registry::GLOBAL_DAEMON_REGISTRY;
 
 impl SledStorage {
     pub async fn new(config: &SledConfig) -> Result<Self, GraphError> {
-        // Step 1: Determine config file path (not storage directory)
         let main_config_path = {
             let project_config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
             let default_config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH);
@@ -44,7 +43,6 @@ impl SledStorage {
             }
         };
 
-        // Step 2: Load or create storage configuration
         let mut storage_config = if main_config_path.exists() {
             debug!("Reading main configuration from file: {:?}", main_config_path);
             load_storage_config_from_yaml(Some(&main_config_path)).await
@@ -73,7 +71,6 @@ impl SledStorage {
                 ])),
                 max_open_files: Some(1024),
             };
-            // Create parent directory and save default config
             if let Some(parent) = main_config_path.parent() {
                 debug!("Creating parent directory: {:?}", parent);
                 if let Err(e) = fs::create_dir_all(parent).await {
@@ -89,7 +86,6 @@ impl SledStorage {
             default_config
         };
 
-        // Step 3: Validate storage directory (config.path)
         let storage_path = &config.path;
         if !storage_path.exists() {
             debug!("Creating storage directory: {:?}", storage_path);
@@ -99,7 +95,6 @@ impl SledStorage {
             }
         }
 
-        // Step 4: Update engine-specific config if missing or incomplete
         if storage_config.engine_specific_config.is_none() || storage_config.engine_specific_config.as_ref().unwrap().is_empty() {
             debug!("Setting default engine-specific config for Sled");
             storage_config.engine_specific_config = Some(HashMap::from([
@@ -113,7 +108,6 @@ impl SledStorage {
             ]));
         }
 
-        // Step 5: Initialize daemon pool
         let mut daemon_pool = SledDaemonPool::new();
         daemon_pool
             .initialize_cluster(&storage_config, config)
@@ -129,7 +123,6 @@ impl SledStorage {
         Ok(SledStorage { pool })
     }
 
-    // ... (rest of the file remains unchanged, included for completeness)
     pub async fn set_key(&self, key: &str, value: &str) -> GraphResult<()> {
         let pool = self.pool.lock().await;
         let daemon = pool.leader_daemon().await?;
@@ -342,6 +335,43 @@ impl SledStorage {
             }
         }
     }
+
+    pub async fn diagnose_persistence(&self) -> GraphResult<serde_json::Value> {
+        let pool = self.pool.lock().await;
+        let daemon = pool.any_daemon().await?;
+        let db_path = daemon.db_path();
+        info!("Diagnosing persistence for SledStorage at {:?}", db_path);
+
+        let kv_count = daemon
+            .kv_pairs
+            .iter()
+            .count();
+        let vertex_count = daemon
+            .vertices
+            .iter()
+            .count();
+        let edge_count = daemon
+            .edges
+            .iter()
+            .count();
+
+        let disk_usage = fs::metadata(&db_path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        let diagnostics = serde_json::json!({
+            "path": db_path.to_string_lossy(),
+            "kv_pairs_count": kv_count,
+            "vertices_count": vertex_count,
+            "edges_count": edge_count,
+            "disk_usage_bytes": disk_usage,
+            "is_running": daemon.is_running().await,
+        });
+
+        info!("Persistence diagnostics: {:?}", diagnostics);
+        Ok(diagnostics)
+    }
 }
 
 #[async_trait]
@@ -353,7 +383,16 @@ impl StorageEngine for SledStorage {
 
     async fn insert(&self, key: Vec<u8>, value: Vec<u8>) -> GraphResult<()> {
         let pool = self.pool.lock().await;
-        let daemon = pool.leader_daemon().await?;
+        let daemon = {
+            #[cfg(feature = "with-openraft-sled")]
+            {
+                pool.leader_daemon().await?
+            }
+            #[cfg(not(feature = "with-openraft-sled"))]
+            {
+                pool.any_daemon().await?
+            }
+        };
         let db_path = daemon.db_path();
         info!("Inserting key {:?} into kv_pairs at path {:?}", key, db_path);
         timeout(Duration::from_secs(5), daemon.insert(&key, &value)).await
@@ -374,7 +413,7 @@ impl StorageEngine for SledStorage {
 
     async fn retrieve(&self, key: &Vec<u8>) -> GraphResult<Option<Vec<u8>>> {
         let pool = self.pool.lock().await;
-        let daemon = pool.leader_daemon().await?;
+        let daemon = pool.any_daemon().await?;
         let db_path = daemon.db_path();
         info!("Retrieving key {:?} from kv_pairs at path {:?}", key, db_path);
         let value = timeout(Duration::from_secs(5), daemon.retrieve(key)).await
@@ -391,7 +430,16 @@ impl StorageEngine for SledStorage {
 
     async fn delete(&self, key: &Vec<u8>) -> GraphResult<()> {
         let pool = self.pool.lock().await;
-        let daemon = pool.leader_daemon().await?;
+        let daemon = {
+            #[cfg(feature = "with-openraft-sled")]
+            {
+                pool.leader_daemon().await?
+            }
+            #[cfg(not(feature = "with-openraft-sled"))]
+            {
+                pool.any_daemon().await?
+            }
+        };
         let db_path = daemon.db_path();
         info!("Deleting key {:?} from kv_pairs at path {:?}", key, db_path);
         timeout(Duration::from_secs(5), daemon.delete(key)).await
@@ -441,14 +489,24 @@ impl StorageEngine for SledStorage {
     }
 }
 
+
 #[async_trait]
 impl GraphStorageEngine for SledStorage {
     async fn create_vertex(&self, vertex: Vertex) -> GraphResult<()> {
         let pool = self.pool.lock().await;
-        let daemon = pool.leader_daemon().await?;
+        let daemon = {
+            #[cfg(feature = "with-openraft-sled")]
+            {
+                pool.leader_daemon().await?
+            }
+            #[cfg(not(feature = "with-openraft-sled"))]
+            {
+                pool.any_daemon().await?
+            }
+        };
         let db_path = daemon.db_path();
         info!("Creating vertex at path {:?}", db_path);
-        timeout(Duration::from_secs(5), pool.create_vertex(vertex, None)).await
+        timeout(Duration::from_secs(5), pool.create_vertex(vertex, false)).await
             .map_err(|_| GraphError::StorageError("Timeout during create_vertex".to_string()))??;
         let bytes_flushed = timeout(Duration::from_secs(10), daemon.db.flush_async()).await
             .map_err(|_| GraphError::StorageError("Timeout flushing after create_vertex".to_string()))?
@@ -466,10 +524,10 @@ impl GraphStorageEngine for SledStorage {
 
     async fn get_vertex(&self, id: &Uuid) -> GraphResult<Option<Vertex>> {
         let pool = self.pool.lock().await;
-        let daemon = pool.leader_daemon().await?;
+        let daemon = pool.any_daemon().await?;
         let db_path = daemon.db_path();
         info!("Retrieving vertex with id {} from path {:?}", id, db_path);
-        let vertex = timeout(Duration::from_secs(5), pool.get_vertex(id, None)).await
+        let vertex = timeout(Duration::from_secs(5), pool.get_vertex(id, false)).await
             .map_err(|_| GraphError::StorageError("Timeout during get_vertex".to_string()))??;
         let vertex_keys: Vec<_> = daemon.vertices
             .iter()
@@ -483,10 +541,19 @@ impl GraphStorageEngine for SledStorage {
 
     async fn update_vertex(&self, vertex: Vertex) -> GraphResult<()> {
         let pool = self.pool.lock().await;
-        let daemon = pool.leader_daemon().await?;
+        let daemon = {
+            #[cfg(feature = "with-openraft-sled")]
+            {
+                pool.leader_daemon().await?
+            }
+            #[cfg(not(feature = "with-openraft-sled"))]
+            {
+                pool.any_daemon().await?
+            }
+        };
         let db_path = daemon.db_path();
         info!("Updating vertex at path {:?}", db_path);
-        timeout(Duration::from_secs(5), pool.update_vertex(vertex, None)).await
+        timeout(Duration::from_secs(5), pool.update_vertex(vertex, false)).await
             .map_err(|_| GraphError::StorageError("Timeout during update_vertex".to_string()))??;
         let bytes_flushed = timeout(Duration::from_secs(10), daemon.db.flush_async()).await
             .map_err(|_| GraphError::StorageError("Timeout flushing after update_vertex".to_string()))?
@@ -504,10 +571,19 @@ impl GraphStorageEngine for SledStorage {
 
     async fn delete_vertex(&self, id: &Uuid) -> GraphResult<()> {
         let pool = self.pool.lock().await;
-        let daemon = pool.leader_daemon().await?;
+        let daemon = {
+            #[cfg(feature = "with-openraft-sled")]
+            {
+                pool.leader_daemon().await?
+            }
+            #[cfg(not(feature = "with-openraft-sled"))]
+            {
+                pool.any_daemon().await?
+            }
+        };
         let db_path = daemon.db_path();
         info!("Deleting vertex with id {} from path {:?}", id, db_path);
-        timeout(Duration::from_secs(5), pool.delete_vertex(id, None)).await
+        timeout(Duration::from_secs(5), pool.delete_vertex(id, false)).await
             .map_err(|_| GraphError::StorageError("Timeout during delete_vertex".to_string()))??;
         let bytes_flushed = timeout(Duration::from_secs(10), daemon.db.flush_async()).await
             .map_err(|_| GraphError::StorageError("Timeout flushing after delete_vertex".to_string()))?
@@ -525,10 +601,19 @@ impl GraphStorageEngine for SledStorage {
 
     async fn create_edge(&self, edge: Edge) -> GraphResult<()> {
         let pool = self.pool.lock().await;
-        let daemon = pool.leader_daemon().await?;
+        let daemon = {
+            #[cfg(feature = "with-openraft-sled")]
+            {
+                pool.leader_daemon().await?
+            }
+            #[cfg(not(feature = "with-openraft-sled"))]
+            {
+                pool.any_daemon().await?
+            }
+        };
         let db_path = daemon.db_path();
         info!("Creating edge at path {:?}", db_path);
-        timeout(Duration::from_secs(5), pool.create_edge(edge, None)).await
+        timeout(Duration::from_secs(5), pool.create_edge(edge, false)).await
             .map_err(|_| GraphError::StorageError("Timeout during create_edge".to_string()))??;
         let bytes_flushed = timeout(Duration::from_secs(10), daemon.db.flush_async()).await
             .map_err(|_| GraphError::StorageError("Timeout flushing after create_edge".to_string()))?
@@ -546,10 +631,10 @@ impl GraphStorageEngine for SledStorage {
 
     async fn get_edge(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> GraphResult<Option<Edge>> {
         let pool = self.pool.lock().await;
-        let daemon = pool.leader_daemon().await?;
+        let daemon = pool.any_daemon().await?;
         let db_path = daemon.db_path();
         info!("Retrieving edge ({}, {}, {}) from path {:?}", outbound_id, edge_type, inbound_id, db_path);
-        let edge = timeout(Duration::from_secs(5), pool.get_edge(outbound_id, edge_type, inbound_id, None)).await
+        let edge = timeout(Duration::from_secs(5), pool.get_edge(outbound_id, edge_type, inbound_id, false)).await
             .map_err(|_| GraphError::StorageError("Timeout during get_edge".to_string()))??;
         let edge_keys: Vec<_> = daemon.edges
             .iter()
@@ -563,10 +648,19 @@ impl GraphStorageEngine for SledStorage {
 
     async fn update_edge(&self, edge: Edge) -> GraphResult<()> {
         let pool = self.pool.lock().await;
-        let daemon = pool.leader_daemon().await?;
+        let daemon = {
+            #[cfg(feature = "with-openraft-sled")]
+            {
+                pool.leader_daemon().await?
+            }
+            #[cfg(not(feature = "with-openraft-sled"))]
+            {
+                pool.any_daemon().await?
+            }
+        };
         let db_path = daemon.db_path();
         info!("Updating edge at path {:?}", db_path);
-        timeout(Duration::from_secs(5), pool.update_edge(edge, None)).await
+        timeout(Duration::from_secs(5), pool.update_edge(edge, false)).await
             .map_err(|_| GraphError::StorageError("Timeout during update_edge".to_string()))??;
         let bytes_flushed = timeout(Duration::from_secs(10), daemon.db.flush_async()).await
             .map_err(|_| GraphError::StorageError("Timeout flushing after update_edge".to_string()))?
@@ -584,10 +678,19 @@ impl GraphStorageEngine for SledStorage {
 
     async fn delete_edge(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> GraphResult<()> {
         let pool = self.pool.lock().await;
-        let daemon = pool.leader_daemon().await?;
+        let daemon = {
+            #[cfg(feature = "with-openraft-sled")]
+            {
+                pool.leader_daemon().await?
+            }
+            #[cfg(not(feature = "with-openraft-sled"))]
+            {
+                pool.any_daemon().await?
+            }
+        };
         let db_path = daemon.db_path();
         info!("Deleting edge ({}, {}, {}) from path {:?}", outbound_id, edge_type, inbound_id, db_path);
-        timeout(Duration::from_secs(5), pool.delete_edge(outbound_id, edge_type, inbound_id, None)).await
+        timeout(Duration::from_secs(5), pool.delete_edge(outbound_id, edge_type, inbound_id, false)).await
             .map_err(|_| GraphError::StorageError("Timeout during delete_edge".to_string()))??;
         let bytes_flushed = timeout(Duration::from_secs(10), daemon.db.flush_async()).await
             .map_err(|_| GraphError::StorageError("Timeout flushing after delete_edge".to_string()))?
@@ -682,7 +785,7 @@ impl GraphStorageEngine for SledStorage {
 
     async fn get_all_vertices(&self) -> Result<Vec<Vertex>, GraphError> {
         let pool = self.pool.lock().await;
-        let daemon = pool.leader_daemon().await?;
+        let daemon = pool.any_daemon().await?;
         let db_path = daemon.db_path();
         info!("Retrieving all vertices from path {:?}", db_path);
         let mut vertices = Vec::new();
@@ -696,7 +799,7 @@ impl GraphStorageEngine for SledStorage {
 
     async fn get_all_edges(&self) -> Result<Vec<Edge>, GraphError> {
         let pool = self.pool.lock().await;
-        let daemon = pool.leader_daemon().await?;
+        let daemon = pool.any_daemon().await?;
         let db_path = daemon.db_path();
         info!("Retrieving all edges from path {:?}", db_path);
         let mut edges = Vec::new();
@@ -710,7 +813,16 @@ impl GraphStorageEngine for SledStorage {
 
     async fn clear_data(&self) -> Result<(), GraphError> {
         let pool = self.pool.lock().await;
-        let daemon = pool.leader_daemon().await?;
+        let daemon = {
+            #[cfg(feature = "with-openraft-sled")]
+            {
+                pool.leader_daemon().await?
+            }
+            #[cfg(not(feature = "with-openraft-sled"))]
+            {
+                pool.any_daemon().await?
+            }
+        };
         let db_path = daemon.db_path();
         info!("Clearing all data from path {:?}", db_path);
         timeout(Duration::from_secs(5), async {
@@ -731,6 +843,7 @@ impl GraphStorageEngine for SledStorage {
         self
     }
 }
+
 
 // Helper function to select an available port from cluster_range
 pub async fn select_available_port(storage_config: &StorageConfig, preferred_port: u16) -> GraphResult<u16> {

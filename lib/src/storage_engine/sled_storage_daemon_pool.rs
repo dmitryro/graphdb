@@ -16,6 +16,7 @@ use models::errors::{GraphError, GraphResult};
 use serde_json::Value;
 use crate::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
 use std::time::{SystemTime, UNIX_EPOCH};
+use futures::future::join_all;
 
 #[cfg(feature = "with-openraft-sled")]
 use {
@@ -28,7 +29,7 @@ use {
 
 impl SledDaemon {
     pub async fn new(config: &SledConfig) -> GraphResult<Self> {
-        println!("===> TRYING TO INITIAZLIE POOL");
+        println!("===> TRYING TO INITIALIZE POOL");
         let db_path = config.path.clone();
         info!("Initializing SledDaemon with path {:?}", db_path);
         if !db_path.exists() {
@@ -37,7 +38,6 @@ impl SledDaemon {
                 .map_err(|e| GraphError::Io(e))?;
         }
 
-        // Pre-check for lock file and processes holding it
         let lock_path = db_path.join("db");
         debug!("Checking for lock file at {:?}", lock_path);
         if lock_path.exists() {
@@ -89,7 +89,7 @@ impl SledDaemon {
             match Config::new()
                 .path(&db_path)
                 .use_compression(config.use_compression)
-                .cache_capacity(config.cache_capacity.unwrap_or(1024 * 1024 * 1024)) // Default 1GB cache
+                .cache_capacity(config.cache_capacity.unwrap_or(1024 * 1024 * 1024))
                 .flush_every_ms(Some(100))
                 .open()
             {
@@ -651,11 +651,9 @@ impl SledDaemonPool {
     pub async fn add_daemon(&mut self, storage_config: &StorageConfig, port: u16, config: &SledConfig) -> GraphResult<()> {
         let mut port_config = config.clone();
         port_config.port = Some(port);
-        // Check if port is already in use
         if self.daemons.contains_key(&port) {
             return Err(GraphError::StorageError(format!("Daemon already exists on port {}", port)));
         }
-        // Check registry for stale entry
         if GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await?.is_some() {
             warn!("Clearing stale daemon registry entry for port {}", port);
             GLOBAL_DAEMON_REGISTRY.unregister_daemon(port).await?;
@@ -687,7 +685,6 @@ impl SledDaemonPool {
     pub async fn initialize_cluster(&mut self, storage_config: &StorageConfig, config: &SledConfig) -> GraphResult<()> {
         debug!("Initializing cluster with use_raft_for_scale: {}", storage_config.use_raft_for_scale);
 
-        // Ensure daemon registry directory exists
         let registry_path = Path::new(DAEMON_REGISTRY_DB_PATH);
         if let Some(parent) = registry_path.parent() {
             debug!("Ensuring daemon registry directory exists: {:?}", parent);
@@ -699,7 +696,6 @@ impl SledDaemonPool {
                 })?;
         }
 
-        // Parse cluster_range
         let range = storage_config.cluster_range.as_str();
         let (start_port, end_port) = if range.contains('-') {
             let parts: Vec<&str> = range.split('-').collect();
@@ -720,7 +716,6 @@ impl SledDaemonPool {
             (port, port)
         };
 
-        // Validate port range
         if end_port < start_port {
             return Err(GraphError::StorageError(format!("Invalid port range: {}-{}", start_port, end_port)));
         }
@@ -728,8 +723,8 @@ impl SledDaemonPool {
             return Err(GraphError::StorageError(format!("Cluster size too large: {}-{}", start_port, end_port)));
         }
 
-        // Clear stale registry entries for the port range
-        for port in start_port..=end_port {
+        let cluster_ports = start_port..=end_port;
+        for port in cluster_ports.clone() {
             if GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await?.is_some() {
                 warn!("Clearing stale daemon registry entry for port {}", port);
                 GLOBAL_DAEMON_REGISTRY.unregister_daemon(port).await?;
@@ -738,7 +733,6 @@ impl SledDaemonPool {
 
         if !storage_config.use_raft_for_scale {
             info!("use_raft_for_scale is false, selecting port within cluster range {}-{}", start_port, end_port);
-            // Use select_available_port to ensure port is within cluster_range
             let port = crate::storage_engine::sled_storage::select_available_port(storage_config, storage_config.default_port).await?;
             if port < start_port || port > end_port {
                 return Err(GraphError::StorageError(format!(
@@ -752,13 +746,13 @@ impl SledDaemonPool {
         #[cfg(feature = "with-openraft-sled")]
         let mut nodes: HashSet<BasicNode> = HashSet::new();
         #[cfg(feature = "with-openraft-sled")]
-        for port in start_port..=end_port {
+        for port in cluster_ports.clone() {
             nodes.insert(BasicNode {
                 addr: format!("127.0.0.1:{}", port),
             });
         }
 
-        for port in start_port..=end_port {
+        for port in cluster_ports {
             let mut port_config = config.clone();
             port_config.port = Some(port);
             let daemon = Arc::new(SledDaemon::new(&port_config).await?);
@@ -782,155 +776,90 @@ impl SledDaemonPool {
                 .await
                 .map_err(|e| {
                     error!("Failed to register daemon on port {}: {}", port, e);
-                    GraphError::StorageError(format!("Failed to register daemon in GLOBAL_DAEMON_REGISTRY: {}", e))
+                    GraphError::StorageError(format!("Failed to register daemon on port {}: {}", port, e))
                 })?;
-            info!("Added daemon for port {} at path {:?}", port, port_config.path);
 
             #[cfg(feature = "with-openraft-sled")]
             {
-                let raft = daemon.raft.clone();
                 let node_id = port as u64;
-                raft.add_learner(node_id, BasicNode {
-                    addr: format!("127.0.0.1:{}", port),
-                }, true)
-                    .await
-                    .map_err(|e| GraphError::StorageError(format!("Failed to add learner for node {}: {}", node_id, e)))?;
-                info!("Added Raft learner for node {} on port {}", node_id, port);
+                let raft = &daemon.raft;
+                let initial_nodes = nodes
+                    .iter()
+                    .map(|node| (node_id, node.clone()))
+                    .collect::<HashMap<_, _>>();
+                raft.initialize(initial_nodes).await
+                    .map_err(|e| {
+                        error!("Failed to initialize Raft for node {}: {}", node_id, e);
+                        GraphError::StorageError(format!("Failed to initialize Raft for node {}: {}", node_id, e))
+                    })?;
+                info!("Initialized Raft for node {} on port {}", node_id, port);
             }
         }
 
-        #[cfg(feature = "with-openraft-sled")]
-        {
-            if let Some(daemon) = self.daemons.get(&start_port) {
-                let raft = daemon.raft.clone();
-                raft.initialize(nodes)
-                    .await
-                    .map_err(|e| GraphError::StorageError(format!("Failed to initialize Raft cluster: {}", e)))?;
-                info!("Raft cluster initialized with nodes {:?}", nodes);
-            }
-        }
-
+        info!("Successfully initialized cluster with {} daemons", self.daemons.len());
         Ok(())
     }
 
-    pub async fn close(&self, port: Option<u16>) -> GraphResult<()> {
-        match port {
-            Some(p) => {
-                if let Some(daemon) = self.daemons.get(&p) {
-                    let daemon = Arc::clone(daemon);
-                    daemon.close().await?;
-                    self.registry.write().await.remove(&p);
-                    GLOBAL_DAEMON_REGISTRY
-                        .unregister_daemon(p)
-                        .await
-                        .map_err(|e| GraphError::StorageError(format!("Failed to unregister daemon from GLOBAL_DAEMON_REGISTRY: {}", e)))?;
-                }
-            }
-            None => {
-                for daemon in self.daemons.values() {
-                    let daemon = Arc::clone(daemon);
-                    let port = daemon.port();
-                    daemon.close().await?;
-                    self.registry.write().await.remove(&port);
-                    GLOBAL_DAEMON_REGISTRY
-                        .unregister_daemon(port)
-                        .await
-                        .map_err(|e| GraphError::StorageError(format!("Failed to unregister daemon from GLOBAL_DAEMON_REGISTRY: {}", e)))?;
-                }
-            }
+    pub async fn any_daemon(&self) -> GraphResult<Arc<SledDaemon>> {
+        if let Some(daemon) = self.daemons.values().next() {
+            info!("Selected daemon on port {} at path {:?}", daemon.port(), daemon.db_path());
+            Ok(Arc::clone(daemon))
+        } else {
+            error!("No daemons available in the pool");
+            Err(GraphError::StorageError("No daemons available".to_string()))
         }
-        Ok(())
     }
 
-    pub fn any_daemon(&self) -> GraphResult<Arc<SledDaemon>> {
-        self.daemons
-            .values()
-            .next()
-            .cloned()
-            .ok_or_else(|| GraphError::StorageError("No available daemon".into()))
+    pub async fn close(&self, _port: Option<u16>) -> GraphResult<()> {
+        let futures = self.daemons.values().map(|daemon| async {
+            let db_path = daemon.db_path();
+            match timeout(Duration::from_secs(10), daemon.close()).await {
+                Ok(Ok(())) => {
+                    info!("Closed daemon at {:?}", db_path);
+                    Ok(())
+                }
+                Ok(Err(e)) => {
+                    error!("Failed to close daemon at {:?}: {}", db_path, e);
+                    Err(GraphError::StorageError(e.to_string()))
+                }
+                Err(_) => {
+                    error!("Timeout closing daemon at {:?}", db_path);
+                    Err(GraphError::StorageError(format!("Timeout closing daemon at {:?}", db_path)))
+                }
+            }
+        });
+        let results = join_all(futures).await;
+        let errors: Vec<_> = results.into_iter().filter_map(|r| r.err()).collect();
+        if !errors.is_empty() {
+            error!("Errors during close: {:?}", errors);
+            return Err(GraphError::StorageError(format!("Close errors: {:?}", errors)));
+        }
+        info!("Successfully closed all daemons");
+        Ok(())
     }
 
     pub async fn leader_daemon(&self) -> GraphResult<Arc<SledDaemon>> {
-        #[cfg(feature = "with-openraft-sled")]
-        {
-            for daemon in self.daemons.values() {
+        for daemon in self.daemons.values() {
+            #[cfg(feature = "with-openraft-sled")]
+            {
                 if daemon.is_leader().await? {
-                    if daemon.is_running().await {
-                        info!("Selected leader daemon on port {} at path {:?}", daemon.port(), daemon.db_path);
-                        return Ok(daemon.clone());
-                    } else {
-                        error!("Leader daemon on port {} is not running", daemon.port());
-                    }
+                    info!("Selected leader daemon on port {} at path {:?}", daemon.port(), daemon.db_path());
+                    return Ok(Arc::clone(daemon));
                 }
             }
-            Err(GraphError::StorageError("No Raft leader available or leader not running".into()))
-        }
-        #[cfg(not(feature = "with-openraft-sled"))]
-        {
-            let daemon = self.any_daemon()?;
-            if daemon.is_running().await {
-                info!("Selected daemon on port {} at path {:?}", daemon.port(), daemon.db_path);
-                Ok(daemon)
-            } else {
-                Err(GraphError::StorageError(format!("Daemon on port {} is not running", daemon.port())))
+            #[cfg(not(feature = "with-openraft-sled"))]
+            {
+                info!("Selected daemon on port {} at path {:?}", daemon.port(), daemon.db_path());
+                return Ok(Arc::clone(daemon));
             }
         }
+        error!("No leader daemon found in the pool");
+        Err(GraphError::StorageError("No leader daemon found".to_string()))
     }
 
-    pub fn list_ports(&self) -> Vec<u16> {
-        self.daemons.keys().copied().collect()
-    }
-
-    pub async fn force_unlock(&self, path: &Path) -> GraphResult<()> {
-        for daemon in self.daemons.values() {
-            let db_path = daemon.db_path();
-            if db_path == path || db_path.starts_with(path) {
-                SledStorage::force_unlock(&db_path).await?;
-            }
-        }
-        Ok(())
-    }
-
-    pub async fn force_reset_all(&self) -> GraphResult<()> {
-        for daemon in self.daemons.values() {
-            daemon.force_reset().await?;
-        }
-        Ok(())
-    }
-
-    pub async fn insert(&self, key: Vec<u8>, value: Vec<u8>, _options: Option<()>) -> GraphResult<()> {
+    pub async fn create_edge(&self, edge: Edge, _use_raft: bool) -> GraphResult<()> {
         let daemon = self.leader_daemon().await?;
-        timeout(Duration::from_secs(5), daemon.insert(&key, &value))
-            .await
-            .map_err(|_| GraphError::StorageError("Timeout during insert".to_string()))?
-    }
-
-    pub async fn retrieve(&self, key: &Vec<u8>, _options: Option<()>) -> GraphResult<Option<Vec<u8>>> {
-        let daemon = self.leader_daemon().await?;
-        timeout(Duration::from_secs(5), daemon.retrieve(key))
-            .await
-            .map_err(|_| GraphError::StorageError("Timeout during retrieve".to_string()))?
-    }
-
-    pub async fn delete(&self, key: &Vec<u8>, _options: Option<()>) -> GraphResult<()> {
-        let daemon = self.leader_daemon().await?;
-        timeout(Duration::from_secs(5), daemon.delete(key))
-            .await
-            .map_err(|_| GraphError::StorageError("Timeout during delete".to_string()))?
-    }
-
-    pub async fn is_locked(&self, _key: &Vec<u8>) -> GraphResult<bool> {
-        Ok(false)
-    }
-
-    pub async fn list_locked_keys(&self) -> GraphResult<Vec<Vec<u8>>> {
-        Ok(vec![])
-    }
-
-    pub async fn create_edge(&self, edge: Edge, _options: Option<()>) -> GraphResult<()> {
-        let daemon = self.leader_daemon().await?;
-        timeout(Duration::from_secs(5), daemon.create_edge(&edge))
-            .await
+        timeout(Duration::from_secs(5), daemon.create_edge(&edge)).await
             .map_err(|_| GraphError::StorageError("Timeout during create_edge".to_string()))?
     }
 
@@ -939,18 +868,16 @@ impl SledDaemonPool {
         outbound_id: &uuid::Uuid,
         edge_type: &Identifier,
         inbound_id: &uuid::Uuid,
-        _options: Option<()>,
+        _use_raft: bool,
     ) -> GraphResult<Option<Edge>> {
         let daemon = self.leader_daemon().await?;
-        timeout(Duration::from_secs(5), daemon.get_edge(outbound_id, edge_type, inbound_id))
-            .await
+        timeout(Duration::from_secs(5), daemon.get_edge(outbound_id, edge_type, inbound_id)).await
             .map_err(|_| GraphError::StorageError("Timeout during get_edge".to_string()))?
     }
 
-    pub async fn update_edge(&self, edge: Edge, _options: Option<()>) -> GraphResult<()> {
+    pub async fn update_edge(&self, edge: Edge, _use_raft: bool) -> GraphResult<()> {
         let daemon = self.leader_daemon().await?;
-        timeout(Duration::from_secs(5), daemon.update_edge(&edge))
-            .await
+        timeout(Duration::from_secs(5), daemon.update_edge(&edge)).await
             .map_err(|_| GraphError::StorageError("Timeout during update_edge".to_string()))?
     }
 
@@ -959,46 +886,37 @@ impl SledDaemonPool {
         outbound_id: &uuid::Uuid,
         edge_type: &Identifier,
         inbound_id: &uuid::Uuid,
-        _options: Option<()>,
+        _use_raft: bool,
     ) -> GraphResult<()> {
         let daemon = self.leader_daemon().await?;
-        timeout(Duration::from_secs(5), daemon.delete_edge(outbound_id, edge_type, inbound_id))
-            .await
+        timeout(Duration::from_secs(5), daemon.delete_edge(outbound_id, edge_type, inbound_id)).await
             .map_err(|_| GraphError::StorageError("Timeout during delete_edge".to_string()))?
     }
 
-    pub async fn create_vertex(&self, vertex: Vertex, _options: Option<()>) -> GraphResult<()> {
+    pub async fn create_vertex(&self, vertex: Vertex, _use_raft: bool) -> GraphResult<()> {
         let daemon = self.leader_daemon().await?;
-        timeout(Duration::from_secs(5), daemon.create_vertex(&vertex))
-            .await
+        timeout(Duration::from_secs(5), daemon.create_vertex(&vertex)).await
             .map_err(|_| GraphError::StorageError("Timeout during create_vertex".to_string()))?
     }
 
-    pub async fn get_vertex(&self, id: &uuid::Uuid, _options: Option<()>) -> GraphResult<Option<Vertex>> {
+    pub async fn get_vertex(&self, id: &uuid::Uuid, _use_raft: bool) -> GraphResult<Option<Vertex>> {
         let daemon = self.leader_daemon().await?;
-        timeout(Duration::from_secs(5), daemon.get_vertex(id))
-            .await
+        timeout(Duration::from_secs(5), daemon.get_vertex(id)).await
             .map_err(|_| GraphError::StorageError("Timeout during get_vertex".to_string()))?
     }
 
-    pub async fn update_vertex(&self, vertex: Vertex, _options: Option<()>) -> GraphResult<()> {
+    pub async fn update_vertex(&self, vertex: Vertex, _use_raft: bool) -> GraphResult<()> {
         let daemon = self.leader_daemon().await?;
-        timeout(Duration::from_secs(5), daemon.update_vertex(&vertex))
-            .await
+        timeout(Duration::from_secs(5), daemon.update_vertex(&vertex)).await
             .map_err(|_| GraphError::StorageError("Timeout during update_vertex".to_string()))?
     }
 
-    pub async fn delete_vertex(&self, id: &uuid::Uuid, _options: Option<()>) -> GraphResult<()> {
+    pub async fn delete_vertex(&self, id: &uuid::Uuid, _use_raft: bool) -> GraphResult<()> {
         let daemon = self.leader_daemon().await?;
-        timeout(Duration::from_secs(5), daemon.delete_vertex(id))
-            .await
+        timeout(Duration::from_secs(5), daemon.delete_vertex(id)).await
             .map_err(|_| GraphError::StorageError("Timeout during delete_vertex".to_string()))?
     }
 }
-
-#[cfg(feature = "with-openraft-sled")]
-#[derive(Clone)]
-struct RaftTcpNetwork {}
 
 #[cfg(feature = "with-openraft-sled")]
 #[async_trait]
@@ -1093,6 +1011,7 @@ impl RaftNetwork<NodeId, BasicNode> for RaftTcpNetwork {
         rpc: openraft::raft::VoteRequest<NodeId>,
     ) -> Result<openraft::raft::VoteResponse<NodeId>, openraft::error::RPCError<NodeId, BasicNode>> {
         let addr = format!("127.0.0.1:{}", target);
+        debug!("Sending vote to node {} at {}", target, addr);
         let mut stream = TcpStream::connect(&addr).await
             .map_err(|e| openraft::error::RPCError::Network {
                 error: openraft::error::NetworkError::new(&e),
