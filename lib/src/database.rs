@@ -10,7 +10,7 @@ use uuid::Uuid;
 use std::collections::HashMap;
 
 use crate::storage_engine::config::{
-    StorageConfig, SledConfig, RocksdbConfig, TikvConfig, StorageEngineType, StorageConfigWrapper
+    StorageConfig, SledConfig, RocksdbConfig, TikvConfig, StorageEngineType, StorageConfigWrapper, DEFAULT_STORAGE_PORT
 };
 use crate::storage_engine::{
     SledStorage,
@@ -49,12 +49,13 @@ impl Database {
                     } else {
                         SledConfig {
                             storage_engine_type: config.storage_engine_type.clone(),
-                            path: config.data_directory.clone(),
-                            host: None,
-                            port: None,
+                            path: config.data_directory.clone(),  // Remove unwrap_or_else - data_directory is PathBuf
+                            host: Some("127.0.0.1".to_string()),
+                            port: Some(config.default_port),  // Remove unwrap_or - default_port is u16
                             cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
                             temporary: false,
                             use_compression: false,
+                            // Remove flush_every_ms - not a field in SledConfig
                         }
                     };
                     Arc::new(SledStorage::new(&sled_config).await?)
@@ -73,7 +74,7 @@ impl Database {
                     } else {
                         RocksdbConfig {
                             storage_engine_type: config.storage_engine_type.clone(),
-                            path: config.data_directory.clone(),
+                            path: config.data_directory.clone(),  // Remove unwrap_or_else
                             host: None,
                             port: None,
                         }
@@ -94,7 +95,7 @@ impl Database {
                     } else {
                         TikvConfig {
                             storage_engine_type: config.storage_engine_type.clone(),
-                            path: config.data_directory.clone(),
+                            path: config.data_directory.clone(),  // Remove unwrap_or_else
                             host: None,
                             port: None,
                             pd_endpoints: None,
@@ -146,14 +147,22 @@ impl Database {
                         Some("sled") => {
                             #[cfg(feature = "with-sled")]
                             {
-                                let sled_config = SledConfig {
-                                    storage_engine_type: StorageEngineType::Sled,
-                                    path: config.data_directory.clone(),
-                                    host: None,
-                                    port: None,
-                                    cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
-                                    temporary: false,
-                                    use_compression: false,
+                                let sled_config = if let Some(ref engine_config) = config.engine_specific_config {
+                                    let config_value = serde_json::to_value(engine_config)
+                                        .map_err(|e| GraphError::ConfigurationError(format!("Failed to serialize map: {}", e)))?;
+                                    serde_json::from_value(config_value)
+                                        .map_err(|e| GraphError::ConfigurationError(format!("Failed to parse SledConfig: {}", e)))?
+                                } else {
+                                    SledConfig {
+                                        storage_engine_type: StorageEngineType::Sled,
+                                        path: config.data_directory.clone(),  // Remove unwrap_or_else
+                                        host: Some("127.0.0.1".to_string()),
+                                        port: Some(config.default_port),  // Remove unwrap_or
+                                        cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
+                                        temporary: false,
+                                        use_compression: false,
+                                        // Remove flush_every_ms
+                                    }
                                 };
                                 Arc::new(SledStorage::new(&sled_config).await?)
                                     as Arc<dyn GraphStorageEngine + Send + Sync>
@@ -164,11 +173,18 @@ impl Database {
                         Some("rocksdb") => {
                             #[cfg(feature = "with-rocksdb")]
                             {
-                                let rocksdb_config = RocksdbConfig {
-                                    storage_engine_type: StorageEngineType::RocksDB,
-                                    path: config.data_directory.clone(),
-                                    host: None,
-                                    port: None,
+                                let rocksdb_config = if let Some(ref engine_config) = config.engine_specific_config {
+                                    let config_value = serde_json::to_value(engine_config)
+                                        .map_err(|e| GraphError::ConfigurationError(format!("Failed to serialize map: {}", e)))?;
+                                    serde_json::from_value(config_value)
+                                        .map_err(|e| GraphError::ConfigurationError(format!("Failed to parse RocksdbConfig: {}", e)))?
+                                } else {
+                                    RocksdbConfig {
+                                        storage_engine_type: StorageEngineType::RocksDB,
+                                        path: config.data_directory.clone(),  // Remove unwrap_or_else
+                                        host: None,
+                                        port: None,
+                                    }
                                 };
                                 Arc::new(RocksdbStorage::new(&rocksdb_config)?)
                                     as Arc<dyn GraphStorageEngine + Send + Sync>
@@ -179,16 +195,21 @@ impl Database {
                         Some("tikv") => {
                             #[cfg(feature = "with-tikv")]
                             {
-                                let tikv_config = TikvConfig {
-                                    storage_engine_type: StorageEngineType::TiKV,
-                                    path: config.data_directory.clone(),
-                                    host: None,
-                                    port: None,
-                                    pd_endpoints: config.engine_specific_config.as_ref()
-                                        .and_then(|config| config.get("pd_endpoints").and_then(|v| v.as_str()))
-                                        .map(|s| s.to_string()),
-                                    username: None,
-                                    password: None,
+                                let tikv_config = if let Some(ref engine_config) = config.engine_specific_config {
+                                    let config_value = serde_json::to_value(engine_config)
+                                        .map_err(|e| GraphError::ConfigurationError(format!("Failed to serialize map: {}", e)))?;
+                                    serde_json::from_value(config_value)
+                                        .map_err(|e| GraphError::ConfigurationError(format!("Failed to parse TikvConfig: {}", e)))?
+                                } else {
+                                    TikvConfig {
+                                        storage_engine_type: StorageEngineType::TiKV,
+                                        path: config.data_directory.clone(),  // Remove unwrap_or_else
+                                        host: None,
+                                        port: None,
+                                        pd_endpoints: None,
+                                        username: None,
+                                        password: None,
+                                    }
                                 };
                                 Arc::new(TikvStorage::new(&tikv_config).await?)
                                     as Arc<dyn GraphStorageEngine + Send + Sync>
@@ -216,14 +237,22 @@ impl Database {
             StorageEngineType::Sled => {
                 #[cfg(feature = "with-sled")]
                 {
-                    let sled_config = SledConfig {
-                        storage_engine_type: StorageEngineType::Sled,
-                        path: config_wrapper.storage.data_directory.clone(),
-                        host: None,
-                        port: None,
-                        cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
-                        temporary: false,
-                        use_compression: false,
+                    let sled_config = if let Some(ref engine_config) = config_wrapper.storage.engine_specific_config {
+                        let config_value = serde_json::to_value(engine_config)
+                            .map_err(|e| anyhow!("Failed to serialize map: {}", e))?;
+                        serde_json::from_value(config_value)
+                            .map_err(|e| anyhow!("Failed to parse SledConfig: {}", e))?
+                    } else {
+                        SledConfig {
+                            storage_engine_type: StorageEngineType::Sled,
+                            path: config_wrapper.storage.data_directory.clone(),  // Remove unwrap_or_else
+                            host: Some("127.0.0.1".to_string()),
+                            port: Some(config_wrapper.storage.default_port),  // Remove unwrap_or
+                            cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
+                            temporary: false,
+                            use_compression: false,
+                            // Remove flush_every_ms
+                        }
                     };
                     Arc::new(SledStorage::new(&sled_config).await?)
                         as Arc<dyn GraphStorageEngine + Send + Sync>
@@ -234,11 +263,18 @@ impl Database {
             StorageEngineType::RocksDB => {
                 #[cfg(feature = "with-rocksdb")]
                 {
-                    let rocksdb_config = RocksdbConfig {
-                        storage_engine_type: StorageEngineType::RocksDB,
-                        path: config_wrapper.storage.data_directory.clone(),
-                        host: None,
-                        port: None,
+                    let rocksdb_config = if let Some(ref engine_config) = config_wrapper.storage.engine_specific_config {
+                        let config_value = serde_json::to_value(engine_config)
+                            .map_err(|e| anyhow!("Failed to serialize map: {}", e))?;
+                        serde_json::from_value(config_value)
+                            .map_err(|e| anyhow!("Failed to parse RocksdbConfig: {}", e))?
+                    } else {
+                        RocksdbConfig {
+                            storage_engine_type: StorageEngineType::RocksDB,
+                            path: config_wrapper.storage.data_directory.clone(),  // Remove unwrap_or_else
+                            host: None,
+                            port: None,
+                        }
                     };
                     Arc::new(RocksdbStorage::new(&rocksdb_config)?)
                         as Arc<dyn GraphStorageEngine + Send + Sync>
@@ -249,14 +285,21 @@ impl Database {
             StorageEngineType::TiKV => {
                 #[cfg(feature = "with-tikv")]
                 {
-                    let tikv_config = TikvConfig {
-                        storage_engine_type: StorageEngineType::TiKV,
-                        path: config_wrapper.storage.data_directory.clone(),
-                        host: None,
-                        port: None,
-                        pd_endpoints: None,
-                        username: None,
-                        password: None,
+                    let tikv_config = if let Some(ref engine_config) = config_wrapper.storage.engine_specific_config {
+                        let config_value = serde_json::to_value(engine_config)
+                            .map_err(|e| anyhow!("Failed to serialize map: {}", e))?;
+                        serde_json::from_value(config_value)
+                            .map_err(|e| anyhow!("Failed to parse TikvConfig: {}", e))?
+                    } else {
+                        TikvConfig {
+                            storage_engine_type: StorageEngineType::TiKV,
+                            path: config_wrapper.storage.data_directory.clone(),  // Remove unwrap_or_else
+                            host: None,
+                            port: None,
+                            pd_endpoints: None,
+                            username: None,
+                            password: None,
+                        }
                     };
                     Arc::new(TikvStorage::new(&tikv_config).await?)
                         as Arc<dyn GraphStorageEngine + Send + Sync>
@@ -306,14 +349,22 @@ impl Database {
                         Some("sled") => {
                             #[cfg(feature = "with-sled")]
                             {
-                                let sled_config = SledConfig {
-                                    storage_engine_type: StorageEngineType::Sled,
-                                    path: config_wrapper.storage.data_directory.clone(),
-                                    host: None,
-                                    port: None,
-                                    cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
-                                    temporary: false,
-                                    use_compression: false,
+                                let sled_config = if let Some(ref engine_config) = config_wrapper.storage.engine_specific_config {
+                                    let config_value = serde_json::to_value(engine_config)
+                                        .map_err(|e| anyhow!("Failed to serialize map: {}", e))?;
+                                    serde_json::from_value(config_value)
+                                        .map_err(|e| anyhow!("Failed to parse SledConfig: {}", e))?
+                                } else {
+                                    SledConfig {
+                                        storage_engine_type: StorageEngineType::Sled,
+                                        path: config_wrapper.storage.data_directory.clone(),  // Remove unwrap_or_else
+                                        host: Some("127.0.0.1".to_string()),
+                                        port: Some(config_wrapper.storage.default_port),  // Remove unwrap_or
+                                        cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
+                                        temporary: false,
+                                        use_compression: false,
+                                        // Remove flush_every_ms
+                                    }
                                 };
                                 Arc::new(SledStorage::new(&sled_config).await?)
                                     as Arc<dyn GraphStorageEngine + Send + Sync>
@@ -324,11 +375,18 @@ impl Database {
                         Some("rocksdb") => {
                             #[cfg(feature = "with-rocksdb")]
                             {
-                                let rocksdb_config = RocksdbConfig {
-                                    storage_engine_type: StorageEngineType::RocksDB,
-                                    path: config_wrapper.storage.data_directory.clone(),
-                                    host: None,
-                                    port: None,
+                                let rocksdb_config = if let Some(ref engine_config) = config_wrapper.storage.engine_specific_config {
+                                    let config_value = serde_json::to_value(engine_config)
+                                        .map_err(|e| anyhow!("Failed to serialize map: {}", e))?;
+                                    serde_json::from_value(config_value)
+                                        .map_err(|e| anyhow!("Failed to parse RocksdbConfig: {}", e))?
+                                } else {
+                                    RocksdbConfig {
+                                        storage_engine_type: StorageEngineType::RocksDB,
+                                        path: config_wrapper.storage.data_directory.clone(),  // Remove unwrap_or_else
+                                        host: None,
+                                        port: None,
+                                    }
                                 };
                                 Arc::new(RocksdbStorage::new(&rocksdb_config)?)
                                     as Arc<dyn GraphStorageEngine + Send + Sync>
@@ -339,14 +397,21 @@ impl Database {
                         Some("tikv") => {
                             #[cfg(feature = "with-tikv")]
                             {
-                                let tikv_config = TikvConfig {
-                                    storage_engine_type: StorageEngineType::TiKV,
-                                    path: config_wrapper.storage.data_directory.clone(),
-                                    host: None,
-                                    port: None,
-                                    pd_endpoints: None,
-                                    username: None,
-                                    password: None,
+                                let tikv_config = if let Some(ref engine_config) = config_wrapper.storage.engine_specific_config {
+                                    let config_value = serde_json::to_value(engine_config)
+                                        .map_err(|e| anyhow!("Failed to serialize map: {}", e))?;
+                                    serde_json::from_value(config_value)
+                                        .map_err(|e| anyhow!("Failed to parse TikvConfig: {}", e))?
+                                } else {
+                                    TikvConfig {
+                                        storage_engine_type: StorageEngineType::TiKV,
+                                        path: config_wrapper.storage.data_directory.clone(),  // Remove unwrap_or_else
+                                        host: None,
+                                        port: None,
+                                        pd_endpoints: None,
+                                        username: None,
+                                        password: None,
+                                    }
                                 };
                                 Arc::new(TikvStorage::new(&tikv_config).await?)
                                     as Arc<dyn GraphStorageEngine + Send + Sync>
@@ -376,8 +441,7 @@ impl Database {
     pub fn get_persistent_engine_type(&self) -> Option<String> {
         if self.config.storage_engine_type == StorageEngineType::Hybrid {
             self.config.engine_specific_config.as_ref()
-                .and_then(|config| config.get("persistent_engine"))
-                .and_then(|v| v.as_str())
+                .and_then(|config| config.get("persistent_engine").and_then(|v| v.as_str()))
                 .map(|s| s.to_string())
         } else {
             Some(self.config.storage_engine_type.to_string())
@@ -427,5 +491,4 @@ impl Database {
     pub async fn close(&self) -> Result<(), GraphError> {
         self.storage.close().await
     }
-
 }

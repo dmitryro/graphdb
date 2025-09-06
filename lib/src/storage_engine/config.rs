@@ -155,6 +155,7 @@ pub struct SledDaemon {
 pub struct SledDaemonPool {
     pub daemons: HashMap<u16, Arc<SledDaemon>>,
     pub registry: Arc<RwLock<HashMap<u16, DaemonMetadata>>>,
+    pub initialized: Arc<RwLock<bool>>, 
 }
 
 #[derive(Debug, Clone)]

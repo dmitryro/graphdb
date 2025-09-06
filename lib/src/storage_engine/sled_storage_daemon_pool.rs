@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use sled::{Config, Db, Tree};
+use std::io::{Cursor, Read, Write};
+use sled::{Config, Db, IVec, Tree, Batch};
 use tokio::sync::{Mutex as TokioMutex, RwLock};
 use tokio::time::{Duration, timeout};
 use tokio::fs;
@@ -17,6 +18,7 @@ use serde_json::Value;
 use crate::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
 use std::time::{SystemTime, UNIX_EPOCH};
 use futures::future::join_all;
+use uuid::Uuid;
 
 #[cfg(feature = "with-openraft-sled")]
 use {
@@ -32,12 +34,15 @@ impl SledDaemon {
         println!("===> TRYING TO INITIALIZE POOL");
         let db_path = config.path.clone();
         info!("Initializing SledDaemon with path {:?}", db_path);
+        debug!("Caller stack trace: {:#?}", std::backtrace::Backtrace::capture());
+
         if !db_path.exists() {
             tokio::fs::create_dir_all(&db_path)
                 .await
                 .map_err(|e| GraphError::Io(e))?;
         }
 
+        // Sled lock directory path (sled uses a 'db' file/dir internally)
         let lock_path = db_path.join("db");
         debug!("Checking for lock file at {:?}", lock_path);
         if lock_path.exists() {
@@ -79,12 +84,14 @@ impl SledDaemon {
             }
         }
 
+        // Force unlock any stale lock
         SledStorage::force_unlock(&db_path).await?;
 
+        // Open sled DB with retries for WouldBlock
         const MAX_RETRIES: u32 = 5;
         const BASE_DELAY_MS: u64 = 1000;
         let mut attempt = 0;
-        let db = loop {
+        let db: Db = loop {
             debug!("Attempt {} to open Sled DB at {:?}", attempt + 1, db_path);
             match Config::new()
                 .path(&db_path)
@@ -93,7 +100,12 @@ impl SledDaemon {
                 .flush_every_ms(Some(100))
                 .open()
             {
-                Ok(db) => break db,
+                Ok(db) => {
+                    // Verify database integrity
+                    let integrity_check = db.was_recovered();
+                    info!("Sled DB opened at {:?}, was_recovered: {}", db_path, integrity_check);
+                    break db;
+                }
                 Err(e) if e.to_string().contains("WouldBlock") && attempt < MAX_RETRIES => {
                     warn!("Failed to open Sled DB on attempt {}: {}. Retrying.", attempt + 1, e);
                     SledStorage::force_unlock(&db_path).await?;
@@ -110,22 +122,15 @@ impl SledDaemon {
             }
         };
 
-        let vertices = db
-            .open_tree("vertices")
-            .map_err(|e| GraphError::StorageError(e.to_string()))?;
-        let edges = db
-            .open_tree("edges")
-            .map_err(|e| GraphError::StorageError(e.to_string()))?;
-        let kv_pairs = db
-            .open_tree("kv_pairs")
-            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+        // Open trees used by the system
+        let vertices: Tree = db.open_tree("vertices").map_err(|e| GraphError::StorageError(e.to_string()))?;
+        let edges: Tree = db.open_tree("edges").map_err(|e| GraphError::StorageError(e.to_string()))?;
+        let kv_pairs: Tree = db.open_tree("kv_pairs").map_err(|e| GraphError::StorageError(e.to_string()))?;
 
+        // Log key count to avoid unnecessary retrieval
+        let kv_key_count = kv_pairs.len();
         let kv_keys: Vec<_> = kv_pairs.iter().keys().filter_map(|k| k.ok()).collect();
-        let vertex_keys: Vec<_> = vertices.iter().keys().filter_map(|k| k.ok()).collect();
-        let edge_keys: Vec<_> = edges.iter().keys().filter_map(|k| k.ok()).collect();
-        info!("Initial kv_pairs keys at {:?}: {:?}", db_path, kv_keys);
-        info!("Initial vertices keys at {:?}: {:?}", db_path, vertex_keys);
-        info!("Initial edges keys at {:?}: {:?}", db_path, edge_keys);
+        info!("Initial kv_pairs key count at {:?}: {}, keys: {:?}", db_path, kv_key_count, kv_keys);
 
         #[cfg(feature = "with-openraft-sled")]
         let (raft, raft_storage) = {
@@ -175,14 +180,17 @@ impl SledDaemon {
             })?;
             let raft = Raft::new(
                 port as u64,
+                Arc::new(raft_config),
                 Arc::new(raft_storage.clone()),
                 Arc::new(RaftTcpNetwork {}),
-                raft_config,
             )
             .await
             .map_err(|e| GraphError::StorageError(format!("Failed to initialize Raft: {}", e)))?;
             (Arc::new(raft), Arc::new(raft_storage))
         };
+
+        #[cfg(not(feature = "with-openraft-sled"))]
+        let (raft, raft_storage, node_id) = (None::<()>, None::<()>, 0);
 
         let port = config.port.ok_or_else(|| {
             GraphError::ConfigurationError("No port specified in SledConfig".to_string())
@@ -203,6 +211,7 @@ impl SledDaemon {
             node_id: port as u64,
         };
 
+        // Register SIGTERM handler to gracefully close and unlock
         #[cfg(unix)]
         {
             let daemon_clone = Arc::new(daemon.clone());
@@ -234,6 +243,7 @@ impl SledDaemon {
 
     pub async fn close(&self) -> GraphResult<()> {
         info!("Closing SledDaemon at path {:?}", self.db_path);
+        // Flush DB and trees
         let db_flush = self.db.flush_async()
             .await
             .map_err(|e| GraphError::StorageError(format!("Failed to flush Sled DB: {}", e)))?;
@@ -283,23 +293,85 @@ impl SledDaemon {
         Ok(())
     }
 
+    /// Helper function to serialize data using Cursor for persistence.
+    fn serialize_to_ivec<T: serde::Serialize>(data: &T) -> GraphResult<IVec> {
+        let mut cursor = Cursor::new(Vec::new());
+        let serialized = serde_json::to_vec(data)
+            .map_err(|e| GraphError::StorageError(format!("Serialization failed: {}", e)))?;
+        cursor.write_all(&serialized)
+            .map_err(|e| GraphError::StorageError(format!("Failed to write to cursor: {}", e)))?;
+        let bytes = cursor.into_inner();
+        Ok(IVec::from(bytes))
+    }
+
+    /// Helper function to deserialize data from IVec using Cursor and Read.
+    fn deserialize_from_ivec<T: serde::de::DeserializeOwned>(ivec: IVec) -> GraphResult<T> {
+        let mut cursor = Cursor::new(ivec.to_vec());
+        let mut bytes = Vec::new();
+        cursor
+            .read_to_end(&mut bytes)
+            .map_err(|e| GraphError::StorageError(format!("Failed to read from cursor: {}", e)))?;
+        serde_json::from_slice(&bytes)
+            .map_err(|e| GraphError::StorageError(format!("Deserialization failed: {}", e)))
+    }
+
+    /// Insert into sled kv_pairs tree with batch and flush, verifying persistence.
     pub async fn insert(&self, key: &[u8], value: &[u8]) -> GraphResult<()> {
         self.ensure_write_access().await?;
         info!("Inserting key into kv_pairs at path {:?}", self.db_path);
+        println!("==> IN INSERT - trying to insert key {:?}", key);
+
         timeout(Duration::from_secs(5), async {
+            // Log existing keys before insert
+            let pre_keys: Vec<_> = self.kv_pairs.iter().keys().filter_map(|k| k.ok()).collect();
+            debug!("Keys before insert at {:?}: {:?}", self.db_path, pre_keys);
+
+            let mut batch = Batch::default();
+            batch.insert(key, value);
             self.kv_pairs
-                .insert(key, value)
-                .map_err(|e| GraphError::StorageError(e.to_string()))?;
-            let bytes_flushed = self.db
-                .flush_async()
-                .await
-                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+                .apply_batch(batch)
+                .map_err(|e| GraphError::StorageError(format!("Failed to apply batch: {}", e)))?;
+
+            // Flush with retry
+            let mut attempt = 0;
+            const FLUSH_RETRIES: u32 = 3;
+            let bytes_flushed = loop {
+                match self.db.flush_async().await {
+                    Ok(bytes) => break bytes,
+                    Err(e) if attempt < FLUSH_RETRIES => {
+                        warn!("Failed to flush DB on attempt {}: {}. Retrying.", attempt + 1, e);
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        attempt += 1;
+                    }
+                    Err(e) => {
+                        error!("Failed to flush DB at {:?} after {} attempts: {}", self.db_path, attempt + 1, e);
+                        return Err(GraphError::StorageError(format!("Failed to flush DB: {}", e)));
+                    }
+                }
+            };
+            info!("Flushed {} bytes after insert at {:?}", bytes_flushed, self.db_path);
+            println!("==> IN INSERT - flushed {} bytes", bytes_flushed);
+
+            // Verify persistence
+            let persisted = self.kv_pairs
+                .get(key)
+                .map_err(|e| GraphError::StorageError(format!("Failed to verify insert: {}", e)))?;
+            println!("==> IN INSERT - inserted key {:?} and value {:?}", key, persisted);
+            if persisted.is_none() || persisted.as_ref().map(|v| v.as_ref()) != Some(value) {
+                error!("Persistence verification failed for key at {:?}", self.db_path);
+                return Err(GraphError::StorageError("Insert not persisted correctly".to_string()));
+            }
+
+            // Log current keys
             let keys: Vec<_> = self.kv_pairs
                 .iter()
                 .keys()
                 .filter_map(|k| k.ok())
                 .collect();
-            info!("Flushed {} bytes after insert at {:?}, current kv_pairs keys: {:?}", bytes_flushed, self.db_path, keys);
+            info!("Current kv_pairs keys at {:?}: {:?}", self.db_path, keys);
+            println!("==> IN INSERT -  {:?}: {:?}", self.db_path, keys);
+
+            // Raft replication if enabled
             #[cfg(feature = "with-openraft-sled")]
             {
                 let request = openraft::raft::ClientWriteRequest::new(
@@ -318,26 +390,48 @@ impl SledDaemon {
         .map_err(|_| GraphError::StorageError("Timeout during insert".to_string()))?
     }
 
+    /// Retrieve from sled kv_pairs tree using Cursor for deserialization.
     pub async fn retrieve(&self, key: &[u8]) -> GraphResult<Option<Vec<u8>>> {
         if !self.is_running().await {
             return Err(GraphError::StorageError(format!("Daemon at path {:?} is not running", self.db_path)));
         }
+        // Log if test_key is accessed
+        if key == b"test_key" {
+            warn!("Retrieving test_key, caller stack trace: {:#?}", std::backtrace::Backtrace::capture());
+        }
         info!("Retrieving key from kv_pairs at path {:?}", self.db_path);
+        println!("==> RETRIEVE: Retrieving key from kv_pairs at path {:?} and key IS {:?}", self.db_path, key);
+
         let value = timeout(Duration::from_secs(5), async {
-            self.kv_pairs
+            // Log existing keys
+            let pre_keys: Vec<_> = self.kv_pairs.iter().keys().filter_map(|k| k.ok()).collect();
+            debug!("Keys before retrieve at {:?}: {:?}", self.db_path, pre_keys);
+
+            let opt = self.kv_pairs
                 .get(key)
-                .map_err(|e| GraphError::StorageError(e.to_string()))
-                .ok()?
-                .map(|v| v.to_vec())
+                .map_err(|e| GraphError::StorageError(format!("Failed to retrieve key: {}", e)))?;
+            match opt {
+                Some(ivec) => {
+                    let mut cursor = Cursor::new(ivec.to_vec());
+                    let mut bytes = Vec::new();
+                    cursor
+                        .read_to_end(&mut bytes)
+                        .map_err(|e| GraphError::StorageError(format!("Failed to read from cursor: {}", e)))?;
+                    Ok::<Option<Vec<u8>>, GraphError>(Some(bytes))
+                }
+                None => Ok::<Option<Vec<u8>>, GraphError>(None),
+            }
         })
         .await
-        .map_err(|_| GraphError::StorageError("Timeout during retrieve".to_string()))?;
+        .map_err(|_| GraphError::StorageError("Timeout during retrieve".to_string()))??;
+
         let keys: Vec<_> = self.kv_pairs
             .iter()
             .keys()
             .filter_map(|k| k.ok())
             .collect();
         info!("Current kv_pairs keys at {:?}: {:?}", self.db_path, keys);
+        println!("==> RETRIEVE: kv_pairs keys at {:?}: {:?} and value {:?}", self.db_path, keys, value);
         Ok(value)
     }
 
@@ -345,6 +439,9 @@ impl SledDaemon {
         self.ensure_write_access().await?;
         info!("Deleting key from kv_pairs at path {:?}", self.db_path);
         timeout(Duration::from_secs(5), async {
+            let pre_keys: Vec<_> = self.kv_pairs.iter().keys().filter_map(|k| k.ok()).collect();
+            debug!("Keys before delete at {:?}: {:?}", self.db_path, pre_keys);
+
             self.kv_pairs
                 .remove(key)
                 .map_err(|e| GraphError::StorageError(e.to_string()))?;
@@ -379,22 +476,38 @@ impl SledDaemon {
     pub async fn create_vertex(&self, vertex: &Vertex) -> GraphResult<()> {
         self.ensure_write_access().await?;
         let key = vertex.id.0.as_bytes();
-        let value = serialize_vertex(vertex)?;
+        let value = Self::serialize_to_ivec(vertex)?;
         info!("Creating vertex with id {} at path {:?}", vertex.id, self.db_path);
+
         timeout(Duration::from_secs(5), async {
+            let mut batch = Batch::default();
+            batch.insert(key, value);
             self.vertices
-                .insert(key, value)
-                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+                .apply_batch(batch)
+                .map_err(|e| GraphError::StorageError(format!("Failed to apply batch for vertex: {}", e)))?;
+
             let bytes_flushed = self.db
                 .flush_async()
                 .await
-                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+                .map_err(|e| GraphError::StorageError(format!("Failed to flush DB: {}", e)))?;
+            info!("Flushed {} bytes after creating vertex at {:?}", bytes_flushed, self.db_path);
+
+            // Verify persistence
+            let persisted = self.vertices
+                .get(key)
+                .map_err(|e| GraphError::StorageError(format!("Failed to verify vertex insert: {}", e)))?;
+            if persisted.is_none() {
+                error!("Persistence verification failed for vertex id {} at {:?}", vertex.id, self.db_path);
+                return Err(GraphError::StorageError("Vertex insert not persisted".to_string()));
+            }
+
             let vertex_keys: Vec<_> = self.vertices
                 .iter()
                 .keys()
                 .filter_map(|k| k.ok())
                 .collect();
-            info!("Flushed {} bytes after creating vertex at {:?}, current vertices keys: {:?}", bytes_flushed, self.db_path, vertex_keys);
+            info!("Current vertices keys at {:?}: {:?}", self.db_path, vertex_keys);
+
             #[cfg(feature = "with-openraft-sled")]
             {
                 let request = openraft::raft::ClientWriteRequest::new(
@@ -413,21 +526,28 @@ impl SledDaemon {
         .map_err(|_| GraphError::StorageError("Timeout during create_vertex".to_string()))?
     }
 
-    pub async fn get_vertex(&self, id: &uuid::Uuid) -> GraphResult<Option<Vertex>> {
+    pub async fn get_vertex(&self, id: &Uuid) -> GraphResult<Option<Vertex>> {
         if !self.is_running().await {
             return Err(GraphError::StorageError(format!("Daemon at path {:?} is not running", self.db_path)));
         }
         let key = id.as_bytes();
         info!("Retrieving vertex with id {} from path {:?}", id, self.db_path);
+
         let res = timeout(Duration::from_secs(5), async {
-            self.vertices
+            let opt = self.vertices
                 .get(key)
-                .map_err(|e| GraphError::StorageError(e.to_string()))?
-                .map(|b| deserialize_vertex(&b))
-                .transpose()
+                .map_err(|e| GraphError::StorageError(format!("Failed to retrieve vertex: {}", e)))?;
+            match opt {
+                Some(ivec) => {
+                    let vertex = Self::deserialize_from_ivec(ivec)?;
+                    Ok::<Option<Vertex>, GraphError>(Some(vertex))
+                }
+                None => Ok::<Option<Vertex>, GraphError>(None),
+            }
         })
         .await
         .map_err(|_| GraphError::StorageError("Timeout during get_vertex".to_string()))??;
+
         let vertex_keys: Vec<_> = self.vertices
             .iter()
             .keys()
@@ -442,7 +562,7 @@ impl SledDaemon {
         self.create_vertex(vertex).await
     }
 
-    pub async fn delete_vertex(&self, id: &uuid::Uuid) -> GraphResult<()> {
+    pub async fn delete_vertex(&self, id: &Uuid) -> GraphResult<()> {
         self.ensure_write_access().await?;
         let key = id.as_bytes();
         info!("Deleting vertex with id {} from path {:?}", id, self.db_path);
@@ -451,6 +571,7 @@ impl SledDaemon {
                 .remove(key)
                 .map_err(|e| GraphError::StorageError(e.to_string()))?;
 
+            // Remove edges with prefix matching the vertex id
             let mut batch = sled::Batch::default();
             let prefix = id.as_bytes();
             for item in self.edges.iter().keys() {
@@ -498,22 +619,39 @@ impl SledDaemon {
     pub async fn create_edge(&self, edge: &Edge) -> GraphResult<()> {
         self.ensure_write_access().await?;
         let key = create_edge_key(&edge.outbound_id.into(), &edge.t, &edge.inbound_id.into())?;
-        let value = serialize_edge(edge)?;
+        let value = Self::serialize_to_ivec(edge)?;
         info!("Creating edge ({}, {}, {}) at path {:?}", edge.outbound_id, edge.t, edge.inbound_id, self.db_path);
+
         timeout(Duration::from_secs(5), async {
+            let mut batch = Batch::default();
+            batch.insert(&*key, value);
             self.edges
-                .insert(key, value)
-                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+                .apply_batch(batch)
+                .map_err(|e| GraphError::StorageError(format!("Failed to apply batch for edge: {}", e)))?;
+
             let bytes_flushed = self.db
                 .flush_async()
                 .await
-                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+                .map_err(|e| GraphError::StorageError(format!("Failed to flush DB: {}", e)))?;
+            info!("Flushed {} bytes after creating edge at {:?}", bytes_flushed, self.db_path);
+
+            // Verify persistence
+            let persisted = self.edges
+                .get(&key)
+                .map_err(|e| GraphError::StorageError(format!("Failed to verify edge insert: {}", e)))?;
+            if persisted.is_none() {
+                error!("Persistence verification failed for edge ({}, {}, {}) at {:?}", 
+                    edge.outbound_id, edge.t, edge.inbound_id, self.db_path);
+                return Err(GraphError::StorageError("Edge insert not persisted".to_string()));
+            }
+
             let edge_keys: Vec<_> = self.edges
                 .iter()
                 .keys()
                 .filter_map(|k| k.ok())
                 .collect();
-            info!("Flushed {} bytes after creating edge at {:?}, current edges keys: {:?}", bytes_flushed, self.db_path, edge_keys);
+            info!("Current edges keys at {:?}: {:?}", self.db_path, edge_keys);
+
             #[cfg(feature = "with-openraft-sled")]
             {
                 let request = openraft::raft::ClientWriteRequest::new(
@@ -534,24 +672,31 @@ impl SledDaemon {
 
     pub async fn get_edge(
         &self,
-        outbound_id: &uuid::Uuid,
+        outbound_id: &Uuid,
         edge_type: &Identifier,
-        inbound_id: &uuid::Uuid,
+        inbound_id: &Uuid,
     ) -> GraphResult<Option<Edge>> {
         if !self.is_running().await {
             return Err(GraphError::StorageError(format!("Daemon at path {:?} is not running", self.db_path)));
         }
         let key = create_edge_key(&(*outbound_id).into(), edge_type, &(*inbound_id).into())?;
         info!("Retrieving edge ({}, {}, {}) from path {:?}", outbound_id, edge_type, inbound_id, self.db_path);
+
         let res = timeout(Duration::from_secs(5), async {
-            self.edges
+            let opt = self.edges
                 .get(&key)
-                .map_err(|e| GraphError::StorageError(e.to_string()))?
-                .map(|b| deserialize_edge(&b))
-                .transpose()
+                .map_err(|e| GraphError::StorageError(format!("Failed to retrieve edge: {}", e)))?;
+            match opt {
+                Some(ivec) => {
+                    let edge = Self::deserialize_from_ivec(ivec)?;
+                    Ok::<Option<Edge>, GraphError>(Some(edge))
+                }
+                None => Ok::<Option<Edge>, GraphError>(None),
+            }
         })
         .await
         .map_err(|_| GraphError::StorageError("Timeout during get_edge".to_string()))??;
+
         let edge_keys: Vec<_> = self.edges
             .iter()
             .keys()
@@ -567,9 +712,9 @@ impl SledDaemon {
 
     pub async fn delete_edge(
         &self,
-        outbound_id: &uuid::Uuid,
+        outbound_id: &Uuid,
         edge_type: &Identifier,
-        inbound_id: &uuid::Uuid,
+        inbound_id: &Uuid,
     ) -> GraphResult<()> {
         self.ensure_write_access().await?;
         let key = create_edge_key(&(*outbound_id).into(), edge_type, &(*inbound_id).into())?;
@@ -645,6 +790,7 @@ impl SledDaemonPool {
         Self {
             daemons: HashMap::new(),
             registry: Arc::new(RwLock::new(HashMap::new())),
+            initialized: Arc::new(RwLock::new(false)),
         }
     }
 
@@ -683,6 +829,13 @@ impl SledDaemonPool {
     }
 
     pub async fn initialize_cluster(&mut self, storage_config: &StorageConfig, config: &SledConfig) -> GraphResult<()> {
+        // Check if already initialized
+        let mut initialized = self.initialized.write().await;
+        if *initialized {
+            warn!("SledDaemonPool already initialized, skipping. Caller stack trace: {:#?}", std::backtrace::Backtrace::capture());
+            return Ok(());
+        }
+
         debug!("Initializing cluster with use_raft_for_scale: {}", storage_config.use_raft_for_scale);
 
         let registry_path = Path::new(DAEMON_REGISTRY_DB_PATH);
@@ -739,7 +892,15 @@ impl SledDaemonPool {
                     "Selected port {} is outside cluster range {}-{}", port, start_port, end_port
                 )));
             }
-            return self.add_daemon(storage_config, port, config).await;
+            
+            // Drop the initialized lock before calling add_daemon
+            drop(initialized);
+            
+            self.add_daemon(storage_config, port, config).await?;
+            
+            // Re-acquire the lock and set initialized to true
+            *self.initialized.write().await = true;
+            return Ok(());
         }
 
         info!("Initializing Raft cluster for ports {}-{}", start_port, end_port);
@@ -796,6 +957,7 @@ impl SledDaemonPool {
             }
         }
 
+        *initialized = true;
         info!("Successfully initialized cluster with {} daemons", self.daemons.len());
         Ok(())
     }
@@ -865,9 +1027,9 @@ impl SledDaemonPool {
 
     pub async fn get_edge(
         &self,
-        outbound_id: &uuid::Uuid,
+        outbound_id: &Uuid,
         edge_type: &Identifier,
-        inbound_id: &uuid::Uuid,
+        inbound_id: &Uuid,
         _use_raft: bool,
     ) -> GraphResult<Option<Edge>> {
         let daemon = self.leader_daemon().await?;
@@ -883,9 +1045,9 @@ impl SledDaemonPool {
 
     pub async fn delete_edge(
         &self,
-        outbound_id: &uuid::Uuid,
+        outbound_id: &Uuid,
         edge_type: &Identifier,
-        inbound_id: &uuid::Uuid,
+        inbound_id: &Uuid,
         _use_raft: bool,
     ) -> GraphResult<()> {
         let daemon = self.leader_daemon().await?;
@@ -899,7 +1061,7 @@ impl SledDaemonPool {
             .map_err(|_| GraphError::StorageError("Timeout during create_vertex".to_string()))?
     }
 
-    pub async fn get_vertex(&self, id: &uuid::Uuid, _use_raft: bool) -> GraphResult<Option<Vertex>> {
+    pub async fn get_vertex(&self, id: &Uuid, _use_raft: bool) -> GraphResult<Option<Vertex>> {
         let daemon = self.leader_daemon().await?;
         timeout(Duration::from_secs(5), daemon.get_vertex(id)).await
             .map_err(|_| GraphError::StorageError("Timeout during get_vertex".to_string()))?
@@ -911,7 +1073,7 @@ impl SledDaemonPool {
             .map_err(|_| GraphError::StorageError("Timeout during update_vertex".to_string()))?
     }
 
-    pub async fn delete_vertex(&self, id: &uuid::Uuid, _use_raft: bool) -> GraphResult<()> {
+    pub async fn delete_vertex(&self, id: &Uuid, _use_raft: bool) -> GraphResult<()> {
         let daemon = self.leader_daemon().await?;
         timeout(Duration::from_secs(5), daemon.delete_vertex(id)).await
             .map_err(|_| GraphError::StorageError("Timeout during delete_vertex".to_string()))?

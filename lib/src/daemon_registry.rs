@@ -568,10 +568,11 @@ impl NonBlockingDaemonRegistry {
         if let Some(pool) = &*storage_guard {
             let test_key = b"__health_check__";
             let test_value = b"ok";
+             
             if pool.insert(test_key, test_value).await.is_ok() {
                 let _ = pool.remove(test_key).await;
                 return Ok(true);
-            }
+            } 
         }
         
         Ok(true)

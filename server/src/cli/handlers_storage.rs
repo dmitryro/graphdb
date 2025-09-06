@@ -354,9 +354,9 @@ pub async fn start_storage_interactive(
     let command = CommandType::StartStorage {
         port,
         config_file: config_file.clone(),
-        cluster: _cluster_opt.clone(),
+        cluster: _cluster_opt.clone(), // Clone to avoid move
         storage_port: port,
-        storage_cluster: _cluster_opt,
+        storage_cluster: _cluster_opt.clone(), // Clone to avoid move
     };
     let cli_config = CliConfig::load(Some(command))
         .with_context(|| "Failed to load CLI configuration. Check file permissions or path.")?;
@@ -502,21 +502,6 @@ pub async fn start_storage_interactive(
     println!("==> STARTING STORAGE - STEP 4 - and engine specific config here is {:?}", storage_config.engine_specific_config);
 
     // --- STEP 4: DETERMINE PORT AND UPDATE CLUSTER RANGE ---
-    // Prioritize CLI port, then engine-specific port, then default port
-    let selected_port = port.unwrap_or_else(|| {
-        storage_config.engine_specific_config
-            .as_ref()
-            .and_then(|c| c.storage.port)
-            .unwrap_or(storage_config.default_port)
-    });
-    info!("===> SELECTED PORT {} (CLI: {:?}, Engine-specific: {:?}, Default: {})",
-        selected_port,
-        port,
-        storage_config.engine_specific_config.as_ref().and_then(|c| c.storage.port),
-        storage_config.default_port
-    );
-    println!("===> SELECTED PORT {}", selected_port);
-
     // Extract TiKV PD port from pd_endpoints if previous engine was TiKV
     let tikv_pd_port = if storage_config.storage_engine_type == StorageEngineType::TiKV {
         storage_config.engine_specific_config
@@ -549,10 +534,36 @@ pub async fn start_storage_interactive(
     };
     debug!("TiKV PD port: {:?}", tikv_pd_port);
 
+    // Prioritize CLI port, then engine-specific port, then default port, but avoid 2379 for non-TiKV engines
+    let selected_port = port.unwrap_or_else(|| {
+        let engine_port = storage_config.engine_specific_config
+            .as_ref()
+            .and_then(|c| c.storage.port);
+        let default_port = if storage_config.storage_engine_type != StorageEngineType::TiKV
+            && storage_config.default_port == tikv_pd_port.unwrap_or(2379)
+        {
+            8049 // Use safe default port for non-TiKV engines
+        } else {
+            storage_config.default_port
+        };
+        engine_port.unwrap_or(default_port)
+    });
+
+    // Early check: Skip daemon startup if selected port is TiKV PD port for non-TiKV engines
+    if storage_config.storage_engine_type != StorageEngineType::TiKV {
+        if let Some(pd_port) = tikv_pd_port {
+            if selected_port == pd_port {
+                info!("Skipping startup on TiKV PD port {} for engine {:?}", selected_port, storage_config.storage_engine_type);
+                println!("Skipping startup on TiKV PD port {} for engine {:?}", selected_port, storage_config.storage_engine_type);
+                return Ok(());
+            }
+        }
+    }
+
     // Early check: Skip daemon startup if selected port is TiKV PD port and engine is TiKV
     if storage_config.storage_engine_type == StorageEngineType::TiKV {
         if let Some(pd_port) = tikv_pd_port {
-            if Some(selected_port) == Some(pd_port) {
+            if selected_port == pd_port {
                 info!("Skipping daemon startup on TiKV PD port {}", selected_port);
                 println!("Skipping daemon startup on TiKV PD port {}.", selected_port);
                 return Ok(());
@@ -560,8 +571,24 @@ pub async fn start_storage_interactive(
         }
     }
 
+    info!("===> SELECTED PORT {} (CLI: {:?}, Engine-specific: {:?}, Default: {})",
+        selected_port,
+        port,
+        storage_config.engine_specific_config.as_ref().and_then(|c| c.storage.port),
+        storage_config.default_port
+    );
+    println!("===> SELECTED PORT {}", selected_port);
+
     // Update engine-specific config with selected port
     if let Some(ref mut engine_config) = storage_config.engine_specific_config {
+        if storage_config.storage_engine_type != StorageEngineType::TiKV {
+            if let Some(pd_port) = tikv_pd_port {
+                if engine_config.storage.port == Some(pd_port) {
+                    engine_config.storage.port = Some(8049); // Use safe port for non-TiKV engines
+                    info!("Changed engine-specific port from {} to 8049 for non-TiKV engine", pd_port);
+                }
+            }
+        }
         engine_config.storage.port = Some(selected_port);
         // Ensure pd_endpoints for TiKV
         if storage_config.storage_engine_type == StorageEngineType::TiKV {
@@ -571,50 +598,53 @@ pub async fn start_storage_interactive(
         }
     }
 
+    // Parse cluster_range, default to selected_port if invalid or not provided
+    let current_ports = if let Some(cluster) = _cluster_opt.as_ref() {
+        match parse_cluster_range(cluster) {
+            Ok(ports) => ports,
+            Err(e) => {
+                warn!("Failed to parse cluster range '{}': {}. Using single port {}.", cluster, e, selected_port);
+                vec![selected_port]
+            }
+        }
+    } else if !storage_config.cluster_range.is_empty() {
+        match parse_cluster_range(&storage_config.cluster_range) {
+            Ok(ports) => ports,
+            Err(e) => {
+                warn!("Failed to parse cluster range '{}': {}. Using single port {}.", storage_config.cluster_range, e, selected_port);
+                vec![selected_port]
+            }
+        }
+    } else {
+        vec![selected_port]
+    };
+
     // Adjust cluster range to exclude TiKV PD port for non-TiKV engines
-    let mut current_ports = parse_port_cluster_range(&storage_config.cluster_range)?;
+    let mut final_ports = current_ports;
     if storage_config.storage_engine_type != StorageEngineType::TiKV {
         if let Some(pd_port) = tikv_pd_port {
-            current_ports.retain(|&p| p != pd_port);
+            final_ports.retain(|&p| p != pd_port);
             info!("Excluding TiKV PD port {} from cluster range for non-TiKV engine", pd_port);
         }
-        storage_config.cluster_range = if current_ports.is_empty() {
-            selected_port.to_string()
-        } else if current_ports.len() == 1 {
-            current_ports[0].to_string()
-        } else {
-            format!("{}-{}", current_ports.iter().min().unwrap_or(&selected_port), current_ports.iter().max().unwrap_or(&selected_port))
-        };
-        info!("Adjusted cluster range to {} for engine {:?}", storage_config.cluster_range, storage_config.storage_engine_type);
-        storage_config.save().context("Failed to save StorageConfig with updated cluster range")?;
+    } else if let Some(pd_port) = tikv_pd_port {
+        if !final_ports.contains(&pd_port) {
+            final_ports.push(pd_port);
+            final_ports.sort();
+            final_ports.dedup();
+            info!("Included TiKV PD port {} in cluster range", pd_port);
+        }
+    }
+
+    // Update storage_config.cluster_range
+    storage_config.cluster_range = if final_ports.is_empty() {
+        selected_port.to_string()
+    } else if final_ports.len() == 1 {
+        final_ports[0].to_string()
     } else {
-        // For TiKV, include the PD port in the cluster range only if it's not already present
-        if let Some(pd_port) = tikv_pd_port {
-            if !current_ports.contains(&pd_port) {
-                current_ports.push(pd_port);
-                current_ports.sort();
-                current_ports.dedup();
-                storage_config.cluster_range = if current_ports.len() == 1 {
-                    pd_port.to_string()
-                } else {
-                    format!("{}-{}", current_ports.iter().min().unwrap_or(&pd_port), current_ports.iter().max().unwrap_or(&selected_port))
-                };
-                info!("Updated cluster range to {} to include TiKV PD port {}", storage_config.cluster_range, pd_port);
-                storage_config.save().context("Failed to save StorageConfig with updated cluster range")?;
-            }
-        }
-    }
-
-    // Ensure selected port is not the TiKV PD port for non-TiKV engines
-    if storage_config.storage_engine_type != StorageEngineType::TiKV {
-        if let Some(pd_port) = tikv_pd_port {
-            if selected_port == pd_port {
-                return Err(anyhow!("Selected port {} is reserved for TiKV PD and cannot be used for engine {:?}", selected_port, storage_config.storage_engine_type));
-            }
-        }
-    }
-
-    storage_config.save().context("Failed to save port-specific StorageConfig")?;
+        format!("{}-{}", final_ports.iter().min().unwrap_or(&selected_port), final_ports.iter().max().unwrap_or(&selected_port))
+    };
+    info!("Set cluster range to {} for engine {:?}", storage_config.cluster_range, storage_config.storage_engine_type);
+    storage_config.save().context("Failed to save StorageConfig with updated cluster range")?;
 
     let ip = "127.0.0.1";
     let ip_addr: IpAddr = ip.parse().with_context(|| format!("Invalid IP address: {}", ip))?;
@@ -635,6 +665,17 @@ pub async fn start_storage_interactive(
             info!("Port {} is in use by a stale GraphDB storage daemon. Removing registry entry.", selected_port);
             if let Err(e) = GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("storage", selected_port).await {
                 warn!("Failed to remove stale storage daemon from registry: {}", e);
+            }
+        }
+    }
+
+    // Skip process termination if selected port is TiKV PD port for non-TiKV engines
+    if storage_config.storage_engine_type != StorageEngineType::TiKV {
+        if let Some(pd_port) = tikv_pd_port {
+            if selected_port == pd_port {
+                info!("Skipping process termination on TiKV PD port {} for engine {:?}", selected_port, storage_config.storage_engine_type);
+                println!("Skipping process termination on TiKV PD port {} for engine {:?}", selected_port, storage_config.storage_engine_type);
+                return Ok(());
             }
         }
     }
@@ -895,7 +936,7 @@ pub async fn start_storage_interactive(
             .map_err(|_| anyhow!("Failed to set StorageEngineManager"))?;
         trace!("GLOBAL_STORAGE_ENGINE_MANAGER has been initialized");
         info!("Initialized StorageEngineManager with engine type: {:?}", storage_config.storage_engine_type);
-        println!("===> TRYING TO INITIAZLIE POOL");
+        println!("===> TRYING TO INITIALIZE POOL");
     } else {
         trace!("GLOBAL_STORAGE_ENGINE_MANAGER already initialized, using existing instance");
         let manager = GLOBAL_STORAGE_ENGINE_MANAGER.get().unwrap();
