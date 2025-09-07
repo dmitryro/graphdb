@@ -12,10 +12,14 @@
 // FIXED: 2025-09-05 - Resolved StorageConfig type mismatch, function signature issues, removed flush_every_ms, and fixed PathBuf errors
 // FIXED: 2025-09-05 - Corrected max_open_files conversion from Option<u64> to Option<i32>
 // UPDATED: 2025-09-06 - Updated handle_kv_command to verify persistence for 'set' operation
+// FIXED: 2025-09-06 - Added AsyncWriteExt and AsyncReadExt imports for TcpStream methods
+// FIXED: 2025-09-06 - Corrected GLOBAL_DAEMON_REGISTRY access using get().await
+// FIXED: 2025-09-06 - Updated handle_kv_sled_tcp and initialize_storage_for_query to use running Sled daemon ports (8051 or 8050)
+// FIXED: 2025-09-06 - Ensured initialize_storage_for_query uses port 8051 for new daemons to align with cluster_range
 
 use anyhow::{anyhow, Context, Result};
 use log::{debug, error, info, warn};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
@@ -24,7 +28,9 @@ use std::sync::Arc;
 use std::fs;
 use tokio::sync::{oneshot, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
-use tokio::time::{self, Duration as TokioDuration};
+use tokio::time::{self, timeout, Duration as TokioDuration};
+use tokio::net::TcpStream;
+use tokio::io::{AsyncWriteExt, AsyncReadExt}; // For write_all, flush, and read
 use lib::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
 use lib::query_exec_engine::query_exec_engine::QueryExecEngine;
 use lib::query_parser::{parse_query_from_string, QueryType};
@@ -227,51 +233,58 @@ pub async fn handle_kv_command(engine: Arc<QueryExecEngine>, operation: String, 
     let validated_op = parse_kv_operation(&operation)
         .map_err(|e| anyhow!("Invalid KV operation: {}", e))?;
 
-    match validated_op.as_str() {
-        "get" => {
-            info!("Executing Key-Value GET for key: {}", key);
-            let result = engine
-                .kv_get(&key)
-                .await
-                .map_err(|e| anyhow!("Failed to get key '{}': {}", key, e))?;
-            match result {
-                Some(val) => {
-                    println!("Value for key '{}': {}", key, val);
-                    Ok(())
+    // Check the storage engine type from the configuration
+    let config = crate::cli::config::load_cli_config()?;
+    if config.storage.storage_engine_type == Some(StorageEngineType::Sled) {
+        info!("Using Sled-specific TCP handler for KV operation: {}", validated_op);
+        handle_kv_sled_tcp(key, value, &validated_op).await
+    } else {
+        match validated_op.as_str() {
+            "get" => {
+                info!("Executing Key-Value GET for key: {}", key);
+                let result = engine
+                    .kv_get(&key)
+                    .await
+                    .map_err(|e| anyhow!("Failed to get key '{}': {}", key, e))?;
+                match result {
+                    Some(val) => {
+                        println!("Value for key '{}': {}", key, val);
+                        Ok(())
+                    }
+                    None => {
+                        println!("Key '{}' not found", key);
+                        Ok(())
+                    }
                 }
-                None => {
+            }
+            "set" => {
+                let value = value.ok_or_else(|| {
+                    anyhow!("Missing value for 'kv set' command. Usage: kv set <key> <value> or kv set --key <key> --value <value>")
+                })?;
+                info!("Executing Key-Value SET for key: {}, value: {}", key, value);
+                let stored_value = engine
+                    .kv_set(&key, &value)
+                    .await
+                    .map_err(|e| anyhow!("Failed to set key '{}': {}", key, e))?;
+                println!("Successfully set and verified key '{:?}' to '{:?}'", key, stored_value);
+                Ok(())
+            }
+            "delete" => {
+                info!("Executing Key-Value DELETE for key: {}", key);
+                let existed = engine
+                    .kv_delete(&key)
+                    .await
+                    .map_err(|e| anyhow!("Failed to delete key '{}': {}", key, e))?;
+                if existed {
+                    println!("Successfully deleted key '{}'", key);
+                } else {
                     println!("Key '{}' not found", key);
-                    Ok(())
                 }
+                Ok(())
             }
-        }
-        "set" => {
-            let value = value.ok_or_else(|| {
-                anyhow!("Missing value for 'kv set' command. Usage: kv set <key> <value> or kv set --key <key> --value <value>")
-            })?;
-            info!("Executing Key-Value SET for key: {}, value: {}", key, value);
-            let stored_value = engine
-                .kv_set(&key, &value)
-                .await
-                .map_err(|e| anyhow!("Failed to set key '{}': {}", key, e))?;
-            println!("Successfully set and verified key '{:?}' to '{:?}'", key, stored_value);
-            Ok(())
-        }
-        "delete" => {
-            info!("Executing Key-Value DELETE for key: {}", key);
-            let existed = engine
-                .kv_delete(&key)
-                .await
-                .map_err(|e| anyhow!("Failed to delete key '{}': {}", key, e))?;
-            if existed {
-                println!("Successfully deleted key '{}'", key);
-            } else {
-                println!("Key '{}' not found", key);
+            _ => {
+                Err(anyhow!("Unsupported KV operation: '{}'. Supported operations: get, set, delete", operation))
             }
-            Ok(())
-        }
-        _ => {
-            Err(anyhow!("Unsupported KV operation: '{}'. Supported operations: get, set, delete", operation))
         }
     }
 }
@@ -323,15 +336,17 @@ pub async fn initialize_storage_for_query(
     println!("===> Initializing Storage Engine...");
 
     let running_daemons: Vec<DaemonMetadata> = GLOBAL_DAEMON_REGISTRY
+        .get()
+        .await
         .get_all_daemon_metadata()
         .await
         .unwrap_or_default()
         .into_iter()
-        .filter(|d| d.service_type == "storage")
+        .filter(|d| d.service_type == "storage" && d.engine_type == Some(StorageEngineType::Sled.to_string()))
         .collect();
 
-    if let Some(daemon) = running_daemons.first() {
-        info!("Found running storage daemon on port {}, connecting to it...", daemon.port);
+    if let Some(daemon) = running_daemons.iter().find(|d| d.port == 8049).or_else(|| running_daemons.iter().find(|d| d.port == 8050)) {
+        info!("Found running Sled storage daemon on port {}, connecting to it...", daemon.port);
 
         let engine_type = daemon.engine_type
             .as_ref()
@@ -385,12 +400,12 @@ pub async fn initialize_storage_for_query(
         info!("Successfully initialized storage engine {:?}", engine_type);
         println!("===> Storage Engine initialized successfully.");
     } else {
-        info!("No running daemon found, starting a new storage daemon.");
-        println!("===> No running daemon found, starting a new storage daemon...");
+        info!("No running Sled daemon found, starting a new storage daemon on port 8051...");
+        println!("===> No running Sled daemon found, starting a new storage daemon...");
         let cwd = std::env::current_dir().context("Failed to get current working directory")?;
         let config_path = cwd.join(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
 
-        let cli_config = match load_storage_config_from_yaml(Some(config_path.clone())) {
+        let mut cli_config = match load_storage_config_from_yaml(Some(config_path.clone())) {
             Ok(config) => {
                 info!("Successfully loaded existing storage config: {:?}", config);
                 config
@@ -400,6 +415,9 @@ pub async fn initialize_storage_for_query(
                 CliStorageConfig::default()
             }
         };
+        // Explicitly set port to 8051 to align with cluster_range
+        cli_config.default_port = 8049;
+        cli_config.cluster_range = "8049".to_string(); // Align with cluster_range
         let lib_config = convert_to_lib_storage_config(cli_config.clone());
 
         let storage_daemon_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>> = Arc::new(TokioMutex::new(None));
@@ -407,18 +425,261 @@ pub async fn initialize_storage_for_query(
         let storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>> = Arc::new(TokioMutex::new(None));
 
         start_storage_interactive(
-            Some(cli_config.default_port),
+            Some(8051),
             Some(config_path),
             Some(cli_config),
             None,
             storage_daemon_shutdown_tx_opt,
             storage_daemon_handle,
             storage_daemon_port_arc,
-        ).await.context("Failed to start storage daemon")?;
+        ).await.context("Failed to start storage daemon on port 8051")?;
 
-        info!("Successfully started a new storage daemon.");
-        println!("===> New storage daemon started successfully.");
+        info!("Successfully started a new storage daemon on port 8051.");
+        println!("===> New storage daemon started successfully on port 8051.");
     }
 
     Ok(())
+}
+
+async fn handle_kv_sled_tcp(key: String, value: Option<String>, operation: &str) -> Result<()> {
+    const READ_TIMEOUT_SECS: u64 = 5;
+    const MAX_MESSAGE_SIZE: usize = 10 * 15024 * 15024; // 10MB max message size
+    const MAX_RETRIES: u32 = 2;
+
+    // Load storage configuration
+    let cli_config = load_storage_config_from_yaml(None)
+        .map_err(|e| anyhow!("Failed to load storage config: {}", e))?;
+    let default_port = cli_config.default_port;
+    let cluster_range_start = cli_config.cluster_range.parse::<u16>().ok();
+
+    // Find a running Sled daemon
+    let registry = GLOBAL_DAEMON_REGISTRY.get().await;
+    let daemons = registry
+        .get_all_daemon_metadata()
+        .await
+        .map_err(|e| anyhow!("Failed to retrieve daemon metadata: {}", e))?
+        .into_iter()
+        .filter(|metadata| metadata.engine_type == Some(StorageEngineType::Sled.to_string()))
+        .collect::<Vec<_>>();
+
+    let mut attempt = 0;
+    while attempt < MAX_RETRIES {
+        let daemon = daemons
+            .iter()
+            .find(|d| {
+                d.port == default_port || cluster_range_start.map_or(false, |range_start| d.port == range_start)
+            })
+            .or_else(|| daemons.first());
+        let port = match daemon {
+            Some(metadata) => metadata.port,
+            None => {
+                return Err(anyhow!("No running Sled daemon found. Please start a daemon with 'storage start'"));
+            }
+        };
+
+        // Connect to daemon
+        let addr = format!("127.0.0.1:{}", port);
+        info!("Connecting to Sled daemon at {}", addr);
+        let mut stream = match TcpStream::connect(&addr).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                warn!("Failed to connect to {}: {}. Retrying...", addr, e);
+                attempt += 1;
+                continue;
+            }
+        };
+
+        // Prepare request
+        let request = match operation {
+            "set" => {
+                if let Some(ref value) = value {
+                    json!({ "command": "set_key", "key": key, "value": value })
+                } else {
+                    return Err(anyhow!("Missing value for 'set' operation"));
+                }
+            }
+            "get" => json!({ "command": "get_key", "key": key }),
+            "delete" => json!({ "command": "delete_key", "key": key }),
+            _ => return Err(anyhow!("Unsupported operation: {}", operation)),
+        };
+
+        // Send request with length prefix
+        let request_data = serde_json::to_vec(&request)
+            .map_err(|e| anyhow!("Failed to serialize request: {}", e))?;
+        let request_length = request_data.len() as u32;
+        let length_bytes = request_length.to_be_bytes();
+        stream.write_all(&length_bytes).await
+            .map_err(|e| anyhow!("Failed to send request length to {}: {}", addr, e))?;
+        stream.write_all(&request_data).await
+            .map_err(|e| anyhow!("Failed to send request to {}: {}", addr, e))?;
+        stream.flush().await
+            .map_err(|e| anyhow!("Failed to flush request to {}: {}", addr, e))?;
+
+        // Read response
+        let mut buffer = Vec::with_capacity(4096);
+        let response = match timeout(TokioDuration::from_secs(READ_TIMEOUT_SECS), async {
+            let mut length_buf = [0u8; 4];
+            stream.read_exact(&mut length_buf).await
+                .map_err(|e| anyhow!("Failed to read response length from {}: {}", addr, e))?;
+            let response_length = u32::from_be_bytes(length_buf) as usize;
+
+            if response_length > MAX_MESSAGE_SIZE {
+                error!("Invalid response size {} exceeds maximum {} from {}", response_length, MAX_MESSAGE_SIZE, addr);
+                return Err(anyhow!("Response size {} exceeds maximum {}", response_length, MAX_MESSAGE_SIZE));
+            }
+            if response_length == 0 {
+                error!("Zero-length response from {}", addr);
+                return Err(anyhow!("Received zero-length response"));
+            }
+            debug!("Received length prefix: {:?}", length_buf);
+
+            buffer.clear();
+            buffer.reserve(response_length.min(MAX_MESSAGE_SIZE));
+            let mut bytes_read = 0;
+            while bytes_read < response_length {
+                let chunk_size = (response_length - bytes_read).min(4096);
+                let mut chunk = vec![0u8; chunk_size];
+                let n = stream.read_exact(&mut chunk).await
+                    .map_err(|e| anyhow!("Failed to read response chunk from {}: {}", addr, e))?;
+                if n == 0 {
+                    return Err(anyhow!("Unexpected EOF from {}", addr));
+                }
+                buffer.extend_from_slice(&chunk[..n]);
+                bytes_read += n;
+            }
+            debug!("Received response of length {} from {}", buffer.len(), addr);
+
+            serde_json::from_slice::<Value>(&buffer)
+                .map_err(|e| anyhow!("Failed to parse response from {}: {}", addr, e))
+        })
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(e)) => {
+                warn!("Response error from {}: {}. Retrying...", addr, e);
+                attempt += 1;
+                continue;
+            }
+            Err(_) => {
+                warn!("Timeout reading response from {}. Retrying...", addr);
+                attempt += 1;
+                continue;
+            }
+        };
+
+        // Shutdown stream
+        if let Err(e) = stream.shutdown().await {
+            warn!("Failed to shutdown stream to {}: {}", addr, e);
+        }
+
+        // Process response
+        match response.get("status").and_then(|s| s.as_str()) {
+            Some("success") => {
+                match operation {
+                    "get" => {
+                        if let Some(response_value) = response.get("value") {
+                            println!(
+                                "Key '{}': {}",
+                                key,
+                                if response_value.is_null() {
+                                    "not found".to_string()
+                                } else {
+                                    response_value.as_str().unwrap_or("").to_string()
+                                }
+                            );
+                        }
+                    }
+                    "set" => {
+                        println!("Set key '{}' successfully", key);
+                        // Verify persistence
+                        let verify_request = json!({ "command": "get_key", "key": key });
+                        let mut verify_stream = TcpStream::connect(&addr).await
+                            .map_err(|e| anyhow!("Failed to connect for verification: {}", e))?;
+                        let verify_data = serde_json::to_vec(&verify_request)
+                            .map_err(|e| anyhow!("Failed to serialize verification request: {}", e))?;
+                        let verify_length = verify_data.len() as u32;
+                        verify_stream.write_all(&verify_length.to_be_bytes()).await
+                            .map_err(|e| anyhow!("Failed to send verification length: {}", e))?;
+                        verify_stream.write_all(&verify_data).await
+                            .map_err(|e| anyhow!("Failed to send verification request: {}", e))?;
+                        verify_stream.flush().await
+                            .map_err(|e| anyhow!("Failed to flush verification request: {}", e))?;
+
+                        let mut verify_buffer = Vec::with_capacity(4096);
+                        let verify_response = timeout(TokioDuration::from_secs(READ_TIMEOUT_SECS), async {
+                            let mut length_buf = [0u8; 4];
+                            verify_stream.read_exact(&mut length_buf).await
+                                .map_err(|e| anyhow!("Failed to read verification length: {}", e))?;
+                            let verify_length = u32::from_be_bytes(length_buf) as usize;
+
+                            if verify_length > MAX_MESSAGE_SIZE {
+                                return Err(anyhow!("Verification response size {} exceeds maximum", verify_length));
+                            }
+                            if verify_length == 0 {
+                                return Err(anyhow!("Zero-length verification response"));
+                            }
+
+                            verify_buffer.clear();
+                            verify_buffer.reserve(verify_length.min(MAX_MESSAGE_SIZE));
+                            let mut bytes_read = 0;
+                            while bytes_read < verify_length {
+                                let chunk_size = (verify_length - bytes_read).min(4096);
+                                let mut chunk = vec![0u8; chunk_size];
+                                let n = verify_stream.read_exact(&mut chunk).await
+                                    .map_err(|e| anyhow!("Failed to read verification chunk: {}", e))?;
+                                if n == 0 {
+                                    return Err(anyhow!("Unexpected EOF in verification"));
+                                }
+                                verify_buffer.extend_from_slice(&chunk[..n]);
+                                bytes_read += n;
+                            }
+
+                            serde_json::from_slice::<Value>(&verify_buffer)
+                                .map_err(|e| anyhow!("Failed to parse verification response: {}", e))
+                        })
+                        .await
+                        .map_err(|_| anyhow!("Timeout reading verification response"))??;
+
+                        if let Err(e) = verify_stream.shutdown().await {
+                            warn!("Failed to shutdown verification stream: {}", e);
+                        }
+
+                        if verify_response.get("status").and_then(|s| s.as_str()) == Some("success") {
+                            if let Some(verify_value) = verify_response.get("value") {
+                                if verify_value.as_str() == value.as_deref() {
+                                    println!("Persistence verified for key '{}'", key);
+                                } else {
+                                    return Err(anyhow!(
+                                        "Persistence verification failed for key '{}'. Expected: '{:?}', Got: '{:?}'",
+                                        key, value.as_deref(), verify_value.as_str()
+                                    ));
+                                }
+                            } else {
+                                return Err(anyhow!("No value in verification response for key '{}'", key));
+                            }
+                        } else {
+                            return Err(anyhow!(
+                                "Verification failed: {}",
+                                verify_response.get("message").and_then(|m| m.as_str()).unwrap_or("Unknown error")
+                            ));
+                        }
+                    }
+                    "delete" => println!("Deleted key '{}' successfully", key),
+                    _ => {}
+                }
+                return Ok(());
+            }
+            Some("error") => {
+                let message = response.get("message").and_then(|m| m.as_str()).unwrap_or("Unknown error");
+                return Err(anyhow!("Daemon error: {}", message));
+            }
+            _ => {
+                warn!("Invalid response from {}: {:?}", addr, response);
+                attempt += 1;
+                continue;
+            }
+        }
+    }
+
+    Err(anyhow!("Failed to get valid response after {} attempts", MAX_RETRIES))
 }
