@@ -12,8 +12,7 @@ use crate::storage_engine::config::{
     SledConfig, SledStorage, SledDaemonPool, load_storage_config_from_yaml, 
     load_engine_specific_config, DEFAULT_DATA_DIRECTORY, SelectedStorageConfig,
     StorageConfigInner, DEFAULT_STORAGE_CONFIG_PATH, DEFAULT_STORAGE_CONFIG_PATH_RELATIVE,
-    DEFAULT_STORAGE_PORT, is_port_in_cluster_range, parse_cluster_range, 
-    StorageConfig, StorageEngineType
+    DEFAULT_STORAGE_PORT, StorageConfig, StorageEngineType, is_port_in_cluster_range, parse_cluster_range, 
 };
 use crate::storage_engine::storage_utils::{serialize_vertex, deserialize_vertex, serialize_edge, deserialize_edge, create_edge_key};
 use models::{Vertex, Edge, Identifier};
@@ -53,8 +52,8 @@ impl SledStorage {
                 config_root_directory: PathBuf::from("./storage_daemon_server"),
                 data_directory: PathBuf::from(DEFAULT_DATA_DIRECTORY),
                 log_directory: String::from("/opt/graphdb/logs"),
-                default_port: 8049,
-                cluster_range: String::from("8049"),
+                default_port: 8050,
+                cluster_range: String::from("8049-8054"),
                 max_disk_space_gb: 1000,
                 min_disk_space_gb: 10,
                 use_raft_for_scale: false,
@@ -63,7 +62,7 @@ impl SledStorage {
                 engine_specific_config: Some(HashMap::from([
                     ("path".to_string(), Value::String(config.path.to_string_lossy().into_owned())),
                     ("host".to_string(), Value::String(config.host.clone().unwrap_or("127.0.0.1".to_string()))),
-                    ("port".to_string(), Value::Number(config.port.unwrap_or(8049).into())),
+                    ("port".to_string(), Value::Number(config.port.unwrap_or(8050).into())),
                     ("temporary".to_string(), Value::Bool(config.temporary)),
                     ("use_compression".to_string(), Value::Bool(config.use_compression)),
                     ("cache_capacity".to_string(), Value::Number(config.cache_capacity.unwrap_or(1024 * 1024 * 1024).into())),
@@ -86,6 +85,61 @@ impl SledStorage {
             default_config
         };
 
+        // Determine the port to use: CLI flag > config file > default
+        let selected_port = if let Some(port) = config.port {
+            debug!("Using CLI-provided port: {}", port);
+            port
+        } else if let Some(engine_config) = &storage_config.engine_specific_config {
+            if let Some(port_value) = engine_config.get("port") {
+                match port_value.as_u64() {
+                    Some(port) => {
+                        debug!("Using config file port: {}", port);
+                        port as u16
+                    }
+                    None => {
+                        warn!("Invalid port value in engine_specific_config: {:?}", port_value);
+                        debug!("Using default port: {}", storage_config.default_port);
+                        storage_config.default_port
+                    }
+                }
+            } else {
+                debug!("No port in engine_specific_config, using default port: {}", storage_config.default_port);
+                storage_config.default_port
+            }
+        } else {
+            debug!("No engine_specific_config, using default port: {}", storage_config.default_port);
+            storage_config.default_port
+        };
+
+        // Validate the selected port
+        debug!("Validating port: {}", selected_port);
+        let current_pid = process::id();
+        if let Some(daemon_metadata) = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(selected_port).await? {
+            if daemon_metadata.pid == current_pid {
+                debug!("Port {} is CLI-owned (PID {}). Reusing it.", selected_port, current_pid);
+            } else {
+                error!("Port {} is in use by PID {}", selected_port, daemon_metadata.pid);
+                return Err(GraphError::StorageError(format!("Port {} is already in use by PID {}", selected_port, daemon_metadata.pid)));
+            }
+        } else {
+            // Verify the port is not bound by another process
+            match tokio::net::TcpListener::bind(("127.0.0.1", selected_port)).await {
+                Ok(_) => {
+                    debug!("Port {} is available.", selected_port);
+                }
+                Err(e) => {
+                    error!("Port {} is not available: {}", selected_port, e);
+                    return Err(GraphError::StorageError(format!("Port {} is not available: {}", selected_port, e)));
+                }
+            }
+        }
+
+        // Update engine_specific_config.port to ensure consistency
+        if let Some(engine_config) = storage_config.engine_specific_config.as_mut() {
+            debug!("Updating engine_specific_config.port to: {}", selected_port);
+            engine_config.insert("port".to_string(), Value::Number(selected_port.into()));
+        }
+
         let storage_path = &config.path;
         if !storage_path.exists() {
             debug!("Creating storage directory: {:?}", storage_path);
@@ -100,7 +154,7 @@ impl SledStorage {
             storage_config.engine_specific_config = Some(HashMap::from([
                 ("path".to_string(), Value::String(storage_path.to_string_lossy().into_owned())),
                 ("host".to_string(), Value::String(config.host.clone().unwrap_or("127.0.0.1".to_string()))),
-                ("port".to_string(), Value::Number(config.port.unwrap_or(storage_config.default_port).into())),
+                ("port".to_string(), Value::Number(selected_port.into())),
                 ("temporary".to_string(), Value::Bool(config.temporary)),
                 ("use_compression".to_string(), Value::Bool(config.use_compression)),
                 ("cache_capacity".to_string(), Value::Number(config.cache_capacity.unwrap_or(1024 * 1024 * 1024).into())),
@@ -117,8 +171,8 @@ impl SledStorage {
         let pool = Arc::new(TokioMutex::new(daemon_pool));
 
         info!(
-            "Successfully initialized SledStorage with config path: {:?}, storage path: {:?}", 
-            main_config_path, storage_path
+            "Successfully initialized SledStorage with config path: {:?}, storage path: {:?}, port: {}", 
+            main_config_path, storage_path, selected_port
         );
         Ok(SledStorage { pool })
     }
@@ -293,49 +347,6 @@ impl SledStorage {
             .map_err(|_| GraphError::StorageError("Timeout initializing SledStorage after reset".to_string()))?
     }
 
-    pub async fn close(&self) -> GraphResult<()> {
-        let pool = self.pool.lock().await;
-        info!("Closing SledStorage pool");
-        let futures = pool.daemons.values().map(|daemon| async {
-            let db_path = daemon.db_path();
-            match timeout(Duration::from_secs(10), daemon.db.flush_async()).await {
-                Ok(Ok(bytes_flushed)) => {
-                    info!("Flushed {} bytes during close at {:?}", bytes_flushed, db_path);
-                    Ok(())
-                }
-                Ok(Err(e)) => {
-                    error!("Failed to flush daemon at {:?}: {}", db_path, e);
-                    Err(GraphError::StorageError(e.to_string()))
-                }
-                Err(_) => {
-                    error!("Timeout flushing daemon at {:?}", db_path);
-                    Err(GraphError::StorageError(format!("Timeout flushing daemon at {:?}", db_path)))
-                }
-            }
-        });
-        let results = join_all(futures).await;
-        let errors: Vec<_> = results.into_iter().filter_map(|r| r.err()).collect();
-        if !errors.is_empty() {
-            error!("Errors during close: {:?}", errors);
-            return Err(GraphError::StorageError(format!("Close errors: {:?}", errors)));
-        }
-
-        match timeout(Duration::from_secs(10), pool.close(None)).await {
-            Ok(Ok(_)) => {
-                info!("Successfully closed SledStorage pool");
-                Ok(())
-            }
-            Ok(Err(e)) => {
-                error!("Failed to close SledStorage pool: {}", e);
-                Err(e)
-            }
-            Err(_) => {
-                error!("Timeout closing SledStorage pool");
-                Err(GraphError::StorageError("Timeout closing SledStorage pool".to_string()))
-            }
-        }
-    }
-
     pub async fn diagnose_persistence(&self) -> GraphResult<serde_json::Value> {
         let pool = self.pool.lock().await;
         let daemon = pool.any_daemon().await?;
@@ -374,6 +385,20 @@ impl SledStorage {
     }
 }
 
+impl Drop for SledStorage {
+    fn drop(&mut self) {
+        if let Ok(mut pool) = self.pool.try_lock() {
+            for daemon in pool.daemons.values() {
+                if let Err(e) = daemon.db.flush() {
+                    eprintln!("Failed to flush sled daemon at {:?}: {}", daemon.db_path(), e);
+                }
+            }
+        } else {
+            eprintln!("Failed to acquire lock on SledDaemonPool during drop");
+        }
+    }
+}
+
 #[async_trait]
 impl StorageEngine for SledStorage {
     async fn connect(&self) -> Result<(), GraphError> {
@@ -394,20 +419,26 @@ impl StorageEngine for SledStorage {
             }
         };
         let db_path = daemon.db_path();
-        info!("Inserting key {:?} into kv_pairs at path {:?}", key, db_path);
+        info!("SledStorage::insert - inserting key {:?} into kv_pairs at {:?}", key, db_path);
+        debug!("Key (utf8 if possible): {:?}", String::from_utf8_lossy(&key));
+
         timeout(Duration::from_secs(5), daemon.insert(&key, &value)).await
-            .map_err(|_| GraphError::StorageError("Timeout during insert".to_string()))??;
+            .map_err(|_| GraphError::StorageError("Timeout during insert".to_string()))??
+        ;
+
         let bytes_flushed = timeout(Duration::from_secs(10), daemon.db.flush_async()).await
             .map_err(|_| GraphError::StorageError("Timeout flushing after insert".to_string()))?
             .map_err(|e| GraphError::StorageError(e.to_string()))?;
-        info!("Flushed {} bytes after insert at {:?}", bytes_flushed, db_path);
+        info!("SledStorage::insert - flushed {} bytes after insert at {:?}", bytes_flushed, db_path);
+
         let keys: Vec<_> = daemon.kv_pairs
             .iter()
             .keys()
             .filter_map(|k| k.ok())
             .map(|k| String::from_utf8_lossy(&k).to_string())
             .collect();
-        info!("Current keys in kv_pairs at {:?}: {:?}", db_path, keys);
+        info!("SledStorage::insert - current kv_pairs keys at {:?}: {:?}", db_path, keys);
+
         Ok(())
     }
 
@@ -415,17 +446,22 @@ impl StorageEngine for SledStorage {
         let pool = self.pool.lock().await;
         let daemon = pool.any_daemon().await?;
         let db_path = daemon.db_path();
-        info!("Retrieving key {:?} from kv_pairs at path {:?}", key, db_path);
-        let value = timeout(Duration::from_secs(5), daemon.retrieve(key)).await
-            .map_err(|_| GraphError::StorageError("Timeout during retrieve".to_string()))??;
+        info!("SledStorage::retrieve - retrieving key {:?} from kv_pairs at {:?}", key, db_path);
+        debug!("Key (utf8 if possible): {:?}", String::from_utf8_lossy(&key));
+
+        let value_opt = timeout(Duration::from_secs(5), daemon.retrieve(key)).await
+            .map_err(|_| GraphError::StorageError("Timeout during retrieve".to_string()))??
+        ;
+
         let keys: Vec<_> = daemon.kv_pairs
             .iter()
             .keys()
             .filter_map(|k| k.ok())
             .map(|k| String::from_utf8_lossy(&k).to_string())
             .collect();
-        info!("Current keys in kv_pairs at {:?}: {:?}", db_path, keys);
-        Ok(value)
+        info!("SledStorage::retrieve - current kv_pairs keys at {:?}: {:?}", db_path, keys);
+
+        Ok(value_opt)
     }
 
     async fn delete(&self, key: &Vec<u8>) -> GraphResult<()> {
@@ -441,20 +477,25 @@ impl StorageEngine for SledStorage {
             }
         };
         let db_path = daemon.db_path();
-        info!("Deleting key {:?} from kv_pairs at path {:?}", key, db_path);
+        info!("SledStorage::delete - deleting key {:?} from kv_pairs at {:?}", key, db_path);
+
         timeout(Duration::from_secs(5), daemon.delete(key)).await
-            .map_err(|_| GraphError::StorageError("Timeout during delete".to_string()))??;
+            .map_err(|_| GraphError::StorageError("Timeout during delete".to_string()))??
+        ;
+
         let bytes_flushed = timeout(Duration::from_secs(10), daemon.db.flush_async()).await
             .map_err(|_| GraphError::StorageError("Timeout flushing after delete".to_string()))?
             .map_err(|e| GraphError::StorageError(e.to_string()))?;
-        info!("Flushed {} bytes after delete at {:?}", bytes_flushed, db_path);
+        info!("SledStorage::delete - flushed {} bytes after delete at {:?}", bytes_flushed, db_path);
+
         let keys: Vec<_> = daemon.kv_pairs
             .iter()
             .keys()
             .filter_map(|k| k.ok())
             .map(|k| String::from_utf8_lossy(&k).to_string())
             .collect();
-        info!("Current keys in kv_pairs at {:?}: {:?}", db_path, keys);
+        info!("SledStorage::delete - current kv_pairs keys at {:?}: {:?}", db_path, keys);
+
         Ok(())
     }
 
@@ -462,18 +503,18 @@ impl StorageEngine for SledStorage {
         let pool = self.pool.lock().await;
         let futures = pool.daemons.values().map(|daemon| async {
             let db_path = daemon.db_path();
-            info!("Flushing daemon at path {:?}", db_path);
+            info!("SledStorage::flush - flushing daemon at {:?}", db_path);
             match timeout(Duration::from_secs(10), daemon.db.flush_async()).await {
                 Ok(Ok(bytes_flushed)) => {
-                    info!("Flushed {} bytes to disk at {:?}", bytes_flushed, db_path);
+                    info!("SledStorage::flush - flushed {} bytes to disk at {:?}", bytes_flushed, db_path);
                     Ok(())
                 }
                 Ok(Err(e)) => {
-                    error!("Failed to flush daemon at {:?}: {}", db_path, e);
+                    error!("SledStorage::flush - failed to flush daemon at {:?}: {}", db_path, e);
                     Err(GraphError::StorageError(e.to_string()))
                 }
                 Err(_) => {
-                    error!("Timeout flushing daemon at {:?}", db_path);
+                    error!("SledStorage::flush - timeout flushing daemon at {:?}", db_path);
                     Err(GraphError::StorageError(format!("Timeout flushing daemon at {:?}", db_path)))
                 }
             }
@@ -481,14 +522,13 @@ impl StorageEngine for SledStorage {
         let results = join_all(futures).await;
         let errors: Vec<_> = results.into_iter().filter_map(|r| r.err()).collect();
         if !errors.is_empty() {
-            error!("Errors during flush: {:?}", errors);
+            error!("SledStorage::flush - errors during flush: {:?}", errors);
             return Err(GraphError::StorageError(format!("Flush errors: {:?}", errors)));
         }
-        info!("Successfully flushed all daemons");
+        info!("SledStorage::flush - successfully flushed all daemons");
         Ok(())
     }
 }
-
 
 #[async_trait]
 impl GraphStorageEngine for SledStorage {
@@ -843,7 +883,6 @@ impl GraphStorageEngine for SledStorage {
         self
     }
 }
-
 
 // Helper function to select an available port from cluster_range
 pub async fn select_available_port(storage_config: &StorageConfig, preferred_port: u16) -> GraphResult<u16> {

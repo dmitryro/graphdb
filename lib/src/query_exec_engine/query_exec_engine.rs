@@ -49,10 +49,9 @@ impl QueryExecEngine {
         println!("Attempting to retrieve key '{}' from storage", key);
         let storage = self.db.get_storage_engine();
         let value = storage.retrieve(&kv_key).await
-            .map_err(|e| {
+            .map_err(|e: GraphError| {
                 warn!("Failed to retrieve key '{}': {}", key, e);
-                println!("Failed to retrieve key '{}': {}", key, e);
-                GraphError::StorageError(format!("Failed to retrieve key '{}': {}", key, e))
+                anyhow!(e)
             })?;
         info!("Retrieved value for key '{}': {:?}", key, value);
         println!("Retrieved value for key '{}': {:?}", key, value);
@@ -64,23 +63,16 @@ impl QueryExecEngine {
         info!("Attempting to set key '{}' to value '{}'", key, value);
         println!("Attempting to set key '{}' to value '{}'", key, value);
         let storage = self.db.get_storage_engine();
-        
-        // Fix 1: Remove & from kv_key (it expects Vec<u8>, not &Vec<u8>)
         storage.insert(kv_key, value.as_bytes().to_vec()).await
-            .map_err(|e| {
+            .map_err(|e: GraphError| {
                 warn!("Failed to set key '{}': {}", key, e);
-                println!("Failed to set key '{}': {}", key, e);
-                GraphError::StorageError(format!("Failed to set key '{}': {}", key, e))
+                anyhow!(e)
             })?;
-        
-        // Fix 2: Use flush() instead of flush_async() - StorageEngine trait uses flush()
         storage.flush().await
-            .map_err(|e| {
+            .map_err(|e: GraphError| {
                 warn!("Failed to flush after setting key '{}': {}", key, e);
-                println!("Failed to flush after setting key '{}': {}", key, e);
-                GraphError::StorageError(format!("Failed to flush after setting key '{}': {}", key, e))
+                anyhow!(e)
             })?;
-        
         info!("Successfully set key '{}' to '{}'", key, value);
         println!("Successfully set key '{}' to '{}'", key, value);
         Ok(())
@@ -91,32 +83,23 @@ impl QueryExecEngine {
         info!("Attempting to delete key '{}'", key);
         println!("Attempting to delete key '{}'", key);
         let storage = self.db.get_storage_engine();
-        
         let existed = storage.retrieve(&kv_key).await
-            .map_err(|e| {
+            .map_err(|e: GraphError| {
                 warn!("Failed to check if key '{}' exists: {}", key, e);
-                println!("Failed to check if key '{}' exists: {}", key, e);
-                GraphError::StorageError(format!("Failed to check if key '{}' exists: {}", key, e))
+                anyhow!(e)
             })?.is_some();
-            
         if existed {
             storage.delete(&kv_key).await
-                .map_err(|e| {
+                .map_err(|e: GraphError| {
                     warn!("Failed to delete key '{}': {}", key, e);
-                    println!("Failed to delete key '{}': {}", key, e);
-                    GraphError::StorageError(format!("Failed to delete key '{}': {}", key, e))
+                    anyhow!(e)
                 })?;
-                
-            // Fix 3: Use flush() instead of flush_async()
             storage.flush().await
-                .map_err(|e| {
+                .map_err(|e: GraphError| {
                     warn!("Failed to flush after deleting key '{}': {}", key, e);
-                    println!("Failed to flush after deleting key '{}': {}", key, e);
-                    GraphError::StorageError(format!("Failed to flush after deleting key '{}': {}", key, e))
+                    anyhow!(e)
                 })?;
-                
             info!("Successfully deleted key '{}'", key);
-            println!("Successfully deleted key '{}'", key);
         }
         Ok(existed)
     }

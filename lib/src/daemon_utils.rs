@@ -201,7 +201,6 @@ pub async fn is_pid_running(pid: u32) -> bool {
     sys.process(sysinfo_pid).is_some()
 }
 
-#[cfg(unix)]
 pub async fn find_port_by_pid(pid: u32) -> Option<u16> {
     let output = TokioCommand::new("lsof")
         .arg("-P")

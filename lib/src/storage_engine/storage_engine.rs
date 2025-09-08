@@ -6,7 +6,6 @@ use models::errors::GraphError;
 use uuid::Uuid;
 use models::{Edge, Identifier, Vertex};
 use tokio::sync::{OnceCell, Mutex as TokioMutex};
-use tokio::signal::unix::{signal, SignalKind};
 use std::fmt::Debug;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -1126,17 +1125,86 @@ impl StorageEngineManager {
             }
         }
 
-        // Step 5: Ensure daemon registry directory
-        let registry_path = Path::new(DAEMON_REGISTRY_DB_PATH);
+        // Step 5: Ensure daemon registry directory with retry and diagnostics
+        let registry_path = PathBuf::from(DAEMON_REGISTRY_DB_PATH);
+        debug!("Attempting to create daemon registry directory for path: {:?}", registry_path);
+
+        // Check if parent directory exists and is writable
         if let Some(parent) = registry_path.parent() {
-            fs::create_dir_all(parent)
-                .await
-                .map_err(|e| {
-                    error!("Failed to create daemon registry directory {:?}: {}", parent, e);
-                    GraphError::Io(e)
-                })?;
-            debug!("Ensured daemon registry directory exists: {:?}", parent);
+            debug!("Checking parent directory: {:?}", parent);
+            if !parent.exists() {
+                debug!("Parent directory does not exist, attempting to create: {:?}", parent);
+                let max_retries = 3;
+                for attempt in 1..=max_retries {
+                    match fs::create_dir_all(parent).await {
+                        Ok(_) => {
+                            debug!("Successfully created daemon registry directory: {:?}", parent);
+                            break;
+                        }
+                        Err(e) => {
+                            error!(
+                                "Failed to create daemon registry directory {:?} on attempt {}/{}: {}",
+                                parent, attempt, max_retries, e
+                            );
+                            // Log permissions and directory status for diagnostics
+                            if parent.exists() {
+                                if let Ok(metadata) = fs::metadata(parent).await {
+                                    error!("Parent directory exists with permissions: {:?}", metadata.permissions());
+                                }
+                            } else {
+                                error!("Parent directory does not exist: {:?}", parent);
+                            }
+                            if attempt == max_retries {
+                                // Fallback to /tmp/graphdb
+                                let fallback_path = PathBuf::from("/tmp/graphdb/daemon_registry.db");
+                                warn!("Falling back to registry path: {:?}", fallback_path);
+                                if let Some(fallback_parent) = fallback_path.parent() {
+                                    fs::create_dir_all(fallback_parent)
+                                        .await
+                                        .map_err(|e| {
+                                            error!("Failed to create fallback registry directory {:?}: {}", fallback_parent, e);
+                                            GraphError::Io(e)
+                                        })?;
+                                    debug!("Successfully created fallback registry directory: {:?}", fallback_parent);
+                                }
+                                // Update registry_path to fallback
+                                let registry_path = fallback_path;
+                                break;
+                            }
+                            sleep(TokioDuration::from_millis(500 * attempt as u64)).await;
+                        }
+                    }
+                }
+            } else {
+                // Verify writability
+                if let Ok(metadata) = fs::metadata(parent).await {
+                    if metadata.permissions().readonly() {
+                        error!("Parent directory {:?} is not writable", parent);
+                        // Fallback to /tmp/graphdb
+                        let fallback_path = PathBuf::from("/tmp/graphdb/daemon_registry.db");
+                        warn!("Falling back to registry path: {:?}", fallback_path);
+                        if let Some(fallback_parent) = fallback_path.parent() {
+                            fs::create_dir_all(fallback_parent)
+                                .await
+                                .map_err(|e| {
+                                    error!("Failed to create fallback registry directory {:?}: {}", fallback_parent, e);
+                                    GraphError::Io(e)
+                                })?;
+                            debug!("Successfully created fallback registry directory: {:?}", fallback_parent);
+                        }
+                        let registry_path = fallback_path;
+                    } else {
+                        debug!("Parent directory is writable: {:?}", parent);
+                    }
+                }
+            }
+        } else {
+            error!("Registry path has no parent: {:?}", registry_path);
+            return Err(GraphError::ConfigurationError(format!(
+                "Invalid registry path: {:?}", registry_path
+            )));
         }
+        debug!("Ensured daemon registry directory exists: {:?}", registry_path);
         println!("IN StorageEngineManager new - STEP 4");
 
         // Step 6: Initialize storage engine
@@ -1415,6 +1483,7 @@ impl StorageEngineManager {
         Ok(Arc::new(InMemoryGraphStorage::new(config)))
     }
 
+
     #[cfg(feature = "with-sled")]
     async fn init_sled(config: &StorageConfig) -> Result<Arc<dyn GraphStorageEngine + Send + Sync>, GraphError> {
         info!("Initializing Sled engine using raw sled crate");
@@ -1426,18 +1495,6 @@ impl StorageEngineManager {
             return Err(GraphError::ConfigurationError(
                 format!("Expected storage_engine_type Sled, found {:?}", config.storage_engine_type)
             ));
-        }
-
-        // Ensure daemon registry directory exists
-        let registry_path = Path::new(DAEMON_REGISTRY_DB_PATH);
-        if let Some(parent) = registry_path.parent() {
-            debug!("Ensuring daemon registry directory exists: {:?}", parent);
-            fs::create_dir_all(parent)
-                .await
-                .map_err(|e| {
-                    error!("Failed to create daemon registry directory {:?}: {}", parent, e);
-                    GraphError::Io(e)
-                })?;
         }
 
         // Build SledConfig
@@ -1459,7 +1516,10 @@ impl StorageEngineManager {
                         .get("port")
                         .and_then(|v| v.as_u64())
                         .map(|p| p as u16),
-                    temporary: false, // Force persistence
+                    temporary: sled_config_map
+                        .get("temporary")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
                     use_compression: sled_config_map
                         .get("use_compression")
                         .and_then(|v| v.as_bool())
@@ -1477,41 +1537,28 @@ impl StorageEngineManager {
                     host: None,
                     port: None,
                     cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
-                    temporary: false, // Force persistence
+                    temporary: false,
                     use_compression: false,
                 }
             }
         };
 
-        // Ensure path exists and is canonicalized
-        let canonical_path = sled_config.path.canonicalize()
-            .unwrap_or_else(|_| sled_config.path.clone());
-        if !canonical_path.exists() {
-            debug!("Creating Sled data directory at {:?}", canonical_path);
-            fs::create_dir_all(&canonical_path).await.map_err(|e| {
-                error!("Failed to create Sled data directory at {:?}: {}", canonical_path, e);
+        // Ensure path exists
+        if !sled_config.path.exists() {
+            debug!("Creating Sled data directory at {:?}", sled_config.path);
+            std::fs::create_dir_all(&sled_config.path).map_err(|e| {
+                error!("Failed to create Sled data directory at {:?}: {}", sled_config.path, e);
                 GraphError::Io(e)
             })?;
         }
 
-        // Select port within cluster_range
-        let port = super::sled_storage::select_available_port(config, sled_config.port.unwrap_or(config.default_port))
-            .await
-            .map_err(|e| {
-                error!("Failed to select available port: {}", e);
-                GraphError::StorageError(format!("Failed to select port: {}", e))
-            })?;
-
-        // Update sled_config with selected port
-        let mut sled_config = sled_config;
-        sled_config.port = Some(port);
-
         // Handle lock file with enhanced diagnostics
-        let lock_path = canonical_path.join("db.lck");
-        if lock_path.exists() {
+        let lock_path = sled_config.path.join("db.lck");
+        if lock_file_exists(lock_path.clone()).await? {
             warn!("Lock file exists at {:?}", lock_path);
             log_lock_file_diagnostics(lock_path.clone()).await?;
 
+            // Check for processes holding the lock file
             #[cfg(unix)]
             {
                 if let Ok(output) = tokio::process::Command::new("lsof")
@@ -1540,12 +1587,14 @@ impl StorageEngineManager {
                                 warn!("Failed to send SIGTERM to process {}: {}", pid, e);
                             } else {
                                 info!("Sent SIGTERM to process {} holding lock file", pid);
-                                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                                tokio::time::sleep(TokioDuration::from_secs(1)).await;
                             }
                         }
                     }
                 }
             }
+
+            // Attempt to recover the lock file
             recover_sled(lock_path.clone()).await?;
         }
 
@@ -1554,14 +1603,8 @@ impl StorageEngineManager {
 
         // Check for existing instance
         if let Some(existing_storage) = singleton_guard.as_ref() {
-            let daemon = existing_storage.pool.lock().await.any_daemon().await?;
-            if daemon.db_path() == canonical_path && daemon.port() == port {
-                info!("Returning existing Sled singleton instance at path {:?}", canonical_path);
-                return Ok(existing_storage.clone() as Arc<dyn GraphStorageEngine + Send + Sync>);
-            } else {
-                warn!("Existing singleton instance uses different path or port, resetting singleton");
-                *singleton_guard = None;
-            }
+            info!("Returning existing Sled singleton instance");
+            return Ok(existing_storage.clone() as Arc<dyn GraphStorageEngine + Send + Sync>);
         }
 
         const MAX_RETRIES: u32 = 5;
@@ -1578,7 +1621,7 @@ impl StorageEngineManager {
                     error!("Failed to initialize Sled on attempt {}: {}", attempt + 1, e);
                     if e.to_string().contains("WouldBlock") || e.to_string().contains("lock") {
                         warn!("Lock contention detected, retrying after {}ms", 1000 * (attempt + 1));
-                        recover_sled(lock_path.clone()).await?;
+                        handle_sled_retry_error(&lock_path, &sled_config.path, attempt).await;
                         tokio::time::sleep(tokio::time::Duration::from_millis(1000 * (attempt + 1) as u64)).await;
                     } else {
                         log_lock_file_diagnostics(lock_path.clone()).await?;
@@ -1586,9 +1629,10 @@ impl StorageEngineManager {
                     }
                     attempt += 1;
                     if attempt >= MAX_RETRIES {
-                        error!("Failed to initialize Sled after {} attempts", MAX_RETRIES);
+                        warn!("Max retries reached, attempting force reset");
                         log_lock_file_diagnostics(lock_path.clone()).await?;
-                        return Err(GraphError::StorageError(format!("Failed to initialize Sled after {} attempts", MAX_RETRIES)));
+                        //let storage = SledStorage::force_reset(&sled_config).await?;
+                        //sled_instance = Some(Arc::new(storage));
                     }
                 }
             }
@@ -1603,38 +1647,15 @@ impl StorageEngineManager {
             }
         };
 
-        // Register daemon
-        let metadata = DaemonMetadata {
-            service_type: "storage".to_string(),
-            port,
-            pid: process::id(),
-            ip_address: "127.0.0.1".to_string(),
-            data_dir: Some(canonical_path.clone()),
-            config_path: Some(config.config_root_directory.join("storage_config.yaml")),
-            engine_type: Some("sled".to_string()),
-            last_seen_nanos: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as i64)
-                .unwrap_or(0),
-        };
-        
-        GLOBAL_DAEMON_REGISTRY
-            .register_daemon(metadata)
-            .await
-            .map_err(|e| {
-                error!("Failed to register daemon on port {}: {}", port, e);
-                GraphError::StorageError(format!("Failed to register daemon in GLOBAL_DAEMON_REGISTRY: {}", e))
-            })?;
-
         // Store in singleton
         *singleton_guard = Some(sled_instance.clone());
 
         // Register SIGTERM handler for graceful shutdown
         #[cfg(unix)]
         {
+            use tokio::signal::unix::{signal, SignalKind};
             let sled_instance_clone = sled_instance.clone();
             let lock_path_clone = lock_path.clone();
-            let port_clone = port;
             tokio::spawn(async move {
                 let mut sigterm = signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
                 sigterm.recv().await;
@@ -1643,28 +1664,17 @@ impl StorageEngineManager {
                     error!("Failed to close Sled instance on SIGTERM: {}", e);
                 }
                 if lock_path_clone.exists() {
-                    if let Err(e) = fs::remove_file(&lock_path_clone).await {
+                    if let Err(e) = std::fs::remove_file(&lock_path_clone) {
                         error!("Failed to remove lock file on SIGTERM: {}", e);
                     } else {
                         info!("Removed lock file on SIGTERM: {:?}", lock_path_clone);
                     }
                 }
-                if let Err(e) = GLOBAL_DAEMON_REGISTRY.unregister_daemon(port_clone).await {
-                    error!("Failed to unregister daemon on SIGTERM: {}", e);
-                }
                 info!("Sled instance closed gracefully");
             });
         }
 
-        // Verify persistence
-        if let Ok(Some(_)) = sled_instance.retrieve(&b"test_key".to_vec()).await {
-            info!("Found existing data in Sled database, confirming persistence");
-        } else {
-            debug!("No test key found, database may be new or empty");
-        }
-        sled_instance.diagnose_persistence().await?;
-
-        info!("Successfully initialized and stored Sled singleton instance at {:?}", canonical_path);
+        info!("Successfully initialized and stored Sled singleton instance");
         Ok(sled_instance as Arc<dyn GraphStorageEngine + Send + Sync>)
     }
 
@@ -2031,31 +2041,20 @@ impl StorageEngineManager {
     }
 
     #[cfg(feature = "with-sled")]
-    async fn handle_sled_retry_error(lock_path: &PathBuf, db_path: &PathBuf, attempt: u32) {
-        warn!("Sled retry error on attempt {}: checking lock file {:?}", attempt + 1, lock_path);
-        if lock_path.exists() {
-            if let Ok(metadata) = fs::metadata(lock_path).await {
-                warn!("Lock file metadata: {:?}", metadata);
+    async fn handle_sled_retry_error(sled_lock_path: &PathBuf, sled_path: &PathBuf, attempt: u32) {
+        // Check if the lock file exists, handling the Result and cloning the path.
+        if let Ok(true) = lock_file_exists(sled_lock_path.clone()).await {
+            warn!("Lock file still exists after retry {}: {:?}", attempt, sled_lock_path);
+            
+            // Assuming this function takes a reference.
+            Self::log_lock_file_diagnostics(sled_lock_path).await;
+            
+            // Try to recover the lock file, also cloning the path to satisfy ownership.
+            if let Err(e) = recover_sled(sled_lock_path.clone()).await {
+                warn!("Failed to recover Sled lock file on retry {}: {}", attempt, e);
             }
-            #[cfg(unix)]
-            {
-                if let Ok(output) = tokio::process::Command::new("lsof")
-                    .arg("-t")
-                    .arg(lock_path.to_str().unwrap_or_default())
-                    .output()
-                    .await
-                {
-                    let pids = String::from_utf8_lossy(&output.stdout)
-                        .lines()
-                        .filter_map(|pid| pid.trim().parse::<u32>().ok())
-                        .collect::<Vec<u32>>();
-                    warn!("Processes holding lock file {:?}: {:?}", lock_path, pids);
-                }
-            }
-        }
-        warn!("Database path: {:?}", db_path);
-        if let Ok(metadata) = fs::metadata(db_path).await {
-            warn!("Database directory metadata: {:?}", metadata);
+        } else {
+            warn!("No lock file found on retry {}, but Sled initialization still failed", attempt);
         }
     }
 

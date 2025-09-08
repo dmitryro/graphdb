@@ -19,7 +19,7 @@ use sled::{Config, Db, Tree};
 use crate::daemon_registry::DaemonMetadata;
 
 // --- Constants ---
-pub const DAEMON_REGISTRY_DB_PATH: &str = "./daemon_registry_db";
+pub const DAEMON_REGISTRY_DB_PATH: &str = "/opt/graphdb/daemon_registry.db";
 pub const DEFAULT_DAEMON_PORT: u16 = 9001;
 pub const DEFAULT_REST_API_PORT: u16 = 8081;
 pub const DEFAULT_STORAGE_PORT: u16 = 8049;
