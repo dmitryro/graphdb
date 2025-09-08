@@ -221,3 +221,20 @@ pub async fn find_port_by_pid(pid: u32) -> Option<u16> {
     }
     None
 }
+
+
+// Helper function to check if a daemon is running on a given port
+pub async fn is_storage_daemon_running(port: u16) -> bool {
+    let addr = format!("127.0.0.1:{}", port);
+    match TcpStream::connect(&addr).await {
+        Ok(_) => {
+            debug!("Port {} is in use, assuming daemon is running", port);
+            true
+        }
+        Err(_) => {
+            debug!("Port {} is not in use", port);
+            false
+        }
+    }
+}
+

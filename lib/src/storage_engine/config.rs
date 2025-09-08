@@ -258,7 +258,7 @@ impl SelectedStorageConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum StorageEngineType {
     Hybrid,
@@ -406,18 +406,30 @@ pub struct RocksdbConfig {
     pub port: Option<u16>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)] // Add this attribute to use the Default trait for deserialization
 pub struct SledConfig {
-    pub storage_engine_type: StorageEngineType,
     pub path: PathBuf,
     pub host: Option<String>,
     pub port: Option<u16>,
-    #[serde(default)]
     pub temporary: bool,
-    #[serde(default)]
     pub use_compression: bool,
-    #[serde(default)]
     pub cache_capacity: Option<u64>,
+    pub storage_engine_type: StorageEngineType,
+}
+
+impl Default for SledConfig {
+    fn default() -> Self {
+        SledConfig {
+            host: Some(String::from("127.0.0.1")),
+            port: Some(8049),
+            path: PathBuf::from("/opt/graphdb/storage_data/sled"),
+            temporary: false,
+            use_compression: true,
+            cache_capacity: None,
+            storage_engine_type: StorageEngineType::Sled,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

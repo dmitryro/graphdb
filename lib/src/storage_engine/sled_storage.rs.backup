@@ -34,21 +34,101 @@ struct SledDbWithPath {
 static SLED_DB: LazyLock<OnceCell<TokioMutex<SledDbWithPath>>> = LazyLock::new(|| OnceCell::new());
 
 impl SledStorage {
-    /// Constructs a new `SledStorage` instance.
-    /// This method is now a pure constructor. It takes a pre-validated `SledConfig`
-    /// and initializes the Sled database without any side effects such as
-    /// checking for daemons or loading configuration files.
     pub async fn new(config: &SledConfig) -> Result<Self, GraphError> {
-        info!("Initializing SledStorage with config: {:?}", config);
+        // Canonicalize the config path to avoid relative path issues
+        let main_config_path = std::fs::canonicalize(PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE))
+            .map_err(|e| GraphError::StorageError(format!("Failed to canonicalize config path: {}", e)))?;
+        debug!("Attempting to load storage config from {:?}", main_config_path);
+        println!("=> Inside sled storage - step 1");
+
+        // Load storage configuration
+        let storage_config = if main_config_path.exists() {
+            debug!("Reading main configuration from file: {:?}", main_config_path);
+            load_storage_config_from_yaml(Some(&main_config_path))
+                .await
+                .map_err(|e| GraphError::StorageError(format!("Failed to load storage config from {:?}: {}", main_config_path, e)))?
+        } else {
+            debug!("No main config file found, creating default at {:?}", main_config_path);
+            StorageConfig {
+                config_root_directory: PathBuf::from("./storage_daemon_server"),
+                data_directory: PathBuf::from(DEFAULT_DATA_DIRECTORY),
+                log_directory: String::from("/opt/graphdb/logs"),
+                default_port: DEFAULT_STORAGE_PORT,
+                cluster_range: String::from("8049"),
+                max_disk_space_gb: 1000,
+                min_disk_space_gb: 10,
+                use_raft_for_scale: false,
+                storage_engine_type: StorageEngineType::Sled,
+                connection_string: None,
+                engine_specific_config: Some(std::collections::HashMap::from([
+                    ("path".to_string(), Value::String(config.path.to_string_lossy().into_owned())),
+                    ("host".to_string(), Value::String(config.host.clone().unwrap_or("127.0.0.1".to_string()))),
+                    ("port".to_string(), Value::Number(config.port.unwrap_or(DEFAULT_STORAGE_PORT).into())),
+                    ("temporary".to_string(), Value::Bool(config.temporary)),
+                    ("use_compression".to_string(), Value::Bool(config.use_compression)),
+                    ("cache_capacity".to_string(), Value::Number(config.cache_capacity.unwrap_or(1024 * 1024 * 1024).into())),
+                    ("storage_engine_type".to_string(), Value::String("sled".to_string())),
+                ])),
+                max_open_files: Some(1024),
+            }
+        };
+        println!("=> Inside sled storage - step 2");
+
+        // Select port: CLI port > engine_specific_config.port > default_port
+        let selected_port = match config.port {
+            Some(port) => {
+                debug!("Using CLI-specified port {}", port);
+                port
+            }
+            None => {
+                let engine_port = storage_config.engine_specific_config
+                    .as_ref()
+                    .and_then(|c| c.get("port"))
+                    .and_then(|v| v.as_u64())
+                    .map(|p| p as u16);
+                if let Some(port) = engine_port {
+                    debug!("Using engine-specific config port {}", port);
+                    port
+                } else if storage_config.default_port != 0 {
+                    debug!("Using default_port {}", storage_config.default_port);
+                    storage_config.default_port
+                } else {
+                    error!("No CLI port, engine-specific port, or default_port specified");
+                    return Err(GraphError::StorageError(
+                        "No valid port specified in CLI, engine-specific config, or default_port".to_string()
+                    ));
+                }
+            }
+        };
+        println!("=> Inside sled storage - step 3");
+
+        // Validate port
+        if selected_port == 0 || selected_port > 65535 {
+            error!("Invalid port {} specified", selected_port);
+            return Err(GraphError::StorageError(format!("Invalid port {}: must be between 1 and 65535", selected_port)));
+        }
+        if is_storage_daemon_running(selected_port).await {
+            error!("Port {} is already in use by another process", selected_port);
+            return Err(GraphError::StorageError(format!("Port {} is already in use", selected_port)));
+        }
+        info!("Selected port: {}", selected_port);
+        println!("=> Inside sled storage - step 4");
+
+        // Query GLOBAL_DAEMON_REGISTRY for running Sled daemons
+        let running_daemons: Vec<DaemonMetadata> = GLOBAL_DAEMON_REGISTRY
+            .get()
+            .await
+            .get_all_daemon_metadata()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|d| d.service_type == "storage" && d.engine_type == Some(StorageEngineType::Sled.to_string()))
+            .collect();
+        debug!("Found {} running Sled daemons: {:?}", running_daemons.len(), running_daemons.iter().map(|d| d.port).collect::<Vec<_>>());
 
         // Use base database path without port-specific subdirectory
-        let db_path = if let path = &config.path {
-            path.clone()
-        } else {
-            PathBuf::from(DEFAULT_DATA_DIRECTORY).join("sled")
-        };
+        let db_path = config.path.join("db");
         info!("Using database path {:?}", db_path);
-        
         if !db_path.exists() {
             info!("Creating database directory at {:?}", db_path);
             fs::create_dir_all(&db_path)
@@ -58,9 +138,11 @@ impl SledStorage {
             error!("Path {:?} exists but is not a directory", db_path);
             return Err(GraphError::StorageError(format!("Path {:?} is not a directory", db_path)));
         }
+        println!("=> Inside sled storage - step 5");
 
         // Initialize or get the single Sled database instance
         let sled_db = SLED_DB.get_or_try_init(|| async {
+            println!("===> TRYING TO INITIALIZE POOL");
             let db = sled::Config::new()
                 .path(&db_path)
                 .use_compression(config.use_compression)
@@ -73,10 +155,16 @@ impl SledStorage {
             Ok::<_, GraphError>(TokioMutex::new(SledDbWithPath { db, path: db_path.clone() }))
         }).await?;
         info!("Successfully initialized or accessed Sled database at {:?}", db_path);
+        println!("=> Inside sled storage - step 6");
 
         // Initialize SledDaemonPool
         let pool = SledDaemonPool::new();
         let pool = Arc::new(TokioMutex::new(pool));
+        let mut new_config = config.clone();
+        new_config.path = config.path.clone(); // Use base path without port subdirectory
+        new_config.port = Some(selected_port); // Ensure port is set explicitly
+        pool.lock().await.add_daemon(&storage_config, selected_port, &new_config).await?;
+        println!("=> Inside sled storage - step 7");
 
         Ok(Self {
             pool,
