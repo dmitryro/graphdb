@@ -19,10 +19,10 @@ pub struct DaemonArgs {
 }
 
 // Import command structs from commands.rs
-use crate::cli::commands::DaemonCliCommand;
+use lib::commands::DaemonCliCommand;
 
 // Import configuration-related items
-use crate::cli::config::{
+use lib::config::{
     DEFAULT_DAEMON_PORT, DEFAULT_REST_API_PORT, DEFAULT_STORAGE_PORT,
     DEFAULT_CONFIG_ROOT_DIRECTORY_STR, MainDaemonConfig, load_daemon_config, load_main_daemon_config
 };
@@ -80,13 +80,16 @@ pub async fn display_daemon_status(port_arg: Option<u16>) {
                 println!("{:<20} {:<15} {:<10} {:<50}", "", "", "", format!("Data Directory: {:?}", meta.data_dir));
                 println!("{:<20} {:<15} {:<10} {:<50}", "", "", "", "Service Type: Core Graph Processing");
                 
-                // Add configuration details from daemon config if available
-                if let Ok(daemon_config) = load_daemon_config(None) {
+                // Load configuration from daemon config file
+                let config_path = meta.config_path.clone().unwrap_or_else(|| PathBuf::from("./storage_daemon_server/daemon_config.yaml"));
+                if let Ok(daemon_config) = load_daemon_config(Some(config_path.to_str().unwrap())).await {
                     println!("{:<20} {:<15} {:<10} {:<50}", "", "", "", format!("Max Connections: {}", daemon_config.max_connections));
                     println!("{:<20} {:<15} {:<10} {:<50}", "", "", "", format!("Max Open Files: {}", daemon_config.max_open_files));
                     println!("{:<20} {:<15} {:<10} {:<50}", "", "", "", format!("Use Raft: {}", daemon_config.use_raft_for_scale));
                     println!("{:<20} {:<15} {:<10} {:<50}", "", "", "", format!("Log Level: {}", daemon_config.log_level));
-                    println!("{:<20} {:<15} {:<10} {:<50}", "", "", "", format!("Log Directory: {}", daemon_config.log_directory));
+                    println!("{:<20} {:<15} {:<10} {:<50}", "", "", "", format!("Log Directory: {}", daemon_config.log_directory.unwrap_or_default()));
+                } else {
+                    println!("{:<20} {:<15} {:<10} {:<50}", "", "", "", "Failed to load daemon config");
                 }
             } else {
                 println!("{:<20} {:<15} {:<10} {:<50}", component_name, "Running", port, "Core Graph Processing (No metadata)");

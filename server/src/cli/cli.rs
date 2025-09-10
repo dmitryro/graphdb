@@ -17,13 +17,13 @@ use log::{info, debug, warn};
 use models::errors::GraphError;
 
 // Import modules
-use crate::cli::commands::{
+use lib::commands::{
     parse_kv_operation, ConfigAction, DaemonCliCommand, HelpArgs, ReloadAction, RestartAction,
     RestCliCommand, SaveAction, ShowAction, StartAction, StatusAction, StopAction, StorageAction,
     StatusArgs, StopArgs, ReloadArgs, RestartArgs, UseAction
 };
-use crate::cli::config::{
-    self, load_storage_config_from_yaml, SelectedStorageConfig, StorageConfig as CliStorageConfig,
+use lib::config::{
+    self, load_storage_config_from_yaml, SelectedStorageConfig, StorageConfig,
     StorageConfigInner, StorageEngineType, DEFAULT_STORAGE_CONFIG_PATH_MYSQL,
     DEFAULT_STORAGE_CONFIG_PATH_POSTGRES, DEFAULT_STORAGE_CONFIG_PATH_REDIS,
     DEFAULT_STORAGE_CONFIG_PATH_ROCKSDB, DEFAULT_STORAGE_CONFIG_PATH_SLED,
@@ -31,7 +31,7 @@ use crate::cli::config::{
     DEFAULT_STORAGE_CONFIG_PATH_HYBRID,
     load_cli_config
 };
-use crate::cli::config as config_mod;
+use lib::config as config_mod;
 use crate::cli::daemon_management;
 use crate::cli::handlers as handlers_mod;
 use crate::cli::handlers_storage::{ start_storage_interactive, stop_storage_interactive, };
@@ -43,7 +43,6 @@ use lib::database::Database;
 use lib::query_parser::config::KeyValueStore;
 use lib::query_parser::{parse_query_from_string, QueryType};
 use lib::query_exec_engine::QueryExecEngine;
-use lib::storage_engine::config::{StorageConfig as LibStorageConfig, StorageEngineType as LibStorageEngineType};
 use lib::storage_engine::storage_engine::{StorageEngineManager, AsyncStorageEngineManager, GLOBAL_STORAGE_ENGINE_MANAGER};
 
 /// GraphDB Command Line Interface
@@ -169,7 +168,7 @@ static QUERY_ENGINE_SINGLETON: OnceCell<Arc<QueryExecEngine>> = OnceCell::const_
 fn start_wrapper(
     port: Option<u16>,
     config_path: Option<PathBuf>,
-    storage_config: Option<CliStorageConfig>,
+    storage_config: Option<StorageConfig>,
     engine_name: Option<String>,
     shutdown_tx: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
     handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
@@ -205,104 +204,22 @@ pub async fn get_query_engine_singleton() -> Result<&'static Arc<QueryExecEngine
     
     QUERY_ENGINE_SINGLETON.get_or_try_init(|| async {
         let storage_config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
-        let cli_storage_config = if storage_config_path.exists() {
+        let storage_config = if storage_config_path.exists() {
             println!("Loading storage config from {}", storage_config_path.display());
-            load_storage_config_from_yaml(Some(storage_config_path.clone()))
+            load_storage_config_from_yaml(Some(storage_config_path.clone())).await
                 .with_context(|| format!("Failed to load storage config from {}", storage_config_path.display()))?
         } else {
             println!("No storage configuration file found at {}. Defaulting to InMemory storage. Use 'use storage <engine_name>' and 'save storage' to persist your configuration.", storage_config_path.display());
-            CliStorageConfig::new_in_memory()
+            StorageConfig::new_in_memory()
         };
         
-        let lib_storage_config = map_cli_to_lib_storage_config(cli_storage_config);
         let database = Arc::new(
-            Database::new(lib_storage_config)
+            Database::new(storage_config)
                 .await
                 .map_err(|e| anyhow!("Failed to create Database: {}", e))?,
         );
         Ok(Arc::new(QueryExecEngine::new(database)))
     }).await
-}
-
-// Maps CliStorageConfig to LibStorageConfig
-pub fn map_cli_to_lib_storage_config(cli_config: CliStorageConfig) -> LibStorageConfig {
-    let engine_specific_config = cli_config.engine_specific_config.as_ref().map(|selected| {
-        let mut map = HashMap::new();
-        
-        map.insert(
-            "storage_engine_type".to_string(),
-            Value::String(selected.storage_engine_type.to_string().to_lowercase())
-        );
-        
-        let engine_path_name = selected.storage_engine_type.to_string().to_lowercase();
-        let data_dir_path = cli_config.data_directory.as_ref().map_or(
-            PathBuf::from("/opt/graphdb/storage_data"),
-            |p| p.clone()
-        );
-        let engine_data_path = data_dir_path.join(&engine_path_name);
-        map.insert(
-            "path".to_string(),
-            Value::String(engine_data_path.to_string_lossy().to_string())
-        );
-        
-        if let Some(host) = &selected.storage.host {
-            map.insert("host".to_string(), Value::String(host.clone()));
-        }
-        if let Some(port) = selected.storage.port {
-            map.insert("port".to_string(), Value::Number(port.into()));
-        }
-        if let Some(username) = &selected.storage.username {
-            map.insert("username".to_string(), Value::String(username.clone()));
-        }
-        if let Some(password) = &selected.storage.password {
-            map.insert("password".to_string(), Value::String(password.clone()));
-        }
-        if let Some(database) = &selected.storage.database {
-            map.insert("database".to_string(), Value::String(database.clone()));
-        }
-        if let Some(pd_endpoints) = &selected.storage.pd_endpoints {
-            map.insert("pd_endpoints".to_string(), Value::String(pd_endpoints.clone()));
-        }
-        
-        map
-    });
-
-    LibStorageConfig {
-        config_root_directory: cli_config
-            .config_root_directory
-            .unwrap_or_else(|| PathBuf::from("/opt/graphdb/config")),
-        data_directory: cli_config
-            .data_directory
-            .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data")),
-        log_directory: cli_config
-            .log_directory
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "/opt/graphdb/logs".to_string()),
-        default_port: cli_config.default_port,
-        cluster_range: cli_config.cluster_range,
-        max_disk_space_gb: cli_config.max_disk_space_gb,
-        min_disk_space_gb: cli_config.min_disk_space_gb,
-        use_raft_for_scale: cli_config.use_raft_for_scale,
-        storage_engine_type: match cli_config.storage_engine_type {
-            StorageEngineType::Hybrid => LibStorageEngineType::Hybrid,
-            StorageEngineType::RocksDB => LibStorageEngineType::RocksDB,
-            StorageEngineType::TiKV => LibStorageEngineType::TiKV,
-            StorageEngineType::Sled => LibStorageEngineType::Sled,
-            StorageEngineType::PostgreSQL => LibStorageEngineType::PostgreSQL,
-            StorageEngineType::MySQL => LibStorageEngineType::MySQL,
-            StorageEngineType::Redis => LibStorageEngineType::Redis,
-            StorageEngineType::InMemory => LibStorageEngineType::InMemory,
-        },
-        engine_specific_config,
-        max_open_files: Some(cli_config.max_open_files as i32),
-        connection_string: match cli_config.storage_engine_type {
-            StorageEngineType::PostgreSQL => Some("postgres://localhost:5432/graphdb".to_string()),
-            StorageEngineType::MySQL => Some("mysql://localhost:3306/graphdb".to_string()),
-            StorageEngineType::Redis => Some("redis://localhost:6379".to_string()),
-            _ => Some("".to_string()),
-        },
-    }
 }
 
 // Re-usable function to handle all commands.
@@ -509,7 +426,7 @@ pub async fn run_single_command(
                     handlers_mod::handle_use_storage_command(engine, permanent).await?;
                 }
                 UseAction::Plugin { enable } => {
-                    let mut config = load_cli_config()?;
+                    let mut config = load_cli_config().await?;
                     config.enable_plugins = enable;
                     config.save()?;
                     println!("Plugins {}", if enable { "enabled" } else { "disabled" });
@@ -518,7 +435,7 @@ pub async fn run_single_command(
             }
         }
         Commands::Save(action) => {
-            let mut config = load_cli_config()?;
+            let mut config = load_cli_config().await?;
             match action {
                 SaveAction::Configuration => {
                     config.save()?;

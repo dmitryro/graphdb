@@ -24,6 +24,13 @@ pub use lib::storage_engine::config::{StorageEngineType, StorageConfig as LibSto
 pub use crate::cli::config_defaults::*;
 pub use crate::cli::serializers::*;
 
+
+// Define a struct to mirror the YAML configuration
+#[derive(Debug, Deserialize)]
+pub struct EngineConfig {
+    pub storage: HashMap<String, Value>,
+}
+
 // A temporary struct to deserialize the raw YAML content, which is flexible.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 //#[serde(rename_all = "kebab-case")]

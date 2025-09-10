@@ -1,7 +1,3 @@
-// lib/src/database.rs
-// Updated: 2025-09-01 - Fixed E0308 by ensuring match arms return Arc<dyn GraphStorageEngine + Send + Sync>
-// and corrected load_engine return type to Arc<dyn GraphStorageEngine + Send + Sync>.
-
 use anyhow::{anyhow, Result, Context};
 use async_trait::async_trait;
 use log::{error, info, warn};
@@ -13,8 +9,8 @@ use std::sync::Arc;
 use uuid::Uuid;
 use std::collections::HashMap;
 
-use crate::storage_engine::config::{
-    StorageConfig, SledConfig, RocksdbConfig, TikvConfig, StorageEngineType, StorageConfigWrapper
+use crate::config::{
+    StorageConfig, SledConfig, RocksdbConfig, TikvConfig, StorageEngineType, StorageConfigWrapper, DEFAULT_DATA_DIRECTORY
 };
 use crate::storage_engine::{
     SledStorage,
@@ -53,9 +49,12 @@ impl Database {
                     } else {
                         SledConfig {
                             storage_engine_type: config.storage_engine_type.clone(),
-                            path: config.data_directory.clone(),
+                            path: config.data_directory.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY)),
                             host: None,
                             port: None,
+                            cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
+                            temporary: false,
+                            use_compression: true,
                         }
                     };
                     Arc::new(SledStorage::new(&sled_config).await?)
@@ -74,7 +73,7 @@ impl Database {
                     } else {
                         RocksdbConfig {
                             storage_engine_type: config.storage_engine_type.clone(),
-                            path: config.data_directory.clone(),
+                            path: config.data_directory.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY)),
                             host: None,
                             port: None,
                         }
@@ -95,10 +94,11 @@ impl Database {
                     } else {
                         TikvConfig {
                             storage_engine_type: config.storage_engine_type.clone(),
-                            path: config.data_directory.clone(),
+                            path: config.data_directory.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY)),
                             host: None,
                             port: None,
-                            pd_endpoints: None,
+                            pd_endpoints: config.engine_specific_config.as_ref()
+                                .and_then(|config| config.storage.pd_endpoints.clone()),
                             username: None,
                             password: None,
                         }
@@ -111,7 +111,8 @@ impl Database {
             StorageEngineType::Redis => {
                 #[cfg(feature = "redis-datastore")]
                 {
-                    let connection_string = config.connection_string.as_ref()
+                    let connection_string = config.engine_specific_config.as_ref()
+                        .and_then(|config| config.storage.connection_string.as_ref())
                         .ok_or_else(|| GraphError::StorageError("Redis connection string is required".to_string()))?;
                     Arc::new(RedisStorage::new(connection_string)?)
                 }
@@ -121,7 +122,8 @@ impl Database {
             StorageEngineType::PostgreSQL => {
                 #[cfg(feature = "postgres-datastore")]
                 {
-                    let connection_string = config.connection_string.as_ref()
+                    let connection_string = config.engine_specific_config.as_ref()
+                        .and_then(|config| config.storage.connection_string.as_ref())
                         .ok_or_else(|| GraphError::StorageError("PostgreSQL connection string is required".to_string()))?;
                     Arc::new(PostgresStorage::new(connection_string)?)
                 }
@@ -131,7 +133,8 @@ impl Database {
             StorageEngineType::MySQL => {
                 #[cfg(feature = "mysql-datastore")]
                 {
-                    let connection_string = config.connection_string.as_ref()
+                    let connection_string = config.engine_specific_config.as_ref()
+                        .and_then(|config| config.storage.connection_string.as_ref())
                         .ok_or_else(|| GraphError::StorageError("MySQL connection string is required".to_string()))?;
                     Arc::new(MySQLStorage::new(connection_string)?)
                 }
@@ -142,16 +145,19 @@ impl Database {
                 #[cfg(any(feature = "with-sled", feature = "with-rocksdb", feature = "with-tikv"))]
                 {
                     let persistent = match config.engine_specific_config.as_ref()
-                        .and_then(|config| config.get("persistent_engine").and_then(|v| v.as_str()))
+                        .map(|config| config.storage_engine_type)
                     {
-                        Some("sled") => {
+                        Some(StorageEngineType::Sled) => {
                             #[cfg(feature = "with-sled")]
                             {
                                 let sled_config = SledConfig {
                                     storage_engine_type: StorageEngineType::Sled,
-                                    path: config.data_directory.clone(),
+                                    path: config.data_directory.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY)),
                                     host: None,
                                     port: None,
+                                    cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
+                                    temporary: false,
+                                    use_compression: true,
                                 };
                                 Arc::new(SledStorage::new(&sled_config).await?)
                                     as Arc<dyn GraphStorageEngine + Send + Sync>
@@ -159,12 +165,12 @@ impl Database {
                             #[cfg(not(feature = "with-sled"))]
                             return Err(GraphError::ConfigurationError("Sled feature not enabled".to_string()));
                         }
-                        Some("rocksdb") => {
+                        Some(StorageEngineType::RocksDB) => {
                             #[cfg(feature = "with-rocksdb")]
                             {
                                 let rocksdb_config = RocksdbConfig {
                                     storage_engine_type: StorageEngineType::RocksDB,
-                                    path: config.data_directory.clone(),
+                                    path: config.data_directory.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY)),
                                     host: None,
                                     port: None,
                                 };
@@ -174,17 +180,16 @@ impl Database {
                             #[cfg(not(feature = "with-rocksdb"))]
                             return Err(GraphError::ConfigurationError("RocksDB feature not enabled".to_string()));
                         }
-                        Some("tikv") => {
+                        Some(StorageEngineType::TiKV) => {
                             #[cfg(feature = "with-tikv")]
                             {
                                 let tikv_config = TikvConfig {
                                     storage_engine_type: StorageEngineType::TiKV,
-                                    path: config.data_directory.clone(),
+                                    path: config.data_directory.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY)),
                                     host: None,
                                     port: None,
                                     pd_endpoints: config.engine_specific_config.as_ref()
-                                        .and_then(|config| config.get("pd_endpoints").and_then(|v| v.as_str()))
-                                        .map(|s| s.to_string()),
+                                        .and_then(|config| config.storage.pd_endpoints.clone()),
                                     username: None,
                                     password: None,
                                 };
@@ -216,9 +221,12 @@ impl Database {
                 {
                     let sled_config = SledConfig {
                         storage_engine_type: StorageEngineType::Sled,
-                        path: config_wrapper.storage.data_directory.clone(),
+                        path: config_wrapper.storage.data_directory.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY)),
                         host: None,
                         port: None,
+                        cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
+                        temporary: false,
+                        use_compression: true,
                     };
                     Arc::new(SledStorage::new(&sled_config).await?)
                         as Arc<dyn GraphStorageEngine + Send + Sync>
@@ -231,7 +239,7 @@ impl Database {
                 {
                     let rocksdb_config = RocksdbConfig {
                         storage_engine_type: StorageEngineType::RocksDB,
-                        path: config_wrapper.storage.data_directory.clone(),
+                        path: config_wrapper.storage.data_directory.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY)),
                         host: None,
                         port: None,
                     };
@@ -246,10 +254,11 @@ impl Database {
                 {
                     let tikv_config = TikvConfig {
                         storage_engine_type: StorageEngineType::TiKV,
-                        path: config_wrapper.storage.data_directory.clone(),
+                        path: config_wrapper.storage.data_directory.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY)),
                         host: None,
                         port: None,
-                        pd_endpoints: None,
+                        pd_endpoints: config_wrapper.storage.engine_specific_config.as_ref()
+                            .and_then(|config| config.storage.pd_endpoints.clone()),
                         username: None,
                         password: None,
                     };
@@ -262,7 +271,8 @@ impl Database {
             StorageEngineType::Redis => {
                 #[cfg(feature = "redis-datastore")]
                 {
-                    let connection_string = config_wrapper.storage.connection_string.as_ref()
+                    let connection_string = config_wrapper.storage.engine_specific_config.as_ref()
+                        .and_then(|config| config.storage.connection_string.as_ref())
                         .ok_or_else(|| anyhow!("Redis connection string is required"))?;
                     Arc::new(RedisStorage::new(connection_string)?)
                         as Arc<dyn GraphStorageEngine + Send + Sync>
@@ -273,7 +283,8 @@ impl Database {
             StorageEngineType::PostgreSQL => {
                 #[cfg(feature = "postgres-datastore")]
                 {
-                    let connection_string = config_wrapper.storage.connection_string.as_ref()
+                    let connection_string = config_wrapper.storage.engine_specific_config.as_ref()
+                        .and_then(|config| config.storage.connection_string.as_ref())
                         .ok_or_else(|| anyhow!("PostgreSQL connection string is required"))?;
                     Arc::new(PostgresStorage::new(connection_string)?)
                         as Arc<dyn GraphStorageEngine + Send + Sync>
@@ -284,7 +295,8 @@ impl Database {
             StorageEngineType::MySQL => {
                 #[cfg(feature = "mysql-datastore")]
                 {
-                    let connection_string = config_wrapper.storage.connection_string.as_ref()
+                    let connection_string = config_wrapper.storage.engine_specific_config.as_ref()
+                        .and_then(|config| config.storage.connection_string.as_ref())
                         .ok_or_else(|| anyhow!("MySQL connection string is required"))?;
                     Arc::new(MySQLStorage::new(connection_string)?)
                         as Arc<dyn GraphStorageEngine + Send + Sync>
@@ -296,16 +308,19 @@ impl Database {
                 #[cfg(any(feature = "with-sled", feature = "with-rocksdb", feature = "with-tikv"))]
                 {
                     let persistent = match config_wrapper.storage.engine_specific_config.as_ref()
-                        .and_then(|config| config.get("persistent_engine").and_then(|v| v.as_str()))
+                        .map(|config| config.storage_engine_type)
                     {
-                        Some("sled") => {
+                        Some(StorageEngineType::Sled) => {
                             #[cfg(feature = "with-sled")]
                             {
                                 let sled_config = SledConfig {
                                     storage_engine_type: StorageEngineType::Sled,
-                                    path: config_wrapper.storage.data_directory.clone(),
+                                    path: config_wrapper.storage.data_directory.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY)),
                                     host: None,
                                     port: None,
+                                    cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
+                                    temporary: false,
+                                    use_compression: true,
                                 };
                                 Arc::new(SledStorage::new(&sled_config).await?)
                                     as Arc<dyn GraphStorageEngine + Send + Sync>
@@ -313,12 +328,12 @@ impl Database {
                             #[cfg(not(feature = "with-sled"))]
                             return Err(anyhow!("Sled support is not enabled."));
                         }
-                        Some("rocksdb") => {
+                        Some(StorageEngineType::RocksDB) => {
                             #[cfg(feature = "with-rocksdb")]
                             {
                                 let rocksdb_config = RocksdbConfig {
                                     storage_engine_type: StorageEngineType::RocksDB,
-                                    path: config_wrapper.storage.data_directory.clone(),
+                                    path: config_wrapper.storage.data_directory.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY)),
                                     host: None,
                                     port: None,
                                 };
@@ -328,15 +343,16 @@ impl Database {
                             #[cfg(not(feature = "with-rocksdb"))]
                             return Err(anyhow!("RocksDB support is not enabled."));
                         }
-                        Some("tikv") => {
+                        Some(StorageEngineType::TiKV) => {
                             #[cfg(feature = "with-tikv")]
                             {
                                 let tikv_config = TikvConfig {
                                     storage_engine_type: StorageEngineType::TiKV,
-                                    path: config_wrapper.storage.data_directory.clone(),
+                                    path: config_wrapper.storage.data_directory.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY)),
                                     host: None,
                                     port: None,
-                                    pd_endpoints: None,
+                                    pd_endpoints: config_wrapper.storage.engine_specific_config.as_ref()
+                                        .and_then(|config| config.storage.pd_endpoints.clone()),
                                     username: None,
                                     password: None,
                                 };
@@ -368,9 +384,7 @@ impl Database {
     pub fn get_persistent_engine_type(&self) -> Option<String> {
         if self.config.storage_engine_type == StorageEngineType::Hybrid {
             self.config.engine_specific_config.as_ref()
-                .and_then(|config| config.get("persistent_engine"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
+                .map(|config| config.storage_engine_type.to_string())
         } else {
             Some(self.config.storage_engine_type.to_string())
         }
@@ -414,5 +428,9 @@ impl Database {
 
     pub async fn get_all_edges(&self) -> Result<Vec<Edge>, GraphError> {
         self.storage.get_all_edges().await
+    }
+
+    pub async fn close(&self) -> Result<(), GraphError> {
+        self.storage.close().await
     }
 }

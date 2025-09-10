@@ -22,7 +22,7 @@ use std::thread::sleep;
 #[cfg(feature = "with-rocksdb")]
 use crate::storage_engine::{GraphStorageEngine, StorageEngine};
 #[cfg(feature = "with-rocksdb")]
-use crate::storage_engine::config::RocksdbConfig;
+use crate::config::RocksdbConfig;
 #[cfg(feature = "with-rocksdb")]
 use models::{Edge, Identifier, Json, Vertex};
 #[cfg(feature = "with-rocksdb")]

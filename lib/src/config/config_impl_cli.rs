@@ -1,31 +1,68 @@
+use std::fmt;
+use std::str::FromStr;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use log::{debug, error, info, warn, trace};
-use serde::{de::DeserializeOwned, Deserialize, Serialize, Serializer, Deserializer};
-use serde::de::{self, MapAccess, Visitor};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_yaml2 as serde_yaml;
-use serde_json::{Map, Value};
-use crate::cli::commands::{Commands, CommandType, StatusArgs, RestartArgs, ReloadArgs, RestartAction, 
-                           ReloadAction, RestCliCommand, StatusAction, StorageAction, ShowAction, ShowArgs,
-                           StartAction, StopAction, StopArgs, DaemonCliCommand, UseAction, SaveAction};
-pub use lib::storage_engine::config::StorageConfig as EngineStorageConfig;
-pub use lib::storage_engine::config::{StorageEngineType, 
-                                      SelectedStorageConfig as LibSelectedStorageConfig,
-                                      StorageConfigInner as LibStorageConfigInner};
-use lib::query_exec_engine::query_exec_engine::{QueryExecEngine};
-pub use lib::storage_engine::storage_engine::{StorageEngineManager, GLOBAL_STORAGE_ENGINE_MANAGER};
-pub use lib::storage_engine::config::{EngineTypeOnly, RocksdbConfig, SledConfig, TikvConfig, MySQLConfig, 
-                                      RedisConfig, PostgreSQLConfig};
+use futures::FutureExt;
+use crate::commands::{Commands, CommandType, StatusArgs, RestartArgs, ReloadArgs, RestartAction, 
+                     ReloadAction, RestCliCommand, StatusAction, StorageAction, ShowAction, ShowArgs,
+                     StartAction, StopAction, StopArgs, DaemonCliCommand, UseAction, SaveAction};
+pub use crate::config::StorageConfig as EngineStorageConfig;
+pub use crate::config::{StorageEngineType, 
+                       SelectedStorageConfig as LibSelectedStorageConfig,
+                       StorageConfigInner as LibStorageConfigInner};
+use crate::query_exec_engine::query_exec_engine::{QueryExecEngine};
+pub use crate::storage_engine::storage_engine::{StorageEngineManager, GLOBAL_STORAGE_ENGINE_MANAGER};
+pub use crate::config::{EngineTypeOnly, RocksdbConfig, SledConfig, TikvConfig, MySQLConfig, 
+                       RedisConfig, PostgreSQLConfig};
 pub use models::errors::GraphError;
-pub use crate::cli::config_structs::*;
-pub use crate::cli::config_constants::*;
-pub use crate::cli::config_defaults::*;
-pub use crate::cli::config_helpers::*;
-pub use crate::cli::serializers::*;
+pub use crate::config::config_structs::*;
+pub use crate::config::config_constants::*;
+pub use crate::config::config_defaults::*;
+pub use crate::config::config_helpers::*;
+pub use crate::config::config_serializers::*;
 
+impl FromStr for StorageEngineType {
+    type Err = GraphError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        trace!("Parsing storage engine type: {}", s);
+        match s.to_lowercase().as_str() {
+            "hybrid" => Ok(StorageEngineType::Hybrid),
+            "sled" => Ok(StorageEngineType::Sled),
+            "rocksdb" | "rocks_db" => Ok(StorageEngineType::RocksDB),
+            "tikv" | "ti_kv" => Ok(StorageEngineType::TiKV),
+            "inmemory" | "in_memory" => Ok(StorageEngineType::InMemory),
+            "redis" => Ok(StorageEngineType::Redis),
+            "postgresql" | "postgres" | "postgres_sql" => Ok(StorageEngineType::PostgreSQL),
+            "mysql" | "my_sql" => Ok(StorageEngineType::MySQL),
+            _ => {
+                error!("Unknown storage engine type: {}", s);
+                Err(GraphError::InvalidData(format!("Unknown storage engine type: {}", s)))
+            }
+        }
+    }
+}
+
+impl fmt::Display for StorageEngineType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StorageEngineType::Hybrid => write!(f, "hybrid"),
+            StorageEngineType::Sled => write!(f, "sled"),
+            StorageEngineType::RocksDB => write!(f, "rocksdb"),
+            StorageEngineType::TiKV => write!(f, "tikv"),
+            StorageEngineType::InMemory => write!(f, "inmemory"),
+            StorageEngineType::Redis => write!(f, "redis"),
+            StorageEngineType::PostgreSQL => write!(f, "postgresql"),
+            StorageEngineType::MySQL => write!(f, "mysql"),
+        }
+    }
+}
 
 impl CliConfig {
     pub async fn execute(&self, manager: &mut StorageEngineManager) -> Result<(), GraphError> {
@@ -39,32 +76,84 @@ impl CliConfig {
                         "Storage engine {:?} is not enabled. Available engines: {:?}", engine, available_engines
                     )));
                 }
-                manager.use_storage(*engine, is_permanent).await?;
-                if is_permanent {
-                    let mut storage_config = load_storage_config_from_yaml(None)
-                        .map_err(|e| GraphError::ConfigurationError(format!("Failed to load storage config: {}", e)))?;
-                    storage_config.storage_engine_type = *engine;
-                    storage_config.default_port = default_rocksdb_port();
-                    storage_config.cluster_range = default_rocksdb_port().to_string();
-                    storage_config.engine_specific_config = Some(SelectedStorageConfig {
-                        storage_engine_type: *engine,
-                        storage: StorageConfigInner {
-                            path: Some(PathBuf::from(format!(
-                                "{}/{}",
-                                storage_config.data_directory.as_ref().map_or(DEFAULT_DATA_DIRECTORY.to_string(), |p| p.to_string_lossy().to_string()),
-                                engine.to_string().to_lowercase()
-                            ))),
-                            host: Some("127.0.0.1".to_string()),
-                            port: Some(default_rocksdb_port()),
-                            username: None,
-                            password: None,
-                            database: None,
-                            pd_endpoints: None,
+
+                // Load or create storage configuration
+                let mut storage_config = match load_storage_config_from_yaml(None).await {
+                    Ok(config) => {
+                        debug!("Loaded existing storage config: {:?}", config);
+                        config
+                    }
+                    Err(e) => {
+                        warn!("Failed to load storage config: {}. Using default config.", e);
+                        StorageConfig::default()
+                    }
+                };
+
+                // Update storage_config with engine-specific settings
+                storage_config.storage_engine_type = *engine;
+                let default_port = match engine {
+                    StorageEngineType::TiKV => 2380,
+                    _ => 8052, // Default for Sled, RocksDB, etc.
+                };
+                storage_config.default_port = default_port;
+                storage_config.cluster_range = default_port.to_string();
+                storage_config.engine_specific_config = Some(SelectedStorageConfig {
+                    storage_engine_type: *engine,
+                    storage: StorageConfigInner {
+                        path: Some(PathBuf::from(format!(
+                            "{}/{}",
+                            storage_config.data_directory.as_ref().map_or(DEFAULT_DATA_DIRECTORY.to_string(), |p| p.to_string_lossy().to_string()),
+                            engine.to_string().to_lowercase()
+                        ))),
+                        host: Some("127.0.0.1".to_string()),
+                        port: Some(default_port),
+                        username: None,
+                        password: None,
+                        database: None,
+                        pd_endpoints: if *engine == StorageEngineType::TiKV {
+                            Some("127.0.0.1:2379".to_string())
+                        } else {
+                            None
                         },
-                    });
-                    storage_config.save()
+                        cache_capacity: Some(1024 * 1024 * 1024),
+                        use_compression: true,
+                    },
+                });
+
+                // Load engine-specific config file if it exists
+                let engine_config_path = match engine.to_string().to_lowercase().as_str() {
+                    "sled" => PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_SLED),
+                    "rocksdb" => PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_ROCKSDB),
+                    "postgres" => PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_POSTGRES),
+                    "mysql" => PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_MYSQL),
+                    "redis" => PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_REDIS),
+                    "tikv" => PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_TIKV),
+                    _ => PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH),
+                };
+                if engine_config_path.exists() {
+                    match SelectedStorageConfig::load_from_yaml(&engine_config_path) {
+                        Ok(engine_specific) => {
+                            storage_config.engine_specific_config = Some(engine_specific);
+                            if let Some(port) = storage_config.engine_specific_config.as_ref().and_then(|c| c.storage.port) {
+                                storage_config.default_port = port;
+                                storage_config.cluster_range = port.to_string();
+                            }
+                            debug!("Loaded engine-specific config from {:?}: {:?}", engine_config_path, storage_config.engine_specific_config);
+                        }
+                        Err(e) => {
+                            warn!("Failed to load engine-specific config from {:?}: {}. Using constructed config.", engine_config_path, e);
+                        }
+                    }
+                }
+
+                // Call use_storage with the storage_config
+                manager.use_storage(storage_config.clone(), is_permanent).await?;
+
+                // Save config if permanent
+                if is_permanent {
+                    storage_config.save().await
                         .map_err(|e| GraphError::ConfigurationError(format!("Failed to save storage config: {}", e)))?;
-                    let reloaded_config = load_storage_config_from_yaml(None)
+                    let reloaded_config = load_storage_config_from_yaml(None).await
                         .map_err(|e| GraphError::ConfigurationError(format!("Failed to reload storage config: {}", e)))?;
                     info!("Reloaded storage config: {:?}", reloaded_config);
                     if reloaded_config.storage_engine_type != *engine {
@@ -72,11 +161,12 @@ impl CliConfig {
                         return Err(GraphError::ConfigurationError("Failed to reload correct storage engine type".to_string()));
                     }
                 }
+
                 println!("Switched to storage engine {} (persisted: {})", daemon_api_storage_engine_type_to_string(engine), is_permanent);
                 Ok(())
             }
             Commands::Show(ShowArgs { action: ShowAction::Storage }) => {
-                let storage_config = load_storage_config_from_yaml(None)
+                let storage_config = load_storage_config_from_yaml(None).await
                     .map_err(|e| GraphError::ConfigurationError(format!("Failed to load storage config: {}", e)))?;
                 debug!("Loaded storage config for show: {:?}", storage_config);
                 println!("Current Storage Configuration (from {:?}):", PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE));
@@ -108,7 +198,7 @@ impl CliConfig {
         }
     }
     
-    /// then YAML files, and finally built-in defaults.
+    /// Loads configuration from CLI arguments, then YAML files, and finally built-in defaults.
     pub fn load(interactive_command: Option<CommandType>) -> Result<Self> {
         // Parse CLI arguments first to get the base configuration
         let mut args = if let Some(cmd) = interactive_command {
@@ -357,19 +447,19 @@ impl CliConfig {
     pub fn get_data_directory(&self) -> Result<String> {
         match &self.command {
             Commands::Start { action: Some(start_action), .. } => match start_action {
-                StartAction::Daemon { .. } => Ok(MainDaemonConfig::default().data_directory),
-                StartAction::Rest { .. } => Ok(RestApiConfig::default().data_directory),
+                StartAction::Daemon { .. } => Ok(DEFAULT_DATA_DIRECTORY.to_string()),
+                StartAction::Rest { .. } => Ok(DEFAULT_DATA_DIRECTORY.to_string()),
                 StartAction::Storage { .. } => Ok(StorageConfig::default().data_directory.unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY)).to_string_lossy().into_owned()),
                 _ => Err(anyhow!("Not in a start context to retrieve data directory.")),
             },
             Commands::Rest(RestCliCommand::Start { .. }) => {
-                Ok(RestApiConfig::default().data_directory)
+                Ok(DEFAULT_DATA_DIRECTORY.to_string())
             }
             Commands::Storage(StorageAction::Start { .. }) => {
                 Ok(StorageConfig::default().data_directory.unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY)).to_string_lossy().into_owned())
             }
             Commands::Daemon(DaemonCliCommand::Start { .. }) => {
-                Ok(MainDaemonConfig::default().data_directory)
+                Ok(DEFAULT_DATA_DIRECTORY.to_string())
             }
             Commands::Use(UseAction::Storage { .. }) => {
                 Ok(StorageConfig::default().data_directory.unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY)).to_string_lossy().into_owned())
@@ -387,8 +477,8 @@ impl CliConfig {
     pub fn get_log_directory(&self) -> Result<String> {
         match &self.command {
             Commands::Start { action: Some(start_action), .. } => match start_action {
-                StartAction::Daemon { .. } => Ok(MainDaemonConfig::default().log_directory),
-                StartAction::Rest { .. } => Ok(RestApiConfig::default().log_directory),
+                StartAction::Daemon { .. } => Ok(DEFAULT_LOG_DIRECTORY.to_string()),
+                StartAction::Rest { .. } => Ok(DEFAULT_LOG_DIRECTORY.to_string()),
                 StartAction::Storage { .. } => {
                     StorageConfig::default().log_directory
                         .map(|path| path.to_string_lossy().to_string())
@@ -397,7 +487,7 @@ impl CliConfig {
                 _ => Err(anyhow!("Not in a start context to retrieve log directory.")),
             },
             Commands::Rest(RestCliCommand::Start { .. }) => {
-                Ok(RestApiConfig::default().log_directory)
+                Ok(DEFAULT_LOG_DIRECTORY.to_string())
             }
             Commands::Storage(StorageAction::Start { .. }) => {
                 StorageConfig::default().log_directory
@@ -405,7 +495,7 @@ impl CliConfig {
                     .ok_or_else(|| anyhow!("No log directory configured for storage"))
             }
             Commands::Daemon(DaemonCliCommand::Start { .. }) => {
-                Ok(MainDaemonConfig::default().log_directory)
+                Ok(DEFAULT_LOG_DIRECTORY.to_string())
             }
             Commands::Use(UseAction::Storage { .. }) => {
                 StorageConfig::default().log_directory
@@ -465,6 +555,27 @@ impl CliConfig {
     }
 }
 
+impl Default for MainDaemonConfig {
+    fn default() -> Self {
+        MainDaemonConfig {
+            data_directory: DEFAULT_DATA_DIRECTORY.to_string(),
+            log_directory: DEFAULT_LOG_DIRECTORY.to_string(),
+            default_port: DEFAULT_DAEMON_PORT,
+            cluster_range: "8080-8082".to_string(),
+        }
+    }
+}
+
+impl Default for RestApiConfig {
+    fn default() -> Self {
+        RestApiConfig {
+            data_directory: DEFAULT_DATA_DIRECTORY.to_string(),
+            log_directory: DEFAULT_LOG_DIRECTORY.to_string(),
+            default_port: DEFAULT_REST_PORT,
+            cluster_range: "8083-8085".to_string(),
+        }
+    }
+}
 
 impl Default for CliConfigToml {
     fn default() -> Self {
@@ -504,20 +615,20 @@ impl From<&CliTomlStorageConfig> for EngineStorageConfig {
     fn from(cli: &CliTomlStorageConfig) -> Self {
         EngineStorageConfig {
             storage_engine_type: cli.storage_engine_type.unwrap_or(StorageEngineType::Sled),
-            data_directory: cli.data_directory
+            data_directory: Some(cli.data_directory
                 .clone()
                 .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY)),
-            connection_string: None,
-            max_open_files: cli.max_open_files.map(|v| v as i32),
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))),
+            max_open_files: cli.max_open_files.unwrap_or(1024),
             engine_specific_config: None,
             default_port: cli.default_port.unwrap_or(DEFAULT_STORAGE_PORT),
-            log_directory: cli.log_directory
+            log_directory: Some(cli.log_directory
                 .clone()
-                .unwrap_or_else(|| DEFAULT_LOG_DIRECTORY.into()),
-            config_root_directory: cli.config_root_directory
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_LOG_DIRECTORY))),
+            config_root_directory: Some(cli.config_root_directory
                 .clone()
-                .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_ROOT_DIRECTORY_STR)),
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_ROOT_DIRECTORY_STR))),
             cluster_range: cli.cluster_range
                 .clone()
                 .unwrap_or("8083-8087".to_string()),
@@ -539,15 +650,8 @@ impl From<CliTomlStorageConfig> for StorageConfig {
             max_disk_space_gb: cli.max_disk_space_gb.unwrap_or(1000),
             min_disk_space_gb: cli.min_disk_space_gb.unwrap_or(10),
             use_raft_for_scale: cli.use_raft_for_scale.unwrap_or(true),
-
-            // unwrap Option<StorageEngineType> or fallback to default
-            storage_engine_type: cli
-                .storage_engine_type
-                .unwrap_or(StorageEngineType::RocksDB),
-
-            // CliTomlStorageConfig does NOT have engine_specific_config
+            storage_engine_type: cli.storage_engine_type.unwrap_or(StorageEngineType::RocksDB),
             engine_specific_config: None,
-
             max_open_files: cli.max_open_files.unwrap_or(1024),
         }
     }
@@ -558,26 +662,17 @@ impl StorageConfig {
     /// This is a common pattern for setting up test environments or temporary storage.
     pub fn new_in_memory() -> Self {
         Self {
-            // Set the storage engine type to Sled or RocksDB, which can be configured for
-            // in-memory or temporary paths. RocksDB can use an empty path for a temporary,
-            // non-persistent instance. We'll use RocksDB here as a common in-memory default.
             storage_engine_type: StorageEngineType::RocksDB,
-            
-            // Set data_directory to None or a temporary path to ensure it's in-memory.
-            // RocksDB will create a temporary, non-persistent instance without a path.
             data_directory: Some(PathBuf::from("")), 
-            
-            // Set other fields to sensible defaults
             config_root_directory: None,
             log_directory: None,
-            default_port: 0, // A dummy port as it won't be exposed
+            default_port: 0,
             cluster_range: "".to_string(),
-            max_disk_space_gb: 1, // Small size for a temporary instance
+            max_disk_space_gb: 1,
             min_disk_space_gb: 0,
-            use_raft_for_scale: false, // No raft for a single in-memory instance
+            use_raft_for_scale: false,
             engine_specific_config: None,
             max_open_files: 1024,
         }
     }
 }
-

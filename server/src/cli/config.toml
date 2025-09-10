@@ -4,15 +4,27 @@ version = "0.1.0"
 [server]
 port = 9002
 host = "127.0.0.1"
+max_connections = 300
+default_port = 9002
+cluster_range = "9001-9005"
 
 [rest]
 port = 8081
 host = "127.0.0.1"
+max_connections = 300
+default_port = 8081
+cluster_range = "8081-8085"
 
 [daemon]
 process_name = "graphdb-cli"
 user = "graphdbuser"
 group = "GraphDBGroup"
+max_connections = 300
+default_port = 9001
+cluster_range = "9001-9005"
+max_open_files = 100
+use_raft_for_scale = false
+log_level = "debug"
 
 [storage]
 port = 9000
@@ -20,20 +32,19 @@ engine_type = "Sled"
 data_directory = "/opt/graphdb/storage_data"
 config_root_directory = "./storage_daemon_server"
 log_directory = "/var/log/graphdb"
-cluster_range = 8083 # Note: This will be parsed as a string by your custom deserializer
+cluster_range = "8047-8051"
 max_disk_space_gb = 10
 min_disk_space_gb = 1
-use_raft_for_scale = true
+use_raft_for_scale = false
 max_open_files = 100
-default_port = 8082
+default_port = 8049
+max_connections = 300
 
 [deployment]
 config_root_directory = "/opt/graphdb"
 
 [security]
 
-
 [paths]
-
 
 [log]
