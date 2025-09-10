@@ -16,10 +16,10 @@ use log::{info, error, warn, debug};
 use std::fs;
 
 // Import command structs from commands.rs
-use crate::cli::commands::{RestCliCommand};
+use lib::commands::{RestCliCommand};
 
 // Import configuration-related items
-use crate::cli::config::{
+use lib::config::{
     DEFAULT_REST_API_PORT, DEFAULT_STORAGE_PORT,
     DEFAULT_CONFIG_ROOT_DIRECTORY_STR, DEFAULT_DAEMON_PORT,
     RestApiConfig, load_rest_config, 

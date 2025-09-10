@@ -25,7 +25,7 @@ use std::collections::HashSet;
 use shlex;
 use log::{info, error, warn, debug};
 use crate::cli::cli::CliArgs;
-use crate::cli::commands::{
+use lib::commands::{
     CommandType, DaemonCliCommand, RestCliCommand, StorageAction, StatusArgs, StopArgs,
     ReloadArgs, ReloadAction, StartAction, RestartArgs, RestartAction, HelpArgs, ShowAction,
     ConfigAction, parse_kv_operation, KvAction,
@@ -36,7 +36,7 @@ use crate::cli::help_display::{
     print_help_clap_generated, print_filtered_help_clap_generated
 };
 use crate::cli::handlers_utils::{parse_show_command};
-pub use lib::storage_engine::config::{StorageEngineType};
+pub use lib::config::{StorageEngineType};
 use lib::query_exec_engine::query_exec_engine::QueryExecEngine;
 
 struct SharedState {

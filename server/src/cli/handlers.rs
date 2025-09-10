@@ -17,13 +17,13 @@ use config::Config;
 use std::fs;
 
 // Import command structs from commands.rs
-use crate::cli::commands::{
+use lib::commands::{
     Commands, StatusArgs, StopArgs, StopAction, StatusAction, ReloadArgs, ReloadAction,
     RestartArgs, RestartAction
 };
 
 // Import configuration-related items
-use crate::cli::config::{
+use lib::config::{
     DEFAULT_DAEMON_PORT, DEFAULT_REST_API_PORT, DEFAULT_STORAGE_PORT,
     DEFAULT_CONFIG_ROOT_DIRECTORY_STR, DEFAULT_STORAGE_CONFIG_PATH_RELATIVE,
     CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS, load_storage_config_str as load_storage_config, 
@@ -85,7 +85,7 @@ pub async fn handle_start_command(
     listen_port: Option<u16>,
     storage_port: Option<u16>,
     storage_config_file: Option<PathBuf>,
-    _config: &crate::cli::config::CliConfig,
+    _config: &lib::config::CliConfig,
     daemon_handles: Arc<TokioMutex<HashMap<u16, (JoinHandle<()>, oneshot::Sender<()>)>>>,
     rest_api_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
     rest_api_port_arc: Arc<TokioMutex<Option<u16>>>,
@@ -169,7 +169,7 @@ pub async fn handle_start_command_interactive(
     listen_port: Option<u16>,
     storage_port: Option<u16>,
     storage_config_file: Option<PathBuf>,
-    _config: &crate::cli::config::CliConfig,
+    _config: &lib::config::CliConfig,
     daemon_handles: Arc<TokioMutex<HashMap<u16, (JoinHandle<()>, oneshot::Sender<()>)>>>,
     rest_api_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
     rest_api_port_arc: Arc<TokioMutex<Option<u16>>>,
@@ -516,7 +516,6 @@ pub async fn reload_cluster_interactive() -> Result<()> {
     
     Ok(())
 }
-
 /// Handles the interactive 'restart' command.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_restart_command_interactive(
@@ -623,11 +622,13 @@ pub async fn handle_restart_command_interactive(
             println!("GraphDB Daemon restarted on port {}.", actual_port);
         },
         RestartAction::Storage { port, config_file, cluster, storage_port, storage_cluster } => {
-            let actual_port = port.or(storage_port).unwrap_or_else(|| {
-                load_storage_config(None)
-                    .map(|c| c.default_port)
-                    .unwrap_or(DEFAULT_STORAGE_PORT)
-            });
+            // Move async config loading outside the closure
+            let default_port = match load_storage_config(None).await {
+                Ok(c) => c.default_port,
+                Err(_) => DEFAULT_STORAGE_PORT,
+            };
+            let actual_port = port.or(storage_port).unwrap_or(default_port);
+            
             println!("Restarting Storage Daemon on port {}...", actual_port);
             stop_storage_interactive(
                 Some(actual_port),
@@ -904,14 +905,14 @@ pub async fn handle_reload_command_interactive(
 }
 
 pub async fn handle_show_plugins_command() -> Result<()> {
-     let config = load_cli_config()?;
+     let config = load_cli_config().await?;
      println!("Plugins Enabled: {}", config.enable_plugins);
      println!("Plugins will be shown here...");
      Ok(())
 }
 
 pub async fn handle_show_plugins_command_interactive() -> Result<()> {
-     let config = load_cli_config()?;
+     let config = load_cli_config().await?;
      println!("Plugins Enabled: {}", config.enable_plugins);
      println!("Plugins will be shown here...");
      Ok(())
@@ -927,7 +928,7 @@ pub async fn handle_save_config() -> Result<()> {
 pub async fn use_plugin(enable: bool) -> Result<()> {
     // Load the current configuration from server/src/cli/config.toml
     let config_path = PathBuf::from("server/src/cli/config.toml");
-    let mut config = load_cli_config()
+    let mut config = load_cli_config().await
         .map_err(|e| anyhow!("Failed to load config from {}: {}", config_path.display(), e))?;
     // Update the plugins_enabled field
     config.enable_plugins = enable;

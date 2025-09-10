@@ -1,77 +1,29 @@
+// server/src/cli/handlers_queries.rs
 use anyhow::{anyhow, Context, Result};
 use log::{debug, error, info, warn};
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::fs;
-use tokio::sync::{oneshot, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
+use tokio::sync::{oneshot, Mutex as TokioMutex};
 use tokio::time::{self, timeout, Duration as TokioDuration};
 use lib::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
 use lib::query_exec_engine::query_exec_engine::QueryExecEngine;
 use lib::query_parser::{parse_query_from_string, QueryType};
-use lib::storage_engine::config::{StorageConfig as LibStorageConfig, SledConfig, StorageEngineType, DEFAULT_STORAGE_CONFIG_PATH_RELATIVE, default_data_directory, default_log_directory};
+use lib::config::{StorageEngineType, DEFAULT_STORAGE_CONFIG_PATH_RELATIVE, default_data_directory, default_log_directory};
 use lib::storage_engine::SledStorage;
 use lib::storage_engine::TikvStorage;
 use lib::storage_engine::storage_engine::{AsyncStorageEngineManager, StorageEngineManager, GLOBAL_STORAGE_ENGINE_MANAGER};
-use super::commands::parse_kv_operation;
-use crate::cli::config::{StorageConfig as CliStorageConfig, MAX_SHUTDOWN_RETRIES, SHUTDOWN_RETRY_DELAY_MS, load_storage_config_from_yaml};
+use lib::commands::parse_kv_operation;
+use lib::config::{StorageConfig, MAX_SHUTDOWN_RETRIES, SHUTDOWN_RETRY_DELAY_MS, load_storage_config_from_yaml};
 use crate::cli::handlers_storage::{start_storage_interactive, stop_storage_interactive};
 use crate::cli::daemon_management::is_storage_daemon_running;
 pub use models::errors::GraphError;
-pub use crate::cli::config_defaults::default_config_root_directory;
+pub use lib::config::config_defaults::default_config_root_directory;
 use zmq::{Context as ZmqContext};
-
-fn convert_to_lib_storage_config(cli_config: CliStorageConfig) -> LibStorageConfig {
-    LibStorageConfig {
-        config_root_directory: cli_config.config_root_directory.unwrap_or_else(default_config_root_directory),
-        data_directory: cli_config.data_directory.unwrap_or_else(default_data_directory),
-        log_directory: cli_config.log_directory.map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(default_log_directory),
-        default_port: cli_config.default_port,
-        cluster_range: cli_config.cluster_range,
-        max_disk_space_gb: cli_config.max_disk_space_gb,
-        min_disk_space_gb: cli_config.min_disk_space_gb,
-        use_raft_for_scale: cli_config.use_raft_for_scale,
-        storage_engine_type: cli_config.storage_engine_type,
-        connection_string: None,
-        engine_specific_config: cli_config.engine_specific_config.map(|sel| {
-            let mut map = HashMap::new();
-            map.insert("storage_engine_type".to_string(), Value::String(sel.storage_engine_type.to_string()));
-            if let Some(path) = sel.storage.path {
-                map.insert("path".to_string(), Value::String(path.to_string_lossy().into_owned()));
-            }
-            if let Some(host) = sel.storage.host {
-                map.insert("host".to_string(), Value::String(host));
-            }
-            if let Some(port) = sel.storage.port {
-                map.insert("port".to_string(), Value::Number(port.into()));
-            }
-            if let Some(username) = sel.storage.username {
-                map.insert("username".to_string(), Value::String(username));
-            }
-            if let Some(password) = sel.storage.password {
-                map.insert("password".to_string(), Value::String(password));
-            }
-            if let Some(database) = sel.storage.database {
-                map.insert("database".to_string(), Value::String(database));
-            }
-            if let Some(pd_endpoints) = sel.storage.pd_endpoints {
-                map.insert("pd_endpoints".to_string(), Value::String(pd_endpoints));
-            }
-            map
-        }),
-        max_open_files: Some(
-            if cli_config.max_open_files <= i32::MAX as u64 {
-                cli_config.max_open_files as i32
-            } else {
-                i32::MAX
-            }
-        ),
-    }
-}
 
 async fn execute_and_print(engine: &Arc<QueryExecEngine>, query_string: &str) -> Result<()> {
     match engine.execute(query_string).await {
@@ -201,7 +153,7 @@ pub async fn handle_kv_command(engine: Arc<QueryExecEngine>, operation: String, 
     let validated_op = parse_kv_operation(&operation)
         .map_err(|e| anyhow!("Invalid KV operation: {}", e))?;
 
-    let config = crate::cli::config::load_cli_config()?;
+    let config = lib::config::load_cli_config().await?;
     if config.storage.storage_engine_type == Some(StorageEngineType::Sled) {
         info!("Using Sled-specific ZeroMQ handler for KV operation: {}", validated_op);
         handle_kv_sled_zmq(key, value, &validated_op).await
@@ -352,7 +304,7 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
 type StartStorageFn = fn(
     Option<u16>,
     Option<PathBuf>,
-    Option<CliStorageConfig>,
+    Option<StorageConfig>,
     Option<String>,
     Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
     Arc<TokioMutex<Option<JoinHandle<()>>>>,
@@ -408,27 +360,26 @@ pub async fn initialize_storage_for_query(
             return Err(anyhow!("Config file does not exist: {:?}", config_path));
         }
 
-        let cli_config = match load_storage_config_from_yaml(Some(config_path.clone())) {
+        let config = match load_storage_config_from_yaml(Some(config_path.clone())).await {
             Ok(config) => {
                 info!("Loaded storage config for engine {:?}: {:?}", engine_type, config);
                 config
             },
             Err(e) => {
                 warn!("Failed to load config from {:?}, using default: {}", config_path, e);
-                CliStorageConfig::default()
+                StorageConfig::default()
             }
         };
-        let lib_config = convert_to_lib_storage_config(cli_config.clone());
 
         // Update port in config to match running daemon
-        let mut updated_config = lib_config;
+        let mut updated_config = config;
         if let Some(engine_specific_config) = &mut updated_config.engine_specific_config {
-            engine_specific_config.insert("port".to_string(), Value::Number(daemon.port.into()));
+            engine_specific_config.storage.port = Some(daemon.port);
         }
 
         match engine_type {
             StorageEngineType::Sled => {
-                let lock_path = updated_config.data_directory.join("sled").join("db.lck");
+                let lock_path = updated_config.data_directory.unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data")).join("sled").join("db.lck");
                 if lock_path.exists() {
                     info!("Removing Sled lock file at {:?}", lock_path);
                     fs::remove_file(&lock_path).context(format!("Failed to remove Sled lock file at {:?}", lock_path))?;
@@ -469,18 +420,17 @@ pub async fn initialize_storage_for_query(
             return Err(anyhow!("Config file does not exist: {:?}", config_path));
         }
 
-        let mut cli_config = match load_storage_config_from_yaml(Some(config_path.clone())) {
+        let mut config = match load_storage_config_from_yaml(Some(config_path.clone())).await {
             Ok(config) => {
                 info!("Successfully loaded existing storage config: {:?}", config);
                 config
             },
             Err(e) => {
                 warn!("Failed to load existing config from {:?}, using default values. Error: {}", config_path, e);
-                CliStorageConfig::default()
+                StorageConfig::default()
             }
         };
-        cli_config.default_port = 8051; // Use CLI-specified port
-        let lib_config = convert_to_lib_storage_config(cli_config.clone());
+        config.default_port = 8051; // Use CLI-specified port
 
         let storage_daemon_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>> = Arc::new(TokioMutex::new(None));
         let storage_daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>> = Arc::new(TokioMutex::new(None));
@@ -489,7 +439,7 @@ pub async fn initialize_storage_for_query(
         start_storage_interactive(
             Some(8051),
             Some(config_path),
-            Some(cli_config),
+            Some(config),
             None,
             storage_daemon_shutdown_tx_opt,
             storage_daemon_handle,

@@ -13,7 +13,7 @@ use chrono::Utc;
 use nix::sys::signal;
 
 // Import configuration-related items
-use crate::cli::config::{
+use lib::config::{
     DEFAULT_DAEMON_PORT, DEFAULT_REST_API_PORT, DEFAULT_STORAGE_PORT,
     DEFAULT_STORAGE_CONFIG_PATH_RELATIVE, StorageConfig, load_storage_config_from_yaml, 
     DEFAULT_CONFIG_ROOT_DIRECTORY_STR, StorageEngineType, daemon_api_storage_engine_type_to_string,
@@ -398,7 +398,7 @@ pub async fn handle_start_all_interactive(
     let actual_storage_config = storage_config.unwrap_or_else(|| PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE));
 
     // Load storage configuration to get the engine-specific port
-    let storage_config_full = load_storage_config_from_yaml(Some(actual_storage_config.clone()))
+    let storage_config_full = load_storage_config_from_yaml(Some(actual_storage_config.clone())).await
         .context("Failed to load storage configuration")?;
     let engine_specific_config = storage_config_full.engine_specific_config
         .context("No engine-specific configuration found")?;
@@ -696,7 +696,7 @@ pub async fn display_full_status_summary(
             let config_path = metadata
                 .and_then(|meta| meta.config_path.clone())
                 .unwrap_or_else(|| PathBuf::from("./storage_daemon_server/storage_config.yaml"));
-            let storage_config = load_storage_config_from_yaml(Some(config_path.clone()))
+            let storage_config = load_storage_config_from_yaml(Some(config_path.clone())).await
                 .unwrap_or_else(|e| {
                     warn!("Failed to load storage config from {:?}: {}, using default", config_path, e);
                     StorageConfig::default()

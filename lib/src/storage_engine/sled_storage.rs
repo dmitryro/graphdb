@@ -4,10 +4,10 @@ use tokio::fs;
 use tokio::net::TcpStream;
 use tokio::sync::{OnceCell, Mutex as TokioMutex};
 use log::{info, debug, warn, error};
-use crate::storage_engine::config::{
-    SledConfig, SledStorage, SledDaemonPool, load_storage_config_from_yaml, 
+pub use crate::config::{
+    SledDbWithPath, SledConfig, SledStorage, SledDaemonPool, load_storage_config_from_yaml, 
     DEFAULT_DATA_DIRECTORY, DEFAULT_STORAGE_CONFIG_PATH_RELATIVE, DEFAULT_STORAGE_PORT, 
-    StorageConfig, StorageEngineType, parse_cluster_range
+    StorageConfig, StorageEngineType, 
 };
 use crate::storage_engine::storage_utils::{serialize_vertex, deserialize_vertex, serialize_edge, deserialize_edge, create_edge_key};
 use models::{Vertex, Edge, Identifier, identifiers::SerializableUuid};
@@ -16,19 +16,12 @@ use uuid::Uuid;
 use async_trait::async_trait;
 use crate::storage_engine::storage_engine::{StorageEngine, GraphStorageEngine};
 use crate::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
-use crate::daemon_utils::{is_storage_daemon_running};
+use crate::daemon_utils::{is_storage_daemon_running, parse_cluster_range};
 use serde_json::Value;
 use std::any::Any;
 use futures::future::join_all;
 use tokio::time::{timeout, Duration};
 use std::fs as std_fs;
-
-// Struct to hold sled::Db and its path
-#[derive(Debug)]
-struct SledDbWithPath {
-    db: sled::Db,
-    path: PathBuf,
-}
 
 // Static LazyLock to hold the single Sled database instance with its path
 static SLED_DB: LazyLock<OnceCell<TokioMutex<SledDbWithPath>>> = LazyLock::new(|| OnceCell::new());
@@ -111,7 +104,7 @@ impl SledStorage {
                 error!("Failed to get key '{}': {}", key, e);
                 GraphError::StorageError(format!("Failed to get key '{}': {}", key, e))
             })?
-            .map(|v| String::from_utf8_lossy(&v).to_string());
+            .map(|v| String::from_utf8_lossy(&*v).to_string()); // Fixed: Changed &v to &*v
         debug!("Retrieved value for key '{}': {:?}", key, value);
         Ok(value)
     }
@@ -243,7 +236,7 @@ impl StorageEngine for SledStorage {
             .iter()
             .keys()
             .filter_map(|k| k.ok())
-            .map(|k| String::from_utf8_lossy(&k).to_string())
+            .map(|k| String::from_utf8_lossy(&*k).to_string())
             .collect();
         info!("SledStorage::insert - current kv_pairs keys at {:?}: {:?}", db_path, keys);
 
@@ -265,7 +258,7 @@ impl StorageEngine for SledStorage {
             .iter()
             .keys()
             .filter_map(|k| k.ok())
-            .map(|k| String::from_utf8_lossy(&k).to_string())
+            .map(|k| String::from_utf8_lossy(&*k).to_string())
             .collect();
         info!("SledStorage::retrieve - current kv_pairs keys at {:?}: {:?}", db_path, keys);
 
@@ -290,7 +283,7 @@ impl StorageEngine for SledStorage {
             .iter()
             .keys()
             .filter_map(|k| k.ok())
-            .map(|k| String::from_utf8_lossy(&k).to_string())
+            .map(|k| String::from_utf8_lossy(&*k).to_string())
             .collect();
         info!("SledStorage::delete - current kv_pairs keys at {:?}: {:?}", db_path, keys);
 
@@ -331,7 +324,7 @@ impl GraphStorageEngine for SledStorage {
             .iter()
             .keys()
             .filter_map(|k| k.ok())
-            .map(|k| String::from_utf8_lossy(&k).to_string())
+            .map(|k| String::from_utf8_lossy(&*k).to_string())
             .collect();
         info!("Current vertex keys at {:?}: {:?}", db_path, vertex_keys);
         Ok(())
@@ -347,14 +340,14 @@ impl GraphStorageEngine for SledStorage {
         let vertex = vertices
             .get(SerializableUuid(*id).0.as_bytes())
             .map_err(|e| GraphError::StorageError(e.to_string()))?
-            .map(|v| deserialize_vertex(&v))
+            .map(|v| deserialize_vertex(&*v))
             .transpose()?;
 
         let vertex_keys: Vec<_> = vertices
             .iter()
             .keys()
             .filter_map(|k| k.ok())
-            .map(|k| String::from_utf8_lossy(&k).to_string())
+            .map(|k| String::from_utf8_lossy(&*k).to_string())
             .collect();
         info!("Current vertex keys at {:?}: {:?}", db_path, vertex_keys);
         Ok(vertex)
@@ -378,7 +371,7 @@ impl GraphStorageEngine for SledStorage {
             .iter()
             .keys()
             .filter_map(|k| k.ok())
-            .map(|k| String::from_utf8_lossy(&k).to_string())
+            .map(|k| String::from_utf8_lossy(&*k).to_string())
             .collect();
         info!("Current vertex keys at {:?}: {:?}", db_path, vertex_keys);
         Ok(())
@@ -402,7 +395,7 @@ impl GraphStorageEngine for SledStorage {
             .iter()
             .keys()
             .filter_map(|k| k.ok())
-            .map(|k| String::from_utf8_lossy(&k).to_string())
+            .map(|k| String::from_utf8_lossy(&*k).to_string())
             .collect();
         info!("Current vertex keys at {:?}: {:?}", db_path, vertex_keys);
         Ok(())
@@ -427,7 +420,7 @@ impl GraphStorageEngine for SledStorage {
             .iter()
             .keys()
             .filter_map(|k| k.ok())
-            .map(|k| String::from_utf8_lossy(&k).to_string())
+            .map(|k| String::from_utf8_lossy(&*k).to_string())
             .collect();
         info!("Current edge keys at {:?}: {:?}", db_path, edge_keys);
         Ok(())
@@ -444,14 +437,14 @@ impl GraphStorageEngine for SledStorage {
         let edge = edges
             .get(&edge_key)
             .map_err(|e| GraphError::StorageError(e.to_string()))?
-            .map(|v| deserialize_edge(&v))
+            .map(|v| deserialize_edge(&*v))
             .transpose()?;
 
         let edge_keys: Vec<_> = edges
             .iter()
             .keys()
             .filter_map(|k| k.ok())
-            .map(|k| String::from_utf8_lossy(&k).to_string())
+            .map(|k| String::from_utf8_lossy(&*k).to_string())
             .collect();
         info!("Current edge keys at {:?}: {:?}", db_path, edge_keys);
         Ok(edge)
@@ -476,7 +469,7 @@ impl GraphStorageEngine for SledStorage {
             .iter()
             .keys()
             .filter_map(|k| k.ok())
-            .map(|k| String::from_utf8_lossy(&k).to_string())
+            .map(|k| String::from_utf8_lossy(&*k).to_string())
             .collect();
         info!("Current edge keys at {:?}: {:?}", db_path, edge_keys);
         Ok(())
@@ -501,7 +494,7 @@ impl GraphStorageEngine for SledStorage {
             .iter()
             .keys()
             .filter_map(|k| k.ok())
-            .map(|k| String::from_utf8_lossy(&k).to_string())
+            .map(|k| String::from_utf8_lossy(&*k).to_string())
             .collect();
         info!("Current edge keys at {:?}: {:?}", db_path, edge_keys);
         Ok(())
@@ -571,7 +564,7 @@ impl GraphStorageEngine for SledStorage {
         let mut vertex_vec = Vec::new();
         for result in vertices.iter() {
             let (_k, v) = result.map_err(|e| GraphError::StorageError(e.to_string()))?;
-            vertex_vec.push(deserialize_vertex(&v)?);
+            vertex_vec.push(deserialize_vertex(&*v)?);
         }
         info!("Retrieved {} vertices from path {:?}", vertex_vec.len(), db_path);
         Ok(vertex_vec)
@@ -587,7 +580,7 @@ impl GraphStorageEngine for SledStorage {
         let mut edge_vec = Vec::new();
         for result in edges.iter() {
             let (_k, v) = result.map_err(|e| GraphError::StorageError(e.to_string()))?;
-            edge_vec.push(deserialize_edge(&v)?);
+            edge_vec.push(deserialize_edge(&*v)?);
         }
         info!("Retrieved {} edges from path {:?}", edge_vec.len(), db_path);
         Ok(edge_vec)
@@ -613,8 +606,7 @@ impl GraphStorageEngine for SledStorage {
 
 // Helper function to select an available port from cluster_range (not used in new)
 pub async fn select_available_port(storage_config: &StorageConfig, preferred_port: u16) -> GraphResult<u16> {
-    let cluster_ports = parse_cluster_range(&storage_config.cluster_range)?;
-    let cluster_ports: Vec<u16> = cluster_ports.collect();
+    let cluster_ports = parse_cluster_range(&storage_config.cluster_range)?; // Fixed: Removed redundant .collect()
 
     // Check if preferred_port is available
     if !is_storage_daemon_running(preferred_port).await {

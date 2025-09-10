@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
-pub use crate::cli::config_constants::*;
-pub use crate::cli::config_structs::{StorageConfigInner, SelectedStorageConfig, StorageConfig};
-pub use crate::cli::config_helpers::{load_rest_config, load_storage_config_from_yaml, load_daemon_config};
-pub use lib::storage_engine::config::{StorageEngineType};
+pub use crate::config::config_constants::*;
+pub use crate::config::config_structs::{StorageConfigInner, SelectedStorageConfig, StorageConfig};
+pub use crate::config::config_helpers::{load_rest_config, load_storage_config_from_yaml, load_daemon_config};
+pub use crate::config::{StorageEngineType};
 
 pub  fn default_config_root_directory_option() -> Option<PathBuf> {
     Some(PathBuf::from(DEFAULT_CONFIG_ROOT_DIRECTORY_STR))
@@ -31,6 +31,8 @@ pub fn default_engine_specific_config() -> Option<SelectedStorageConfig> {
             password: None,
             database: None,
             pd_endpoints: None,
+            cache_capacity: Some(1024*1024*1024),
+            use_compression: true,
         },
     })
 }
@@ -78,20 +80,20 @@ pub fn get_default_rest_port_from_config() -> u16 {
         .unwrap_or(DEFAULT_REST_API_PORT)
 }
 
-pub fn get_default_daemon_port() -> u16 {
-    load_daemon_config(None)
+pub async fn get_default_daemon_port() -> u16 {
+    load_daemon_config(None).await
         .map(|cfg| cfg.default_port)
         .unwrap_or(DEFAULT_DAEMON_PORT)
 }
 
-pub fn get_default_storage_port_from_config_or_cli_default() -> u16 {
-    load_storage_config_from_yaml(None)
+pub async fn get_default_storage_port_from_config_or_cli_default() -> u16 {
+    load_storage_config_from_yaml(None).await
         .map(|config| config.default_port)
         .unwrap_or(DEFAULT_STORAGE_PORT)
 }
 
-pub fn get_storage_cluster_range() -> String {
-    load_storage_config_from_yaml(None)
+pub async fn get_storage_cluster_range() -> String {
+    load_storage_config_from_yaml(None).await
         .map(|cfg| cfg.cluster_range)
         .unwrap_or_else(|_| StorageConfig::default().cluster_range)
 }

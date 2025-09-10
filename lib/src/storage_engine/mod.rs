@@ -7,11 +7,14 @@
 // Fixed: 2025-08-14 - Fixed type mismatch for RocksdbStorage::new error handling
 // Updated: 2025-09-01 - Implemented Hybrid match arm, fixed TiKV branch to use TikvConfig
 // Updated: 2025-09-01 - Fixed TiKV deserialization, restored InMemoryGraphStorage alias, added start calls, improved Hybrid config and error messages
+// Fixed: 2025-09-09 - Replaced incorrect enum variant matching on SelectedStorageConfig with struct field access,
+//                     fixed Hybrid storage to default to Sled as persistent engine, and handled data_directory type mismatch
 
 use log::{info, error, warn, debug};
 use std::sync::Arc;
 use anyhow::{Result, anyhow};
 use std::path::{Path, PathBuf};
+use serde_json::Value;
 
 // Declare submodules
 pub mod config;
@@ -34,18 +37,22 @@ pub mod hybrid_storage;
 #[cfg(feature = "with-sled")]
 pub mod sled_storage_daemon_pool;
 // Re-export key items
-pub use config::{ CliConfigToml, StorageConfig, StorageEngineType, RocksdbConfig, SledConfig, TikvConfig, HybridConfig,
-                 format_engine_config, load_storage_config_from_yaml};
+pub use crate::config::{
+    CliConfigToml, StorageConfig, StorageEngineType, RocksdbConfig, SledConfig, TikvConfig, HybridConfig,
+    format_engine_config, load_storage_config_from_yaml, SelectedStorageConfig,
+};
 pub use inmemory_storage::{InMemoryStorage as InMemoryGraphStorage};
 #[cfg(feature = "with-sled")]
 pub mod sled_storage;
 #[cfg(feature = "with-sled")]
-pub use crate::storage_engine::config::{ SledStorage, SledDaemonPool };
+pub use crate::config::{ SledStorage, SledDaemonPool };
 #[cfg(feature = "with-sled")]
-pub use storage_engine::{ AsyncStorageEngineManager, GraphStorageEngine, StorageEngine, 
-                          SurrealdbGraphStorage,
-                          StorageEngineManager, emergency_cleanup_storage_engine_manager, init_storage_engine_manager, 
-                          GLOBAL_STORAGE_ENGINE_MANAGER, recover_sled, log_lock_file_diagnostics, lock_file_exists };
+pub use storage_engine::{
+    AsyncStorageEngineManager, GraphStorageEngine, StorageEngine, 
+    SurrealdbGraphStorage,
+    StorageEngineManager, emergency_cleanup_storage_engine_manager, init_storage_engine_manager, 
+    GLOBAL_STORAGE_ENGINE_MANAGER, recover_sled, log_lock_file_diagnostics, lock_file_exists
+};
 pub use storage_utils::{serialize_vertex, deserialize_vertex, serialize_edge, deserialize_edge, create_edge_key};
 
 // Correctly re-export storage engines under feature flags
@@ -62,6 +69,7 @@ pub use mysql_storage::MySQLStorage;
 #[cfg(any(feature = "with-sled", feature = "with-rocksdb", feature = "with-tikv"))]
 pub use hybrid_storage::HybridStorage;
 pub use inmemory_storage::InMemoryStorage;
+
 /// Creates a storage engine instance based on the provided configuration.
 ///
 /// Uses Sled as the default storage engine (as per StorageConfig::default).
@@ -79,12 +87,18 @@ pub async fn create_storage(config: &StorageConfig) -> Result<Arc<dyn GraphStora
             debug!("Attempting to create RocksDB storage");
             #[cfg(feature = "with-rocksdb")]
             {
-                let rocksdb_config: RocksdbConfig = serde_json::from_value(
-                    config.engine_specific_config
-                        .as_ref()
-                        .map(|c| c.get("rocksdb").cloned().unwrap_or_else(|| serde_json::to_value(c).unwrap()))
-                        .ok_or_else(|| anyhow!("RocksDB configuration is missing."))?
-                ).map_err(|e| anyhow!("Failed to deserialize RocksDB config: {}", e))?;
+                let rocksdb_config: RocksdbConfig = match config.engine_specific_config.as_ref() {
+                    Some(selected) if selected.storage_engine_type == StorageEngineType::RocksDB => {
+                        serde_json::from_value(serde_json::to_value(&selected.storage)?)
+                            .map_err(|e| anyhow!("Failed to deserialize RocksDB config: {}", e))?
+                    }
+                    _ => RocksdbConfig {
+                        storage_engine_type: StorageEngineType::RocksDB,
+                        path: config.data_directory.clone().unwrap_or(PathBuf::from(config::DEFAULT_DATA_DIRECTORY)),
+                        host: None,
+                        port: None,
+                    },
+                };
 
                 match RocksdbStorage::new(&rocksdb_config) {
                     Ok(storage) => {
@@ -107,28 +121,39 @@ pub async fn create_storage(config: &StorageConfig) -> Result<Arc<dyn GraphStora
             debug!("Attempting to create Hybrid storage");
             #[cfg(any(feature = "with-sled", feature = "with-rocksdb", feature = "with-tikv"))]
             {
-                let persistent_engine = config.engine_specific_config.as_ref()
-                    .and_then(|config| config.get("persistent_engine").and_then(|v| v.as_str()))
-                    .ok_or_else(|| anyhow!("Persistent engine not specified for Hybrid storage"))?;
+                // Default to Sled as the persistent engine if available, else RocksDB, then TiKV
+                let persistent_engine = match (
+                    cfg!(feature = "with-sled"),
+                    cfg!(feature = "with-rocksdb"),
+                    cfg!(feature = "with-tikv"),
+                    config.engine_specific_config.as_ref(),
+                ) {
+                    (true, _, _, Some(selected)) if selected.storage_engine_type == StorageEngineType::Hybrid => "sled",
+                    (true, _, _, None) => "sled",
+                    (false, true, _, _) => "rocksdb",
+                    (false, false, true, _) => "tikv",
+                    _ => return Err(anyhow!("No supported persistent engine available for Hybrid storage. Enable 'with-sled', 'with-rocksdb', or 'with-tikv'.")),
+                };
 
                 let persistent: Arc<dyn GraphStorageEngine + Send + Sync> = match persistent_engine {
                     "sled" => {
                         #[cfg(feature = "with-sled")]
                         {
-                            let sled_config: SledConfig = serde_json::from_value(
-                                config.engine_specific_config
-                                    .as_ref()
-                                    .map(|c| c.get("sled").cloned().unwrap_or_else(|| serde_json::to_value(SledConfig {
-                                        storage_engine_type: StorageEngineType::Sled,
-                                        path: config.data_directory.clone(),
-                                        host: None,
-                                        port: None,
-                                        cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
-                                        temporary: false,
-                                        use_compression: false,
-                                    }).unwrap()))
-                                    .ok_or_else(|| anyhow!("Sled configuration is missing for Hybrid."))?
-                            ).map_err(|e| anyhow!("Failed to deserialize Sled config for Hybrid: {}", e))?;
+                            let sled_config: SledConfig = match config.engine_specific_config.as_ref() {
+                                Some(selected) if selected.storage_engine_type == StorageEngineType::Hybrid => {
+                                    serde_json::from_value(serde_json::to_value(&selected.storage)?)
+                                        .map_err(|e| anyhow!("Failed to deserialize Sled config for Hybrid: {}", e))?
+                                }
+                                _ => SledConfig {
+                                    storage_engine_type: StorageEngineType::Sled,
+                                    path: config.data_directory.clone().unwrap_or(PathBuf::from(config::DEFAULT_DATA_DIRECTORY)).join("sled"),
+                                    host: None,
+                                    port: None,
+                                    cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
+                                    temporary: false,
+                                    use_compression: true,
+                                },
+                            };
 
                             match SledStorage::new(&sled_config).await {
                                 Ok(storage) => {
@@ -147,17 +172,18 @@ pub async fn create_storage(config: &StorageConfig) -> Result<Arc<dyn GraphStora
                     "rocksdb" => {
                         #[cfg(feature = "with-rocksdb")]
                         {
-                            let rocksdb_config: RocksdbConfig = serde_json::from_value(
-                                config.engine_specific_config
-                                    .as_ref()
-                                    .map(|c| c.get("rocksdb").cloned().unwrap_or_else(|| serde_json::to_value(RocksdbConfig {
-                                        storage_engine_type: StorageEngineType::RocksDB,
-                                        path: config.data_directory.clone(),
-                                        host: None,
-                                        port: None,
-                                    }).unwrap()))
-                                    .ok_or_else(|| anyhow!("RocksDB configuration is missing for Hybrid."))?
-                            ).map_err(|e| anyhow!("Failed to deserialize RocksDB config for Hybrid: {}", e))?;
+                            let rocksdb_config: RocksdbConfig = match config.engine_specific_config.as_ref() {
+                                Some(selected) if selected.storage_engine_type == StorageEngineType::Hybrid => {
+                                    serde_json::from_value(serde_json::to_value(&selected.storage)?)
+                                        .map_err(|e| anyhow!("Failed to deserialize RocksDB config for Hybrid: {}", e))?
+                                }
+                                _ => RocksdbConfig {
+                                    storage_engine_type: StorageEngineType::RocksDB,
+                                    path: config.data_directory.clone().unwrap_or(PathBuf::from(config::DEFAULT_DATA_DIRECTORY)).join("rocksdb"),
+                                    host: None,
+                                    port: None,
+                                },
+                            };
 
                             match RocksdbStorage::new(&rocksdb_config) {
                                 Ok(storage) => {
@@ -176,12 +202,21 @@ pub async fn create_storage(config: &StorageConfig) -> Result<Arc<dyn GraphStora
                     "tikv" => {
                         #[cfg(feature = "with-tikv")]
                         {
-                            let tikv_config: TikvConfig = serde_json::from_value(
-                                config.engine_specific_config
-                                    .as_ref()
-                                    .map(|c| c.get("tikv").cloned().unwrap_or_else(|| serde_json::to_value(c).unwrap()))
-                                    .ok_or_else(|| anyhow!("TiKV configuration is missing for Hybrid."))?
-                            ).map_err(|e| anyhow!("Failed to deserialize TiKV config for Hybrid: {}", e))?;
+                            let tikv_config: TikvConfig = match config.engine_specific_config.as_ref() {
+                                Some(selected) if selected.storage_engine_type == StorageEngineType::Hybrid => {
+                                    serde_json::from_value(serde_json::to_value(&selected.storage)?)
+                                        .map_err(|e| anyhow!("Failed to deserialize TiKV config for Hybrid: {}", e))?
+                                }
+                                _ => TikvConfig {
+                                    storage_engine_type: StorageEngineType::TiKV,
+                                    path: config.data_directory.clone().unwrap_or(PathBuf::from(config::DEFAULT_DATA_DIRECTORY)).join("tikv"),
+                                    host: None,
+                                    port: None,
+                                    pd_endpoints: None,
+                                    username: None,
+                                    password: None,
+                                },
+                            };
 
                             match TikvStorage::new(&tikv_config).await {
                                 Ok(storage) => {
@@ -215,12 +250,21 @@ pub async fn create_storage(config: &StorageConfig) -> Result<Arc<dyn GraphStora
             debug!("Attempting to create Sled storage");
             #[cfg(feature = "with-sled")]
             {
-                let sled_config: SledConfig = serde_json::from_value(
-                    config.engine_specific_config
-                        .as_ref()
-                        .map(|c| c.get("sled").cloned().unwrap_or_else(|| serde_json::to_value(c).unwrap()))
-                        .ok_or_else(|| anyhow!("Sled configuration is missing."))?
-                ).map_err(|e| anyhow!("Failed to deserialize Sled config: {}", e))?;
+                let sled_config: SledConfig = match config.engine_specific_config.as_ref() {
+                    Some(selected) if selected.storage_engine_type == StorageEngineType::Sled => {
+                        serde_json::from_value(serde_json::to_value(&selected.storage)?)
+                            .map_err(|e| anyhow!("Failed to deserialize Sled config: {}", e))?
+                    }
+                    _ => SledConfig {
+                        storage_engine_type: StorageEngineType::Sled,
+                        path: config.data_directory.clone().unwrap_or(PathBuf::from(config::DEFAULT_DATA_DIRECTORY)),
+                        host: None,
+                        port: None,
+                        cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
+                        temporary: false,
+                        use_compression: true,
+                    },
+                };
 
                 match SledStorage::new(&sled_config).await {
                     Ok(storage) => {
@@ -243,12 +287,13 @@ pub async fn create_storage(config: &StorageConfig) -> Result<Arc<dyn GraphStora
             debug!("Attempting to create TiKV storage");
             #[cfg(feature = "with-tikv")]
             {
-                let tikv_config: TikvConfig = serde_json::from_value(
-                    config.engine_specific_config
-                        .as_ref()
-                        .map(|c| c.get("tikv").cloned().unwrap_or_else(|| serde_json::to_value(c).unwrap()))
-                        .ok_or_else(|| anyhow!("TiKV configuration is missing."))?
-                ).map_err(|e| anyhow!("Failed to deserialize TiKV config: {}", e))?;
+                let tikv_config: TikvConfig = match config.engine_specific_config.as_ref() {
+                    Some(selected) if selected.storage_engine_type == StorageEngineType::TiKV => {
+                        serde_json::from_value(serde_json::to_value(&selected.storage)?)
+                            .map_err(|e| anyhow!("Failed to deserialize TiKV config: {}", e))?
+                    }
+                    _ => return Err(anyhow!("TiKV configuration is missing.")),
+                };
 
                 match TikvStorage::new(&tikv_config).await {
                     Ok(storage) => {

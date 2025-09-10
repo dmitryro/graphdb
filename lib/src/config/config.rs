@@ -1,3 +1,6 @@
+
+
+
 // server/src/cli/config.rs
 // ADDED: 2025-08-08 - Added `enable_plugins` field to `CliConfigToml`. Implemented `save` method for `CliConfigToml` to serialize to TOML file. Replaced `std::fs` with `fs` and ensured consistent use of `serde_yaml2`.
 // UPDATED: 2025-08-08 - Changed `load_cli_config` to use `/opt/graphdb/config.toml` instead of `config.toml` in `CARGO_MANIFEST_DIR`.
@@ -50,53 +53,25 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use dirs;
 use toml;
-use lib::storage_engine::config::StorageConfig as EngineStorageConfig;
-use crate::cli::commands::{Commands, CommandType, StatusArgs, RestartArgs, ReloadArgs, RestartAction, 
+use crate::storage_engine::config::StorageConfig as EngineStorageConfig;
+use crate::commands::{Commands, CommandType, StatusArgs, RestartArgs, ReloadArgs, RestartAction, 
                            ReloadAction, RestCliCommand, StatusAction, StorageAction, ShowAction, ShowArgs,
                            StartAction, StopAction, StopArgs, DaemonCliCommand, UseAction, SaveAction};
-use super::daemon_management::{is_port_in_cluster_range, is_valid_cluster_range, parse_cluster_range}; // Import the correct helper function
-pub use lib::storage_engine::storage_engine::{StorageEngineManager, GLOBAL_STORAGE_ENGINE_MANAGER};
-pub use lib::storage_engine::config::{EngineTypeOnly, RocksdbConfig, SledConfig, TikvConfig, MySQLConfig, 
-                                      RedisConfig, PostgreSQLConfig};
+pub use crate::storage_engine::storage_engine::{StorageEngineManager, GLOBAL_STORAGE_ENGINE_MANAGER};
 pub use models::errors::GraphError;
-pub use lib::storage_engine::config::{StorageEngineType, StorageConfig as LibStorageConfig, 
-                                      SelectedStorageConfig as LibSelectedStorageConfig,
-                                      StorageConfigInner as LibStorageConfigInner};
-pub use crate::cli::config_structs::*;
-pub use crate::cli::config_constants::*;
-pub use crate::cli::config_defaults::*;
-pub use crate::cli::config_helpers::*;
-pub use crate::cli::serializers::*;
-pub use crate:: cli::config_impl_cli::*;
-pub use crate:: cli::config_impl_storage::*;
+pub use super::config_structs::*;
+pub use super::config_helpers::*;
+pub use super::config_defaults::*;
+pub use super::config_impl_cli::*;
+pub use super::config_impl_storage::*;
+pub use super::config_serializers::*;
+pub use super::config_constants::*;
 
-use lib::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
+use crate::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
 
 // This is the custom deserializer function that will handle the conversion.
 use serde::de::Error; // Add this import at the top of your file
 
-
-impl Default for MainDaemonConfig {
-    fn default() -> Self {
-        MainDaemonConfig {
-            data_directory: format!("{}/daemon_data", DEFAULT_CONFIG_ROOT_DIRECTORY_STR),
-            log_directory: format!("{}/daemon", DEFAULT_LOG_DIRECTORY),
-            default_port: DEFAULT_MAIN_PORT,
-            cluster_range: DEFAULT_CLUSTER_RANGE.to_string(),
-        }
-    }
-}
-
-impl Default for RestApiConfig {
-    fn default() -> Self {
-        RestApiConfig {
-            data_directory: format!("{}/rest_api_data", DEFAULT_CONFIG_ROOT_DIRECTORY_STR),
-            log_directory: format!("{}/daemon", DEFAULT_LOG_DIRECTORY),
-            default_port: DEFAULT_REST_API_PORT,
-            cluster_range: format!("{}", DEFAULT_REST_API_PORT),
-        }
-    }
-}
 
 impl Default for DaemonYamlConfig {
     fn default() -> Self {
@@ -113,54 +88,4 @@ impl Default for DaemonYamlConfig {
         }
     }
 }
-
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        AppConfig {
-            version: "0.1.0".to_string(),
-        }
-    }
-}
-
-
-impl Default for DeploymentConfig {
-    fn default() -> Self {
-        DeploymentConfig {
-            config_root_directory: default_config_root_directory(),
-        }
-    }
-}
-
-impl Default for ServerConfig {
-    fn default() -> Self {
-        ServerConfig {
-            port: Some(DEFAULT_MAIN_PORT),
-            host: Some("127.0.0.1".to_string()),
-        }
-    }
-}
-
-impl Default for RestConfig {
-    fn default() -> Self {
-        RestConfig {
-            port: DEFAULT_REST_API_PORT,
-            host: "127.0.0.1".to_string(),
-        }
-    }
-}
-
-impl Default for DaemonConfig {
-    fn default() -> Self {
-        DaemonConfig {
-            port: Some(DEFAULT_DAEMON_PORT),
-            process_name: EXECUTABLE_NAME.to_string(),
-            user: "graphdb".to_string(),
-            group: "graphdb".to_string(),
-        }
-    }
-}
-
-
-
 

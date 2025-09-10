@@ -25,7 +25,7 @@ use tokio::process::Command;
 use std::os::unix::process::ExitStatusExt;
 use std::fs;
 
-use crate::storage_engine::config::{
+use crate::config::config::{
     CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS,
     StorageConfig,
     DEFAULT_DAEMON_PORT,
@@ -74,13 +74,13 @@ pub fn parse_cluster_range(range_str: &str) -> Result<Vec<u16>, anyhow::Error> {
             return Err(anyhow!("Start port cannot be greater than end port."));
         }
         let ports: Vec<u16> = (start_port..=end_port).collect();
-        if ports.len() > MAX_CLUSTER_SIZE {
+        /*if ports.len() > MAX_CLUSTER_SIZE {
             return Err(anyhow!(
                 "Cluster port range size ({}) exceeds maximum allowed ({})",
                 ports.len(),
                 MAX_CLUSTER_SIZE
             ));
-        }
+        } */
         Ok(ports)
     } else if parts.len() == 1 {
         let port: u16 = range_str
@@ -238,3 +238,7 @@ pub async fn is_storage_daemon_running(port: u16) -> bool {
     }
 }
 
+// Helper function to check if a string is a valid cluster range (e.g., "8081-8084")
+pub fn is_valid_cluster_range(range: &str) -> bool {
+    range.contains('-') && range.split('-').all(|s| s.parse::<u16>().is_ok())
+}

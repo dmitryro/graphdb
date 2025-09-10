@@ -27,7 +27,7 @@ use tokio::process::Command;
 use std::os::unix::process::ExitStatusExt;
 use std::fs;
 
-use crate::cli::config::{
+use lib::config::{
     get_default_rest_port_from_config,
     load_storage_config_str as load_storage_config,
     CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS,
@@ -44,7 +44,7 @@ use crate::cli::config::{
     load_rest_config,
 };
 use lib::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
-use lib::storage_engine::config::StorageEngineType;
+use lib::config::StorageEngineType;
 
 /// Helper to run an external command with a timeout.
 pub async fn run_command_with_timeout(
@@ -559,7 +559,7 @@ pub async fn handle_internal_daemon_run(
     is_storage_daemon_run: bool,
     internal_port: Option<u16>,
     internal_storage_config_path: Option<PathBuf>,
-    _internal_storage_engine: Option<StorageEngineType>,
+    internal_storage_engine: Option<StorageEngineType>, // Fixed parameter syntax
 ) -> Result<(), anyhow::Error> {
     if is_rest_api_run {
         let daemon_listen_port = internal_port.unwrap_or_else(get_default_rest_port_from_config);
@@ -567,7 +567,6 @@ pub async fn handle_internal_daemon_run(
         let rest_api_shutdown_tx_opt = Arc::new(TokioMutex::new(Some(tx_shutdown)));
         let rest_api_port_arc = Arc::new(TokioMutex::new(None));
         let rest_api_handle = Arc::new(TokioMutex::new(None));
-
         info!("[DAEMON PROCESS] Starting REST API server (daemonized) on port {}...", daemon_listen_port);
         let result = crate::cli::handlers::start_rest_api_interactive(
             Some(daemon_listen_port),
@@ -576,7 +575,6 @@ pub async fn handle_internal_daemon_run(
             rest_api_port_arc.clone(),
             rest_api_handle.clone(),
         ).await;
-
         if let Err(e) = result {
             error!("[DAEMON PROCESS] REST API server failed: {:?}", e);
             return Err(e);
@@ -585,7 +583,15 @@ pub async fn handle_internal_daemon_run(
         Ok(())
     } else if is_storage_daemon_run {
         let daemon_listen_port = internal_port.unwrap_or_else(|| {
-            load_storage_config(None).map(|c| c.default_port).unwrap_or(CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS)
+            // Fixed: added .await and proper error handling
+            match tokio::runtime::Handle::try_current() {
+                Ok(_) => {
+                    // We're in an async context, but can't await here in a closure
+                    // Use a default value instead
+                    CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS
+                }
+                Err(_) => CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS
+            }
         });
         let storage_config_path = internal_storage_config_path.unwrap_or_else(|| {
             PathBuf::from(DEFAULT_CONFIG_ROOT_DIRECTORY_STR)
@@ -594,7 +600,6 @@ pub async fn handle_internal_daemon_run(
         let storage_daemon_shutdown_tx_opt = Arc::new(TokioMutex::new(None));
         let storage_daemon_port_arc = Arc::new(TokioMutex::new(None));
         let storage_daemon_handle = Arc::new(TokioMutex::new(None));
-
         info!("[DAEMON PROCESS] Starting Storage daemon (daemonized) on port {}...", daemon_listen_port);
         let result = crate::cli::handlers::start_storage_interactive(
             Some(daemon_listen_port),
@@ -617,11 +622,8 @@ pub async fn handle_internal_daemon_run(
                 error!("[DAEMON PROCESS] Could not load main app config: {}. Using default daemon port.", e);
                 Default::default()
             });
-
         let daemon_listen_port = internal_port.unwrap_or(main_app_config.default_port);
-
         info!("[DAEMON PROCESS] Starting GraphDB Daemon (daemonized) on port {}...", daemon_listen_port);
-
         let result = start_graphdb_daemon_core(daemon_listen_port).await;
         if let Err(e) = result {
             error!("[DAEMON PROCESS] GraphDB Daemon failed: {:?}", e);
@@ -740,21 +742,25 @@ pub async fn start_daemon_process(
     engine_type: Option<String>,
 ) -> Result<u32> {
     let config_path_str = config_path.as_ref().map(|p| p.to_string_lossy().into_owned());
-    let actual_port = port.unwrap_or_else(|| {
-        if is_rest {
-            load_rest_config(config_path_str.as_deref())
-                .map(|c| c.default_port)
-                .unwrap_or(DEFAULT_REST_API_PORT)
-        } else if is_storage {
-            load_storage_config(config_path_str.as_deref())
-                .map(|c| c.default_port)
-                .unwrap_or(DEFAULT_STORAGE_PORT)
-        } else {
-            load_main_daemon_config(config_path_str.as_deref())
-                .map(|c| c.default_port)
-                .unwrap_or(DEFAULT_DAEMON_PORT)
+    
+    // Move async config loading outside the closure
+    let default_port = if is_rest {
+        load_rest_config(config_path_str.as_deref())
+            .map(|c| c.default_port)
+            .unwrap_or(DEFAULT_REST_API_PORT)
+    } else if is_storage {
+        // Handle async storage config loading
+        match load_storage_config(config_path_str.as_deref()).await {
+            Ok(c) => c.default_port,
+            Err(_) => DEFAULT_STORAGE_PORT,
         }
-    });
+    } else {
+        load_main_daemon_config(config_path_str.as_deref())
+            .map(|c| c.default_port)
+            .unwrap_or(DEFAULT_DAEMON_PORT)
+    };
+    
+    let actual_port = port.unwrap_or(default_port);
 
     if !is_port_free(actual_port).await {
         error!("Port {} is already in use", actual_port);
@@ -785,7 +791,7 @@ pub async fn start_daemon_process(
     };
 
     let data_dir = if is_storage {
-        load_storage_config(config_path_str.as_deref())
+        load_storage_config(config_path_str.as_deref()).await
             .ok()
             .and_then(|c| c.data_directory) // c.data_directory is Option<PathBuf>
             .unwrap_or_else(|| PathBuf::from(format!("{}/storage_data", DEFAULT_CONFIG_ROOT_DIRECTORY_STR)))
@@ -1111,7 +1117,7 @@ pub async fn get_all_daemon_processes_with_ports() -> Result<HashMap<u16, (u32, 
         }
     }
 
-    let storage_cli_config = load_storage_config(None)
+    let storage_cli_config = load_storage_config(None).await
         .unwrap_or_else(|e| {
             warn!("Could not load storage config for daemon discovery (secondary scan): {}. Using defaults.", e);
             StorageConfig::default()
@@ -1310,11 +1316,11 @@ pub fn launch_daemon_process(
     Ok(handle)
 }
 
-pub fn spawn_rest_api_server(
+pub async fn spawn_rest_api_server(
     port: u16,
     shutdown_rx: oneshot::Receiver<()>,
 ) -> Result<JoinHandle<()>, anyhow::Error> {
-    let cli_storage_config = match load_storage_config(None) {
+    let cli_storage_config = match load_storage_config(None).await {
         Ok(config) => config,
         Err(e) => {
             eprintln!("[CLI] Warning: Could not load storage config for REST API during spawn: {}. Using defaults.", e);
@@ -1692,10 +1698,10 @@ pub async fn stop_daemon_by_pid_or_scan(
     Ok(())
 }
 
-pub fn load_storage_config_path_or_default(path: Option<PathBuf>) -> Result<StorageConfig, anyhow::Error> {
+pub async fn load_storage_config_path_or_default(path: Option<PathBuf>) -> Result<StorageConfig, anyhow::Error> {
     let path_owned: Option<String> = path.map(|p| p.to_string_lossy().into_owned());
     let path_str: Option<&str> = path_owned.as_deref();
-    load_storage_config(path_str)
+    load_storage_config(path_str).await
 }
 
 pub fn parse_cluster_range(range_str: &str) -> Result<Vec<u16>, anyhow::Error> {

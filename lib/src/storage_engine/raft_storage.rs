@@ -1,7 +1,7 @@
 use std::any::Any;
 use std::sync::Arc;
 use async_trait::async_trait;
-use crate::storage_engine::config::{ TypeConfig, MemStoreForTypeConfig}; // ensure this path matches where TypeConfig is defined
+use crate::config::{ TypeConfig, MemStoreForTypeConfig}; // ensure this path matches where TypeConfig is defined
 use crate::storage_engine::{GraphStorageEngine, StorageConfig, StorageEngine};
 use models::{Edge, Identifier, Vertex};
 use models::errors::{GraphError, GraphResult};

@@ -7,7 +7,7 @@ use tokio::sync::{Mutex as TokioMutex, RwLock};
 use tokio::time::{Duration, timeout};
 use tokio::fs;
 use log::{info, debug, warn, error};
-use crate::storage_engine::config::{SledConfig, SledDaemon, SledDaemonPool, SledStorage, StorageConfig, DAEMON_REGISTRY_DB_PATH};
+use crate::config::{SledConfig, SledDaemon, SledDaemonPool, SledStorage, StorageConfig, DAEMON_REGISTRY_DB_PATH};
 use crate::storage_engine::storage_utils::{create_edge_key, deserialize_edge, deserialize_vertex, serialize_edge, serialize_vertex};
 use models::{Edge, Identifier, Vertex};
 use models::errors::{GraphError, GraphResult};
@@ -1025,29 +1025,51 @@ impl SledDaemonPool {
         }
     }
 
-    pub async fn add_daemon(&mut self, storage_config: &StorageConfig, port: u16, config: &SledConfig) -> GraphResult<()> {
+    pub async fn add_daemon(
+        &mut self,
+        storage_config: &StorageConfig,
+        port: u16,
+        config: &SledConfig,
+    ) -> GraphResult<()> {
         let mut system = System::new_all();
         system.refresh_all();
         let port_in_use = system.processes().values().any(|proc| {
-            proc.cmd().iter().any(|arg| arg.to_string_lossy().contains(&port.to_string())) && 
-            proc.name().to_string_lossy().contains("graphdb")
+            proc.cmd()
+                .iter()
+                .any(|arg| arg.to_string_lossy().contains(&port.to_string()))
+                && proc.name().to_string_lossy().contains("graphdb")
         });
         if port_in_use {
             error!("Port {} is already in use by another process", port);
             println!("===> ERROR: PORT {} IS ALREADY IN USE BY ANOTHER PROCESS", port);
-            return Err(GraphError::StorageError(format!("Port {} is already in use", port)));
+            return Err(GraphError::StorageError(format!(
+                "Port {} is already in use",
+                port
+            )));
         }
 
         if self.daemons.contains_key(&port) {
             error!("Daemon already exists on port {}", port);
             println!("===> ERROR: DAEMON ALREADY EXISTS ON PORT {}", port);
-            return Err(GraphError::StorageError(format!("Daemon already exists on port {}", port)));
+            return Err(GraphError::StorageError(format!(
+                "Daemon already exists on port {}",
+                port
+            )));
         }
 
         if GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await?.is_some() {
-            warn!("Storage process already registered on port {}. Skipping cleanup.", port);
-            println!("===> WARNING: STORAGE PROCESS ALREADY REGISTERED ON PORT {}. SKIPPING CLEANUP.", port);
-            return Err(GraphError::StorageError(format!("Daemon already registered on port {}", port)));
+            warn!(
+                "Storage process already registered on port {}. Skipping cleanup.",
+                port
+            );
+            println!(
+                "===> WARNING: STORAGE PROCESS ALREADY REGISTERED ON PORT {}. SKIPPING CLEANUP.",
+                port
+            );
+            return Err(GraphError::StorageError(format!(
+                "Daemon already registered on port {}",
+                port
+            )));
         }
 
         let mut port_config = config.clone();
@@ -1063,7 +1085,10 @@ impl SledDaemonPool {
             pid: std::process::id(),
             ip_address: "127.0.0.1".to_string(),
             data_dir: Some(port_config.path.clone()),
-            config_path: Some(storage_config.config_root_directory.join("storage_config.yaml")),
+            config_path: storage_config
+                .config_root_directory
+                .as_ref()
+                .map(|p| p.join("storage_config.yaml")), // Fixed: Handle Option
             engine_type: Some("sled".to_string()),
             last_seen_nanos: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1074,59 +1099,108 @@ impl SledDaemonPool {
         GLOBAL_DAEMON_REGISTRY
             .register_daemon(metadata)
             .await
-            .map_err(|e| GraphError::StorageError(format!("Failed to register daemon in GLOBAL_DAEMON_REGISTRY: {}", e)))?;
+            .map_err(|e| {
+                GraphError::StorageError(format!(
+                    "Failed to register daemon in GLOBAL_DAEMON_REGISTRY: {}",
+                    e
+                ))
+            })?;
         info!("Added daemon for port {} at path {:?}", port, port_config.path);
-        println!("===> ADDED DAEMON FOR PORT {} AT PATH {:?}", port, port_config.path);
+        println!(
+            "===> ADDED DAEMON FOR PORT {} AT PATH {:?}",
+            port, port_config.path
+        );
         Ok(())
     }
 
-    pub async fn initialize_cluster(&mut self, storage_config: &StorageConfig, config: &SledConfig, cli_port: Option<u16>) -> GraphResult<()> {
+    pub async fn initialize_cluster(
+        &mut self,
+        storage_config: &StorageConfig,
+        config: &SledConfig,
+        cli_port: Option<u16>,
+    ) -> GraphResult<()> {
         let mut initialized = self.initialized.write().await;
         if *initialized {
-            warn!("SledDaemonPool already initialized, skipping. Caller stack trace: {:#?}", std::backtrace::Backtrace::capture());
-            println!("===> WARNING: SLED DAEMON POOL ALREADY INITIALIZED, SKIPPING. CALLER STACK TRACE: {:#?}", std::backtrace::Backtrace::capture());
+            warn!(
+                "SledDaemonPool already initialized, skipping. Caller stack trace: {:#?}",
+                std::backtrace::Backtrace::capture()
+            );
+            println!(
+                "===> WARNING: SLED DAEMON POOL ALREADY INITIALIZED, SKIPPING. CALLER STACK TRACE: {:#?}",
+                std::backtrace::Backtrace::capture()
+            );
             return Ok(());
         }
 
-        debug!("Initializing cluster with use_raft_for_scale: {}", storage_config.use_raft_for_scale);
-        println!("===> INITIALIZING CLUSTER WITH USE_RAFT_FOR_SCALE: {}", storage_config.use_raft_for_scale);
+        debug!(
+            "Initializing cluster with use_raft_for_scale: {}",
+            storage_config.use_raft_for_scale
+        );
+        println!(
+            "===> INITIALIZING CLUSTER WITH USE_RAFT_FOR_SCALE: {}",
+            storage_config.use_raft_for_scale
+        );
 
         let registry_path = Path::new(DAEMON_REGISTRY_DB_PATH);
         if let Some(parent) = registry_path.parent() {
             debug!("Ensuring daemon registry directory exists: {:?}", parent);
             println!("===> ENSURING DAEMON REGISTRY DIRECTORY EXISTS: {:?}", parent);
-            fs::create_dir_all(parent)
-                .await
-                .map_err(|e| {
-                    error!("Failed to create daemon registry directory {:?}: {}", parent, e);
-                    println!("===> ERROR: FAILED TO CREATE DAEMON REGISTRY DIRECTORY {:?}: {}", parent, e);
-                    GraphError::Io(e)
-                })?;
+            fs::create_dir_all(parent).await.map_err(|e| {
+                error!(
+                    "Failed to create daemon registry directory {:?}: {}",
+                    parent, e
+                );
+                println!(
+                    "===> ERROR: FAILED TO CREATE DAEMON REGISTRY DIRECTORY {:?}: {}",
+                    parent, e
+                );
+                GraphError::Io(e)
+            })?;
         }
 
         let port = cli_port.unwrap_or(8051);
         println!("===> INITIALIZING CLUSTER ON PORT {}", port);
         if storage_config.use_raft_for_scale {
-            warn!("Raft clustering is enabled, but only a single daemon will be initialized on port {}", port);
-            println!("===> WARNING: RAFT CLUSTERING ENABLED, BUT ONLY SINGLE DAEMON INITIALIZED ON PORT {}", port);
+            warn!(
+                "Raft clustering is enabled, but only a single daemon will be initialized on port {}",
+                port
+            );
+            println!(
+                "===> WARNING: RAFT CLUSTERING ENABLED, BUT ONLY SINGLE DAEMON INITIALIZED ON PORT {}",
+                port
+            );
         }
 
         let mut system = System::new_all();
         system.refresh_all();
         let port_in_use = system.processes().values().any(|proc| {
-            proc.cmd().iter().any(|arg| arg.to_string_lossy().contains(&port.to_string())) && 
-            proc.name().to_string_lossy().contains("graphdb")
+            proc.cmd()
+                .iter()
+                .any(|arg| arg.to_string_lossy().contains(&port.to_string()))
+                && proc.name().to_string_lossy().contains("graphdb")
         });
         if port_in_use {
             error!("Port {} is already in use by another process", port);
             println!("===> ERROR: PORT {} IS ALREADY IN USE BY ANOTHER PROCESS", port);
-            return Err(GraphError::StorageError(format!("Port {} is already in use", port)));
+            return Err(GraphError::StorageError(format!(
+                "Port {} is already in use",
+                port
+            )));
         }
 
         if GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await?.is_some() {
-            warn!("Storage process already registered on port {}. Skipping initialization.", port);
-            println!("===> WARNING: STORAGE PROCESS ALREADY REGISTERED ON PORT {}. SKIPPING INITIALIZATION.", port);
-            return Err(GraphError::StorageError(format!("Daemon already registered on port {}", port)));
+            warn!(
+                "Storage process already registered on port {}. Skipping initialization.",
+                port
+            );
+            println!(
+                "===> WARNING: STORAGE PROCESS ALREADY REGISTERED ON PORT {}. SKIPPING INITIALIZATION.",
+                port
+            );
+            return Err(GraphError::StorageError(format!(
+                "Daemon already registered on port {}",
+                port
+            )));
         }
 
         info!("Initializing single daemon for port {}", port);
@@ -1141,7 +1215,10 @@ impl SledDaemonPool {
             pid: std::process::id(),
             ip_address: "127.0.0.1".to_string(),
             data_dir: Some(port_config.path.clone()),
-            config_path: Some(storage_config.config_root_directory.join("storage_config.yaml")),
+            config_path: storage_config
+                .config_root_directory
+                .as_ref()
+                .map(|p| p.join("storage_config.yaml")), // Fixed: Handle Option
             engine_type: Some("sled".to_string()),
             last_seen_nanos: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1162,15 +1239,25 @@ impl SledDaemonPool {
         {
             let node_id = port as u64;
             let raft = &daemon.raft;
-            let initial_nodes = HashMap::from([(node_id, BasicNode { addr: format!("127.0.0.1:{}", port) })]);
-            raft.initialize(initial_nodes).await
-                .map_err(|e| {
-                    error!("Failed to initialize Raft for node {}: {}", node_id, e);
-                    println!("===> ERROR: FAILED TO INITIALIZE RAFT FOR NODE {}: {}", node_id, e);
-                    GraphError::StorageError(format!("Failed to initialize Raft for node {}: {}", node_id, e))
-                })?;
+            let initial_nodes = HashMap::from([(
+                node_id,
+                BasicNode {
+                    addr: format!("127.0.0.1:{}", port),
+                },
+            )]);
+            raft.initialize(initial_nodes).await.map_err(|e| {
+                error!("Failed to initialize Raft for node {}: {}", node_id, e);
+                println!(
+                    "===> ERROR: FAILED TO INITIALIZE RAFT FOR NODE {}: {}",
+                    node_id, e
+                );
+                GraphError::StorageError(format!("Failed to initialize Raft for node {}: {}", node_id, e))
+            })?;
             info!("Initialized Raft for node {} on port {}", node_id, port);
-            println!("===> INITIALIZED RAFT FOR NODE {} ON PORT {}", node_id, port);
+            println!(
+                "===> INITIALIZED RAFT FOR NODE {} ON PORT {}",
+                node_id, port
+            );
         }
 
         *initialized = true;

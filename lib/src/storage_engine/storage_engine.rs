@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use models::errors::{GraphError, GraphResult, ValidationError};
 use uuid::Uuid;
 use models::{Edge, Identifier, Vertex};
-use tokio::sync::{OnceCell, Mutex as TokioMutex};
+use tokio::sync::{OnceCell, RwLock, Mutex as TokioMutex};
 use std::fmt::Debug;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -27,7 +27,7 @@ use std::process;
 use anyhow::{Result, Context, anyhow};
 use std::io::Error;
 use serde_yaml2 as serde_yaml;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, from_value};
 use serde::{Deserialize, Serialize, Deserializer};
 use log::{info, debug, warn, error, trace};
 #[cfg(unix)]
@@ -36,6 +36,7 @@ use sysinfo::System;
 use nix::sys::signal::{self, kill, Signal};
 #[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt, MetadataExt};
+use std::net::SocketAddr; // Added for TcpStream::connect
 use openraft::{
     Raft, Config as RaftConfig, error::RaftError, NodeId,
     raft::{AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse, VoteRequest, VoteResponse},
@@ -54,20 +55,21 @@ use openraft_memstore::TypeConfig as RaftMemStoreTypeConfig;
 // Or if it's named differently:
 // use openraft::error::NetworkError as RPCError;
 use crate::daemon_config::DAEMON_REGISTRY_DB_PATH; // Corrected import
-use crate::storage_engine::config::{DEFAULT_DATA_DIRECTORY, DEFAULT_LOG_DIRECTORY, LOCK_FILE_PATH,
+use crate::config::{DEFAULT_DATA_DIRECTORY, DEFAULT_LOG_DIRECTORY, LOCK_FILE_PATH,
                                  DEFAULT_STORAGE_PORT, StorageConfig, SledConfig, RocksdbConfig, TikvConfig,
                                  RedisConfig, MySQLConfig, PostgreSQLConfig, TypeConfig, 
-                                 StorageConfigWrapper, load_storage_config_from_yaml,
+                                 StorageConfigInner, SelectedStorageConfig, StorageConfigWrapper, 
+                                 load_storage_config_from_yaml,
                                  load_engine_specific_config};
 use crate::daemon_utils::{find_pid_by_port, stop_process, parse_cluster_range};
-use crate::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
+use crate::daemon_registry::{GLOBAL_DAEMON_REGISTRY,  NonBlockingDaemonRegistry, DaemonMetadata};
 use crate::storage_engine::inmemory_storage::{InMemoryStorage};
 use crate::storage_engine::raft_storage::{RaftStorage};
-pub use crate::storage_engine::config::{ StorageEngineType };
+pub use crate::config::{ StorageEngineType };
 
 pub use crate::storage_engine::inmemory_storage::InMemoryStorage as InMemoryGraphStorage;
 #[cfg(feature = "with-sled")]
-pub use crate::storage_engine::config::SledStorage;
+pub use crate::storage_engine::sled_storage::SledStorage;
 #[cfg(feature = "with-rocksdb")]
 pub use crate::storage_engine::rocksdb_storage::RocksdbStorage;
 #[cfg(feature = "with-tikv")]
@@ -135,6 +137,20 @@ pub struct ApplicationStateMachine {
 
 #[derive(Clone, Debug, Default)]
 pub struct ExampleNetwork;
+
+// Helper method to get string values from StorageConfig, similar to get_config_port
+fn get_config_value(config: &StorageConfig, key: &str, default: &str) -> String {
+    config.engine_specific_config
+        .as_ref()
+        .and_then(|selected_config| match key {
+            "host" => selected_config.storage.host.clone(),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            warn!("No {} specified in config, using default: {}", key, default);
+            default.to_string()
+        })
+}
 
 impl RaftNetwork<RaftMemStoreTypeConfig> for ExampleNetwork {
     fn append_entries(
@@ -487,9 +503,9 @@ impl AsyncStorageEngineManager {
         manager.get_persistent_engine()
     }
 
-    pub async fn use_storage(&self, engine_type: StorageEngineType, permanent: bool) -> Result<(), GraphError> {
+    pub async fn use_storage(&self, config: StorageConfig, permanent: bool) -> Result<(), GraphError> {
         let mut manager = self.manager.lock().await;
-        manager.use_storage(engine_type, permanent).await
+        manager.use_storage(config, permanent).await
     }
 
     pub async fn current_engine_type(&self) -> StorageEngineType {
@@ -513,6 +529,9 @@ pub async fn lock_file_exists(lock_path: PathBuf) -> Result<bool, GraphError> {
 
 /// Initializes the global StorageEngineManager
 pub async fn init_storage_engine_manager(config_path_yaml: PathBuf) -> Result<(), GraphError> {
+    use tokio::fs;
+    use anyhow::Context;
+
     info!("Initializing StorageEngineManager with YAML: {:?}", config_path_yaml);
     
     if let Some(parent) = config_path_yaml.parent() {
@@ -530,7 +549,7 @@ pub async fn init_storage_engine_manager(config_path_yaml: PathBuf) -> Result<()
     
     // Load configuration from YAML to get storage_engine_type
     info!("Loading config from {:?}", config_path_yaml);
-    let config = load_storage_config_from_yaml(Some(&config_path_yaml)).await
+    let config = load_storage_config_from_yaml(Some(config_path_yaml.clone())).await
         .map_err(|e| {
             error!("Failed to load YAML config from {:?}: {}", config_path_yaml, e);
             GraphError::ConfigurationError(format!("Failed to load YAML config: {}", e))
@@ -555,7 +574,6 @@ pub async fn init_storage_engine_manager(config_path_yaml: PathBuf) -> Result<()
     info!("StorageEngineManager initialized successfully with engine: {:?}", storage_engine);
     Ok(())
 }
-
 #[cfg(feature = "with-sled")]
 pub async fn log_lock_file_diagnostics(lock_path: PathBuf) -> Result<(), GraphError> {
     debug!("Running log_lock_file_diagnostics for {:?}", lock_path);
@@ -950,21 +968,29 @@ async fn create_default_yaml_config(yaml_path: &PathBuf, engine_type: StorageEng
     info!("Creating default YAML config at {:?}", yaml_path);
     let config = StorageConfig {
         storage_engine_type: engine_type,
-        config_root_directory: PathBuf::from("./storage_daemon_server"),
-        data_directory: PathBuf::from(DEFAULT_DATA_DIRECTORY),
-        log_directory: DEFAULT_LOG_DIRECTORY.to_string(),
+        config_root_directory: Some(PathBuf::from("./storage_daemon_server")),
+        data_directory: Some(PathBuf::from(DEFAULT_DATA_DIRECTORY)),
+        log_directory: Some(PathBuf::from(DEFAULT_LOG_DIRECTORY)),
         default_port: DEFAULT_STORAGE_PORT,
         cluster_range: DEFAULT_STORAGE_PORT.to_string(),
         max_disk_space_gb: 1000,
         min_disk_space_gb: 10,
         use_raft_for_scale: true,
-        max_open_files: Some(100),
-        connection_string: None,
-        engine_specific_config: Some(HashMap::from_iter(vec![
-            ("path".to_string(), Value::String(format!("{}/{}", DEFAULT_DATA_DIRECTORY, engine_type.to_string().to_lowercase()))),
-            ("host".to_string(), Value::String("127.0.0.1".to_string())),
-            ("port".to_string(), Value::Number(DEFAULT_STORAGE_PORT.into())),
-        ])),
+        max_open_files: 100u64,
+        engine_specific_config: Some(SelectedStorageConfig {
+            storage_engine_type: engine_type,
+            storage: StorageConfigInner {
+                path: Some(PathBuf::from(format!("{}/{}", DEFAULT_DATA_DIRECTORY, engine_type.to_string().to_lowercase()))),
+                host: Some("127.0.0.1".to_string()),
+                port: Some(DEFAULT_STORAGE_PORT),
+                username: None,
+                password: None,
+                database: None,
+                pd_endpoints: None,
+                cache_capacity: Some(1024 * 1024 * 1024),
+                use_compression: false, // Fixed: Changed False to false
+            },
+        }),
     };
 
     config.save().await
@@ -1050,47 +1076,63 @@ impl StorageEngineManager {
                 GraphError::ConfigurationError(format!("Failed to load config: {}", e))
             })?;
         debug!("Loaded config: {:?}", config);
-        println!("IN StorageEngineManager new - STEP 4");
+        println!("IN StorageEngineManager new - STEP 4 - {:?}", config);
 
         // Step 4: Extract and validate port
-        let selected_port = config.engine_specific_config
-            .as_ref()
-            .and_then(|c| c.get("port"))
-            .and_then(|v| v.as_u64())
-            .map(|p| p as u16)
-            .ok_or_else(|| {
-                error!("No port specified in engine_specific_config");
-                GraphError::ConfigurationError("No port specified in engine_specific_config".to_string())
-            })?;
+        let selected_port = if let Some(sled_config_map) = &config.engine_specific_config {
+            let port = sled_config_map.storage.port.unwrap_or_else(|| {
+                if config.default_port != 0 {
+                    info!("No valid port in engine_specific_config, using default_port: {}", config.default_port);
+                    println!("===> NO VALID PORT IN ENGINE_SPECIFIC_CONFIG, USING DEFAULT_PORT: {}", config.default_port);
+                    config.default_port
+                } else {
+                    warn!("No valid port in engine_specific_config and default_port is 0, using DEFAULT_STORAGE_PORT: {}", DEFAULT_STORAGE_PORT);
+                    println!("===> NO VALID PORT IN ENGINE_SPECIFIC_CONFIG AND DEFAULT_PORT IS 0, USING DEFAULT_STORAGE_PORT: {}", DEFAULT_STORAGE_PORT);
+                    DEFAULT_STORAGE_PORT
+                }
+            });
+            info!("Using engine-specific port from config: {}", port);
+            println!("===> USING ENGINE-SPECIFIC PORT FROM CONFIG: {}", port);
+            port
+        } else {
+            let port = if config.default_port != 0 {
+                info!("No engine-specific config found, using default_port: {}", config.default_port);
+                println!("===> NO ENGINE-SPECIFIC CONFIG FOUND, USING DEFAULT_PORT: {}", config.default_port);
+                config.default_port
+            } else {
+                warn!("No engine-specific config found and default_port is 0, using DEFAULT_STORAGE_PORT: {}", DEFAULT_STORAGE_PORT);
+                println!("===> NO ENGINE-SPECIFIC CONFIG FOUND AND DEFAULT_PORT IS 0, USING DEFAULT_STORAGE_PORT: {}", DEFAULT_STORAGE_PORT);
+                DEFAULT_STORAGE_PORT
+            };
+            port
+        };
+
         if selected_port == 0 || selected_port > 65535 {
             error!("Invalid port {} specified", selected_port);
             return Err(GraphError::StorageError(format!("Invalid port {}: must be between 1 and 65535", selected_port)));
         }
         info!("Selected port: {}", selected_port);
-        println!("===> SELECTED PORT {}", selected_port);
+        println!("===> SELECTED PORT {} WHILE CONFIG {:?}", selected_port, config);
 
         // Step 5: Check for port conflicts and clean up
-        let mut system = System::new_all();
-        system.refresh_all();
-        let port_in_use = system.processes().values().any(|proc| {
-            proc.cmd().iter().any(|arg| arg.to_string_lossy().contains(&selected_port.to_string())) &&
-            proc.name().to_string_lossy().contains("graphdb")
-        });
-        if port_in_use {
-            error!("Port {} is already in use by another process", selected_port);
-            return Err(GraphError::StorageError(format!("Port {} is already in use", selected_port)));
-        }
-        let daemon_metadata = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(selected_port).await?;
-        if daemon_metadata.is_some() {
-            warn!("Storage process already registered on port {}. Attempting cleanup.", selected_port);
-            GLOBAL_DAEMON_REGISTRY.unregister_daemon(selected_port).await?;
-            if storage_engine == StorageEngineType::Sled {
-                let sled_path = config.data_directory.join("sled").join("db");
-                if let Err(e) = SledStorage::force_unlock(&sled_path).await {
-                    warn!("Failed to unlock Sled storage at {:?}: {}", sled_path, e);
-                } else {
-                    info!("Successfully unlocked Sled storage at {:?}", sled_path);
+        if let Some(metadata) = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(selected_port).await? {
+            if !NonBlockingDaemonRegistry::is_pid_running(metadata.pid).await.unwrap_or(false) {
+                warn!("Stale storage process registered on port {}. Attempting cleanup.", selected_port);
+                GLOBAL_DAEMON_REGISTRY.unregister_daemon(selected_port).await?;
+                if storage_engine == StorageEngineType::Sled {
+                    let sled_path = config.data_directory
+                        .clone()
+                        .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
+                        .join("sled")
+                        .join("db");
+                    if let Err(e) = SledStorage::force_unlock(&sled_path).await {
+                        warn!("Failed to unlock Sled storage at {:?}: {}", sled_path, e);
+                    } else {
+                        info!("Successfully unlocked Sled storage at {:?}", sled_path);
+                    }
                 }
+            } else {
+                info!("Active storage process found on port {}. Skipping cleanup.", selected_port);
             }
         }
         println!("IN StorageEngineManager new - STEP 5");
@@ -1192,7 +1234,14 @@ impl StorageEngineManager {
         println!("IN StorageEngineManager new - STEP 8");
 
         // Step 9: Create final manager
-        let manager = Self::create_manager(storage_engine, config, config_path_yaml, persistent, permanent, raft_instances);
+        let manager = Self::create_manager(
+            storage_engine,
+            config, // Pass config directly, no Arc
+            config_path_yaml,
+            persistent,
+            permanent, // Pass permanent as parameter
+            raft_instances,
+        );
         println!("IN StorageEngineManager new - STEP 9");
         info!("StorageEngineManager initialized with engine: {:?}", storage_engine);
         Ok(Arc::new(manager))
@@ -1239,7 +1288,6 @@ impl StorageEngineManager {
         let raft_graph_store = RaftStorage::new(config);
 
         // Create the OpenRaft adaptor for log & state machine
-        // Note: MemStore::new_async() already returns Arc<MemStore>
         let store: Arc<MemStore> = MemStore::new_async().await;
         let (log_store, state_machine) =
             Adaptor::<RaftMemStoreTypeConfig, Arc<MemStore>>::new(store.clone());
@@ -1336,7 +1384,7 @@ impl StorageEngineManager {
         
         debug!("Raw YAML content from {:?}:\n{}", config_path_yaml, content);
         
-        load_storage_config_from_yaml(Some(&config_path_yaml.to_path_buf())).await
+        load_storage_config_from_yaml(Some(config_path_yaml.to_path_buf())).await
             .map_err(|e| {
                 error!("Failed to deserialize YAML config from {:?}: {}", config_path_yaml, e);
                 GraphError::ConfigurationError(format!("Failed to load YAML config: {}", e))
@@ -1351,7 +1399,7 @@ impl StorageEngineManager {
         
         create_default_yaml_config(&config_path_yaml.to_path_buf(), storage_engine).await?;
         
-        load_storage_config_from_yaml(Some(&config_path_yaml.to_path_buf())).await
+        load_storage_config_from_yaml(Some(config_path_yaml.to_path_buf())).await
             .map_err(|e| {
                 error!("Failed to load newly created YAML config from {:?}: {}", config_path_yaml, e);
                 GraphError::ConfigurationError(format!("Failed to load YAML config: {}", e))
@@ -1457,53 +1505,30 @@ impl StorageEngineManager {
             ));
         }
 
-        // Determine the selected port based on the specified priority.
-        let selected_port = if let Some(sled_config_map) = &config.engine_specific_config {
-            // Fall back to engine-specific port.
-            let port = sled_config_map
-                .get("port")
-                .and_then(|v| v.as_u64())
-                .map(|p| p as u16)
-                .unwrap_or(DEFAULT_STORAGE_PORT); // Use constant as fallback
-            info!("Using engine-specific port from config: {}", port);
-            println!("===> USING ENGINE-SPECIFIC PORT FROM CONFIG: {}", port);
-            port
-        } else {
-            // Fallback to a default port if no engine-specific config is specified.
-            warn!("No engine-specific config found, using default port {}", DEFAULT_STORAGE_PORT);
-            println!("===> WARNING: NO ENGINE-SPECIFIC CONFIG FOUND, USING DEFAULT PORT {}", DEFAULT_STORAGE_PORT);
-            DEFAULT_STORAGE_PORT
-        };
+        let sled_config_inner = config.engine_specific_config.as_ref().map(|c| &c.storage);
 
         // Build SledConfig
         let sled_config = SledConfig {
             storage_engine_type: StorageEngineType::Sled,
-            path: config.engine_specific_config
-                .as_ref()
-                .and_then(|m| m.get("path"))
-                .and_then(|v| v.as_str())
-                .map(PathBuf::from)
-                .unwrap_or_else(|| config.data_directory.join("sled")),
-            host: config.engine_specific_config
-                .as_ref()
-                .and_then(|m| m.get("host"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            port: Some(selected_port),
-            temporary: config.engine_specific_config
-                .as_ref()
-                .and_then(|m| m.get("temporary"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            use_compression: config.engine_specific_config
-                .as_ref()
-                .and_then(|m| m.get("use_compression"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            cache_capacity: config.engine_specific_config
-                .as_ref()
-                .and_then(|m| m.get("cache_capacity"))
-                .and_then(|v| v.as_u64()),
+            path: sled_config_inner
+                .and_then(|c| c.path.clone())
+                .unwrap_or_else(|| config.data_directory
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
+                    .join("sled")),
+            host: sled_config_inner
+                .and_then(|c| c.host.clone()),
+            port: sled_config_inner
+                .and_then(|c| c.port),
+            temporary: sled_config_inner
+                .and_then(|c| c.path.as_ref().map(|p| p.to_string_lossy().contains("temporary")))
+                .unwrap_or_else(|| SledConfig::default().temporary),
+            use_compression: sled_config_inner
+                .and_then(|c| Some(c.use_compression))
+                .unwrap_or_else(|| SledConfig::default().use_compression),
+            cache_capacity: sled_config_inner
+                .and_then(|c| c.cache_capacity)
+                .or_else(|| SledConfig::default().cache_capacity),
         };
 
         // Ensure path exists
@@ -1518,61 +1543,75 @@ impl StorageEngineManager {
         }
 
         // Log selected port
-        info!("Selected port {} for Sled initialization", selected_port);
-        println!("===> SELECTED PORT {} FOR SLED INITIALIZATION", selected_port);
+        info!("Selected port {:?} for Sled initialization", sled_config.port);
+        println!("===> SELECTED PORT {:?} FOR SLED INITIALIZATION", sled_config.port);
+
+        // Use port-specific singleton key
+        let port_key = sled_config.port.unwrap_or(DEFAULT_STORAGE_PORT);
+        static SLED_SINGLETON_MAP: OnceCell<Arc<TokioMutex<HashMap<u16, Arc<dyn GraphStorageEngine + Send + Sync>>>>> = OnceCell::const_new();
+        
+        let singleton_map = SLED_SINGLETON_MAP
+            .get_or_init(|| async {
+                Arc::new(TokioMutex::new(HashMap::new()))
+            })
+            .await;
 
         // Check daemon registry for existing daemon on port
-        if let Some(metadata) = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(selected_port).await? {
-            info!("Found existing daemon on port {} at path {:?}", selected_port, metadata.data_dir);
-            println!("===> FOUND EXISTING DAEMON ON PORT {} AT PATH {:?}", selected_port, metadata.data_dir);
-            // Check if singleton exists
-            let mut singleton_guard = SLED_SINGLETON.lock().await;
-            if let Some(existing_storage) = singleton_guard.as_ref() {
-                info!("Returning existing Sled singleton instance on port {}", selected_port);
-                println!("===> RETURNING EXISTING SLED SINGLETON INSTANCE ON PORT {}", selected_port);
-                return Ok(existing_storage.clone() as Arc<dyn GraphStorageEngine + Send + Sync>);
+        if let Some(selected_port) = sled_config.port {
+            if let Some(metadata) = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(selected_port).await? {
+                info!("Found existing daemon on port {} at path {:?}", selected_port, metadata.data_dir);
+                println!("===> FOUND EXISTING DAEMON ON PORT {} AT PATH {:?}", selected_port, metadata.data_dir);
+                let mut singleton_guard = singleton_map.lock().await;
+                if let Some(existing_storage) = singleton_guard.get(&selected_port) {
+                    info!("Returning existing Sled singleton instance on port {}", selected_port);
+                    println!("===> RETURNING EXISTING SLED SINGLETON INSTANCE ON PORT {}", selected_port);
+                    return Ok(existing_storage.clone());
+                }
             }
         }
 
         // Initialize Sled storage
         let sled_instance = match SledStorage::new(&sled_config).await {
             Ok(storage) => {
-                info!("Successfully initialized Sled storage on port {}", selected_port);
-                println!("===> SUCCESSFULLY INITIALIZED SLED STORAGE ON PORT {}", selected_port);
+                info!("Successfully initialized Sled storage on port {:?}", sled_config.port);
+                println!("===> SUCCESSFULLY INITIALIZED SLED STORAGE ON PORT {:?}", sled_config.port);
                 Arc::new(storage)
             }
             Err(e) => {
-                error!("Failed to initialize Sled storage on port {}: {}", selected_port, e);
-                println!("===> ERROR: FAILED TO INITIALIZE SLED STORAGE ON PORT {}: {}", selected_port, e);
+                error!("Failed to initialize Sled storage on port {:?}: {}", sled_config.port, e);
+                println!("===> ERROR: FAILED TO INITIALIZE SLED STORAGE ON PORT {:?}: {}", sled_config.port, e);
                 return Err(e);
             }
         };
 
-        // Store in singleton
-        let mut singleton_guard = SLED_SINGLETON.lock().await;
-        *singleton_guard = Some(sled_instance.clone());
+        // Store in singleton map
+        let mut singleton_guard = singleton_map.lock().await;
+        singleton_guard.insert(port_key, sled_instance.clone());
 
         // Register SIGTERM handler for graceful shutdown
         #[cfg(unix)]
         {
             use tokio::signal::unix::{signal, SignalKind};
             let sled_instance_clone = sled_instance.clone();
+            let port_key = port_key;
             tokio::spawn(async move {
                 let mut sigterm = signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
                 sigterm.recv().await;
-                info!("Received SIGTERM, closing Sled instance");
-                println!("===> RECEIVED SIGTERM, CLOSING SLED INSTANCE");
+                info!("Received SIGTERM, closing Sled instance for port {}", port_key);
+                println!("===> RECEIVED SIGTERM, CLOSING SLED INSTANCE FOR PORT {}", port_key);
                 if let Err(e) = sled_instance_clone.close().await {
-                    error!("Failed to close Sled instance on SIGTERM: {}", e);
-                    println!("===> ERROR: FAILED TO CLOSE SLED INSTANCE ON SIGTERM: {}", e);
+                    error!("Failed to close Sled instance on SIGTERM for port {}: {}", port_key, e);
+                    println!("===> ERROR: FAILED TO CLOSE SLED INSTANCE ON SIGTERM FOR PORT {}: {}", port_key, e);
                 }
-                info!("Sled instance closed gracefully");
-                println!("===> SLED INSTANCE CLOSED GRACEFULLY");
+                let mut singleton_guard = singleton_map.lock().await;
+                singleton_guard.remove(&port_key);
+                info!("Sled instance closed gracefully for port {}", port_key);
+                println!("===> SLED INSTANCE CLOSED GRACEFULLY FOR PORT {}", port_key);
             });
         }
 
-        info!("Successfully initialized and stored Sled singleton instance on port {}", selected_port);
-        println!("===> SUCCESSFULLY INITIALIZED AND STORED SLED SINGLETON INSTANCE ON PORT {}", selected_port);
+        info!("Successfully initialized and stored Sled singleton instance on port {:?}", sled_config.port);
+        println!("===> SUCCESSFULLY INITIALIZED AND STORED SLED SINGLETON INSTANCE ON PORT {:?}", sled_config.port);
         Ok(sled_instance as Arc<dyn GraphStorageEngine + Send + Sync>)
     }
 
@@ -1595,35 +1634,20 @@ impl StorageEngineManager {
 
         let tikv_config = TikvConfig {
             storage_engine_type: StorageEngineType::TiKV,
-            path: engine_specific
-                .get("path")
-                .and_then(|p| p.as_str())
+            path: engine_specific.storage.path
+                .clone()
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data/tikv")),
-            host: engine_specific
-                .get("host")
-                .and_then(|val| val.as_str())
-                .map(|s| s.to_string()),
-            port: engine_specific
-                .get("port")
-                .and_then(|val| val.as_u64())
-                .map(|p| p as u16),
-            pd_endpoints: engine_specific
-                .get("pd_endpoints")
-                .and_then(|val| val.as_str())
-                .map(|s| s.to_string())
+            host: engine_specific.storage.host.clone(),
+            port: engine_specific.storage.port,
+            pd_endpoints: engine_specific.storage.pd_endpoints
+                .clone()
                 .or_else(|| {
                     warn!("pd_endpoints missing in TiKV configuration, using default: 127.0.0.1:2379");
                     Some("127.0.0.1:2379".to_string())
                 }),
-            username: engine_specific
-                .get("username")
-                .and_then(|val| val.as_str())
-                .map(|s| s.to_string()),
-            password: engine_specific
-                .get("password")
-                .and_then(|val| val.as_str())
-                .map(|s| s.to_string()),
+            username: engine_specific.storage.username.clone(),
+            password: engine_specific.storage.password.clone(),
         };
 
         debug!("TiKV config: {:?}", tikv_config);
@@ -1763,9 +1787,9 @@ impl StorageEngineManager {
             StorageEngineType::Sled => {
                 Ok(config.engine_specific_config
                     .as_ref()
-                    .and_then(|map| map.get("path").and_then(|v| v.as_str()).map(PathBuf::from))
+                    .and_then(|selected_config| selected_config.storage.path.clone())
                     .unwrap_or_else(|| {
-                        let path = PathBuf::from(&format!("{}/sled", DEFAULT_DATA_DIRECTORY));
+                        let path = PathBuf::from(format!("{}/sled", DEFAULT_DATA_DIRECTORY));
                         warn!("No path specified for Sled, using default: {:?}", path);
                         path
                     }))
@@ -1773,7 +1797,7 @@ impl StorageEngineManager {
             StorageEngineType::RocksDB => {
                 config.engine_specific_config
                     .as_ref()
-                    .and_then(|map| map.get("path").and_then(|v| v.as_str()).map(PathBuf::from))
+                    .and_then(|selected_config| selected_config.storage.path.clone())
                     .ok_or_else(|| {
                         error!("RocksDB path is missing in engine_specific_config: {:?}", config.engine_specific_config);
                         GraphError::ConfigurationError(
@@ -1782,9 +1806,13 @@ impl StorageEngineManager {
                     })
             }
             _ => {
-                let path = config.data_directory.clone();
-                info!("Using data_directory for engine: {:?}", path);
-                Ok(path)
+                config.data_directory.clone()
+                    .ok_or_else(|| {
+                        error!("No data_directory specified for engine type: {:?}", engine_type);
+                        GraphError::ConfigurationError(
+                            "No data_directory specified in config".to_string()
+                        )
+                    })
             }
         }
     }
@@ -1797,19 +1825,13 @@ impl StorageEngineManager {
         Ok(SledConfig {
             storage_engine_type: StorageEngineType::Sled,
             path,
-            host: Some(Self::get_config_value(config, "host", "127.0.0.1")),
+            host: Some(get_config_value(config, "host", "127.0.0.1")),
             port: Some(Self::get_config_port(config, config.default_port)),
-            temporary: engine_config
-                .get("temporary")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            use_compression: engine_config
-                .get("use_compression")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            cache_capacity: engine_config
-                .get("cache_capacity")
-                .and_then(|v| v.as_u64()),
+            // Note: temporary, use_compression, and cache_capacity are not in StorageConfigInner.
+            // Using SledConfig defaults as they are defined in the struct.
+            temporary: false,
+            use_compression: true,
+            cache_capacity: None,
         })
     }
 
@@ -1818,7 +1840,7 @@ impl StorageEngineManager {
         Ok(RocksdbConfig {
             storage_engine_type: StorageEngineType::RocksDB,
             path,
-            host: Some(Self::get_config_value(config, "host", "127.0.0.1")),
+            host: Some(get_config_value(config, "host", "127.0.0.1")),
             port: Some(Self::get_config_port(config, config.default_port)),
         })
     }
@@ -1869,18 +1891,10 @@ impl StorageEngineManager {
     }
 
     // Utility helper methods
-    fn get_config_value(config: &StorageConfig, key: &str, default: &str) -> String {
-        config.engine_specific_config
-            .as_ref()
-            .and_then(|map| map.get(key).and_then(|v| v.as_str()))
-            .unwrap_or(default)
-            .to_string()
-    }
-
     fn get_config_port(config: &StorageConfig, default: u16) -> u16 {
         config.engine_specific_config
             .as_ref()
-            .and_then(|map| map.get("port").and_then(|v| v.as_u64()).map(|p| p as u16))
+            .and_then(|selected_config| selected_config.storage.port)
             .unwrap_or(default)
     }
 
@@ -1991,6 +2005,9 @@ impl StorageEngineManager {
 
     /// Validates the storage configuration for the specified engine type
     async fn validate_config(config: &StorageConfig, engine_type: StorageEngineType) -> Result<(), GraphError> {
+        use tokio::fs;
+        use anyhow::Context;
+
         info!("Validating config for engine type: {:?}", engine_type);
         debug!("Full config: {:?}", config);
         
@@ -2000,17 +2017,15 @@ impl StorageEngineManager {
                     .as_ref()
                     .and_then(|map| {
                         debug!("engine_specific_config for {:?}: {:?}", engine_type, map);
-                        map.get("path").and_then(|v| {
-                            let path_str = v.as_str();
-                            debug!("Extracted path: {:?}", path_str);
-                            path_str.map(PathBuf::from)
-                        })
+                        map.storage.path.clone().map(PathBuf::from)
                     })
                     .unwrap_or_else(|| {
                         let default_path = match engine_type {
                             StorageEngineType::Sled => PathBuf::from(&format!("{}/sled", DEFAULT_DATA_DIRECTORY)),
                             StorageEngineType::RocksDB => PathBuf::from(&format!("{}/rocksdb", DEFAULT_DATA_DIRECTORY)),
-                            _ => config.data_directory.clone(),
+                            _ => config.data_directory
+                                .clone()
+                                .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY)),
                         };
                         warn!("No path specified in engine_specific_config, using default: {:?}", default_path);
                         default_path
@@ -2055,14 +2070,14 @@ impl StorageEngineManager {
                 
                 debug!("engine_specific_config for {:?}: {:?}", engine_type, map);
                 
-                if !map.contains_key("host") || !map.contains_key("port") {
+                if map.storage.host.is_none() || map.storage.port.is_none() {
                     return Err(GraphError::ConfigurationError(format!(
                         "Host and port are required for {:?}", engine_type
                     )));
                 }
                 
                 if matches!(engine_type, StorageEngineType::PostgreSQL | StorageEngineType::MySQL) {
-                    if !map.contains_key("username") || !map.contains_key("password") || !map.contains_key("database") {
+                    if map.storage.username.is_none() || map.storage.password.is_none() || map.storage.database.is_none() {
                         return Err(GraphError::ConfigurationError(format!(
                             "Username, password, and database are required for {:?}", engine_type
                         )));
@@ -2299,28 +2314,21 @@ impl StorageEngineManager {
 
     pub async fn current_engine_data_path(&self) -> Option<PathBuf> {
         let engine_type = self.current_engine_type().await;
-        let path = match engine_type {
+        match engine_type {
             StorageEngineType::Sled => {
-                self.config.engine_specific_config
+                Some(self.config.engine_specific_config
                     .as_ref()
-                    .and_then(|map| {
-                        map.get("path").and_then(|v| v.as_str()).map(PathBuf::from)
-                    })
-                    .unwrap_or_else(|| PathBuf::from("./storage_daemon_server/data/sled"))
+                    .and_then(|map| map.storage.path.clone().map(PathBuf::from))
+                    .unwrap_or_else(|| PathBuf::from("./storage_daemon_server/data/sled")))
             }
             StorageEngineType::RocksDB => {
-                self.config.engine_specific_config
+                Some(self.config.engine_specific_config
                     .as_ref()
-                    .and_then(|map| {
-                        map.get("path").and_then(|v| v.as_str()).map(PathBuf::from)
-                    })
-                    .unwrap_or_else(|| PathBuf::from("./storage_daemon_server/data/rocksdb"))
+                    .and_then(|map| map.storage.path.clone().map(PathBuf::from))
+                    .unwrap_or_else(|| PathBuf::from("./storage_daemon_server/data/rocksdb")))
             }
-            _ => {
-                self.config.data_directory.clone()
-            }
-        };
-        Some(path)
+            _ => self.config.data_directory.clone(),
+        }
     }
 
     fn get_engine_config_path(&self, engine_type: StorageEngineType) -> PathBuf {
@@ -2375,19 +2383,19 @@ impl StorageEngineManager {
         engines
     }
 
-    pub async fn use_storage(&mut self, engine_type: StorageEngineType, permanent: bool) -> Result<(), GraphError> {
-        info!("=== Starting use_storage for engine: {:?}, permanent: {} ===", engine_type, permanent);
-        trace!("use_storage called with engine_type: {:?}", engine_type);
+    pub async fn use_storage(&mut self, new_config: StorageConfig, permanent: bool) -> Result<(), GraphError> {
+        info!("=== Starting use_storage for engine: {:?}, permanent: {} ===", new_config.storage_engine_type, permanent);
+        trace!("use_storage called with engine_type: {:?}", new_config.storage_engine_type);
         let start_time = Instant::now();
         println!("===> USE STORAGE HANDLER - STEP 1");
 
         // Check if requested engine is available
         let available_engines = Self::available_engines();
         trace!("Available engines: {:?}", available_engines);
-        if !available_engines.contains(&engine_type) {
-            error!("Storage engine {:?} is not supported in this build. Available: {:?}", engine_type, available_engines);
+        if !available_engines.contains(&new_config.storage_engine_type) {
+            error!("Storage engine {:?} is not supported in this build. Available: {:?}", new_config.storage_engine_type, available_engines);
             return Err(GraphError::InvalidStorageEngine(format!(
-                "Storage engine {:?} is not supported. Available engines: {:?}", engine_type, available_engines
+                "Storage engine {:?} is not supported. Available engines: {:?}", new_config.storage_engine_type, available_engines
             )));
         }
 
@@ -2401,14 +2409,14 @@ impl StorageEngineManager {
         };
 
         // Skip if no change needed
-        if old_engine_type == engine_type && self.session_engine_type.is_none() {
-            info!("No switch needed: current engine is already {:?}", engine_type);
+        if old_engine_type == new_config.storage_engine_type && self.session_engine_type.is_none() {
+            info!("No switch needed: current engine is already {:?}", new_config.storage_engine_type);
             trace!("Skipping switch: current engine matches requested and no session override. Elapsed: {}ms", start_time.elapsed().as_millis());
             return Ok(());
         }
 
         // Cleanup previous engine state only if it was RocksDB and switching to a different engine
-        if old_engine_type == StorageEngineType::RocksDB && old_engine_type != engine_type {
+        if old_engine_type == StorageEngineType::RocksDB && old_engine_type != new_config.storage_engine_type {
             #[cfg(feature = "with-rocksdb")]
             {
                 let mut rocksdb_singleton = ROCKSDB_SINGLETON.lock().await;
@@ -2420,12 +2428,12 @@ impl StorageEngineManager {
                 }
                 let rocksdb_path = PathBuf::from("/opt/graphdb/storage_data/rocksdb");
                 if rocksdb_path.exists() {
-                    warn!("Cleaning up RocksDB directory for switch to {:?}", engine_type);
+                    warn!("Cleaning up RocksDB directory for switch to {:?}", new_config.storage_engine_type);
                     recover_rocksdb(&rocksdb_path).await?;
                 }
             }
         } else {
-            debug!("Skipping RocksDB cleanup for engine switch to {:?}", engine_type);
+            debug!("Skipping RocksDB cleanup for engine switch to {:?}", new_config.storage_engine_type);
         }
         println!("===> USE STORAGE HANDLER - STEP 2: Loading configuration...");
 
@@ -2435,70 +2443,69 @@ impl StorageEngineManager {
         trace!("Resolved config path: {:?}", config_path);
 
         // Load or create configuration
-        let mut new_config = if config_path.exists() {
+        let mut loaded_config = if config_path.exists() {
             info!("Loading existing config from {:?}", config_path);
             trace!("Reading config file: {:?}", config_path);
-            load_storage_config_from_yaml(Some(&config_path)).await
+            load_storage_config_from_yaml(Some(config_path.clone())).await
                 .map_err(|e| {
                     error!("Failed to deserialize YAML config from {:?}: {}", config_path, e);
                     GraphError::ConfigurationError(format!("Failed to load YAML config: {}", e))
                 })?
         } else {
             warn!("Config file not found at {:?}", config_path);
-            create_default_yaml_config(&config_path, engine_type).await?;
-            load_storage_config_from_yaml(Some(&config_path)).await
+            create_default_yaml_config(&config_path, new_config.storage_engine_type).await?;
+            load_storage_config_from_yaml(Some(config_path.clone())).await
                 .map_err(|e| {
                     error!("Failed to load newly created YAML config from {:?}: {}", config_path, e);
                     GraphError::ConfigurationError(format!("Failed to load YAML config: {}", e))
                 })?
         };
         println!("===> Configuration loaded successfully.");
-        debug!("Loaded storage config: {:?}", new_config);
+        debug!("Loaded storage config: {:?}", loaded_config);
 
-        // Update configuration for the new engine
-        new_config.storage_engine_type = engine_type;
-        new_config.engine_specific_config = Some(load_engine_specific_config(engine_type, &config_path)
-            .map_err(|e| {
-                error!("Failed to load engine-specific config for {:?}: {}", engine_type, e);
-                GraphError::ConfigurationError(format!("Failed to load engine-specific config: {}", e))
-            })?);
+        // Update configuration with provided new_config
+        loaded_config.storage_engine_type = new_config.storage_engine_type;
+        loaded_config.engine_specific_config = new_config.engine_specific_config.clone();
         println!("===> USE STORAGE HANDLER - STEP 3: Loading engine-specific configuration...");
-        debug!("Using config root directory: {:?}", new_config.config_root_directory);
+        debug!("Using config root directory: {:?}", loaded_config.config_root_directory);
         println!("===> Engine-specific configuration loaded successfully.");
 
         // Validate new configuration
-        Self::validate_config(&new_config, engine_type)
+        Self::validate_config(&loaded_config, new_config.storage_engine_type)
             .await
             .map_err(|e| {
-                error!("Configuration validation failed for new engine {:?}: {}", engine_type, e);
+                error!("Configuration validation failed for new engine {:?}: {}", new_config.storage_engine_type, e);
                 GraphError::ConfigurationError(format!("Configuration validation failed: {}", e))
             })?;
 
         // If permanent, save the new configuration using StorageConfig::save
         if permanent {
-            info!("Saving new configuration for permanent switch to {:?}", engine_type);
-            new_config.save().await
+            info!("Saving new configuration for permanent switch to {:?}", new_config.storage_engine_type);
+            loaded_config.save().await
                 .map_err(|e| {
                     error!("Failed to save new config to {:?}: {}", config_path, e);
                     GraphError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
                 })?;
             self.session_engine_type = None;
         } else {
-            self.session_engine_type = Some(engine_type);
+            self.session_engine_type = Some(new_config.storage_engine_type);
         }
         println!("===> USE STORAGE HANDLER - STEP 4: Saving and reloading config");
-        debug!("Final new_config before saving: {:?}", new_config);
+        debug!("Final loaded_config before saving: {:?}", loaded_config);
         println!("===> Saving configuration to disk...");
         println!("===> Configuration saved successfully.");
-        println!("------------------------------> SEE IT <-------------------------------- {:?} vs {:?}", engine_type, StorageEngineType::TiKV);
-        debug!("Reloaded storage config for daemon management: {:?}", new_config);
+        println!("------------------------------> SEE IT <-------------------------------- {:?} vs {:?}", new_config.storage_engine_type, StorageEngineType::TiKV);
+        debug!("Reloaded storage config for daemon management: {:?}", loaded_config);
 
-        println!("==> ENGINE TYPE {:?}", engine_type);
+        println!("==> ENGINE TYPE {:?}", new_config.storage_engine_type);
 
         // Skip daemon cleanup for TiKV to prevent killing PD
-        if engine_type != StorageEngineType::TiKV {
+        if new_config.storage_engine_type != StorageEngineType::TiKV {
             println!("===> USE STORAGE HANDLER - STEP 5: Attempting to stop existing daemon...");
-            let port = new_config.default_port;
+            let port = loaded_config.engine_specific_config
+                .as_ref()
+                .and_then(|c| c.storage.port)
+                .unwrap_or(loaded_config.default_port);
             let max_attempts = 5;
             let mut attempt = 0;
             let mut pid = None;
@@ -2508,11 +2515,21 @@ impl StorageEngineManager {
                     Ok(opt_pid) => match opt_pid {
                         Some(found_pid) => {
                             debug!("Found PID {} for port {} on attempt {}", found_pid, port, attempt);
-                            pid = Some(found_pid);
-                            break;
+                            if NonBlockingDaemonRegistry::is_pid_running(found_pid).await.unwrap_or(false) {
+                                info!("Active daemon found on port {}, skipping stop.", port);
+                                println!("===> Active daemon found on port {}.", port);
+                                pid = None; // Don't stop active daemon
+                                break;
+                            } else {
+                                info!("Stale daemon found on port {}, removing from registry.", port);
+                                GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("storage", port).await?;
+                                pid = Some(found_pid);
+                                break;
+                            }
                         }
                         None => {
                             debug!("No process found on port {} on attempt {}", port, attempt);
+                            println!("===> No daemon found on port {}.", port);
                             break;
                         }
                     },
@@ -2525,7 +2542,7 @@ impl StorageEngineManager {
             }
 
             if let Some(found_pid) = pid {
-                info!("Attempting to stop Storage Daemon on port {}...", port);
+                info!("Attempting to stop stale Storage Daemon on port {}...", port);
                 if let Err(e) = stop_process(found_pid).await {
                     error!("Failed to stop daemon on PID {}: {}", found_pid, e);
                     return Err(GraphError::StorageError(format!("Failed to stop daemon on PID {}: {}", found_pid, e)));
@@ -2556,10 +2573,10 @@ impl StorageEngineManager {
         }
 
         // Pre-check PD endpoint for TiKV to ensure cluster is running
-        if engine_type == StorageEngineType::TiKV {
+        if new_config.storage_engine_type == StorageEngineType::TiKV {
             let pd_endpoints = new_config.engine_specific_config
                 .as_ref()
-                .and_then(|map| map.get("pd_endpoints").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                .and_then(|map| map.storage.pd_endpoints.clone())
                 .unwrap_or("127.0.0.1:2382".to_string());
             let pd_endpoint_list: Vec<String> = pd_endpoints.split(',').map(|s| s.trim().to_string()).collect();
             let client = Client::new();
@@ -2591,12 +2608,12 @@ impl StorageEngineManager {
         }
 
         // Clean up lock files for TiKV
-        if engine_type == StorageEngineType::TiKV {
+        if new_config.storage_engine_type == StorageEngineType::TiKV {
             println!("===> USE STORAGE HANDLER - STEP 5.5: Cleaning up lock files for TiKV");
             info!("Cleaning up lock files...");
             let tikv_path = new_config.engine_specific_config
                 .as_ref()
-                .and_then(|map| map.get("path").and_then(|v| v.as_str()).map(PathBuf::from))
+                .and_then(|map| map.storage.path.clone())
                 .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data/tikv"));
             if tikv_path.exists() {
                 if let Err(e) = TikvStorage::force_unlock().await {
@@ -2611,7 +2628,7 @@ impl StorageEngineManager {
         // Initialize new engine
         println!("===> USE STORAGE HANDLER - STEP 6: Initializing StorageEngineManager...");
         println!("===> Creating new instance of StorageEngineManager...");
-        let new_persistent: Arc<dyn GraphStorageEngine + Send + Sync> = match engine_type {
+        let new_persistent: Arc<dyn GraphStorageEngine + Send + Sync> = match new_config.storage_engine_type {
             StorageEngineType::InMemory => {
                 info!("Initializing InMemory engine");
                 Arc::new(InMemoryGraphStorage::new(&new_config))
@@ -2620,10 +2637,8 @@ impl StorageEngineManager {
                 debug!("Attempting to create Hybrid storage");
                 #[cfg(any(feature = "with-sled", feature = "with-rocksdb", feature = "with-tikv"))]
                 {
-                    let persistent_engine = new_config.engine_specific_config
-                        .as_ref()
-                        .and_then(|map| map.get("persistent_engine").and_then(|v| v.as_str()))
-                        .unwrap_or("sled");
+                    // persistent_engine is not in StorageConfigInner; use default or error
+                    let persistent_engine = "sled"; // Default to sled, as it's a common choice
                     let persistent: Arc<dyn GraphStorageEngine + Send + Sync> = match persistent_engine {
                         "sled" => {
                             #[cfg(feature = "with-sled")]
@@ -2632,25 +2647,17 @@ impl StorageEngineManager {
                                     storage_engine_type: StorageEngineType::Sled,
                                     path: new_config.engine_specific_config
                                         .as_ref()
-                                        .and_then(|map| map.get("storage").and_then(|v| v.as_object()).and_then(|m| m.get("path").and_then(|v| v.as_str()).map(PathBuf::from)))
+                                        .and_then(|map| map.storage.path.clone())
                                         .unwrap_or_else(|| PathBuf::from(format!("{}/sled", DEFAULT_DATA_DIRECTORY))),
                                     host: new_config.engine_specific_config
                                         .as_ref()
-                                        .and_then(|map| map.get("storage").and_then(|v| v.as_object()).and_then(|m| m.get("host").and_then(|v| v.as_str()).map(|s| s.to_string()))),
+                                        .and_then(|map| map.storage.host.clone()),
                                     port: new_config.engine_specific_config
                                         .as_ref()
-                                        .and_then(|map| map.get("storage").and_then(|v| v.as_object()).and_then(|m| m.get("port").and_then(|v| v.as_u64()).map(|p| p as u16))),
-                                    cache_capacity: new_config.engine_specific_config
-                                        .as_ref()
-                                        .and_then(|map| map.get("storage").and_then(|v| v.as_object()).and_then(|m| m.get("cache_capacity").and_then(|v| v.as_u64()))),
-                                    temporary: new_config.engine_specific_config
-                                        .as_ref()
-                                        .and_then(|map| map.get("storage").and_then(|v| v.as_object()).and_then(|m| m.get("temporary").and_then(|v| v.as_bool())))
-                                        .unwrap_or(false),
-                                    use_compression: new_config.engine_specific_config
-                                        .as_ref()
-                                        .and_then(|map| map.get("storage").and_then(|v| v.as_object()).and_then(|m| m.get("use_compression").and_then(|v| v.as_bool())))
-                                        .unwrap_or(false),
+                                        .and_then(|map| map.storage.port),
+                                    cache_capacity: None, // Not in StorageConfigInner, use SledConfig default
+                                    temporary: false,    // Not in StorageConfigInner, use SledConfig default
+                                    use_compression: true, // Not in StorageConfigInner, use SledConfig default
                                 };
                                 match SledStorage::new(&sled_config).await {
                                     Ok(storage) => {
@@ -2673,14 +2680,14 @@ impl StorageEngineManager {
                                     storage_engine_type: StorageEngineType::RocksDB,
                                     path: new_config.engine_specific_config
                                         .as_ref()
-                                        .and_then(|map| map.get("storage").and_then(|v| v.as_object()).and_then(|m| m.get("path").and_then(|v| v.as_str()).map(PathBuf::from)))
+                                        .and_then(|map| map.storage.path.clone())
                                         .unwrap_or_else(|| PathBuf::from(format!("{}/rocksdb", DEFAULT_DATA_DIRECTORY))),
                                     host: new_config.engine_specific_config
                                         .as_ref()
-                                        .and_then(|map| map.get("storage").and_then(|v| v.as_object()).and_then(|m| m.get("host").and_then(|v| v.as_str()).map(|s| s.to_string()))),
+                                        .and_then(|map| map.storage.host.clone()),
                                     port: new_config.engine_specific_config
                                         .as_ref()
-                                        .and_then(|map| map.get("storage").and_then(|v| v.as_object()).and_then(|m| m.get("port").and_then(|v| v.as_u64()).map(|p| p as u16))),
+                                        .and_then(|map| map.storage.port),
                                 };
                                 match RocksdbStorage::new(&rocksdb_config) {
                                     Ok(storage) => {
@@ -2699,44 +2706,31 @@ impl StorageEngineManager {
                         "tikv" => {
                             #[cfg(feature = "with-tikv")]
                             {
-                                let inner_config = new_config.engine_specific_config
-                                    .as_ref()
-                                    .and_then(|map| map.get("storage").and_then(|v| v.as_object()))
-                                    .ok_or_else(|| {
-                                        error!("Missing or invalid 'storage' field in engine_specific_config for TiKV");
-                                        GraphError::ConfigurationError("Missing or invalid 'storage' field in TiKV configuration".to_string())
-                                    })?;
                                 let tikv_config = TikvConfig {
                                     storage_engine_type: StorageEngineType::TiKV,
-                                    path: inner_config
-                                        .get("path")
-                                        .and_then(|v| v.as_str())
-                                        .map(PathBuf::from)
+                                    path: new_config.engine_specific_config
+                                        .as_ref()
+                                        .and_then(|map| map.storage.path.clone())
                                         .unwrap_or_else(|| PathBuf::from(format!("{}/tikv", DEFAULT_DATA_DIRECTORY))),
-                                    host: inner_config
-                                        .get("host")
-                                        .and_then(|v| v.as_str())
-                                        .map(|s| s.to_string()),
-                                    port: inner_config
-                                        .get("port")
-                                        .and_then(|v| v.as_u64())
-                                        .map(|p| p as u16),
-                                    pd_endpoints: inner_config
-                                        .get("pd_endpoints")
-                                        .and_then(|v| v.as_str())
-                                        .map(|s| s.to_string())
+                                    host: new_config.engine_specific_config
+                                        .as_ref()
+                                        .and_then(|map| map.storage.host.clone()),
+                                    port: new_config.engine_specific_config
+                                        .as_ref()
+                                        .and_then(|map| map.storage.port),
+                                    pd_endpoints: new_config.engine_specific_config
+                                        .as_ref()
+                                        .and_then(|map| map.storage.pd_endpoints.clone())
                                         .or_else(|| {
                                             warn!("pd_endpoints missing in TiKV configuration, using default: 127.0.0.1:2379");
                                             Some("127.0.0.1:2379".to_string())
                                         }),
-                                    username: inner_config
-                                        .get("username")
-                                        .and_then(|v| v.as_str())
-                                        .map(|s| s.to_string()),
-                                    password: inner_config
-                                        .get("password")
-                                        .and_then(|v| v.as_str())
-                                        .map(|s| s.to_string()),
+                                    username: new_config.engine_specific_config
+                                        .as_ref()
+                                        .and_then(|map| map.storage.username.clone()),
+                                    password: new_config.engine_specific_config
+                                        .as_ref()
+                                        .and_then(|map| map.storage.password.clone()),
                                 };
                                 match TikvStorage::new(&tikv_config).await {
                                     Ok(storage) => {
@@ -2773,25 +2767,17 @@ impl StorageEngineManager {
                         storage_engine_type: StorageEngineType::Sled,
                         path: new_config.engine_specific_config
                             .as_ref()
-                            .and_then(|map| map.get("path").and_then(|v| v.as_str()).map(PathBuf::from))
+                            .and_then(|map| map.storage.path.clone())
                             .unwrap_or_else(|| PathBuf::from(format!("{}/sled", DEFAULT_DATA_DIRECTORY))),
                         host: new_config.engine_specific_config
                             .as_ref()
-                            .and_then(|map| map.get("host").and_then(|v| v.as_str()).map(|s| s.to_string())),
+                            .and_then(|map| map.storage.host.clone()),
                         port: new_config.engine_specific_config
                             .as_ref()
-                            .and_then(|map| map.get("port").and_then(|v| v.as_u64()).map(|p| p as u16)),
-                        temporary: new_config.engine_specific_config
-                            .as_ref()
-                            .and_then(|map| map.get("temporary").and_then(|v| v.as_bool()))
-                            .unwrap_or(false),
-                        use_compression: new_config.engine_specific_config
-                            .as_ref()
-                            .and_then(|map| map.get("use_compression").and_then(|v| v.as_bool()))
-                            .unwrap_or(false),
-                        cache_capacity: new_config.engine_specific_config
-                            .as_ref()
-                            .and_then(|map| map.get("cache_capacity").and_then(|v| v.as_u64())),
+                            .and_then(|map| map.storage.port),
+                        temporary: false,    // Not in StorageConfigInner, use SledConfig default
+                        use_compression: true, // Not in StorageConfigInner, use SledConfig default
+                        cache_capacity: None, // Not in StorageConfigInner, use SledConfig default
                     };
                     println!("===> USE STORAGE HANDLER - STEP 3.1 - SLED");
                     info!("Initializing Sled engine with path: {:?}", sled_config.path);
@@ -2819,7 +2805,7 @@ impl StorageEngineManager {
                 {
                     let rocksdb_path = new_config.engine_specific_config
                         .as_ref()
-                        .and_then(|map| map.get("path").and_then(|v| v.as_str()).map(PathBuf::from))
+                        .and_then(|map| map.storage.path.clone())
                         .unwrap_or_else(|| PathBuf::from(format!("{}/rocksdb", DEFAULT_DATA_DIRECTORY)));
                     if lock_file_exists(rocksdb_path.join("LOCK")).await? {
                         warn!("Lock file exists for RocksDB: {:?}", rocksdb_path.join("LOCK"));
@@ -2830,10 +2816,10 @@ impl StorageEngineManager {
                         path: rocksdb_path,
                         host: new_config.engine_specific_config
                             .as_ref()
-                            .and_then(|map| map.get("host").and_then(|v| v.as_str()).map(|s| s.to_string())),
+                            .and_then(|map| map.storage.host.clone()),
                         port: new_config.engine_specific_config
                             .as_ref()
-                            .and_then(|map| map.get("port").and_then(|v| v.as_u64()).map(|p| p as u16)),
+                            .and_then(|map| map.storage.port),
                     };
                     info!("Initializing RocksDB engine with path: {:?}", rocksdb_config.path);
                     let mut rocksdb_singleton = ROCKSDB_SINGLETON.lock().await;
@@ -2879,15 +2865,15 @@ impl StorageEngineManager {
                         storage_engine_type: StorageEngineType::Redis,
                         host: new_config.engine_specific_config
                             .as_ref()
-                            .and_then(|map| map.get("host").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                            .and_then(|map| map.storage.host.clone())
                             .unwrap_or("127.0.0.1".to_string()),
                         port: new_config.engine_specific_config
                             .as_ref()
-                            .and_then(|map| map.get("port").and_then(|v| v.as_u64()).map(|p| p as u16))
+                            .and_then(|map| map.storage.port)
                             .unwrap_or(6379),
                         database: new_config.engine_specific_config
                             .as_ref()
-                            .and_then(|map| map.get("database").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                            .and_then(|map| map.storage.database.clone())
                             .unwrap_or("0".to_string()),
                         username: None,
                         password: None,
@@ -2912,23 +2898,23 @@ impl StorageEngineManager {
                         storage_engine_type: StorageEngineType::PostgreSQL,
                         host: new_config.engine_specific_config
                             .as_ref()
-                            .and_then(|map| map.get("host").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                            .and_then(|map| map.storage.host.clone())
                             .unwrap_or("127.0.0.1".to_string()),
                         port: new_config.engine_specific_config
                             .as_ref()
-                            .and_then(|map| map.get("port").and_then(|v| v.as_u64()).map(|p| p as u16))
+                            .and_then(|map| map.storage.port)
                             .unwrap_or(5432),
                         username: new_config.engine_specific_config
                             .as_ref()
-                            .and_then(|map| map.get("username").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                            .and_then(|map| map.storage.username.clone())
                             .unwrap_or("graphdb_user".to_string()),
                         password: new_config.engine_specific_config
                             .as_ref()
-                            .and_then(|map| map.get("password").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                            .and_then(|map| map.storage.password.clone())
                             .unwrap_or("secure_password".to_string()),
                         database: new_config.engine_specific_config
                             .as_ref()
-                            .and_then(|map| map.get("database").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                            .and_then(|map| map.storage.database.clone())
                             .unwrap_or("graphdb".to_string()),
                     };
                     let postgres_instance = POSTGRES_SINGLETON.get_or_init(|| async {
@@ -2951,23 +2937,23 @@ impl StorageEngineManager {
                         storage_engine_type: StorageEngineType::MySQL,
                         host: new_config.engine_specific_config
                             .as_ref()
-                            .and_then(|map| map.get("host").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                            .and_then(|map| map.storage.host.clone())
                             .unwrap_or("127.0.0.1".to_string()),
                         port: new_config.engine_specific_config
                             .as_ref()
-                            .and_then(|map| map.get("port").and_then(|v| v.as_u64()).map(|p| p as u16))
+                            .and_then(|map| map.storage.port)
                             .unwrap_or(3306),
                         username: new_config.engine_specific_config
                             .as_ref()
-                            .and_then(|map| map.get("username").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                            .and_then(|map| map.storage.username.clone())
                             .unwrap_or("graphdb_user".to_string()),
                         password: new_config.engine_specific_config
                             .as_ref()
-                            .and_then(|map| map.get("password").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                            .and_then(|map| map.storage.password.clone())
                             .unwrap_or("secure_password".to_string()),
                         database: new_config.engine_specific_config
                             .as_ref()
-                            .and_then(|map| map.get("database").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                            .and_then(|map| map.storage.database.clone())
                             .unwrap_or("graphdb".to_string()),
                     };
                     let mysql_instance = MYSQL_SINGLETON.get_or_init(|| async {
@@ -2986,7 +2972,7 @@ impl StorageEngineManager {
         };
 
         // Migrate data if switching engines
-        if old_engine_type != engine_type {
+        if old_engine_type != new_config.storage_engine_type {
             info!("Migrating data from {} to {}", old_persistent_arc.get_type(), new_persistent.get_type());
             self.migrate_data(&old_persistent_arc, &new_persistent).await?;
         }
@@ -3004,7 +2990,7 @@ impl StorageEngineManager {
             inmemory: Arc::new(InMemoryGraphStorage::new(&new_config)),
             persistent: new_persistent.clone(),
             running: Arc::new(TokioMutex::new(false)),
-            engine_type,
+            engine_type: new_config.storage_engine_type,
         }));
         self.persistent_engine = new_persistent;
 
@@ -3015,7 +3001,7 @@ impl StorageEngineManager {
                 .map_err(|e| GraphError::StorageError(format!("Failed to start new engine: {}", e)))?;
         }
 
-        info!("Successfully switched to storage engine: {:?}", engine_type);
+        info!("Successfully switched to storage engine: {:?}", new_config.storage_engine_type);
         trace!("use_storage completed in {}ms", start_time.elapsed().as_millis());
         Ok(())
     }
