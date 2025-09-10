@@ -181,7 +181,7 @@ struct RegistryConfig {
 }
 
 #[derive(Clone)]
-struct NonBlockingDaemonRegistry {
+pub struct NonBlockingDaemonRegistry {
     memory_store: Arc<RwLock<HashMap<u16, DaemonMetadata>>>,
     storage: Arc<RwLock<Option<ImprovedSledPool>>>,
     config: Arc<RegistryConfig>,
@@ -305,7 +305,7 @@ impl NonBlockingDaemonRegistry {
         validation_result
     }
 
-    async fn is_pid_running(pid: u32) -> Result<bool> {
+    pub async fn is_pid_running(pid: u32) -> Result<bool> {
         tokio::task::spawn_blocking(move || {
             let mut sys = System::new();
             let sysinfo_pid = Pid::from_u32(pid);

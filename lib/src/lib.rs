@@ -19,7 +19,9 @@ pub mod daemon_registry;
 pub mod daemon_config;
 pub mod daemon_utils;
 pub mod util;
-pub use storage_engine::config::StorageEngineType;
+pub use config::StorageEngineType;
+pub mod config;
+pub mod commands;
 
 // Now, import directly from the 'models' crate.
 pub use models::{Edge, Identifier, Json, Vertex}; // Added Vertex here for convenience
@@ -30,6 +32,7 @@ pub use models::queries::EdgeDirection;
 pub use models::properties::{EdgeProperties, NamedProperty, PropertyValue, VertexProperties};
 pub use models::queries::{Query, QueryOutputValue};
 pub use models::medical::{Login, User};
+pub use commands::*;
 
 #[cfg(feature = "bench-suite")]
 extern crate test;

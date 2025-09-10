@@ -9,9 +9,12 @@ use std::fs;
 use log::{info, error, warn, debug};
 use tokio::time::{sleep, Duration};
 use serde_json::{self, Value};
-use crate::cli::commands::{CommandType, ShowAction,  ConfigAction};
-use crate::cli::config::{StorageConfig, SelectedStorageConfig, daemon_api_storage_engine_type_to_string, DAEMON_REGISTRY_DB_PATH};
-use lib::storage_engine::config::{StorageEngineType};
+use lib::commands::{CommandType, ShowAction,  ConfigAction};
+use lib::config::{StorageConfig, SelectedStorageConfig, 
+                         daemon_api_storage_engine_type_to_string, 
+                         load_storage_config_from_yaml, 
+                         DAEMON_REGISTRY_DB_PATH};
+use lib::config::{StorageEngineType};
 use crossterm::style::{self, Stylize};
 use crossterm::terminal::{Clear, ClearType, size as terminal_size};
 use crossterm::execute;
@@ -361,6 +364,19 @@ pub fn selected_storage_config_to_hashmap(config: &SelectedStorageConfig) -> Has
     map
 }
 
-
-
+// Helper function to load TiKV PD port from configuration
+pub async fn load_tikv_pd_port() -> Option<u16> {
+    let config_path = PathBuf::from("./storage_daemon_server/storage_config_tikv.yaml");
+    match load_storage_config_from_yaml(Some(config_path)).await {
+        Ok(config) => {
+            config.engine_specific_config
+                .and_then(|c| c.storage.pd_endpoints)
+                .and_then(|pd| pd.split(':').last().and_then(|p| p.parse::<u16>().ok()))
+        }
+        Err(e) => {
+            warn!("Failed to load TiKV config: {}", e);
+            None
+        }
+    }
+}
 

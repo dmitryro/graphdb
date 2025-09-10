@@ -2,8 +2,9 @@
 pub const DAEMON_REGISTRY_DB_PATH: &str = "./daemon_registry_db";
 pub const DEFAULT_DAEMON_PORT: u16 = 9001;
 pub const DEFAULT_REST_API_PORT: u16 = 8081;
+pub const DEFAULT_REST_PORT: u16 = 8081;
 pub const DEFAULT_STORAGE_PORT: u16 = 8049;
-pub const MAX_CLUSTER_SIZE: usize = 100;
+pub const MAX_CLUSTER_SIZE: usize = 10000;
 pub const DEFAULT_MAIN_PORT: u16 = 9001;
 pub const DEFAULT_CLUSTER_RANGE: &str = "9001-9005";
 pub const CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS: u16 = 8085;

@@ -5,6 +5,10 @@
 // Fixed: 2025-08-10 - Added missing StorageConfig fields (E0063)
 // Fixed: 2025-08-10 - Converted log_directory to String (E0308)
 // Fixed: 2025-08-10 - Removed invalid max_disk_space_mb field (E0560)
+// Fixed: 2025-09-09 - Fixed type mismatches in load_storage_config_from_yaml and StorageSettings conversion
+// Fixed: 2025-09-09 - Corrected engine_specific_config conversion from SelectedStorageConfig to HashMap
+// Fixed: 2025-09-09 - Removed invalid unwrap_or on max_open_files
+// Fixed: 2025-09-09 - Fixed type mismatches in init_storage_engine_manager and related functions
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -14,8 +18,8 @@ use tokio::sync::oneshot;
 use tokio::sync::mpsc::Sender;
 use tokio::signal;
 use tokio::time::{sleep, Duration};
-
 use lib::storage_engine::{GraphStorageEngine, StorageConfig, StorageEngineType, create_storage};
+use lib::config::{SelectedStorageConfig, StorageConfigInner, load_storage_config_from_yaml};
 use std::sync::{Arc, Mutex};
 use openraft::{Config as RaftConfig, Raft, BasicNode};
 use openraft::network::{RaftNetwork, RaftNetworkFactory, RPCOption};
@@ -32,6 +36,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use log::{info, error, warn, debug};
 use simplelog::{CombinedLogger, TermLogger, WriteLogger, LevelFilter, Config, ConfigBuilder, TerminalMode, ColorChoice};
 use serde_json::{Value, Map};
+use lib::storage_engine::storage_engine::{StorageEngineManager, GLOBAL_STORAGE_ENGINE_MANAGER, AsyncStorageEngineManager};
+use models::errors::{GraphError, GraphResult};
 
 // Declare the storage_client module.
 pub mod storage_client;
@@ -114,7 +120,6 @@ pub struct StorageSettings {
     pub min_disk_space_gb: u64,
     pub use_raft_for_scale: bool,
     pub storage_engine_type: String,
-    // Corrected: Use a HashMap to handle arbitrary key-value pairs from the YAML file.
     #[serde(default)]
     pub engine_specific_config: HashMap<String, serde_json::Value>,
     pub max_open_files: u64,
@@ -124,7 +129,7 @@ impl Default for StorageSettings {
     fn default() -> Self {
         StorageSettings {
             config_root_directory: PathBuf::from("./storage_daemon_server"),
-            data_directory: PathBuf::from("/opt/graphdb/storage_data"), // Corrected to match your YAML
+            data_directory: PathBuf::from("/opt/graphdb/storage_data"),
             log_directory: PathBuf::from("/opt/graphdb/logs"),
             default_port: 8083,
             cluster_range: "8083".to_string(),
@@ -132,7 +137,7 @@ impl Default for StorageSettings {
             min_disk_space_gb: 10,
             use_raft_for_scale: true,
             storage_engine_type: "sled".to_string(),
-            engine_specific_config: HashMap::new(), // Initialize with an empty HashMap
+            engine_specific_config: HashMap::new(),
             max_open_files: 100,
         }
     }
@@ -150,9 +155,52 @@ impl StorageSettings {
             .with_context(|| format!("Failed to parse YAML from {:?}", path))?;
         Ok(wrapper.storage)
     }
+
+    pub fn from_storage_config(config: &StorageConfig) -> Self {
+        let mut engine_specific_config = HashMap::new();
+        if let Some(esc) = &config.engine_specific_config {
+            if let Some(path) = &esc.storage.path {
+                engine_specific_config.insert("path".to_string(), Value::String(path.display().to_string()));
+            }
+            if let Some(host) = &esc.storage.host {
+                engine_specific_config.insert("host".to_string(), Value::String(host.clone()));
+            }
+            if let Some(port) = esc.storage.port {
+                engine_specific_config.insert("port".to_string(), Value::Number(port.into()));
+            }
+            if let Some(username) = &esc.storage.username {
+                engine_specific_config.insert("username".to_string(), Value::String(username.clone()));
+            }
+            if let Some(password) = &esc.storage.password {
+                engine_specific_config.insert("password".to_string(), Value::String(password.clone()));
+            }
+            if let Some(database) = &esc.storage.database {
+                engine_specific_config.insert("database".to_string(), Value::String(database.clone()));
+            }
+            if let Some(pd_endpoints) = &esc.storage.pd_endpoints {
+                engine_specific_config.insert("pd_endpoints".to_string(), Value::String(pd_endpoints.clone()));
+            }
+        }
+
+        StorageSettings {
+            config_root_directory: config.config_root_directory.clone()
+                .unwrap_or_else(|| PathBuf::from("./storage_daemon_server")),
+            data_directory: config.data_directory.clone()
+                .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data")),
+            log_directory: config.log_directory.clone()
+                .unwrap_or_else(|| PathBuf::from("/opt/graphdb/logs")),
+            default_port: config.default_port,
+            cluster_range: config.cluster_range.clone(),
+            max_disk_space_gb: config.max_disk_space_gb,
+            min_disk_space_gb: config.min_disk_space_gb,
+            use_raft_for_scale: config.use_raft_for_scale,
+            storage_engine_type: config.storage_engine_type.to_string(),
+            engine_specific_config,
+            max_open_files: config.max_open_files,
+        }
+    }
 }
 
-// The `StorageSettingsWrapper` struct can remain as is.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageSettingsWrapper {
     pub storage: StorageSettings,
@@ -485,12 +533,120 @@ impl RaftStorage<TypeConfig> for InMemoryRaftStorage {
     }
 }
 
+// --- Corrected `create_default_yaml_config` function ---
+async fn create_default_yaml_config(yaml_path: &PathBuf, engine_type: StorageEngineType) -> Result<(), GraphError> {
+    info!("Creating default YAML config at {:?}", yaml_path);
+    let config = StorageConfig {
+        storage_engine_type: engine_type,
+        config_root_directory: Some(PathBuf::from("./storage_daemon_server")),
+        data_directory: Some(PathBuf::from("/opt/graphdb/storage_data")),
+        log_directory: Some(PathBuf::from("/opt/graphdb/logs")),
+        default_port: 8083,
+        cluster_range: "8083".to_string(),
+        max_disk_space_gb: 1000,
+        min_disk_space_gb: 10,
+        use_raft_for_scale: true,
+        max_open_files: 100,
+        engine_specific_config: Some(SelectedStorageConfig {
+            storage_engine_type: engine_type,
+            storage: StorageConfigInner {
+                path: Some(PathBuf::from(format!("/opt/graphdb/storage_data/{}", engine_type.to_string().to_lowercase()))),
+                host: Some("127.0.0.1".to_string()),
+                port: Some(8083),
+                username: None,
+                password: None,
+                database: None,
+                pd_endpoints: None,
+                cache_capacity: Some(1024*1024*1024),
+                use_compression: true,
+            },
+        }),
+    };
+
+    config.save().await
+        .map_err(|e| {
+            error!("Failed to save default YAML config to {:?}: {}", yaml_path, e);
+            GraphError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        })?;
+    info!("Default YAML config created at {:?}", yaml_path);
+    Ok(())
+}
+
+// --- Corrected `init_storage_engine_manager` function ---
+pub async fn init_storage_engine_manager(config_path_yaml: PathBuf) -> Result<(), GraphError> {
+    use tokio::fs;
+    use anyhow::Context;
+
+    info!("Initializing StorageEngineManager with YAML: {:?}", config_path_yaml);
+    
+    if let Some(parent) = config_path_yaml.parent() {
+        fs::create_dir_all(parent)
+            .await
+            .map_err(|e| GraphError::Io(e))
+            .with_context(|| format!("Failed to create directory for YAML config: {:?}", parent))?;
+    }
+    
+    // Check if already initialized
+    if GLOBAL_STORAGE_ENGINE_MANAGER.get().is_some() {
+        info!("StorageEngineManager already initialized, reusing existing instance");
+        return Ok(());
+    }
+    
+    // Load configuration from YAML to get storage_engine_type and port
+    info!("Loading config from {:?}", config_path_yaml);
+    let mut config = load_storage_config_from_yaml(Some(config_path_yaml.clone())).await
+        .map_err(|e| {
+            error!("Failed to load YAML config from {:?}: {}", config_path_yaml, e);
+            GraphError::ConfigurationError(format!("Failed to load YAML config: {}", e))
+        })?;
+    
+    let storage_engine = config.storage_engine_type.clone();
+    let port = config.engine_specific_config
+        .as_ref()
+        .and_then(|c| c.storage.port)
+        .unwrap_or_else(|| match storage_engine {
+            StorageEngineType::TiKV => 2380,
+            _ => 8052, // Default for Sled and others
+        });
+
+    // Update Sled path to be port-specific
+    if storage_engine == StorageEngineType::Sled {
+        if let Some(ref mut engine_config) = config.engine_specific_config {
+            let base_path = config.data_directory
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data"))
+                .join(format!("sled_{}", port));
+            engine_config.storage.path = Some(base_path);
+        }
+        config.save().await
+            .map_err(|e| GraphError::ConfigurationError(format!("Failed to save updated StorageConfig with port-specific Sled path: {}", e)))?;
+    }
+
+    debug!("Loaded storage_engine_type: {:?}, port: {:?}", storage_engine, port);
+    
+    // Initialize StorageEngineManager with the loaded storage_engine_type and port
+    let manager = StorageEngineManager::new(storage_engine, &config_path_yaml, false, Some(port)).await
+        .map_err(|e| {
+            error!("Failed to create StorageEngineManager: {}", e);
+            GraphError::StorageError(format!("Failed to create StorageEngineManager: {}", e))
+        })?;
+    
+    GLOBAL_STORAGE_ENGINE_MANAGER.set(Arc::new(AsyncStorageEngineManager::from_manager(
+        Arc::try_unwrap(manager)
+            .map_err(|_| GraphError::StorageError("Failed to unwrap Arc<StorageEngineManager>: multiple references exist".to_string()))?
+    )))
+        .map_err(|_| GraphError::StorageError("Failed to set StorageEngineManager: already initialized".to_string()))?;
+    
+    info!("StorageEngineManager initialized successfully with engine: {:?} on port {:?}", storage_engine, port);
+    Ok(())
+}
+
 // --- Corrected `start_storage_daemon_server_real` function ---
 pub async fn start_storage_daemon_server_real(
     port: u16,
     settings: StorageSettings,
     shutdown_rx: oneshot::Receiver<()>,
-) -> Result<StorageDaemon> {
+) -> Result<StorageDaemon, anyhow::Error> {
     // Initialize logger
     let log_file_path = format!("/tmp/graphdb-storage-{}.out", port);
     let log_file = File::create(&log_file_path)
@@ -542,24 +698,45 @@ pub async fn start_storage_daemon_server_real(
 
     let cluster_range_str = settings.cluster_range.clone();
 
+    let storage_engine_type = StorageEngineType::from_str(&settings.storage_engine_type)
+        .map_err(|e| anyhow::anyhow!("Invalid storage engine type: {}", e))?;
+
     let storage_config = StorageConfig {
-        storage_engine_type: StorageEngineType::from_str(&settings.storage_engine_type)
-            .map_err(|e| anyhow::anyhow!("Invalid storage engine type: {}", e))?,
-        data_directory: settings.data_directory,
-        config_root_directory: settings.config_root_directory,
-        log_directory: settings.log_directory.display().to_string(),
+        storage_engine_type: storage_engine_type,
+        data_directory: Some(settings.data_directory),
+        config_root_directory: Some(settings.config_root_directory),
+        log_directory: Some(PathBuf::from(settings.log_directory.display().to_string())),
         default_port: settings.default_port,
         cluster_range: settings.cluster_range,
         use_raft_for_scale: settings.use_raft_for_scale,
         max_disk_space_gb: 10,
         min_disk_space_gb: 1,
-        engine_specific_config: Some(settings.engine_specific_config),
-        max_open_files: Some(settings.max_open_files as i32),
-        connection_string: match settings.storage_engine_type.as_str() {
+        engine_specific_config: Some(SelectedStorageConfig {
+            storage_engine_type: storage_engine_type,
+            storage: StorageConfigInner {
+                path: settings.engine_specific_config.get("path").and_then(|p| p.as_str()).map(PathBuf::from),
+                host: settings.engine_specific_config.get("host").and_then(|h| h.as_str()).map(String::from),
+                port: settings.engine_specific_config.get("port").and_then(|p| p.as_u64()).map(|p| p as u16),
+                username: settings.engine_specific_config.get("username").and_then(|u| u.as_str()).map(String::from),
+                password: settings.engine_specific_config.get("password").and_then(|p| p.as_str()).map(String::from),
+                database: settings.engine_specific_config.get("database").and_then(|d| d.as_str()).map(String::from),
+                pd_endpoints: settings.engine_specific_config.get("pd_endpoints").and_then(|p| p.as_str()).map(String::from),
+                cache_capacity: settings.engine_specific_config.get("cache_capacity").and_then(|p| p.as_u64()),
+                // The fix is here:
+                // 1. We use `.as_bool()` to correctly parse the value into an `Option<bool>`.
+                // 2. We use `.unwrap_or(false)` to get the `bool` value, providing a default if it's missing.
+                use_compression: settings.engine_specific_config.get("use_compression")
+                    .and_then(|p| p.as_bool())
+                    .unwrap_or(false),
+            },
+        }),
+        max_open_files: settings.max_open_files,
+        /*connection_string: match settings.storage_engine_type.as_str() {
             "redis" | "postgresql" | "mysql" => Some(format!("{}:{}", cluster_range_str, port)),
             _ => None,
-        },
+        },*/
     };
+
     let storage = match create_storage(&storage_config).await {
         Ok(storage) => {
             info!("[Storage Daemon] Initialized storage backend: {}", settings.storage_engine_type);
@@ -613,7 +790,6 @@ pub async fn start_storage_daemon_server_real(
     info!("[Storage Daemon] Successfully bound to port {}. Now listening for connections.", port);
 
     // Set up registration and shutdown handling
-    // Fix Option 1: Use a shared state approach
     let (shutdown_tx, mut shutdown_rx_task) = oneshot::channel();
     let (registration_tx, mut registration_rx) = oneshot::channel::<()>();
     let storage_clone = storage.clone();

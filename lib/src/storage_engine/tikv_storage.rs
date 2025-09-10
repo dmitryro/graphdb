@@ -11,7 +11,7 @@ use uuid::Uuid;
 use models::{Edge, Identifier, Vertex};
 use models::errors::{GraphError, GraphResult};
 use models::identifiers::SerializableUuid;
-use crate::storage_engine::config::{TikvConfig, StorageEngineType};
+use crate::config::{TikvConfig, StorageEngineType};
 use crate::storage_engine::storage_utils::{
     serialize_vertex, deserialize_vertex, serialize_edge, deserialize_edge,
 };

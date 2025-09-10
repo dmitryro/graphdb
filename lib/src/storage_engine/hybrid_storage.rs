@@ -1,6 +1,9 @@
 // lib/src/storage_engine/hybrid_storage.rs
-// Updated: 2025-09-01 - Fixed E0308 and E0063 by providing a complete StorageConfig with all required fields,
-// ensuring data_directory is a PathBuf, and maintaining generic compatibility with all storage engines.
+// Updated: 2025-09-09 - Fixed E0308 and E0560 by correcting StorageConfig initialization:
+// - Wrapped PathBuf fields in Some for data_directory and config_root_directory.
+// - Removed non-existent connection_string field.
+// - Converted log_directory to Option<PathBuf>.
+// - Provided a u64 value for max_open_files.
 
 use async_trait::async_trait;
 use std::any::Any;
@@ -12,7 +15,7 @@ use serde_json::Value;
 use uuid::Uuid;
 use crate::storage_engine::{GraphStorageEngine, StorageEngine};
 use crate::storage_engine::inmemory_storage::InMemoryStorage;
-use crate::storage_engine::config::{StorageConfig, StorageEngineType};
+use crate::config::config::{StorageConfig, StorageEngineType};
 use tokio::sync::Mutex as TokioMutex;
 
 #[derive(Debug)]
@@ -27,17 +30,16 @@ impl HybridStorage {
     pub fn new(persistent: Arc<dyn GraphStorageEngine + Send + Sync>) -> Self {
         let config = StorageConfig {
             storage_engine_type: StorageEngineType::InMemory,
-            data_directory: PathBuf::from("/tmp/graphdb_inmemory"),
-            connection_string: None,
-            engine_specific_config: None,
-            cluster_range: String::new(),
-            config_root_directory: PathBuf::from("/tmp/graphdb_config"),
+            data_directory: Some(PathBuf::from("/tmp/graphdb_inmemory")), // Fixed: Wrapped in Some
+            config_root_directory: Some(PathBuf::from("/tmp/graphdb_config")), // Fixed: Wrapped in Some
+            log_directory: Some(PathBuf::from("/tmp/graphdb_logs")), // Fixed: Converted to PathBuf and wrapped in Some
             default_port: 0,
-            log_directory: String::from("/tmp/graphdb_logs"),
+            cluster_range: String::new(),
             max_disk_space_gb: 100,
             min_disk_space_gb: 1,
             use_raft_for_scale: false,
-            max_open_files: None,
+            engine_specific_config: None,
+            max_open_files: 1000, // Fixed: Provided u64 value
         };
         HybridStorage {
             inmemory: Arc::new(InMemoryStorage::new(&config)),

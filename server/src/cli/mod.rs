@@ -4,8 +4,6 @@
 // It includes argument parsing, command handling, and interactive mode.
 
 pub mod cli;
-pub mod commands;
-pub mod config;
 pub mod daemon_management;
 pub mod handlers;
 pub mod help_display;
@@ -16,6 +14,7 @@ pub mod handlers_storage;
 pub mod handlers_rest;
 pub mod handlers_all;
 pub mod handlers_queries;
+/*
 pub mod serializers;
 pub mod config_structs;
 pub mod config_constants;
@@ -23,15 +22,15 @@ pub mod config_defaults;
 pub mod config_helpers;
 pub mod config_impl_cli;
 pub mod config_impl_storage;
-
+*/
 // Re-export the main CLI entry point from cli.rs
 pub use cli::{start_cli, CliArgs, Commands}; // Corrected: Changed run_cli to start_cli
-pub use config_structs::*;
-pub use config_defaults::*;
-pub use config_constants::*;
-pub use config_helpers::*;
-pub use serializers::*;
-pub use config::{
+pub use lib::config::config_structs::*;
+pub use lib::config::config_defaults::*;
+pub use lib::config::config_constants::*;
+pub use lib::config::config_helpers::*;
+pub use lib::config::config_serializers::*;
+pub use lib::config::{
     load_cli_config,
     load_storage_config_str,
     load_storage_config_from_yaml,
@@ -54,7 +53,7 @@ pub use config::{
     DAEMON_NAME_STORAGE_DAEMON,
 };
 // Re-export specific types/functions from other modules if they are part of the public CLI API
-pub use commands::{
+pub use lib::commands::{
     DaemonCliCommand,
     RestCliCommand,
     StorageAction,

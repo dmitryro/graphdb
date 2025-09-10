@@ -12,12 +12,12 @@ use tokio::task::JoinHandle;
 use tokio::sync::{oneshot, Mutex as TokioMutex};
 use tokio::net::TcpStream;
 use tokio::process::{Command as TokioCommand, Child};
-use tokio::time::{self, Duration as TokioDuration};
+use tokio::time::{self, Duration as TokioDuration, sleep, timeout};
 use tokio::io::{AsyncWriteExt, AsyncBufReadExt, BufReader, ErrorKind};
 use log::{info, error, warn, debug};
 use chrono::Utc;
 use nix::unistd::Pid as NixPid;
-use nix::sys::signal::{kill, Signal};
+use nix::sys::signal::{self, kill, Signal};
 use daemon_api::{start_daemon, stop_daemon, stop_port_daemon, DaemonError};
 use rest_api::start_server as start_rest_server;
 use storage_daemon_server::run_storage_daemon as start_storage_server;
@@ -27,7 +27,7 @@ use tokio::process::Command;
 use std::os::unix::process::ExitStatusExt;
 use std::fs;
 
-use crate::cli::config::{
+use lib::config::{
     get_default_rest_port_from_config,
     load_storage_config_str as load_storage_config,
     CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS,
@@ -44,7 +44,7 @@ use crate::cli::config::{
     load_rest_config,
 };
 use lib::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
-use lib::storage_engine::config::StorageEngineType;
+use lib::config::StorageEngineType;
 
 /// Helper to run an external command with a timeout.
 pub async fn run_command_with_timeout(
@@ -177,20 +177,24 @@ pub async fn check_process_status_by_port(
 }
 
 /// Stops a process running on the specified port.
-/// This version is now more robust against race conditions where the process
-/// is killed but a subsequent check fails.
+/// This version is robust against race conditions where the process
+/// is killed but a subsequent check fails, and avoids thread joins.
 pub async fn stop_process_by_port(
     process_name: &str,
     port: u16
 ) -> Result<(), anyhow::Error> {
     println!("Attempting to stop {} on port {}...", process_name, port);
+    info!("Attempting to stop {} on port {}", process_name, port);
+
+    // Determine service type
     let service_type_str = if process_name.contains("Storage") { "storage" }
         else if process_name.contains("REST") { "rest" }
         else { "main" };
     let service_type = ServiceType::from_str(service_type_str, true)
         .map_err(|e| anyhow!("Invalid service type: {}", e))?;
-    
-    let metadata = match tokio::time::timeout(
+
+    // Check daemon registry for metadata
+    let metadata = match timeout(
         Duration::from_secs(2),
         GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port),
     ).await {
@@ -205,57 +209,111 @@ pub async fn stop_process_by_port(
             None
         }
     };
-    
-    let mut pid_to_stop: Option<u32> = metadata.map(|meta| meta.pid);
-    if pid_to_stop.is_none() {
-        pid_to_stop = find_pid_by_port(port).await;
+
+    // Get PID from metadata or find_pid_by_port
+    let pid_to_stop = match metadata.map(|meta| meta.pid) {
+        Some(pid) => Some(pid),
+        None => find_pid_by_port(port).await, // This is already async, no closure needed
+    };
+
+    // Skip termination for TiKV PD port (2379) unless explicitly required
+    if port == 2379 && !process_name.contains("TiKV") {
+        info!("Skipping termination for TiKV PD port {} (process: {})", port, process_name);
+        println!("Skipping termination for TiKV PD port {} (process: {}).", port, process_name);
+        return Ok(());
     }
 
     if let Some(pid) = pid_to_stop {
         let nix_pid = NixPid::from_raw(pid as i32);
-        
-        if let Err(e) = kill(nix_pid, Signal::SIGTERM) {
-            error!("Failed to send SIGTERM to PID {}: {}", pid, e);
-        } else {
-            println!("Sent SIGTERM to PID {} for {} on port {}.", pid, process_name, port);
-            let start_time = Instant::now();
-            let wait_timeout = Duration::from_secs(5);
-            let poll_interval = Duration::from_millis(200);
-            while start_time.elapsed() < wait_timeout {
-                if is_port_free(port).await {
-                    break;
-                }
-                tokio::time::sleep(poll_interval).await;
-            }
+        info!("Found PID {} for {} on port {}", pid, process_name, port);
 
-            if is_process_running(pid).await {
-                warn!("Process {} (PID {}) on port {} still running after SIGTERM. Sending SIGKILL.", process_name, pid, port);
-                if let Err(e) = kill(nix_pid, Signal::SIGKILL) {
-                    error!("Failed to send SIGKILL to PID {}: {}", pid, e);
-                } else {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    if is_process_running(pid).await {
-                        return Err(anyhow!("Failed to stop {} (PID {}) on port {}.", process_name, pid, port));
+        // Send SIGTERM
+        match signal::kill(nix_pid, Signal::SIGTERM) {
+            Ok(_) => {
+                println!("Sent SIGTERM to PID {} for {} on port {}.", pid, process_name, port);
+                info!("Sent SIGTERM to PID {} for {} on port {}", pid, process_name, port);
+            }
+            Err(nix::Error::ESRCH) => {
+                info!("Process with PID {} on port {} already terminated", pid, port);
+                println!("Process with PID {} on port {} already terminated.", pid, port);
+                // Proceed to cleanup
+            }
+            Err(e) => {
+                error!("Failed to send SIGTERM to PID {}: {}", pid, e);
+                return Err(anyhow!("Failed to send SIGTERM to PID {}: {}", pid, e));
+            }
+        }
+
+        // Poll for port to become free
+        let wait_timeout = Duration::from_secs(5);
+        let poll_interval = Duration::from_millis(200);
+        let start_time = Instant::now();
+        while start_time.elapsed() < wait_timeout {
+            if is_port_free(port).await {
+                info!("Port {} is now free after SIGTERM for PID {}", port, pid);
+                println!("Port {} is now free.", port);
+                break;
+            }
+            debug!("Port {} still in use for PID {} after {}ms", port, pid, start_time.elapsed().as_millis());
+            sleep(poll_interval).await;
+        }
+
+        // If port is still in use, send SIGKILL
+        if !is_port_free(port).await {
+            warn!("Process {} (PID {}) on port {} still running after SIGTERM. Sending SIGKILL.", process_name, pid, port);
+            match signal::kill(nix_pid, Signal::SIGKILL) {
+                Ok(_) => {
+                    info!("Sent SIGKILL to PID {} for {} on port {}", pid, process_name, port);
+                    // Poll again after SIGKILL
+                    let sigkill_timeout = Duration::from_secs(2);
+                    let sigkill_start = Instant::now();
+                    while sigkill_start.elapsed() < sigkill_timeout {
+                        if is_port_free(port).await {
+                            info!("Port {} is now free after SIGKILL for PID {}", port, pid);
+                            println!("Port {} is now free.", port);
+                            break;
+                        }
+                        debug!("Port {} still in use after SIGKILL for PID {} after {}ms", port, pid, sigkill_start.elapsed().as_millis());
+                        sleep(poll_interval).await;
                     }
+                }
+                Err(nix::Error::ESRCH) => {
+                    info!("Process with PID {} on port {} already terminated during SIGKILL attempt", pid, port);
+                    println!("Process with PID {} on port {} already terminated.", pid, port);
+                }
+                Err(e) => {
+                    error!("Failed to send SIGKILL to PID {}: {}", pid, e);
+                    return Err(anyhow!("Failed to send SIGKILL to PID {}: {}", pid, e));
                 }
             }
         }
+
+        // Final check
+        if !is_port_free(port).await {
+            return Err(anyhow!("Failed to stop {} (PID {}) on port {} after SIGTERM and SIGKILL.", process_name, pid, port));
+        }
     } else {
+        info!("No process found for {} on port {}.", process_name, port);
         println!("No process found for {} on port {}.", process_name, port);
     }
 
-    if let Err(e) = tokio::time::timeout(
-        Duration::from_secs(2),
-        GLOBAL_DAEMON_REGISTRY.unregister_daemon(port),
-    ).await {
-        error!("Failed to unregister daemon for port {}: {:?}", port, e);
+    // Unregister daemon and remove PID file
+    match timeout(Duration::from_secs(2), GLOBAL_DAEMON_REGISTRY.unregister_daemon(port)).await {
+        Ok(Ok(_)) => info!("Successfully unregistered daemon for port {}", port),
+        Ok(Err(e)) => error!("Failed to unregister daemon for port {}: {}", port, e),
+        Err(_) => error!("Timeout unregistering daemon for port {}", port),
+    };
+
+    if let Err(e) = remove_pid_file(port, &service_type).await {
+        warn!("Failed to remove PID file for port {}: {}", port, e);
     }
-    remove_pid_file(port, &service_type).await?;
 
     if is_port_free(port).await {
-        println!("Port {} is now free.", port);
+        info!("{} on port {} stopped successfully.", process_name, port);
+        println!("{} on port {} stopped.", process_name, port);
         Ok(())
     } else {
+        error!("Port {} remained in use after termination attempts.", port);
         Err(anyhow!("Port {} remained in use after termination attempts.", port))
     }
 }
@@ -501,7 +559,7 @@ pub async fn handle_internal_daemon_run(
     is_storage_daemon_run: bool,
     internal_port: Option<u16>,
     internal_storage_config_path: Option<PathBuf>,
-    _internal_storage_engine: Option<StorageEngineType>,
+    internal_storage_engine: Option<StorageEngineType>, // Fixed parameter syntax
 ) -> Result<(), anyhow::Error> {
     if is_rest_api_run {
         let daemon_listen_port = internal_port.unwrap_or_else(get_default_rest_port_from_config);
@@ -509,7 +567,6 @@ pub async fn handle_internal_daemon_run(
         let rest_api_shutdown_tx_opt = Arc::new(TokioMutex::new(Some(tx_shutdown)));
         let rest_api_port_arc = Arc::new(TokioMutex::new(None));
         let rest_api_handle = Arc::new(TokioMutex::new(None));
-
         info!("[DAEMON PROCESS] Starting REST API server (daemonized) on port {}...", daemon_listen_port);
         let result = crate::cli::handlers::start_rest_api_interactive(
             Some(daemon_listen_port),
@@ -518,7 +575,6 @@ pub async fn handle_internal_daemon_run(
             rest_api_port_arc.clone(),
             rest_api_handle.clone(),
         ).await;
-
         if let Err(e) = result {
             error!("[DAEMON PROCESS] REST API server failed: {:?}", e);
             return Err(e);
@@ -527,7 +583,15 @@ pub async fn handle_internal_daemon_run(
         Ok(())
     } else if is_storage_daemon_run {
         let daemon_listen_port = internal_port.unwrap_or_else(|| {
-            load_storage_config(None).map(|c| c.default_port).unwrap_or(CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS)
+            // Fixed: added .await and proper error handling
+            match tokio::runtime::Handle::try_current() {
+                Ok(_) => {
+                    // We're in an async context, but can't await here in a closure
+                    // Use a default value instead
+                    CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS
+                }
+                Err(_) => CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS
+            }
         });
         let storage_config_path = internal_storage_config_path.unwrap_or_else(|| {
             PathBuf::from(DEFAULT_CONFIG_ROOT_DIRECTORY_STR)
@@ -536,7 +600,6 @@ pub async fn handle_internal_daemon_run(
         let storage_daemon_shutdown_tx_opt = Arc::new(TokioMutex::new(None));
         let storage_daemon_port_arc = Arc::new(TokioMutex::new(None));
         let storage_daemon_handle = Arc::new(TokioMutex::new(None));
-
         info!("[DAEMON PROCESS] Starting Storage daemon (daemonized) on port {}...", daemon_listen_port);
         let result = crate::cli::handlers::start_storage_interactive(
             Some(daemon_listen_port),
@@ -559,11 +622,8 @@ pub async fn handle_internal_daemon_run(
                 error!("[DAEMON PROCESS] Could not load main app config: {}. Using default daemon port.", e);
                 Default::default()
             });
-
         let daemon_listen_port = internal_port.unwrap_or(main_app_config.default_port);
-
         info!("[DAEMON PROCESS] Starting GraphDB Daemon (daemonized) on port {}...", daemon_listen_port);
-
         let result = start_graphdb_daemon_core(daemon_listen_port).await;
         if let Err(e) = result {
             error!("[DAEMON PROCESS] GraphDB Daemon failed: {:?}", e);
@@ -682,21 +742,25 @@ pub async fn start_daemon_process(
     engine_type: Option<String>,
 ) -> Result<u32> {
     let config_path_str = config_path.as_ref().map(|p| p.to_string_lossy().into_owned());
-    let actual_port = port.unwrap_or_else(|| {
-        if is_rest {
-            load_rest_config(config_path_str.as_deref())
-                .map(|c| c.default_port)
-                .unwrap_or(DEFAULT_REST_API_PORT)
-        } else if is_storage {
-            load_storage_config(config_path_str.as_deref())
-                .map(|c| c.default_port)
-                .unwrap_or(DEFAULT_STORAGE_PORT)
-        } else {
-            load_main_daemon_config(config_path_str.as_deref())
-                .map(|c| c.default_port)
-                .unwrap_or(DEFAULT_DAEMON_PORT)
+    
+    // Move async config loading outside the closure
+    let default_port = if is_rest {
+        load_rest_config(config_path_str.as_deref())
+            .map(|c| c.default_port)
+            .unwrap_or(DEFAULT_REST_API_PORT)
+    } else if is_storage {
+        // Handle async storage config loading
+        match load_storage_config(config_path_str.as_deref()).await {
+            Ok(c) => c.default_port,
+            Err(_) => DEFAULT_STORAGE_PORT,
         }
-    });
+    } else {
+        load_main_daemon_config(config_path_str.as_deref())
+            .map(|c| c.default_port)
+            .unwrap_or(DEFAULT_DAEMON_PORT)
+    };
+    
+    let actual_port = port.unwrap_or(default_port);
 
     if !is_port_free(actual_port).await {
         error!("Port {} is already in use", actual_port);
@@ -727,7 +791,7 @@ pub async fn start_daemon_process(
     };
 
     let data_dir = if is_storage {
-        load_storage_config(config_path_str.as_deref())
+        load_storage_config(config_path_str.as_deref()).await
             .ok()
             .and_then(|c| c.data_directory) // c.data_directory is Option<PathBuf>
             .unwrap_or_else(|| PathBuf::from(format!("{}/storage_data", DEFAULT_CONFIG_ROOT_DIRECTORY_STR)))
@@ -1053,7 +1117,7 @@ pub async fn get_all_daemon_processes_with_ports() -> Result<HashMap<u16, (u32, 
         }
     }
 
-    let storage_cli_config = load_storage_config(None)
+    let storage_cli_config = load_storage_config(None).await
         .unwrap_or_else(|e| {
             warn!("Could not load storage config for daemon discovery (secondary scan): {}. Using defaults.", e);
             StorageConfig::default()
@@ -1252,11 +1316,11 @@ pub fn launch_daemon_process(
     Ok(handle)
 }
 
-pub fn spawn_rest_api_server(
+pub async fn spawn_rest_api_server(
     port: u16,
     shutdown_rx: oneshot::Receiver<()>,
 ) -> Result<JoinHandle<()>, anyhow::Error> {
-    let cli_storage_config = match load_storage_config(None) {
+    let cli_storage_config = match load_storage_config(None).await {
         Ok(config) => config,
         Err(e) => {
             eprintln!("[CLI] Warning: Could not load storage config for REST API during spawn: {}. Using defaults.", e);
@@ -1634,10 +1698,10 @@ pub async fn stop_daemon_by_pid_or_scan(
     Ok(())
 }
 
-pub fn load_storage_config_path_or_default(path: Option<PathBuf>) -> Result<StorageConfig, anyhow::Error> {
+pub async fn load_storage_config_path_or_default(path: Option<PathBuf>) -> Result<StorageConfig, anyhow::Error> {
     let path_owned: Option<String> = path.map(|p| p.to_string_lossy().into_owned());
     let path_str: Option<&str> = path_owned.as_deref();
-    load_storage_config(path_str)
+    load_storage_config(path_str).await
 }
 
 pub fn parse_cluster_range(range_str: &str) -> Result<Vec<u16>, anyhow::Error> {

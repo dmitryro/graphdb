@@ -1,6 +1,7 @@
 // daemon_api/src/lib.rs
 use serde::{Serialize, Deserialize};
 use std::fs::{self, File};
+use std::collections::{HashMap};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{PathBuf, Path};
 use std::process::Stdio;
@@ -19,8 +20,8 @@ use tokio::time::{sleep, Duration};
 use serde_json;
 use std::collections::HashSet;
 use lib::storage_engine::config::{daemon_api_storage_engine_type_to_string, load_storage_config_from_yaml,
-                                  StorageConfig as EngineStorageConfig,
-                                  DEFAULT_STORAGE_CONFIG_PATH};
+                                  EngineStorageConfig, StorageEngineType, DEFAULT_STORAGE_CONFIG_PATH};
+use lib::config::{SelectedStorageConfig, StorageConfigInner};
 use storage_daemon_server::{StorageSettings, start_storage_daemon_server_real};
 use simplelog::{
     CombinedLogger,
@@ -61,9 +62,9 @@ pub struct DaemonStartConfig {
     pub config_path: String,
     pub daemon_type: String,
     pub port: u16,
-    pub storage_config: Option<EngineStorageConfig>, // You would define your StorageConfig type here
     pub skip_ports: Vec<u16>,
     pub host: String,
+    pub storage_config: Option<EngineStorageConfig>,
 }
 
 lazy_static! {
@@ -72,18 +73,43 @@ lazy_static! {
 
 // Conversion function: EngineStorageConfig to StorageSettings
 pub fn engine_storage_config_to_storage_settings(config: EngineStorageConfig) -> StorageSettings {
+    let mut engine_specific_config = HashMap::new();
+    if let Some(esc) = config.engine_specific_config {
+        if let Some(path) = esc.storage.path {
+            engine_specific_config.insert("path".to_string(), serde_json::Value::String(path.display().to_string()));
+        }
+        if let Some(host) = esc.storage.host {
+            engine_specific_config.insert("host".to_string(), serde_json::Value::String(host));
+        }
+        if let Some(port) = esc.storage.port {
+            engine_specific_config.insert("port".to_string(), serde_json::Value::Number(port.into()));
+        }
+        if let Some(username) = esc.storage.username {
+            engine_specific_config.insert("username".to_string(), serde_json::Value::String(username));
+        }
+        if let Some(password) = esc.storage.password {
+            engine_specific_config.insert("password".to_string(), serde_json::Value::String(password));
+        }
+        if let Some(database) = esc.storage.database {
+            engine_specific_config.insert("database".to_string(), serde_json::Value::String(database));
+        }
+        if let Some(pd_endpoints) = esc.storage.pd_endpoints {
+            engine_specific_config.insert("pd_endpoints".to_string(), serde_json::Value::String(pd_endpoints));
+        }
+    }
+
     StorageSettings {
-        config_root_directory: config.config_root_directory,
-        data_directory: config.data_directory,
-        log_directory: PathBuf::from(config.log_directory),
+        config_root_directory: config.config_root_directory.unwrap_or_else(|| PathBuf::from("./storage_daemon_server")),
+        data_directory: config.data_directory.unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data")),
+        log_directory: config.log_directory.unwrap_or_else(|| PathBuf::from("/opt/graphdb/logs")),
         default_port: config.default_port,
         cluster_range: config.cluster_range,
         max_disk_space_gb: config.max_disk_space_gb,
         min_disk_space_gb: config.min_disk_space_gb,
         use_raft_for_scale: config.use_raft_for_scale,
         storage_engine_type: daemon_api_storage_engine_type_to_string(&config.storage_engine_type),
-        engine_specific_config: config.engine_specific_config.unwrap_or_default(),
-        max_open_files: config.max_open_files.unwrap_or(1024) as u64,
+        engine_specific_config,
+        max_open_files: config.max_open_files,
     }
 }
 
@@ -260,7 +286,7 @@ pub async fn start_daemon(
             Some(config)
         } else {
             info!("Loading storage configuration from file: {}", storage_config_yaml);
-            let config_result = load_storage_config_from_yaml(Some(&PathBuf::from(storage_config_yaml)))
+            let config_result = load_storage_config_from_yaml(Some(PathBuf::from(storage_config_yaml))).await
                 .map_err(|e| anyhow::Error::new(e).context(format!("Failed to load storage config from {}", storage_config_yaml)))?;
             Some(config_result)
         }
@@ -375,7 +401,6 @@ pub async fn start_daemon(
                                     
                                     // Spawn signal handler for graceful shutdown
                                     let signal_handle = {
-                                        // Create signal handler outside the async block
                                         let mut term_signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                                             .map_err(|e| DaemonError::SignalError(e.to_string()))?;
                                         
@@ -509,7 +534,7 @@ pub async fn start_daemon(
                     port: current_port,
                     pid: confirmed_pid,
                     ip_address: host_to_use.clone(),
-                    data_dir: settings.as_ref().map(|s| s.data_directory.clone()),
+                    data_dir: settings.as_ref().and_then(|s| s.data_directory.clone()),
                     config_path: if daemon_type == "storage" && settings.is_none() {
                         Some(PathBuf::from(storage_config_yaml))
                     } else {
