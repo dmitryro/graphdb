@@ -529,9 +529,6 @@ pub async fn lock_file_exists(lock_path: PathBuf) -> Result<bool, GraphError> {
 
 /// Initializes the global StorageEngineManager
 pub async fn init_storage_engine_manager(config_path_yaml: PathBuf) -> Result<(), GraphError> {
-    use tokio::fs;
-    use anyhow::Context;
-
     info!("Initializing StorageEngineManager with YAML: {:?}", config_path_yaml);
     
     if let Some(parent) = config_path_yaml.parent() {
@@ -547,19 +544,40 @@ pub async fn init_storage_engine_manager(config_path_yaml: PathBuf) -> Result<()
         return Ok(());
     }
     
-    // Load configuration from YAML to get storage_engine_type
+    // Load configuration from YAML to get storage_engine_type and port
     info!("Loading config from {:?}", config_path_yaml);
-    let config = load_storage_config_from_yaml(Some(config_path_yaml.clone())).await
+    let mut config = load_storage_config_from_yaml(Some(config_path_yaml.clone())).await
         .map_err(|e| {
             error!("Failed to load YAML config from {:?}: {}", config_path_yaml, e);
             GraphError::ConfigurationError(format!("Failed to load YAML config: {}", e))
         })?;
     
-    let storage_engine = config.storage_engine_type;
-    debug!("Loaded storage_engine_type from YAML: {:?}", storage_engine);
+    let storage_engine = config.storage_engine_type.clone();
+    let port = config.engine_specific_config
+        .as_ref()
+        .and_then(|c| c.storage.port)
+        .unwrap_or_else(|| match storage_engine {
+            StorageEngineType::TiKV => 2380,
+            _ => 8052, // Default for Sled and others
+        });
+
+    // Update Sled path to be port-specific
+    if storage_engine == StorageEngineType::Sled {
+        if let Some(ref mut engine_config) = config.engine_specific_config {
+            let base_path = config.data_directory
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
+                .join(format!("sled_{}", port));
+            engine_config.storage.path = Some(base_path);
+        }
+        config.save().await
+            .map_err(|e| GraphError::ConfigurationError(format!("Failed to save updated StorageConfig with port-specific Sled path: {}", e)))?;
+    }
+
+    debug!("Loaded storage_engine_type: {:?}, port: {:?}", storage_engine, port);
     
-    // Initialize StorageEngineManager with the loaded storage_engine_type
-    let manager = StorageEngineManager::new(storage_engine, &config_path_yaml, false).await
+    // Initialize StorageEngineManager with the loaded storage_engine_type and port
+    let manager = StorageEngineManager::new(storage_engine, &config_path_yaml, false, Some(port)).await
         .map_err(|e| {
             error!("Failed to create StorageEngineManager: {}", e);
             GraphError::StorageError(format!("Failed to create StorageEngineManager: {}", e))
@@ -571,9 +589,10 @@ pub async fn init_storage_engine_manager(config_path_yaml: PathBuf) -> Result<()
     )))
         .map_err(|_| GraphError::StorageError("Failed to set StorageEngineManager: already initialized".to_string()))?;
     
-    info!("StorageEngineManager initialized successfully with engine: {:?}", storage_engine);
+    info!("StorageEngineManager initialized successfully with engine: {:?} on port {:?}", storage_engine, port);
     Ok(())
 }
+
 #[cfg(feature = "with-sled")]
 pub async fn log_lock_file_diagnostics(lock_path: PathBuf) -> Result<(), GraphError> {
     debug!("Running log_lock_file_diagnostics for {:?}", lock_path);
@@ -1051,6 +1070,7 @@ impl StorageEngineManager {
         storage_engine: StorageEngineType,
         config_path_yaml: &Path,
         permanent: bool,
+        port: Option<u16>, // New parameter to pass CLI-provided port
     ) -> Result<Arc<StorageEngineManager>, GraphError> {
         info!("Creating StorageEngineManager with engine: {:?}", storage_engine);
         println!("IN StorageEngineManager new - STEP 1");
@@ -1069,7 +1089,7 @@ impl StorageEngineManager {
         println!("IN StorageEngineManager new - STEP 3");
 
         // Step 3: Load and configure
-        let config = Self::load_and_configure(storage_engine, config_path_yaml, permanent)
+        let mut config = Self::load_and_configure(storage_engine, config_path_yaml, permanent)
             .await
             .map_err(|e| {
                 error!("Failed to load config: {}", e);
@@ -1079,40 +1099,54 @@ impl StorageEngineManager {
         println!("IN StorageEngineManager new - STEP 4 - {:?}", config);
 
         // Step 4: Extract and validate port
-        let selected_port = if let Some(sled_config_map) = &config.engine_specific_config {
-            let port = sled_config_map.storage.port.unwrap_or_else(|| {
-                if config.default_port != 0 {
-                    info!("No valid port in engine_specific_config, using default_port: {}", config.default_port);
-                    println!("===> NO VALID PORT IN ENGINE_SPECIFIC_CONFIG, USING DEFAULT_PORT: {}", config.default_port);
+        let selected_port = port.unwrap_or_else(|| {
+            if let Some(sled_config_map) = &config.engine_specific_config {
+                let port = sled_config_map.storage.port.unwrap_or_else(|| {
+                    if config.default_port != 0 {
+                        info!("No valid port in engine_specific_config, using default_port: {}", config.default_port);
+                        println!("===> NO VALID PORT IN ENGINE_SPECIFIC_CONFIG, USING DEFAULT_PORT: {}", config.default_port);
+                        config.default_port
+                    } else {
+                        warn!("No valid port in engine_specific_config and default_port is 0, using DEFAULT_STORAGE_PORT: {}", DEFAULT_STORAGE_PORT);
+                        println!("===> NO VALID PORT IN ENGINE_SPECIFIC_CONFIG AND DEFAULT_PORT IS 0, USING DEFAULT_STORAGE_PORT: {}", DEFAULT_STORAGE_PORT);
+                        DEFAULT_STORAGE_PORT
+                    }
+                });
+                info!("Using engine-specific port from config: {}", port);
+                println!("===> USING ENGINE-SPECIFIC PORT FROM CONFIG: {}", port);
+                port
+            } else {
+                let port = if config.default_port != 0 {
+                    info!("No engine-specific config found, using default_port: {}", config.default_port);
+                    println!("===> NO ENGINE-SPECIFIC CONFIG FOUND, USING DEFAULT_PORT: {}", config.default_port);
                     config.default_port
                 } else {
-                    warn!("No valid port in engine_specific_config and default_port is 0, using DEFAULT_STORAGE_PORT: {}", DEFAULT_STORAGE_PORT);
-                    println!("===> NO VALID PORT IN ENGINE_SPECIFIC_CONFIG AND DEFAULT_PORT IS 0, USING DEFAULT_STORAGE_PORT: {}", DEFAULT_STORAGE_PORT);
+                    warn!("No engine-specific config found and default_port is 0, using DEFAULT_STORAGE_PORT: {}", DEFAULT_STORAGE_PORT);
+                    println!("===> NO ENGINE-SPECIFIC CONFIG FOUND AND DEFAULT_PORT IS 0, USING DEFAULT_STORAGE_PORT: {}", DEFAULT_STORAGE_PORT);
                     DEFAULT_STORAGE_PORT
-                }
-            });
-            info!("Using engine-specific port from config: {}", port);
-            println!("===> USING ENGINE-SPECIFIC PORT FROM CONFIG: {}", port);
-            port
-        } else {
-            let port = if config.default_port != 0 {
-                info!("No engine-specific config found, using default_port: {}", config.default_port);
-                println!("===> NO ENGINE-SPECIFIC CONFIG FOUND, USING DEFAULT_PORT: {}", config.default_port);
-                config.default_port
-            } else {
-                warn!("No engine-specific config found and default_port is 0, using DEFAULT_STORAGE_PORT: {}", DEFAULT_STORAGE_PORT);
-                println!("===> NO ENGINE-SPECIFIC CONFIG FOUND AND DEFAULT_PORT IS 0, USING DEFAULT_STORAGE_PORT: {}", DEFAULT_STORAGE_PORT);
-                DEFAULT_STORAGE_PORT
-            };
-            port
-        };
+                };
+                port
+            }
+        });
 
         if selected_port == 0 || selected_port > 65535 {
-            error!("Invalid port {} specified", selected_port);
+            error!(" instalacji port {} specified", selected_port);
             return Err(GraphError::StorageError(format!("Invalid port {}: must be between 1 and 65535", selected_port)));
         }
         info!("Selected port: {}", selected_port);
         println!("===> SELECTED PORT {} WHILE CONFIG {:?}", selected_port, config);
+
+        // Update config with port-specific path for Sled
+        if storage_engine == StorageEngineType::Sled {
+            if let Some(ref mut engine_config) = config.engine_specific_config {
+                engine_config.storage.port = Some(selected_port);
+                let base_path = config.data_directory
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
+                    .join(format!("sled_{}", selected_port));
+                engine_config.storage.path = Some(base_path);
+            }
+        }
 
         // Step 5: Check for port conflicts and clean up
         if let Some(metadata) = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(selected_port).await? {
@@ -1123,7 +1157,7 @@ impl StorageEngineManager {
                     let sled_path = config.data_directory
                         .clone()
                         .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
-                        .join("sled")
+                        .join(format!("sled_{}", selected_port))
                         .join("db");
                     if let Err(e) = SledStorage::force_unlock(&sled_path).await {
                         warn!("Failed to unlock Sled storage at {:?}: {}", sled_path, e);
@@ -1236,10 +1270,10 @@ impl StorageEngineManager {
         // Step 9: Create final manager
         let manager = Self::create_manager(
             storage_engine,
-            config, // Pass config directly, no Arc
+            config,
             config_path_yaml,
             persistent,
-            permanent, // Pass permanent as parameter
+            permanent,
             raft_instances,
         );
         println!("IN StorageEngineManager new - STEP 9");
@@ -1508,6 +1542,9 @@ impl StorageEngineManager {
         let sled_config_inner = config.engine_specific_config.as_ref().map(|c| &c.storage);
 
         // Build SledConfig
+        let port = sled_config_inner
+            .and_then(|c| c.port)
+            .unwrap_or(DEFAULT_STORAGE_PORT);
         let sled_config = SledConfig {
             storage_engine_type: StorageEngineType::Sled,
             path: sled_config_inner
@@ -1515,11 +1552,10 @@ impl StorageEngineManager {
                 .unwrap_or_else(|| config.data_directory
                     .clone()
                     .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
-                    .join("sled")),
+                    .join(format!("sled_{}", port))),
             host: sled_config_inner
                 .and_then(|c| c.host.clone()),
-            port: sled_config_inner
-                .and_then(|c| c.port),
+            port: Some(port),
             temporary: sled_config_inner
                 .and_then(|c| c.path.as_ref().map(|p| p.to_string_lossy().contains("temporary")))
                 .unwrap_or_else(|| SledConfig::default().temporary),
@@ -2260,15 +2296,39 @@ impl StorageEngineManager {
         Ok(())
     }
 
+    /// Resets the StorageEngineManager
     pub async fn reset(&mut self) -> Result<(), GraphError> {
         info!("Resetting StorageEngineManager");
         let engine = self.engine.lock().await;
         if (*engine).is_running().await {
             (*engine).stop().await?;
         }
-        let engine_type = engine.engine_type; // Extract engine_type before dropping the lock
+        let engine_type = engine.engine_type.clone(); // Extract engine_type before dropping the lock
         drop(engine); // Release the lock
-        let new_manager = StorageEngineManager::new(engine_type, &self.config_path, self.session_engine_type.is_none()).await
+
+        // Extract port from config or use default
+        let port = self.config.engine_specific_config
+            .as_ref()
+            .and_then(|c| c.storage.port)
+            .unwrap_or_else(|| match engine_type {
+                StorageEngineType::TiKV => 2380,
+                _ => 8052,
+            });
+
+        // Update Sled path to be port-specific
+        if engine_type == StorageEngineType::Sled {
+            if let Some(ref mut engine_config) = self.config.engine_specific_config {
+                let base_path = self.config.data_directory
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
+                    .join(format!("sled_{}", port));
+                engine_config.storage.path = Some(base_path);
+            }
+            self.config.save().await
+                .map_err(|e| GraphError::ConfigurationError(format!("Failed to save updated StorageConfig with port-specific Sled path: {}", e)))?;
+        }
+
+        let new_manager = StorageEngineManager::new(engine_type, &self.config_path, self.session_engine_type.is_none(), Some(port)).await
             .map_err(|e| {
                 error!("Failed to create new StorageEngineManager: {}", e);
                 GraphError::StorageError(format!("Failed to reset StorageEngineManager: {}", e))
@@ -2277,7 +2337,7 @@ impl StorageEngineManager {
         self.persistent_engine = new_manager.persistent_engine.clone();
         self.session_engine_type = new_manager.session_engine_type;
         self.config = new_manager.config.clone();
-        info!("StorageEngineManager reset completed with engine: {:?}", engine_type);
+        info!("StorageEngineManager reset completed with engine: {:?} on port {:?}", engine_type, port);
         Ok(())
     }
 

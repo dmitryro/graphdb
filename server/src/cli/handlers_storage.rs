@@ -381,7 +381,11 @@ pub async fn start_storage_interactive(
             PathBuf::from(DEFAULT_DATA_DIRECTORY),
             |p| p.clone()
         );
-        let engine_data_path = data_dir_path.join(&engine_path_name);
+        let engine_data_path = if storage_config.storage_engine_type == StorageEngineType::Sled {
+            data_dir_path.join(format!("sled_{}", selected_port))
+        } else {
+            data_dir_path.join(&engine_path_name)
+        };
         
         let mut needs_save = false;
         
@@ -571,7 +575,7 @@ pub async fn start_storage_interactive(
         let sled_path = storage_config.engine_specific_config
             .as_ref()
             .map(|c| c.storage.path.clone())
-            .unwrap_or_else(|| Some(PathBuf::from(DEFAULT_DATA_DIRECTORY).join("sled")))
+            .unwrap_or_else(|| Some(PathBuf::from(DEFAULT_DATA_DIRECTORY).join(format!("sled_{}", selected_port))))
             .ok_or_else(|| anyhow!("Sled path is None"))?;
         info!("Sled path set to {:?}", sled_path);
         println!("===> SLED PATH SET TO {:?}", sled_path);
@@ -673,15 +677,23 @@ pub async fn start_storage_interactive(
     trace!("Checking if GLOBAL_STORAGE_ENGINE_MANAGER is initialized");
     if GLOBAL_STORAGE_ENGINE_MANAGER.get().is_none() {
         trace!("GLOBAL_STORAGE_ENGINE_MANAGER not initialized, creating new instance");
-        // Create a modified StorageConfig with the updated port
+        // Create a modified StorageConfig with the updated port and path
         let mut storage_config_for_manager = storage_config.clone();
         if let Some(ref mut engine_config) = storage_config_for_manager.engine_specific_config {
             engine_config.storage.port = Some(selected_port);
+            if storage_config_for_manager.storage_engine_type == StorageEngineType::Sled {
+                let base_path = storage_config_for_manager.data_directory
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
+                    .join(format!("sled_{}", selected_port));
+                engine_config.storage.path = Some(base_path);
+            }
         }
         let manager = StorageEngineManager::new(
             storage_config_for_manager.storage_engine_type.clone(),
             config_path.as_ref(),
-            is_permanent
+            is_permanent,
+            Some(selected_port),
         ).await
             .map_err(|e| {
                 error!("Failed to create StorageEngineManager with config path {:?}: {}", config_path, e);
@@ -705,10 +717,17 @@ pub async fn start_storage_interactive(
     } else {
         trace!("GLOBAL_STORAGE_ENGINE_MANAGER already initialized, updating engine");
         let manager = GLOBAL_STORAGE_ENGINE_MANAGER.get().unwrap();
-        // Update the engine with the correct port
+        // Update the engine with the correct port and path
         let mut storage_config_for_manager = storage_config.clone();
         if let Some(ref mut engine_config) = storage_config_for_manager.engine_specific_config {
             engine_config.storage.port = Some(selected_port);
+            if storage_config_for_manager.storage_engine_type == StorageEngineType::Sled {
+                let base_path = storage_config_for_manager.data_directory
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
+                    .join(format!("sled_{}", selected_port));
+                engine_config.storage.path = Some(base_path);
+            }
         }
         manager.use_storage(storage_config_for_manager.clone(), is_permanent)
             .await
@@ -1680,7 +1699,13 @@ pub async fn handle_use_storage_command(
     let path = engine_specific_config.get("path")
         .and_then(|v| v.as_str())
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(format!("{}/{}", DEFAULT_DATA_DIRECTORY, engine.to_string().to_lowercase())));
+        .unwrap_or_else(|| {
+            if engine == StorageEngineType::Sled {
+                PathBuf::from(format!("{}/sled_{}", DEFAULT_DATA_DIRECTORY, new_port))
+            } else {
+                PathBuf::from(format!("{}/{}", DEFAULT_DATA_DIRECTORY, engine.to_string().to_lowercase()))
+            }
+        });
     let host = engine_specific_config.get("host")
         .and_then(|v| v.as_str())
         .map(String::from)
@@ -1880,8 +1905,8 @@ pub async fn handle_use_storage_command(
         }
     } else {
         let lock_path = new_config.data_directory.as_ref()
-            .map(|d| PathBuf::from(d).join("sled").join("db.lck"))
-            .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data/sled/db.lck"));
+            .map(|d| PathBuf::from(d).join(format!("sled_{}", new_port)).join("db.lck"))
+            .unwrap_or_else(|| PathBuf::from(format!("/opt/graphdb/storage_data/sled_{}/db.lck", new_port)));
         debug!("Checking Sled lock file at {:?}", lock_path);
         if lock_path.exists() {
             info!("Removing Sled lock file at {:?}", lock_path);
@@ -1896,10 +1921,14 @@ pub async fn handle_use_storage_command(
     if GLOBAL_STORAGE_ENGINE_MANAGER.get().is_none() {
         debug!("StorageEngineManager not initialized, creating new instance");
         println!("===> Creating new instance of StorageEngineManager...");
-        let manager = StorageEngineManager::new(expected_engine_type.clone(), &absolute_config_path, permanent)
-            .await
+        let manager = StorageEngineManager::new(
+            expected_engine_type.clone(),
+            &absolute_config_path,
+            permanent,
+            Some(new_port)
+        ).await
             .context("Failed to initialize StorageEngineManager")?;
-        debug!("StorageEngineManager created: engine_type={:?}, config_path={:?}", expected_engine_type, absolute_config_path);
+        debug!("StorageEngineManager created: engine_type={:?}, config_path={:?}, port={:?}", expected_engine_type, absolute_config_path, new_port);
         GLOBAL_STORAGE_ENGINE_MANAGER
             .set(Arc::new(AsyncStorageEngineManager::from_manager(
                 Arc::try_unwrap(manager)
@@ -1941,10 +1970,22 @@ pub async fn handle_use_storage_command(
         info!("No storage daemons to restart, starting single daemon on port {}", config_port);
         println!("===> No existing storage cluster found, starting single daemon...");
 
+        let mut port_specific_config = new_config.clone();
+        if let Some(ref mut engine_config) = port_specific_config.engine_specific_config {
+            engine_config.storage.port = Some(config_port);
+            if port_specific_config.storage_engine_type == StorageEngineType::Sled {
+                let base_path = port_specific_config.data_directory
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
+                    .join(format!("sled_{}", config_port));
+                engine_config.storage.path = Some(base_path);
+            }
+        }
+
         start_storage_interactive(
             Some(config_port),
             Some(absolute_config_path.clone()),
-            Some(new_config.clone()),
+            Some(port_specific_config),
             None,
             Arc::new(TokioMutex::new(None)),
             Arc::new(TokioMutex::new(None)),
@@ -1964,9 +2005,15 @@ pub async fn handle_use_storage_command(
                      index + 1, daemon_ports_to_restart.len(), port);
 
             let mut port_specific_config = new_config.clone();
-            port_specific_config.default_port = *port;
             if let Some(ref mut engine_config) = port_specific_config.engine_specific_config {
                 engine_config.storage.port = Some(*port);
+                if port_specific_config.storage_engine_type == StorageEngineType::Sled {
+                    let base_path = port_specific_config.data_directory
+                        .clone()
+                        .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
+                        .join(format!("sled_{}", port));
+                    engine_config.storage.path = Some(base_path);
+                }
             }
 
             match start_storage_interactive(
@@ -2182,7 +2229,6 @@ pub async fn handle_show_storage_command_interactive() -> Result<()> {
     println!("Current Storage Engine (Interactive Mode): {}", daemon_api_storage_engine_type_to_string(&engine_type));
     Ok(())
 }
-
 
 /// Handles the interactive 'use storage' command.
 pub async fn handle_use_storage_interactive(

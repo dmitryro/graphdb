@@ -360,6 +360,7 @@ pub async fn initialize_storage_for_query(
             return Err(anyhow!("Config file does not exist: {:?}", config_path));
         }
 
+        
         let config = match load_storage_config_from_yaml(Some(config_path.clone())).await {
             Ok(config) => {
                 info!("Loaded storage config for engine {:?}: {:?}", engine_type, config);
@@ -395,7 +396,16 @@ pub async fn initialize_storage_for_query(
             }
         }
 
-        let manager = StorageEngineManager::new(engine_type.clone(), &config_path, false)
+        let storage_engine = updated_config.storage_engine_type.clone();
+        let port = updated_config.engine_specific_config
+            .as_ref()
+            .and_then(|c| c.storage.port)
+            .unwrap_or_else(|| match storage_engine {
+                StorageEngineType::TiKV => 2380,
+                _ => 8052, // Default for Sled and others
+            });
+
+        let manager = StorageEngineManager::new(engine_type.clone(), &config_path, false, Some(port))
             .await
             .context(format!("Failed to initialize StorageEngineManager for engine {:?}", engine_type))?;
 

@@ -592,19 +592,40 @@ pub async fn init_storage_engine_manager(config_path_yaml: PathBuf) -> Result<()
         return Ok(());
     }
     
-    // Load configuration from YAML to get storage_engine_type
+    // Load configuration from YAML to get storage_engine_type and port
     info!("Loading config from {:?}", config_path_yaml);
-    let config = load_storage_config_from_yaml(Some(config_path_yaml.clone())).await
+    let mut config = load_storage_config_from_yaml(Some(config_path_yaml.clone())).await
         .map_err(|e| {
             error!("Failed to load YAML config from {:?}: {}", config_path_yaml, e);
             GraphError::ConfigurationError(format!("Failed to load YAML config: {}", e))
         })?;
     
-    let storage_engine = config.storage_engine_type;
-    debug!("Loaded storage_engine_type from YAML: {:?}", storage_engine);
+    let storage_engine = config.storage_engine_type.clone();
+    let port = config.engine_specific_config
+        .as_ref()
+        .and_then(|c| c.storage.port)
+        .unwrap_or_else(|| match storage_engine {
+            StorageEngineType::TiKV => 2380,
+            _ => 8052, // Default for Sled and others
+        });
+
+    // Update Sled path to be port-specific
+    if storage_engine == StorageEngineType::Sled {
+        if let Some(ref mut engine_config) = config.engine_specific_config {
+            let base_path = config.data_directory
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data"))
+                .join(format!("sled_{}", port));
+            engine_config.storage.path = Some(base_path);
+        }
+        config.save().await
+            .map_err(|e| GraphError::ConfigurationError(format!("Failed to save updated StorageConfig with port-specific Sled path: {}", e)))?;
+    }
+
+    debug!("Loaded storage_engine_type: {:?}, port: {:?}", storage_engine, port);
     
-    // Initialize StorageEngineManager with the loaded storage_engine_type
-    let manager = StorageEngineManager::new(storage_engine, &config_path_yaml, false).await
+    // Initialize StorageEngineManager with the loaded storage_engine_type and port
+    let manager = StorageEngineManager::new(storage_engine, &config_path_yaml, false, Some(port)).await
         .map_err(|e| {
             error!("Failed to create StorageEngineManager: {}", e);
             GraphError::StorageError(format!("Failed to create StorageEngineManager: {}", e))
@@ -616,7 +637,7 @@ pub async fn init_storage_engine_manager(config_path_yaml: PathBuf) -> Result<()
     )))
         .map_err(|_| GraphError::StorageError("Failed to set StorageEngineManager: already initialized".to_string()))?;
     
-    info!("StorageEngineManager initialized successfully with engine: {:?}", storage_engine);
+    info!("StorageEngineManager initialized successfully with engine: {:?} on port {:?}", storage_engine, port);
     Ok(())
 }
 
