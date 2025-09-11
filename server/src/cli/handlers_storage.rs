@@ -382,7 +382,7 @@ pub async fn start_storage_interactive(
             |p| p.clone()
         );
         let engine_data_path = if storage_config.storage_engine_type == StorageEngineType::Sled {
-            data_dir_path.join(format!("sled_{}", selected_port))
+            data_dir_path.join("sled")
         } else {
             data_dir_path.join(&engine_path_name)
         };
@@ -575,7 +575,7 @@ pub async fn start_storage_interactive(
         let sled_path = storage_config.engine_specific_config
             .as_ref()
             .map(|c| c.storage.path.clone())
-            .unwrap_or_else(|| Some(PathBuf::from(DEFAULT_DATA_DIRECTORY).join(format!("sled_{}", selected_port))))
+            .unwrap_or_else(|| Some(PathBuf::from(DEFAULT_DATA_DIRECTORY).join("sled")))
             .ok_or_else(|| anyhow!("Sled path is None"))?;
         info!("Sled path set to {:?}", sled_path);
         println!("===> SLED PATH SET TO {:?}", sled_path);
@@ -685,7 +685,7 @@ pub async fn start_storage_interactive(
                 let base_path = storage_config_for_manager.data_directory
                     .clone()
                     .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
-                    .join(format!("sled_{}", selected_port));
+                    .join("sled");
                 engine_config.storage.path = Some(base_path);
             }
         }
@@ -725,7 +725,7 @@ pub async fn start_storage_interactive(
                 let base_path = storage_config_for_manager.data_directory
                     .clone()
                     .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
-                    .join(format!("sled_{}", selected_port));
+                    .join("sled");
                 engine_config.storage.path = Some(base_path);
             }
         }
@@ -1701,7 +1701,7 @@ pub async fn handle_use_storage_command(
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             if engine == StorageEngineType::Sled {
-                PathBuf::from(format!("{}/sled_{}", DEFAULT_DATA_DIRECTORY, new_port))
+                PathBuf::from(format!("{}/sled", DEFAULT_DATA_DIRECTORY))
             } else {
                 PathBuf::from(format!("{}/{}", DEFAULT_DATA_DIRECTORY, engine.to_string().to_lowercase()))
             }
@@ -1905,8 +1905,8 @@ pub async fn handle_use_storage_command(
         }
     } else {
         let lock_path = new_config.data_directory.as_ref()
-            .map(|d| PathBuf::from(d).join(format!("sled_{}", new_port)).join("db.lck"))
-            .unwrap_or_else(|| PathBuf::from(format!("/opt/graphdb/storage_data/sled_{}/db.lck", new_port)));
+            .map(|d| PathBuf::from(d).join("sled").join("db.lck"))
+            .unwrap_or_else(|| PathBuf::from(format!("/opt/graphdb/storage_data/sled/db.lck")));
         debug!("Checking Sled lock file at {:?}", lock_path);
         if lock_path.exists() {
             info!("Removing Sled lock file at {:?}", lock_path);
@@ -1977,7 +1977,7 @@ pub async fn handle_use_storage_command(
                 let base_path = port_specific_config.data_directory
                     .clone()
                     .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
-                    .join(format!("sled_{}", config_port));
+                    .join("sled");
                 engine_config.storage.path = Some(base_path);
             }
         }
@@ -2011,7 +2011,7 @@ pub async fn handle_use_storage_command(
                     let base_path = port_specific_config.data_directory
                         .clone()
                         .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
-                        .join(format!("sled_{}", port));
+                        .join("sled");
                     engine_config.storage.path = Some(base_path);
                 }
             }

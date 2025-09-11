@@ -560,20 +560,42 @@ pub async fn init_storage_engine_manager(config_path_yaml: PathBuf) -> Result<()
             StorageEngineType::TiKV => 2380,
             _ => 8052, // Default for Sled and others
         });
-
-    // Update Sled path to be port-specific
+    
+    // Normalize Sled path to remove port suffixes - use clean engine name
     if storage_engine == StorageEngineType::Sled {
         if let Some(ref mut engine_config) = config.engine_specific_config {
-            let base_path = config.data_directory
+            let base_data_dir = config.data_directory
                 .clone()
-                .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
-                .join(format!("sled_{}", port));
-            engine_config.storage.path = Some(base_path);
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY));
+            
+            // Use clean path without port suffix
+            let normalized_path = base_data_dir.join("sled");
+            
+            // Check if path needs updating (remove port suffixes)
+            let needs_update = engine_config.storage.path.as_ref()
+                .map(|current_path| current_path != &normalized_path)
+                .unwrap_or(true);
+                
+            if needs_update {
+                info!("Normalizing Sled path from {:?} to {:?}", 
+                      engine_config.storage.path, normalized_path);
+                
+                // Clean up any old port-suffixed directories
+                cleanup_legacy_sled_paths(&base_data_dir, port).await;
+                
+                engine_config.storage.path = Some(normalized_path);
+                engine_config.storage.port = Some(port);
+                
+                config.save().await
+                    .map_err(|e| GraphError::ConfigurationError(
+                        format!("Failed to save updated StorageConfig with normalized Sled path: {}", e)
+                    ))?;
+                    
+                info!("Updated and saved config with normalized Sled path");
+            }
         }
-        config.save().await
-            .map_err(|e| GraphError::ConfigurationError(format!("Failed to save updated StorageConfig with port-specific Sled path: {}", e)))?;
     }
-
+    
     debug!("Loaded storage_engine_type: {:?}, port: {:?}", storage_engine, port);
     
     // Initialize StorageEngineManager with the loaded storage_engine_type and port
@@ -591,6 +613,66 @@ pub async fn init_storage_engine_manager(config_path_yaml: PathBuf) -> Result<()
     
     info!("StorageEngineManager initialized successfully with engine: {:?} on port {:?}", storage_engine, port);
     Ok(())
+}
+
+/// Helper function to clean up legacy port-suffixed Sled directories
+async fn cleanup_legacy_sled_paths(base_data_dir: &Path, current_port: u16) {
+    info!("Cleaning up legacy port-suffixed Sled directories in {:?}", base_data_dir);
+    
+    if !base_data_dir.exists() {
+        return;
+    }
+    
+    if let Ok(entries) = tokio::fs::read_dir(base_data_dir).await {
+        let mut entries = entries;
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if let Some(name) = entry.file_name().to_str() {
+                // Look for directories matching pattern like "sled_8052", "sled_8053", etc.
+                if name.starts_with("sled_") && name != "sled" {
+                    if let Some(suffix) = name.strip_prefix("sled_") {
+                        if let Ok(old_port) = suffix.parse::<u16>() {
+                            let old_path = entry.path();
+                            info!("Found legacy Sled directory: {:?} (port {})", old_path, old_port);
+                            
+                            // Try to force unlock any database locks first
+                            let db_path = old_path.join("db");
+                            if db_path.exists() {
+                                // Attempt to force unlock the database
+                                if let Err(e) = SledStorage::force_unlock(&db_path).await {
+                                    warn!("Failed to force unlock Sled database at {:?}: {}", db_path, e);
+                                } else {
+                                    info!("Successfully unlocked Sled database at {:?}", db_path);
+                                }
+                            }
+                            
+                            // Attempt to remove the entire legacy directory
+                            match tokio::fs::remove_dir_all(&old_path).await {
+                                Ok(_) => {
+                                    info!("Successfully removed legacy Sled directory: {:?}", old_path);
+                                    
+                                    // Also clean up daemon registry entry for the old port if it exists
+                                    if let Ok(_) = GLOBAL_DAEMON_REGISTRY.unregister_daemon(old_port).await {
+                                        info!("Unregistered daemon registry entry for legacy port {}", old_port);
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Failed to remove legacy Sled directory {:?}: {}", old_path, e);
+                                    // If we can't remove it, at least try to clean up the registry
+                                    if let Ok(_) = GLOBAL_DAEMON_REGISTRY.unregister_daemon(old_port).await {
+                                        info!("Unregistered daemon registry entry for legacy port {} (directory removal failed)", old_port);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        warn!("Could not read directory entries from {:?}", base_data_dir);
+    }
+    
+    info!("Completed cleanup of legacy port-suffixed Sled directories");
 }
 
 #[cfg(feature = "with-sled")]
@@ -1098,150 +1180,71 @@ impl StorageEngineManager {
         debug!("Loaded config: {:?}", config);
         println!("IN StorageEngineManager new - STEP 4 - {:?}", config);
 
-        // Step 4: Extract and validate port
+        // Step 4: Extract and validate port with simplified logic
         let selected_port = port.unwrap_or_else(|| {
-            if let Some(sled_config_map) = &config.engine_specific_config {
-                let port = sled_config_map.storage.port.unwrap_or_else(|| {
-                    if config.default_port != 0 {
-                        info!("No valid port in engine_specific_config, using default_port: {}", config.default_port);
-                        println!("===> NO VALID PORT IN ENGINE_SPECIFIC_CONFIG, USING DEFAULT_PORT: {}", config.default_port);
-                        config.default_port
-                    } else {
-                        warn!("No valid port in engine_specific_config and default_port is 0, using DEFAULT_STORAGE_PORT: {}", DEFAULT_STORAGE_PORT);
-                        println!("===> NO VALID PORT IN ENGINE_SPECIFIC_CONFIG AND DEFAULT_PORT IS 0, USING DEFAULT_STORAGE_PORT: {}", DEFAULT_STORAGE_PORT);
-                        DEFAULT_STORAGE_PORT
-                    }
-                });
-                info!("Using engine-specific port from config: {}", port);
-                println!("===> USING ENGINE-SPECIFIC PORT FROM CONFIG: {}", port);
-                port
-            } else {
-                let port = if config.default_port != 0 {
-                    info!("No engine-specific config found, using default_port: {}", config.default_port);
-                    println!("===> NO ENGINE-SPECIFIC CONFIG FOUND, USING DEFAULT_PORT: {}", config.default_port);
-                    config.default_port
-                } else {
-                    warn!("No engine-specific config found and default_port is 0, using DEFAULT_STORAGE_PORT: {}", DEFAULT_STORAGE_PORT);
-                    println!("===> NO ENGINE-SPECIFIC CONFIG FOUND AND DEFAULT_PORT IS 0, USING DEFAULT_STORAGE_PORT: {}", DEFAULT_STORAGE_PORT);
-                    DEFAULT_STORAGE_PORT
-                };
-                port
+            // Try engine-specific config first
+            if let Some(ref engine_config) = config.engine_specific_config {
+                if let Some(config_port) = engine_config.storage.port {
+                    info!("Using engine-specific port from config: {}", config_port);
+                    println!("===> USING ENGINE-SPECIFIC PORT FROM CONFIG: {}", config_port);
+                    return config_port;
+                }
             }
+            
+            // Fall back to default port
+            let fallback_port = if config.default_port != 0 {
+                info!("Using default_port: {}", config.default_port);
+                println!("===> USING DEFAULT_PORT: {}", config.default_port);
+                config.default_port
+            } else {
+                warn!("Using DEFAULT_STORAGE_PORT: {}", DEFAULT_STORAGE_PORT);
+                println!("===> USING DEFAULT_STORAGE_PORT: {}", DEFAULT_STORAGE_PORT);
+                DEFAULT_STORAGE_PORT
+            };
+            
+            fallback_port
         });
 
         if selected_port == 0 || selected_port > 65535 {
-            error!(" instalacji port {} specified", selected_port);
+            error!("Invalid port {} specified", selected_port);
             return Err(GraphError::StorageError(format!("Invalid port {}: must be between 1 and 65535", selected_port)));
         }
         info!("Selected port: {}", selected_port);
         println!("===> SELECTED PORT {} WHILE CONFIG {:?}", selected_port, config);
 
-        // Update config with port-specific path for Sled
-        if storage_engine == StorageEngineType::Sled {
-            if let Some(ref mut engine_config) = config.engine_specific_config {
-                engine_config.storage.port = Some(selected_port);
-                let base_path = config.data_directory
-                    .clone()
-                    .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
-                    .join(format!("sled_{}", selected_port));
-                engine_config.storage.path = Some(base_path);
+        // Step 4.1: Update config with normalized paths (remove old port suffixes)
+        if let Some(ref mut engine_config) = config.engine_specific_config {
+            engine_config.storage.port = Some(selected_port);
+            
+            // Get base data directory
+            let base_data_dir = config.data_directory
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY));
+            
+            // Create clean engine-specific path WITHOUT port suffixes
+            let clean_engine_path = base_data_dir.join(storage_engine.to_string().to_lowercase());
+                        
+            // Update the config path
+            engine_config.storage.path = Some(clean_engine_path.clone());
+            
+            info!("Normalized storage path to: {:?}", clean_engine_path);
+            
+            // Clean up any old port-suffixed directories for the same engine type
+            if storage_engine == StorageEngineType::Sled {
+                Self::cleanup_old_port_directories(&base_data_dir, "sled", selected_port).await;
             }
         }
 
-        // Step 5: Check for port conflicts and clean up
-        if let Some(metadata) = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(selected_port).await? {
-            if !NonBlockingDaemonRegistry::is_pid_running(metadata.pid).await.unwrap_or(false) {
-                warn!("Stale storage process registered on port {}. Attempting cleanup.", selected_port);
-                GLOBAL_DAEMON_REGISTRY.unregister_daemon(selected_port).await?;
-                if storage_engine == StorageEngineType::Sled {
-                    let sled_path = config.data_directory
-                        .clone()
-                        .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
-                        .join(format!("sled_{}", selected_port))
-                        .join("db");
-                    if let Err(e) = SledStorage::force_unlock(&sled_path).await {
-                        warn!("Failed to unlock Sled storage at {:?}: {}", sled_path, e);
-                    } else {
-                        info!("Successfully unlocked Sled storage at {:?}", sled_path);
-                    }
-                }
-            } else {
-                info!("Active storage process found on port {}. Skipping cleanup.", selected_port);
-            }
+        // Step 5: Check for port conflicts and clean up with reduced lock contention
+        let cleanup_result = Self::handle_port_conflicts(storage_engine, &config, selected_port).await;
+        if let Err(e) = cleanup_result {
+            warn!("Port conflict cleanup encountered issues: {}", e);
+            // Don't fail here, just warn - we'll try to proceed
         }
         println!("IN StorageEngineManager new - STEP 5");
 
         // Step 6: Ensure daemon registry directory
-        let registry_path = PathBuf::from(DAEMON_REGISTRY_DB_PATH);
-        debug!("Attempting to create daemon registry directory for path: {:?}", registry_path);
-        if let Some(parent) = registry_path.parent() {
-            debug!("Checking parent directory: {:?}", parent);
-            if !parent.exists() {
-                debug!("Parent directory does not exist, attempting to create: {:?}", parent);
-                let max_retries = 3;
-                for attempt in 1..=max_retries {
-                    match fs::create_dir_all(parent).await {
-                        Ok(_) => {
-                            debug!("Successfully created daemon registry directory: {:?}", parent);
-                            break;
-                        }
-                        Err(e) => {
-                            error!(
-                                "Failed to create daemon registry directory {:?} on attempt {}/{}: {}",
-                                parent, attempt, max_retries, e
-                            );
-                            if parent.exists() {
-                                if let Ok(metadata) = fs::metadata(parent).await {
-                                    error!("Parent directory exists with permissions: {:?}", metadata.permissions());
-                                }
-                            } else {
-                                error!("Parent directory does not exist: {:?}", parent);
-                            }
-                            if attempt == max_retries {
-                                let fallback_path = PathBuf::from("/tmp/graphdb/daemon_registry.db");
-                                warn!("Falling back to registry path: {:?}", fallback_path);
-                                if let Some(fallback_parent) = fallback_path.parent() {
-                                    fs::create_dir_all(fallback_parent)
-                                        .await
-                                        .map_err(|e| {
-                                            error!("Failed to create fallback registry directory {:?}: {}", fallback_parent, e);
-                                            GraphError::Io(e)
-                                        })?;
-                                    debug!("Successfully created fallback registry directory: {:?}", fallback_parent);
-                                }
-                                break;
-                            }
-                            sleep(TokioDuration::from_millis(500 * attempt as u64)).await;
-                        }
-                    }
-                }
-            } else {
-                if let Ok(metadata) = fs::metadata(parent).await {
-                    if metadata.permissions().readonly() {
-                        error!("Parent directory {:?} is not writable", parent);
-                        let fallback_path = PathBuf::from("/tmp/graphdb/daemon_registry.db");
-                        warn!("Falling back to registry path: {:?}", fallback_path);
-                        if let Some(fallback_parent) = fallback_path.parent() {
-                            fs::create_dir_all(fallback_parent)
-                                .await
-                                .map_err(|e| {
-                                    error!("Failed to create fallback registry directory {:?}: {}", fallback_parent, e);
-                                    GraphError::Io(e)
-                                })?;
-                            debug!("Successfully created fallback registry directory: {:?}", fallback_parent);
-                        }
-                    } else {
-                        debug!("Parent directory is writable: {:?}", parent);
-                    }
-                }
-            }
-        } else {
-            error!("Registry path has no parent: {:?}", registry_path);
-            return Err(GraphError::ConfigurationError(format!(
-                "Invalid registry path: {:?}", registry_path
-            )));
-        }
-        debug!("Ensured daemon registry directory exists: {:?}", registry_path);
+        Self::ensure_daemon_registry_directory().await?;
         println!("IN StorageEngineManager new - STEP 6");
 
         // Step 7: Initialize storage engine
@@ -1425,6 +1428,218 @@ impl StorageEngineManager {
             })
     }
 
+    // Helper method to clean up old port-suffixed directories
+    async fn cleanup_old_port_directories(base_dir: &Path, engine_prefix: &str, current_port: u16) {
+        if let Ok(entries) = tokio::fs::read_dir(base_dir).await {
+            let mut entries = entries;
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if let Some(name) = entry.file_name().to_str() {
+                    // Look for directories matching pattern like "sled_8052", "sled_8053", etc.
+                    if name.starts_with(&format!("{}_", engine_prefix)) && name != format!("{}_{}", engine_prefix, current_port) {
+                        if let Ok(path) = entry.path().canonicalize() {
+                            // Check if this looks like an old port directory
+                            if let Some(suffix) = name.strip_prefix(&format!("{}_", engine_prefix)) {
+                                if suffix.parse::<u16>().is_ok() {
+                                    // This looks like an old port directory
+                                    match tokio::fs::remove_dir_all(&path).await {
+                                        Ok(_) => info!("Cleaned up old storage directory: {:?}", path),
+                                        Err(e) => warn!("Failed to clean up old storage directory {:?}: {}", path, e),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+
+    // Helper method to handle port conflicts with reduced lock contention
+    async fn handle_port_conflicts(
+        storage_engine: StorageEngineType,
+        config: &StorageConfig,
+        selected_port: u16,
+    ) -> Result<(), GraphError> {
+        if let Some(metadata) = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(selected_port).await? {
+            if !NonBlockingDaemonRegistry::is_pid_running(metadata.pid).await.unwrap_or(false) {
+                warn!("Stale storage process registered on port {}. Attempting cleanup.", selected_port);
+                GLOBAL_DAEMON_REGISTRY.unregister_daemon(selected_port).await?;
+                
+                if storage_engine == StorageEngineType::Sled {
+                    // Get the actual configured path (without port suffix)
+                    let sled_path = if let Some(ref engine_config) = config.engine_specific_config {
+                        engine_config.storage.path.clone()
+                            .unwrap_or_else(|| {
+                                config.data_directory
+                                    .clone()
+                                    .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
+                                    .join("sled")
+                            })
+                    } else {
+                        config.data_directory
+                            .clone()
+                            .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
+                            .join("sled")
+                    };
+                    
+                    let sled_db_path = sled_path.join("db");
+                    
+                    // Also check for legacy port-suffixed paths and clean them up
+                    let base_data_dir = config.data_directory
+                        .clone()
+                        .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY));
+                    
+                    // Try to unlock the current configured path
+                    if sled_db_path.exists() {
+                        if let Err(e) = SledStorage::force_unlock(&sled_db_path).await {
+                            warn!("Failed to unlock Sled storage at {:?}: {}", sled_db_path, e);
+                        } else {
+                            info!("Successfully unlocked Sled storage at {:?}", sled_db_path);
+                        }
+                    }
+                    
+                    // Also check for and clean up any legacy port-suffixed paths
+                    Self::cleanup_legacy_port_conflicts(&base_data_dir, selected_port).await;
+                }
+            } else {
+                info!("Active storage process found on port {}. Skipping cleanup.", selected_port);
+            }
+        }
+        Ok(())
+    }
+
+    // Helper method to clean up legacy port-suffixed database locks
+    async fn cleanup_legacy_port_conflicts(base_data_dir: &Path, current_port: u16) {
+        if !base_data_dir.exists() {
+            return;
+        }
+        
+        info!("Checking for legacy port-suffixed Sled databases to unlock in {:?}", base_data_dir);
+        
+        if let Ok(entries) = tokio::fs::read_dir(base_data_dir).await {
+            let mut entries = entries;
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if let Some(name) = entry.file_name().to_str() {
+                    // Look for directories matching pattern like "sled_8052", "sled_8053", etc.
+                    if name.starts_with("sled_") && name != "sled" {
+                        if let Some(suffix) = name.strip_prefix("sled_") {
+                            if let Ok(legacy_port) = suffix.parse::<u16>() {
+                                let legacy_sled_path = entry.path();
+                                let legacy_db_path = legacy_sled_path.join("db");
+                                
+                                if legacy_db_path.exists() {
+                                    info!("Found legacy Sled database at {:?} (port {})", legacy_db_path, legacy_port);
+                                    
+                                    // Try to force unlock the legacy database
+                                    if let Err(e) = SledStorage::force_unlock(&legacy_db_path).await {
+                                        warn!("Failed to unlock legacy Sled storage at {:?}: {}", legacy_db_path, e);
+                                    } else {
+                                        info!("Successfully unlocked legacy Sled storage at {:?}", legacy_db_path);
+                                        
+                                        // If we successfully unlocked it, try to remove the entire legacy directory
+                                        match tokio::fs::remove_dir_all(&legacy_sled_path).await {
+                                            Ok(_) => info!("Removed legacy Sled directory: {:?}", legacy_sled_path),
+                                            Err(e) => warn!("Failed to remove legacy Sled directory {:?}: {}", legacy_sled_path, e),
+                                        }
+                                    }
+                                    
+                                    // Also clean up daemon registry for the legacy port
+                                    if let Ok(_) = GLOBAL_DAEMON_REGISTRY.unregister_daemon(legacy_port).await {
+                                        info!("Unregistered legacy daemon registry entry for port {}", legacy_port);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Helper method to ensure daemon registry directory exists
+    async fn ensure_daemon_registry_directory() -> Result<(), GraphError> {
+        let registry_path = PathBuf::from(DAEMON_REGISTRY_DB_PATH);
+        debug!("Attempting to create daemon registry directory for path: {:?}", registry_path);
+        
+        if let Some(parent) = registry_path.parent() {
+            debug!("Checking parent directory: {:?}", parent);
+            if !parent.exists() {
+                debug!("Parent directory does not exist, attempting to create: {:?}", parent);
+                let max_retries = 3;
+                
+                for attempt in 1..=max_retries {
+                    match fs::create_dir_all(parent).await {
+                        Ok(_) => {
+                            debug!("Successfully created daemon registry directory: {:?}", parent);
+                            break;
+                        }
+                        Err(e) => {
+                            error!(
+                                "Failed to create daemon registry directory {:?} on attempt {}/{}: {}",
+                                parent, attempt, max_retries, e
+                            );
+                            
+                            if parent.exists() {
+                                if let Ok(metadata) = fs::metadata(parent).await {
+                                    error!("Parent directory exists with permissions: {:?}", metadata.permissions());
+                                }
+                            } else {
+                                error!("Parent directory does not exist: {:?}", parent);
+                            }
+                            
+                            if attempt == max_retries {
+                                let fallback_path = PathBuf::from("/tmp/graphdb/daemon_registry.db");
+                                warn!("Falling back to registry path: {:?}", fallback_path);
+                                
+                                if let Some(fallback_parent) = fallback_path.parent() {
+                                    fs::create_dir_all(fallback_parent)
+                                        .await
+                                        .map_err(|e| {
+                                            error!("Failed to create fallback registry directory {:?}: {}", fallback_parent, e);
+                                            GraphError::Io(e)
+                                        })?;
+                                    debug!("Successfully created fallback registry directory: {:?}", fallback_parent);
+                                }
+                                break;
+                            }
+                            
+                            sleep(TokioDuration::from_millis(500 * attempt as u64)).await;
+                        }
+                    }
+                }
+            } else {
+                if let Ok(metadata) = fs::metadata(parent).await {
+                    if metadata.permissions().readonly() {
+                        error!("Parent directory {:?} is not writable", parent);
+                        let fallback_path = PathBuf::from("/tmp/graphdb/daemon_registry.db");
+                        warn!("Falling back to registry path: {:?}", fallback_path);
+                        
+                        if let Some(fallback_parent) = fallback_path.parent() {
+                            fs::create_dir_all(fallback_parent)
+                                .await
+                                .map_err(|e| {
+                                    error!("Failed to create fallback registry directory {:?}: {}", fallback_parent, e);
+                                    GraphError::Io(e)
+                                })?;
+                            debug!("Successfully created fallback registry directory: {:?}", fallback_parent);
+                        }
+                    } else {
+                        debug!("Parent directory is writable: {:?}", parent);
+                    }
+                }
+            }
+        } else {
+            error!("Registry path has no parent: {:?}", registry_path);
+            return Err(GraphError::ConfigurationError(format!(
+                "Invalid registry path: {:?}", registry_path
+            )));
+        }
+        
+        debug!("Ensured daemon registry directory exists: {:?}", registry_path);
+        Ok(())
+    }
+
     async fn create_default_config(
         storage_engine: StorageEngineType,
         config_path_yaml: &Path,
@@ -1541,18 +1756,29 @@ impl StorageEngineManager {
 
         let sled_config_inner = config.engine_specific_config.as_ref().map(|c| &c.storage);
 
-        // Build SledConfig
+        // Get port from config
         let port = sled_config_inner
             .and_then(|c| c.port)
             .unwrap_or(DEFAULT_STORAGE_PORT);
-        let sled_config = SledConfig {
-            storage_engine_type: StorageEngineType::Sled,
-            path: sled_config_inner
-                .and_then(|c| c.path.clone())
-                .unwrap_or_else(|| config.data_directory
+
+        // Use the path directly from config - no more automatic port suffixing
+        let sled_path = sled_config_inner
+            .and_then(|c| c.path.clone())
+            .unwrap_or_else(|| {
+                // Only fall back to port-suffixed path if no path is configured
+                config.data_directory
                     .clone()
                     .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
-                    .join(format!("sled_{}", port))),
+                    .join("sled") // Use simple "sled" without port suffix
+            });
+
+        info!("Using Sled path: {:?} for port: {}", sled_path, port);
+        println!("===> USING SLED PATH: {:?} FOR PORT: {}", sled_path, port);
+
+        // Build SledConfig
+        let sled_config = SledConfig {
+            storage_engine_type: StorageEngineType::Sled,
+            path: sled_path.clone(),
             host: sled_config_inner
                 .and_then(|c| c.host.clone()),
             port: Some(port),
@@ -1566,6 +1792,11 @@ impl StorageEngineManager {
                 .and_then(|c| c.cache_capacity)
                 .or_else(|| SledConfig::default().cache_capacity),
         };
+
+        // Clean up any old port-suffixed directories if they exist
+        if let Some(parent_dir) = sled_path.parent() {
+            Self::cleanup_legacy_sled_directories(parent_dir, port).await;
+        }
 
         // Ensure path exists
         if !sled_config.path.exists() {
@@ -1592,16 +1823,45 @@ impl StorageEngineManager {
             })
             .await;
 
-        // Check daemon registry for existing daemon on port
-        if let Some(selected_port) = sled_config.port {
-            if let Some(metadata) = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(selected_port).await? {
-                info!("Found existing daemon on port {} at path {:?}", selected_port, metadata.data_dir);
-                println!("===> FOUND EXISTING DAEMON ON PORT {} AT PATH {:?}", selected_port, metadata.data_dir);
-                let mut singleton_guard = singleton_map.lock().await;
-                if let Some(existing_storage) = singleton_guard.get(&selected_port) {
-                    info!("Returning existing Sled singleton instance on port {}", selected_port);
-                    println!("===> RETURNING EXISTING SLED SINGLETON INSTANCE ON PORT {}", selected_port);
-                    return Ok(existing_storage.clone());
+        // Check if we already have an instance for this port
+        {
+            let singleton_guard = singleton_map.lock().await;
+            if let Some(existing_storage) = singleton_guard.get(&port_key) {
+                info!("Returning existing Sled singleton instance on port {}", port_key);
+                println!("===> RETURNING EXISTING SLED SINGLETON INSTANCE ON PORT {}", port_key);
+                return Ok(existing_storage.clone());
+            }
+        }
+
+        // Check daemon registry for existing daemon on port and handle path mismatches
+        if let Some(metadata) = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port_key).await? {
+            info!("Found existing daemon metadata on port {} at path {:?}", port_key, metadata.data_dir);
+            println!("===> FOUND EXISTING DAEMON METADATA ON PORT {} AT PATH {:?}", port_key, metadata.data_dir);
+            
+            // Check if the registered path matches our current path
+            if let Some(registered_path) = &metadata.data_dir {
+                if registered_path != &sled_path {
+                    warn!("Path mismatch: daemon registry shows {:?}, but config specifies {:?}", registered_path, sled_path);
+                    println!("===> PATH MISMATCH: DAEMON REGISTRY SHOWS {:?}, BUT CONFIG SPECIFIES {:?}", registered_path, sled_path);
+                    
+                    // Check if the old path exists and try to migrate/cleanup
+                    if registered_path.exists() {
+                        warn!("Old Sled path {:?} still exists. Attempting cleanup.", registered_path);
+                        
+                        // Try to force unlock the old path if it's a Sled database
+                        let old_db_path = registered_path.join("db");
+                        if old_db_path.exists() {
+                            if let Err(e) = SledStorage::force_unlock(&old_db_path).await {
+                                warn!("Failed to unlock old Sled storage at {:?}: {}", old_db_path, e);
+                            } else {
+                                info!("Successfully unlocked old Sled storage at {:?}", old_db_path);
+                            }
+                        }
+                    }
+                    
+                    // Unregister the old daemon entry
+                    GLOBAL_DAEMON_REGISTRY.unregister_daemon(port_key).await?;
+                    info!("Unregistered old daemon entry for port {}", port_key);
                 }
             }
         }
@@ -1616,20 +1876,45 @@ impl StorageEngineManager {
             Err(e) => {
                 error!("Failed to initialize Sled storage on port {:?}: {}", sled_config.port, e);
                 println!("===> ERROR: FAILED TO INITIALIZE SLED STORAGE ON PORT {:?}: {}", sled_config.port, e);
-                return Err(e);
+                
+                // If it's a lock error, try to force unlock and retry once
+                if e.to_string().contains("could not acquire lock") {
+                    warn!("Lock contention detected, attempting force unlock and retry");
+                    let db_path = sled_path.join("db");
+                    if let Ok(_) = SledStorage::force_unlock(&db_path).await {
+                        info!("Force unlock successful, retrying initialization");
+                        match SledStorage::new(&sled_config).await {
+                            Ok(storage) => {
+                                info!("Successfully initialized Sled storage after unlock retry");
+                                println!("===> SUCCESSFULLY INITIALIZED SLED STORAGE AFTER UNLOCK RETRY");
+                                Arc::new(storage)
+                            }
+                            Err(retry_error) => {
+                                error!("Retry after unlock also failed: {}", retry_error);
+                                return Err(retry_error);
+                            }
+                        }
+                    } else {
+                        return Err(e);
+                    }
+                } else {
+                    return Err(e);
+                }
             }
         };
 
         // Store in singleton map
-        let mut singleton_guard = singleton_map.lock().await;
-        singleton_guard.insert(port_key, sled_instance.clone());
+        {
+            let mut singleton_guard = singleton_map.lock().await;
+            singleton_guard.insert(port_key, sled_instance.clone());
+        }
 
         // Register SIGTERM handler for graceful shutdown
         #[cfg(unix)]
         {
             use tokio::signal::unix::{signal, SignalKind};
             let sled_instance_clone = sled_instance.clone();
-            let port_key = port_key;
+            let singleton_map_clone = singleton_map.clone();
             tokio::spawn(async move {
                 let mut sigterm = signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
                 sigterm.recv().await;
@@ -1639,7 +1924,7 @@ impl StorageEngineManager {
                     error!("Failed to close Sled instance on SIGTERM for port {}: {}", port_key, e);
                     println!("===> ERROR: FAILED TO CLOSE SLED INSTANCE ON SIGTERM FOR PORT {}: {}", port_key, e);
                 }
-                let mut singleton_guard = singleton_map.lock().await;
+                let mut singleton_guard = singleton_map_clone.lock().await;
                 singleton_guard.remove(&port_key);
                 info!("Sled instance closed gracefully for port {}", port_key);
                 println!("===> SLED INSTANCE CLOSED GRACEFULLY FOR PORT {}", port_key);
@@ -1649,6 +1934,41 @@ impl StorageEngineManager {
         info!("Successfully initialized and stored Sled singleton instance on port {:?}", sled_config.port);
         println!("===> SUCCESSFULLY INITIALIZED AND STORED SLED SINGLETON INSTANCE ON PORT {:?}", sled_config.port);
         Ok(sled_instance as Arc<dyn GraphStorageEngine + Send + Sync>)
+    }
+
+    // Helper method to cleanup legacy port-suffixed Sled directories
+    async fn cleanup_legacy_sled_directories(parent_dir: &Path, current_port: u16) {
+        info!("Checking for legacy Sled directories in {:?}", parent_dir);
+        
+        if let Ok(entries) = tokio::fs::read_dir(parent_dir).await {
+            let mut entries = entries;
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if let Some(name) = entry.file_name().to_str() {
+                    // Look for directories matching pattern like "sled_8052", "sled_8053", etc.
+                    if name.starts_with("sled_") && name != "sled" {
+                        if let Some(suffix) = name.strip_prefix("sled_") {
+                            if let Ok(port) = suffix.parse::<u16>() {
+                                info!("Found legacy Sled directory: {:?} (port {})", entry.path(), port);
+                                
+                                // Try to unlock the database first
+                                let db_path = entry.path().join("db");
+                                if db_path.exists() {
+                                    if let Ok(_) = SledStorage::force_unlock(&db_path).await {
+                                        info!("Force unlocked legacy Sled database at {:?}", db_path);
+                                    }
+                                }
+                                
+                                // Attempt to remove the legacy directory
+                                match tokio::fs::remove_dir_all(&entry.path()).await {
+                                    Ok(_) => info!("Cleaned up legacy Sled directory: {:?}", entry.path()),
+                                    Err(e) => warn!("Failed to clean up legacy Sled directory {:?}: {}", entry.path(), e),
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[cfg(feature = "with-tikv")]
@@ -2305,7 +2625,7 @@ impl StorageEngineManager {
         }
         let engine_type = engine.engine_type.clone(); // Extract engine_type before dropping the lock
         drop(engine); // Release the lock
-
+        
         // Extract port from config or use default
         let port = self.config.engine_specific_config
             .as_ref()
@@ -2314,31 +2634,115 @@ impl StorageEngineManager {
                 StorageEngineType::TiKV => 2380,
                 _ => 8052,
             });
-
-        // Update Sled path to be port-specific
+        
+        // Normalize Sled path to remove port suffixes
         if engine_type == StorageEngineType::Sled {
             if let Some(ref mut engine_config) = self.config.engine_specific_config {
-                let base_path = self.config.data_directory
+                let base_data_dir = self.config.data_directory
                     .clone()
-                    .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
-                    .join(format!("sled_{}", port));
-                engine_config.storage.path = Some(base_path);
+                    .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY));
+                
+                // Use clean path without port suffix
+                let normalized_path = base_data_dir.join("sled");
+                
+                // Check if path needs updating (remove port suffixes)
+                let needs_update = engine_config.storage.path.as_ref()
+                    .map(|current_path| current_path != &normalized_path)
+                    .unwrap_or(true);
+                    
+                if needs_update {
+                    info!("Normalizing Sled path during reset from {:?} to {:?}", 
+                          engine_config.storage.path, normalized_path);
+                    
+                    // Clean up any legacy port-suffixed directories
+                    Self::cleanup_legacy_sled_directories_during_reset(&base_data_dir, port).await;
+                    
+                    engine_config.storage.path = Some(normalized_path);
+                    engine_config.storage.port = Some(port);
+                    
+                    self.config.save().await
+                        .map_err(|e| GraphError::ConfigurationError(
+                            format!("Failed to save updated StorageConfig with normalized Sled path during reset: {}", e)
+                        ))?;
+                        
+                    info!("Updated and saved config with normalized Sled path during reset");
+                }
             }
-            self.config.save().await
-                .map_err(|e| GraphError::ConfigurationError(format!("Failed to save updated StorageConfig with port-specific Sled path: {}", e)))?;
         }
-
+        
         let new_manager = StorageEngineManager::new(engine_type, &self.config_path, self.session_engine_type.is_none(), Some(port)).await
             .map_err(|e| {
                 error!("Failed to create new StorageEngineManager: {}", e);
                 GraphError::StorageError(format!("Failed to reset StorageEngineManager: {}", e))
             })?;
+        
         self.engine = new_manager.engine.clone();
         self.persistent_engine = new_manager.persistent_engine.clone();
         self.session_engine_type = new_manager.session_engine_type;
         self.config = new_manager.config.clone();
+        
         info!("StorageEngineManager reset completed with engine: {:?} on port {:?}", engine_type, port);
         Ok(())
+    }
+
+
+    /// Helper method to clean up legacy Sled directories during reset
+    async fn cleanup_legacy_sled_directories_during_reset(base_data_dir: &Path, current_port: u16) {
+        info!("Cleaning up legacy port-suffixed Sled directories during reset in {:?}", base_data_dir);
+        
+        if !base_data_dir.exists() {
+            return;
+        }
+        
+        if let Ok(entries) = tokio::fs::read_dir(base_data_dir).await {
+            let mut entries = entries;
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if let Some(name) = entry.file_name().to_str() {
+                    // Look for directories matching pattern like "sled_8052", "sled_8053", etc.
+                    if name.starts_with("sled_") && name != "sled" {
+                        if let Some(suffix) = name.strip_prefix("sled_") {
+                            if let Ok(old_port) = suffix.parse::<u16>() {
+                                let old_path = entry.path();
+                                info!("Found legacy Sled directory during reset: {:?} (port {})", old_path, old_port);
+                                
+                                // Try to force unlock any database locks first
+                                let db_path = old_path.join("db");
+                                if db_path.exists() {
+                                    if let Err(e) = SledStorage::force_unlock(&db_path).await {
+                                        warn!("Failed to force unlock Sled database during reset at {:?}: {}", db_path, e);
+                                    } else {
+                                        info!("Successfully unlocked Sled database during reset at {:?}", db_path);
+                                    }
+                                }
+                                
+                                // Attempt to remove the entire legacy directory
+                                match tokio::fs::remove_dir_all(&old_path).await {
+                                    Ok(_) => {
+                                        info!("Successfully removed legacy Sled directory during reset: {:?}", old_path);
+                                        
+                                        // Also clean up daemon registry entry for the old port if it exists
+                                        if let Ok(_) = GLOBAL_DAEMON_REGISTRY.unregister_daemon(old_port).await {
+                                            info!("Unregistered daemon registry entry for legacy port {} during reset", old_port);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to remove legacy Sled directory during reset {:?}: {}", old_path, e);
+                                        // If we can't remove it, at least try to clean up the registry
+                                        if let Ok(_) = GLOBAL_DAEMON_REGISTRY.unregister_daemon(old_port).await {
+                                            info!("Unregistered daemon registry entry for legacy port {} during reset (directory removal failed)", old_port);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            warn!("Could not read directory entries from {:?} during reset", base_data_dir);
+        }
+        
+        info!("Completed cleanup of legacy port-suffixed Sled directories during reset");
     }
 
     pub fn get_persistent_engine(&self) -> Arc<dyn GraphStorageEngine + Send + Sync> {
@@ -3067,3 +3471,5 @@ impl StorageEngineManager {
     }
 
 }
+
+
