@@ -155,7 +155,7 @@ pub async fn create_storage(config: &StorageConfig) -> Result<Arc<dyn GraphStora
                                 },
                             };
 
-                            match SledStorage::new(&sled_config).await {
+                            match SledStorage::new(&sled_config, &config).await {
                                 Ok(storage) => {
                                     info!("Created Sled storage for Hybrid");
                                     Arc::new(storage)
@@ -266,7 +266,7 @@ pub async fn create_storage(config: &StorageConfig) -> Result<Arc<dyn GraphStora
                     },
                 };
 
-                match SledStorage::new(&sled_config).await {
+                match SledStorage::new(&sled_config, &config).await {
                     Ok(storage) => {
                         info!("Created Sled storage");
                         Arc::new(storage)

@@ -10,7 +10,7 @@ use std::fs;
 use tokio::task::JoinHandle;
 use tokio::sync::{oneshot, Mutex as TokioMutex};
 use tokio::time::{self, timeout, Duration as TokioDuration};
-use lib::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
+use lib::daemon::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
 use lib::query_exec_engine::query_exec_engine::QueryExecEngine;
 use lib::query_parser::{parse_query_from_string, QueryType};
 use lib::config::{StorageEngineType, DEFAULT_STORAGE_CONFIG_PATH_RELATIVE, default_data_directory, default_log_directory};
@@ -20,10 +20,11 @@ use lib::storage_engine::storage_engine::{AsyncStorageEngineManager, StorageEngi
 use lib::commands::parse_kv_operation;
 use lib::config::{StorageConfig, MAX_SHUTDOWN_RETRIES, SHUTDOWN_RETRY_DELAY_MS, load_storage_config_from_yaml};
 use crate::cli::handlers_storage::{start_storage_interactive, stop_storage_interactive};
-use crate::cli::daemon_management::is_storage_daemon_running;
+pub use crate::cli::daemon_management::is_storage_daemon_running;
 pub use models::errors::GraphError;
 pub use lib::config::config_defaults::default_config_root_directory;
 use zmq::{Context as ZmqContext};
+use zmq::Error::EPROTO;
 
 async fn execute_and_print(engine: &Arc<QueryExecEngine>, query_string: &str) -> Result<()> {
     match engine.execute(query_string).await {
@@ -208,8 +209,16 @@ pub async fn handle_kv_command(engine: Arc<QueryExecEngine>, operation: String, 
     }
 }
 
+// =============================================================================
+// CLIENT SIDE FIXES (handlers_queries.rs)
+// =============================================================================
+
 async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str) -> Result<()> {
-    const READ_TIMEOUT_SECS: u64 = 5;
+    const CONNECT_TIMEOUT_SECS: u64 = 3;
+    const REQUEST_TIMEOUT_SECS: u64 = 10;
+    const RECEIVE_TIMEOUT_SECS: u64 = 15;
+
+    println!("===> STARTING ZMQ KV OPERATION: {} for key: {}", operation, key);
 
     let registry = GLOBAL_DAEMON_REGISTRY.get().await;
     let daemons = registry
@@ -220,28 +229,32 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
         .filter(|metadata| metadata.engine_type == Some(StorageEngineType::Sled.to_string()))
         .collect::<Vec<_>>();
 
-    let daemon = daemons
-        .iter()
-        .find(|d| d.port == 8051)
-        .or_else(|| daemons.iter().find(|d| d.port == 8050))
-        .or_else(|| daemons.iter().find(|d| d.port == 8049))
-        .or_else(|| daemons.first());
+    println!("===> FOUND {} SLED DAEMONS", daemons.len());
 
-    let port = match daemon {
-        Some(metadata) => metadata.port,
+    // Simply take the first available Sled daemon from the registry
+    let daemon = daemons.first();
+
+    match daemon {
+        Some(metadata) => {
+            println!("===> SELECTED DAEMON ON PORT: {}", metadata.port);
+        },
         None => {
             return Err(anyhow!("No running Sled daemon found. Please start a daemon with 'storage start'"));
         }
     };
 
-    let context = ZmqContext::new();
-    let requester = context.socket(zmq::REQ)
-        .map_err(|e| anyhow!("Failed to create ZeroMQ socket: {}", e))?;
-    let addr = format!("ipc://graphdb_{}.ipc", port);
-    info!("Connecting to Sled daemon at {}", addr);
-    requester.connect(&addr)
-        .map_err(|e| anyhow!("Failed to connect to {}: {}", addr, e))?;
+    // Use the standard IPC socket path for all GraphDB communication
+    let socket_path = "/opt/graphdb/pgraphdb.ipc";
+    let addr = format!("ipc://{}", socket_path);
+    
+    // Check if socket file exists
+    if !tokio::fs::metadata(&socket_path).await.is_ok() {
+        return Err(anyhow!("IPC socket file {} does not exist. Daemon may not be running properly.", socket_path));
+    }
 
+    println!("===> CONNECTING TO SLED DAEMON AT: {}", addr);
+
+    // Prepare request
     let request = match operation {
         "set" => {
             if let Some(ref value) = value {
@@ -255,49 +268,103 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
         _ => return Err(anyhow!("Unsupported operation: {}", operation)),
     };
 
+    println!("===> SENDING REQUEST: {:?}", request);
     let request_data = serde_json::to_vec(&request)
         .map_err(|e| anyhow!("Failed to serialize request: {}", e))?;
-    requester.send(&request_data, 0)
-        .map_err(|e| anyhow!("Failed to send request to {}: {}", addr, e))?;
 
-    let response = timeout(TokioDuration::from_secs(READ_TIMEOUT_SECS), async {
-        let msg = requester.recv_bytes(0)
-            .map_err(|e| anyhow!("Failed to receive response from {}: {}", addr, e))?;
-        serde_json::from_slice::<Value>(&msg)
-            .map_err(|e| anyhow!("Failed to parse response from {}: {}", addr, e))
-    })
-    .await
-    .map_err(|_| anyhow!("Timeout reading response from {}", addr))??;
+    // Perform the entire ZMQ interaction in a single blocking task
+    let response_result = tokio::task::spawn_blocking({
+        let addr = addr.clone();
+        let request_data = request_data;
+        move || {
+            // Create zmq_context inside the blocking task as it is not Send
+            let zmq_context = zmq::Context::new();
+            let client_result = zmq_context.socket(zmq::REQ);
 
+            if let Err(e) = client_result {
+                return Err(anyhow!("Failed to create ZMQ socket: {}", e));
+            }
+
+            let client = client_result.unwrap();
+
+            // Set socket timeouts
+            if let Err(e) = client.set_rcvtimeo((RECEIVE_TIMEOUT_SECS * 1000) as i32) {
+                return Err(anyhow!("Failed to set receive timeout: {}", e));
+            }
+            if let Err(e) = client.set_sndtimeo((REQUEST_TIMEOUT_SECS * 1000) as i32) {
+                return Err(anyhow!("Failed to set send timeout: {}", e));
+            }
+
+            if let Err(e) = client.connect(&addr) {
+                return Err(anyhow!("Failed to connect to {}: {}", addr, e));
+            }
+
+            println!("===> SUCCESSFULLY CONNECTED TO: {}", addr);
+
+            if let Err(e) = client.send(&request_data, 0) {
+                return Err(anyhow!("Failed to send request to {}: {}", addr, e));
+            }
+
+            println!("===> REQUEST SENT SUCCESSFULLY");
+
+            let mut msg = zmq::Message::new();
+            if let Err(e) = client.recv(&mut msg, 0) {
+                return Err(anyhow!("Failed to receive response from {}: {}", addr, e));
+            }
+            
+            println!("===> RECEIVED RESPONSE");
+            let response_bytes = msg.to_vec();
+            let response: Value = serde_json::from_slice(&response_bytes)
+                .map_err(|e| anyhow!("Failed to deserialize response from {}: {}", addr, e))?;
+
+            println!("===> PARSED RESPONSE: {:?}", response);
+            Ok(response)
+        }
+    });
+
+    // Process the response from the blocking task
+    let response = match response_result.await {
+        Ok(Ok(response)) => response,
+        Ok(Err(e)) => return Err(e),
+        Err(e) => return Err(anyhow!("Task join error: {}", e)),
+    };
+
+    // Process the final `Value` response
     match response.get("status").and_then(|s| s.as_str()) {
         Some("success") => {
+            println!("===> OPERATION SUCCESSFUL");
             match operation {
                 "get" => {
                     if let Some(response_value) = response.get("value") {
-                        println!(
-                            "Key '{}': {}",
-                            key,
-                            if response_value.is_null() {
-                                "not found".to_string()
-                            } else {
-                                response_value.as_str().unwrap_or("").to_string()
-                            }
-                        );
+                        let display_value = if response_value.is_null() {
+                            "not found".to_string()
+                        } else {
+                            response_value.as_str().unwrap_or("<non-string value>").to_string()
+                        };
+                        println!("Key '{}': {}", key, display_value);
+                    } else {
+                        println!("Key '{}': no value in response", key);
                     }
                 }
                 "set" => {
                     println!("Set key '{}' successfully", key);
                 }
-                "delete" => println!("Deleted key '{}' successfully", key),
+                "delete" => {
+                    println!("Deleted key '{}' successfully", key);
+                }
                 _ => {}
             }
             Ok(())
         }
         Some("error") => {
             let message = response.get("message").and_then(|m| m.as_str()).unwrap_or("Unknown error");
+            println!("===> DAEMON ERROR: {}", message);
             Err(anyhow!("Daemon error: {}", message))
         }
-        _ => Err(anyhow!("Invalid response from {}: {:?}", addr, response)),
+        _ => {
+            println!("===> INVALID RESPONSE: {:?}", response);
+            Err(anyhow!("Invalid response from {}: {:?}", addr, response))
+        }
     }
 }
 

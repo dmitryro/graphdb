@@ -32,7 +32,7 @@ use crate::cli::handlers_main::{start_daemon_instance_interactive, stop_main_int
 use lib::storage_engine::{StorageEngineManager, GLOBAL_STORAGE_ENGINE_MANAGER,
                           emergency_cleanup_storage_engine_manager};
 // Import daemon registry
-use lib::daemon_registry::{GLOBAL_DAEMON_REGISTRY};
+use lib::daemon::daemon_registry::{GLOBAL_DAEMON_REGISTRY};
 
 // Static lock to prevent concurrent storage daemon startups
 lazy_static::lazy_static! {

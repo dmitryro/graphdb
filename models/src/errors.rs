@@ -1,10 +1,16 @@
 // models/src/errors.rs
 
 use std::io;
+use std::string::FromUtf8Error;
 pub use thiserror::Error;
 use uuid;
+use uuid::Error as UuidError;
 use bincode::error::{DecodeError, EncodeError};
 use anyhow::Error as AnyhowError;
+use serde_json::Error as SerdeJsonError;
+use rmp_serde::encode::Error as RmpEncodeError;
+use rmp_serde::decode::Error as RmpDecodeError;
+use zmq::Error as ZmqError;
 
 use crate::{identifiers::Identifier, properties::PropertyMap, PropertyValue};
 
@@ -55,17 +61,20 @@ pub enum GraphError {
     #[error(transparent)]
     BincodeEncode(#[from] EncodeError),
     #[error("UUID parsing or generation error: {0}")]
-    Uuid(#[from] uuid::Error),
+    Uuid(#[from] UuidError),
     #[error("An unknown error occurred.")]
     Unknown,
     #[error("Authentication error: {0}")]
     Auth(String), // General authentication error
-   
+
     #[error("Invalid storage engine: {0}")]
     InvalidStorageEngine(String),
 
     #[error("Configuration error: {0}")]
     ConfigurationError(String),
+
+    #[error("Network error: {0}")]
+    NetworkError(String),
 }
 
 // Implement From for serde_json::Error to convert into GraphError variants.
@@ -93,6 +102,13 @@ impl From<rmp_serde::decode::Error> for GraphError {
 impl From<AnyhowError> for GraphError {
     fn from(err: AnyhowError) -> Self {
         GraphError::StorageError(format!("Underlying storage operation failed: {}", err))
+    }
+}
+
+// NEW: Implement From for zmq::Error
+impl From<ZmqError> for GraphError {
+    fn from(err: ZmqError) -> Self {
+        GraphError::NetworkError(format!("ZeroMQ error: {}", err))
     }
 }
 

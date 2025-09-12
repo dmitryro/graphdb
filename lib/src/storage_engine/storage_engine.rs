@@ -21,7 +21,7 @@ use surrealdb::engine::any::Any as SurrealAny;
 use surrealdb::sql::Thing;
 use tokio::fs;
 use tokio::net::TcpStream;
-use tokio::time::{self, sleep, Duration as TokioDuration};
+use tokio::time::{self, sleep, timeout, Duration as TokioDuration};
 use reqwest::Client;
 use std::process;
 use anyhow::{Result, Context, anyhow};
@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize, Deserializer};
 use log::{info, debug, warn, error, trace};
 #[cfg(unix)]
 use nix::unistd::{Pid, getpid, getuid};
-use sysinfo::System;
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, RefreshKind};
 use nix::sys::signal::{self, kill, Signal};
 #[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt, MetadataExt};
@@ -54,15 +54,15 @@ use openraft_memstore::TypeConfig as RaftMemStoreTypeConfig;
 // use openraft::network::RPCError;
 // Or if it's named differently:
 // use openraft::error::NetworkError as RPCError;
-use crate::daemon_config::DAEMON_REGISTRY_DB_PATH; // Corrected import
+use crate::daemon::daemon_config::DAEMON_REGISTRY_DB_PATH; // Corrected import
 use crate::config::{DEFAULT_DATA_DIRECTORY, DEFAULT_LOG_DIRECTORY, LOCK_FILE_PATH,
                                  DEFAULT_STORAGE_PORT, StorageConfig, SledConfig, RocksdbConfig, TikvConfig,
                                  RedisConfig, MySQLConfig, PostgreSQLConfig, TypeConfig, 
                                  StorageConfigInner, SelectedStorageConfig, StorageConfigWrapper, 
                                  load_storage_config_from_yaml,
                                  load_engine_specific_config};
-use crate::daemon_utils::{find_pid_by_port, stop_process, parse_cluster_range};
-use crate::daemon_registry::{GLOBAL_DAEMON_REGISTRY,  NonBlockingDaemonRegistry, DaemonMetadata};
+use crate::daemon::daemon_utils::{find_pid_by_port, stop_process, parse_cluster_range};
+use crate::daemon::daemon_registry::{GLOBAL_DAEMON_REGISTRY,  NonBlockingDaemonRegistry, DaemonMetadata};
 use crate::storage_engine::inmemory_storage::{InMemoryStorage};
 use crate::storage_engine::raft_storage::{RaftStorage};
 pub use crate::config::{ StorageEngineType };
@@ -1149,139 +1149,422 @@ pub struct StorageEngineManager {
 
 impl StorageEngineManager {
     pub async fn new(
-        storage_engine: StorageEngineType,
-        config_path_yaml: &Path,
-        permanent: bool,
-        port: Option<u16>, // New parameter to pass CLI-provided port
-    ) -> Result<Arc<StorageEngineManager>, GraphError> {
-        info!("Creating StorageEngineManager with engine: {:?}", storage_engine);
-        println!("IN StorageEngineManager new - STEP 1");
+        storage_engine_type: StorageEngineType,
+        config_path: &PathBuf,
+        use_temp: bool,
+        port: Option<u16>,
+    ) -> Result<Arc<Self>, GraphError> {
+        info!("Creating new StorageEngineManager with engine type: {:?}", storage_engine_type);
+        println!("===> CREATING NEW STORAGE ENGINE MANAGER WITH TYPE {:?}", storage_engine_type);
+        let mut config = crate::config::load_storage_config_from_yaml(Some(config_path.clone())).await?;
 
-        // Step 1: Validate config file existence
-        if !config_path_yaml.exists() {
-            error!("Config file does not exist: {:?}", config_path_yaml);
-            return Err(GraphError::ConfigurationError(format!(
-                "Config file does not exist: {:?}", config_path_yaml
-            )));
+        // Override port in config if provided via CLI flag
+        if let Some(cli_port) = port {
+            if let Some(engine_config) = config.engine_specific_config.as_mut() {
+                engine_config.storage.port = Some(cli_port);
+            } else {
+                config.engine_specific_config = Some(SelectedStorageConfig {
+                    storage_engine_type,
+                    storage: StorageConfigInner {
+                        path: None,
+                        host: None,
+                        port: Some(cli_port),
+                        username: None,
+                        password: None,
+                        database: None,
+                        pd_endpoints: None,
+                        use_compression: false,
+                        cache_capacity: None,
+                    },
+                });
+            }
         }
-        println!("IN StorageEngineManager new - STEP 2");
 
-        // Step 2: Graceful shutdown of existing manager
-        Self::shutdown_existing_manager().await;
-        println!("IN StorageEngineManager new - STEP 3");
+        // Get port for path and registration
+        let port = config
+            .engine_specific_config
+            .as_ref()
+            .and_then(|c| c.storage.port)
+            .unwrap_or(DEFAULT_STORAGE_PORT);
+        let sled_path = config
+            .engine_specific_config
+            .as_ref()
+            .and_then(|c| c.storage.path.clone())
+            .unwrap_or_else(|| {
+                config
+                    .data_directory
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
+                    .join("sled")
+                    .join(port.to_string()) // Ensure unique path per port
+            });
 
-        // Step 3: Load and configure
-        let mut config = Self::load_and_configure(storage_engine, config_path_yaml, permanent)
-            .await
-            .map_err(|e| {
-                error!("Failed to load config: {}", e);
-                GraphError::ConfigurationError(format!("Failed to load config: {}", e))
-            })?;
-        debug!("Loaded config: {:?}", config);
-        println!("IN StorageEngineManager new - STEP 4 - {:?}", config);
+        // Log the path being used
+        info!("Calculated new sled path: {:?}", sled_path);
+        println!("===> CALCULATED NEW SLED PATH: {:?}", sled_path);
 
-        // Step 4: Extract and validate port with simplified logic
-        let selected_port = port.unwrap_or_else(|| {
-            // Try engine-specific config first
-            if let Some(ref engine_config) = config.engine_specific_config {
-                if let Some(config_port) = engine_config.storage.port {
-                    info!("Using engine-specific port from config: {}", config_port);
-                    println!("===> USING ENGINE-SPECIFIC PORT FROM CONFIG: {}", config_port);
-                    return config_port;
+        // Check for existing daemon process and stop if path mismatches
+        if let Some(existing_metadata) = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await? {
+            if existing_metadata.data_dir != Some(sled_path.clone()) {
+                warn!("Daemon registry path mismatch on port {}. Unregistering and stopping existing daemon.", port);
+                println!("===> WARNING: DAEMON REGISTRY PATH MISMATCH ON PORT {}. UNREGISTERING AND STOPPING.", port);
+                println!("===> Mismatch: New path is {:?}, but registry path is {:?}", sled_path, existing_metadata.data_dir);
+                info!("Mismatch: New path is {:?}, but registry path is {:?}", sled_path, existing_metadata.data_dir);
+
+                // Check for running process
+                let pid = tokio::task::spawn_blocking(move || {
+                    let mut system = System::new_with_specifics(RefreshKind::everything().with_processes(ProcessRefreshKind::everything()));
+                    system.processes().values().find(|proc| {
+                        proc.cmd()
+                            .iter()
+                            .any(|arg| arg.to_string_lossy().contains(&port.to_string()))
+                            && proc.name().to_string_lossy().contains("graphdb")
+                    }).map(|proc| Pid::from_raw(proc.pid().as_u32() as i32))
+                })
+                .await
+                .map_err(|e| {
+                    warn!("Failed to check for running processes: {:?}", e);
+                    println!("===> WARNING: FAILED TO CHECK FOR RUNNING PROCESSES: {:?}", e);
+                    GraphError::StorageError(format!("Failed to check for running processes: {:?}", e))
+                })?;
+
+                if let Some(pid) = pid {
+                    info!("Sending SIGTERM to existing daemon process (PID {}) on port {}", pid, port);
+                    println!("===> SENDING SIGTERM TO EXISTING DAEMON PROCESS (PID {}) ON PORT {}", pid, port);
+                    kill(pid, Signal::SIGTERM).map_err(|e| {
+                        error!("Failed to send SIGTERM to PID {}: {}", pid, e);
+                        println!("===> ERROR: FAILED TO SEND SIGTERM TO PID {}: {}", pid, e);
+                        GraphError::StorageError(format!("Failed to send SIGTERM to PID {}: {}", pid, e))
+                    })?;
+
+                    // Wait for the process to terminate and port to be free
+                    let mut attempts = 0;
+                    while attempts < 20 { // Increased to 20 attempts (10 seconds total)
+                        let port_in_use = tokio::task::spawn_blocking(move || {
+                            let mut system = System::new_with_specifics(RefreshKind::everything().with_processes(ProcessRefreshKind::everything()));
+                            system.processes().values().any(|proc| {
+                                proc.cmd()
+                                    .iter()
+                                    .any(|arg| arg.to_string_lossy().contains(&port.to_string()))
+                                    && proc.name().to_string_lossy().contains("graphdb")
+                            })
+                        })
+                        .await
+                        .map_err(|e| {
+                            warn!("Failed to check if port is free: {:?}", e);
+                            println!("===> WARNING: FAILED TO CHECK IF PORT IS FREE: {:?}", e);
+                            GraphError::StorageError(format!("Failed to check if port is free: {:?}", e))
+                        })?;
+
+                        if !port_in_use {
+                            break;
+                        }
+                        attempts += 1;
+                        tokio::time::sleep(TokioDuration::from_millis(500)).await;
+                    }
+                    if attempts >= 20 {
+                        error!("Failed to free port {} after sending SIGTERM to PID {}", port, pid);
+                        println!("===> ERROR: FAILED TO FREE PORT {} AFTER SENDING SIGTERM TO PID {}", port, pid);
+                        return Err(GraphError::StorageError(format!("Failed to free port {} after sending SIGTERM to PID {}", port, pid)));
+                    }
+                    info!("Port {} is now free after stopping PID {}", port, pid);
+                    println!("===> PORT {} IS NOW FREE AFTER STOPPING PID {}", port, pid);
+                }
+
+                timeout(TokioDuration::from_secs(5), GLOBAL_DAEMON_REGISTRY.unregister_daemon(port))
+                    .await
+                    .map_err(|_| {
+                        warn!("Timeout unregistering daemon on port {}", port);
+                        println!("===> WARNING: TIMEOUT UNREGISTERING DAEMON ON PORT {}", port);
+                        GraphError::StorageError(format!("Timeout unregistering daemon on port {}", port))
+                    })?;
+                info!("Successfully unregistered daemon on port {}", port);
+                println!("===> SUCCESSFULLY UNREGISTERED DAEMON ON PORT {}", port);
+            } else {
+                info!("Daemon already registered on port {} with matching path {:?}", port, sled_path);
+                println!("===> DAEMON ALREADY REGISTERED ON PORT {} WITH MATCHING PATH {:?}", port, sled_path);
+                // Check if singleton exists
+                let singleton_guard = SLED_SINGLETON.lock().await;
+                if let Some(existing_storage) = singleton_guard.as_ref() {
+                    info!("Returning existing Sled singleton instance on port {}", port);
+                    println!("===> RETURNING EXISTING SLED SINGLETON INSTANCE ON PORT {}", port);
+                    return Ok(Arc::new(StorageEngineManager {
+                        engine: Arc::new(TokioMutex::new(HybridStorage::new(existing_storage.clone()))),
+                        persistent_engine: existing_storage.clone(),
+                        session_engine_type: Some(storage_engine_type),
+                        config,
+                        config_path: config_path.clone(),
+                        raft_instances: Arc::new(TokioMutex::new(std::collections::HashMap::new())),
+                    }));
                 }
             }
-            
-            // Fall back to default port
-            let fallback_port = if config.default_port != 0 {
-                info!("Using default_port: {}", config.default_port);
-                println!("===> USING DEFAULT_PORT: {}", config.default_port);
-                config.default_port
-            } else {
-                warn!("Using DEFAULT_STORAGE_PORT: {}", DEFAULT_STORAGE_PORT);
-                println!("===> USING DEFAULT_STORAGE_PORT: {}", DEFAULT_STORAGE_PORT);
-                DEFAULT_STORAGE_PORT
-            };
-            
-            fallback_port
-        });
-
-        if selected_port == 0 || selected_port > 65535 {
-            error!("Invalid port {} specified", selected_port);
-            return Err(GraphError::StorageError(format!("Invalid port {}: must be between 1 and 65535", selected_port)));
         }
-        info!("Selected port: {}", selected_port);
-        println!("===> SELECTED PORT {} WHILE CONFIG {:?}", selected_port, config);
 
-        // Step 4.1: Update config with normalized paths (remove old port suffixes)
-        if let Some(ref mut engine_config) = config.engine_specific_config {
-            engine_config.storage.port = Some(selected_port);
-            
-            // Get base data directory
-            let base_data_dir = config.data_directory
-                .clone()
-                .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY));
-            
-            // Create clean engine-specific path WITHOUT port suffixes
-            let clean_engine_path = base_data_dir.join(storage_engine.to_string().to_lowercase());
-                        
-            // Update the config path
-            engine_config.storage.path = Some(clean_engine_path.clone());
-            
-            info!("Normalized storage path to: {:?}", clean_engine_path);
-            
-            // Clean up any old port-suffixed directories for the same engine type
-            if storage_engine == StorageEngineType::Sled {
-                Self::cleanup_old_port_directories(&base_data_dir, "sled", selected_port).await;
+        // Additional port check
+        let port_in_use = tokio::task::spawn_blocking(move || {
+            let mut system = System::new_with_specifics(RefreshKind::everything().with_processes(ProcessRefreshKind::everything()));
+            system.processes().values().any(|proc| {
+                proc.cmd()
+                    .iter()
+                    .any(|arg| arg.to_string_lossy().contains(&port.to_string()))
+                    && proc.name().to_string_lossy().contains("graphdb")
+            })
+        })
+        .await
+        .map_err(|e| {
+            warn!("Failed to check for running processes: {:?}", e);
+            println!("===> WARNING: FAILED TO CHECK FOR RUNNING PROCESSES: {:?}", e);
+            GraphError::StorageError(format!("Failed to check for running processes: {:?}", e))
+        })?;
+
+        if port_in_use {
+            error!("Port {} is already in use by another process", port);
+            println!("===> ERROR: PORT {} IS ALREADY IN USE BY ANOTHER PROCESS", port);
+            return Err(GraphError::StorageError(format!("Port {} is in use", port)));
+        }
+
+        // Initialize the storage engine
+        let engine: Arc<dyn GraphStorageEngine + Send + Sync> = match storage_engine_type {
+            #[cfg(feature = "with-sled")]
+            StorageEngineType::Sled => {
+                info!("Step 5: Initializing Sled storage");
+                println!("===> INITIALIZING SLED STORAGE");
+                Self::init_sled(&config).await?
+            }
+            _ => {
+                error!("Unsupported storage engine: {:?}", storage_engine_type);
+                println!("===> ERROR: UNSUPPORTED STORAGE ENGINE: {:?}", storage_engine_type);
+                return Err(GraphError::ConfigurationError(format!("Unsupported storage engine: {:?}", storage_engine_type)));
+            }
+        };
+
+        // Register the daemon
+        let daemon_metadata = DaemonMetadata {
+            service_type: "storage".to_string(),
+            port,
+            pid: std::process::id(),
+            ip_address: "127.0.0.1".to_string(),
+            data_dir: Some(sled_path.clone()),
+            config_path: Some(config_path.clone()),
+            engine_type: Some(storage_engine_type.to_string()),
+            last_seen_nanos: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as i64)
+                .unwrap_or(0),
+        };
+
+        timeout(TokioDuration::from_secs(5), GLOBAL_DAEMON_REGISTRY.register_daemon(daemon_metadata))
+            .await
+            .map_err(|_| {
+                error!("Timeout registering daemon on port {}", port);
+                println!("===> ERROR: TIMEOUT REGISTERING DAEMON ON PORT {}", port);
+                GraphError::StorageError(format!("Timeout registering daemon on port {}", port))
+            })??;
+        info!("Successfully registered daemon on port {}", port);
+        println!("===> SUCCESSFULLY REGISTERED DAEMON ON PORT {}", port);
+
+        // Complete initialization
+        let manager = StorageEngineManager {
+            engine: Arc::new(TokioMutex::new(HybridStorage::new(engine.clone()))),
+            persistent_engine: engine,
+            session_engine_type: Some(storage_engine_type),
+            config,
+            config_path: config_path.clone(),
+            raft_instances: Arc::new(TokioMutex::new(std::collections::HashMap::new())),
+        };
+        info!("StorageEngineManager initialized successfully for port {}", port);
+        println!("===> STORAGE ENGINE MANAGER INITIALIZED SUCCESSFULLY FOR PORT {}", port);
+        Ok(Arc::new(manager))
+    }
+
+    #[cfg(feature = "with-sled")]
+    async fn init_sled(config: &StorageConfig) -> Result<Arc<dyn GraphStorageEngine + Send + Sync>, GraphError> {
+        info!("Initializing Sled engine using raw sled crate");
+        println!("===> INITIALIZING SLED ENGINE");
+        trace!("Sled initialization started with config: {:?}", config);
+
+        // Validate configuration
+        if config.storage_engine_type != StorageEngineType::Sled {
+            warn!("Configuration mismatch: expected Sled, found {:?}", config.storage_engine_type);
+            println!("===> WARNING: CONFIGURATION MISMATCH: EXPECTED SLED, FOUND {:?}", config.storage_engine_type);
+            return Err(GraphError::ConfigurationError(
+                format!("Expected storage_engine_type Sled, found {:?}", config.storage_engine_type)
+            ));
+        }
+
+        let sled_config_inner = config.engine_specific_config.as_ref().map(|c| &c.storage);
+
+        // Get port from config
+        let port = sled_config_inner
+            .and_then(|c| c.port)
+            .unwrap_or(DEFAULT_STORAGE_PORT);
+        println!("===> SELECTED PORT {} FOR SLED INITIALIZATION", port);
+
+        // Use the path from config, ensuring it ends with the port for uniqueness
+        let sled_path = sled_config_inner
+            .and_then(|c| c.path.clone())
+            .unwrap_or_else(|| {
+                config
+                    .data_directory
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
+                    .join("sled")
+                    .join(port.to_string())
+            });
+
+        info!("Using Sled path: {:?} for port: {}", sled_path, port);
+        println!("===> USING SLED PATH: {:?} FOR PORT: {}", sled_path, port);
+
+        // Clean up any invalid /db subdirectory
+        let invalid_db_path = sled_path.join("db");
+        if invalid_db_path.exists() {
+            warn!("Found invalid /db subdirectory at {:?}", invalid_db_path);
+            println!("===> WARNING: FOUND INVALID /DB SUBDIRECTORY AT {:?}", invalid_db_path);
+            if invalid_db_path.is_dir() {
+                fs::remove_dir_all(&invalid_db_path)
+                    .await
+                    .map_err(|e| {
+                        error!("Failed to remove invalid /db directory at {:?}: {}", invalid_db_path, e);
+                        println!("===> ERROR: FAILED TO REMOVE INVALID /DB DIRECTORY AT {:?}", invalid_db_path);
+                        GraphError::StorageError(format!("Failed to remove invalid /db directory at {:?}: {}", invalid_db_path, e))
+                    })?;
+                info!("Removed invalid /db directory at {:?}", invalid_db_path);
+                println!("===> REMOVED INVALID /DB DIRECTORY AT {:?}", invalid_db_path);
+            } else {
+                fs::remove_file(&invalid_db_path)
+                    .await
+                    .map_err(|e| {
+                        error!("Failed to remove invalid /db file at {:?}: {}", invalid_db_path, e);
+                        println!("===> ERROR: FAILED TO REMOVE INVALID /DB FILE AT {:?}", invalid_db_path);
+                        GraphError::StorageError(format!("Failed to remove invalid /db file at {:?}: {}", invalid_db_path, e))
+                    })?;
+                info!("Removed invalid /db file at {:?}", invalid_db_path);
+                println!("===> REMOVED INVALID /DB FILE AT {:?}", invalid_db_path);
             }
         }
 
-        // Step 5: Check for port conflicts and clean up with reduced lock contention
-        let cleanup_result = Self::handle_port_conflicts(storage_engine, &config, selected_port).await;
-        if let Err(e) = cleanup_result {
-            warn!("Port conflict cleanup encountered issues: {}", e);
-            // Don't fail here, just warn - we'll try to proceed
-        }
-        println!("IN StorageEngineManager new - STEP 5");
-
-        // Step 6: Ensure daemon registry directory
-        Self::ensure_daemon_registry_directory().await?;
-        println!("IN StorageEngineManager new - STEP 6");
-
-        // Step 7: Initialize storage engine
-        let persistent = if storage_engine == StorageEngineType::TiKV {
-            debug!("Attempting to initialize TiKV engine with config: {:?}", config);
-            Self::init_tikv(&config).await.map_err(|e| {
-                error!("Failed to initialize TiKV: {}", e);
-                GraphError::StorageError(format!("Failed to initialize TiKV: {}", e))
-            })?
+        // Ensure directory exists and is writable
+        if !sled_path.exists() {
+            info!("Creating Sled directory at {:?}", sled_path);
+            println!("===> CREATING SLED DIRECTORY AT {:?}", sled_path);
+            fs::create_dir_all(&sled_path)
+                .await
+                .map_err(|e| {
+                    error!("Failed to create Sled directory at {:?}: {}", sled_path, e);
+                    println!("===> ERROR: FAILED TO CREATE SLED DIRECTORY AT {:?}: {}", sled_path, e);
+                    GraphError::Io(e)
+                })?;
         } else {
-            debug!("Initializing engine_type={:?}", storage_engine);
-            Self::initialize_storage_engine(storage_engine, &config).await?
+            let metadata = fs::metadata(&sled_path)
+                .await
+                .map_err(|e| {
+                    error!("Failed to access directory metadata at {:?}: {}", sled_path, e);
+                    println!("===> ERROR: FAILED TO ACCESS DIRECTORY METADATA AT {:?}", sled_path);
+                    GraphError::StorageError(format!("Failed to access directory metadata at {:?}: {}", sled_path, e))
+                })?;
+            if metadata.permissions().readonly() {
+                error!("Directory at {:?} is not writable", sled_path);
+                println!("===> ERROR: DIRECTORY AT {:?} IS NOT WRITABLE", sled_path);
+                return Err(GraphError::StorageError(format!("Directory at {:?} is not writable", sled_path)));
+            }
+        }
+
+        // Clean up stale lock file
+        let lock_file = sled_path.join("db.lck");
+        if lock_file.exists() {
+            warn!("Found stale lock file at {:?}", lock_file);
+            println!("===> FOUND STALE LOCK FILE AT {:?}", lock_file);
+            fs::remove_file(&lock_file)
+                .await
+                .map_err(|e| {
+                    error!("Failed to remove lock file at {:?}: {}", lock_file, e);
+                    println!("===> ERROR: FAILED TO REMOVE LOCK FILE AT {:?}", lock_file);
+                    GraphError::StorageError(format!("Failed to remove lock file at {:?}: {}", lock_file, e))
+                })?;
+            info!("Successfully removed stale lock file at {:?}", lock_file);
+            println!("===> SUCCESSFULLY REMOVED STALE LOCK FILE AT {:?}", lock_file);
+        }
+
+        // Build SledConfig
+        let sled_config = SledConfig {
+            storage_engine_type: StorageEngineType::Sled,
+            path: sled_path.clone(),
+            host: sled_config_inner.and_then(|c| c.host.clone()),
+            port: Some(port),
+            temporary: sled_config_inner
+                .and_then(|c| c.path.as_ref())
+                .map(|p| p.to_string_lossy().contains("temporary"))
+                .unwrap_or(SledConfig::default().temporary),
+            use_compression: sled_config_inner
+                .and_then(|c| Some(c.use_compression))
+                .unwrap_or(SledConfig::default().use_compression),
+            cache_capacity: sled_config_inner
+                .and_then(|c| c.cache_capacity)
+                .or_else(|| SledConfig::default().cache_capacity),
         };
-        println!("IN StorageEngineManager new - STEP 7");
 
-        // Step 8: Initialize Raft instances if clustering is enabled
-        let raft_instances = Arc::new(TokioMutex::new(HashMap::new()));
-        if config.use_raft_for_scale {
-            info!("use_raft_for_scale is true, initializing Raft instances");
-            Self::initialize_raft_instances(&config, &raft_instances).await?;
-        } else {
-            info!("use_raft_for_scale is false, skipping Raft initialization");
+        // Initialize Sled storage
+        let sled_instance = match SledStorage::new(&sled_config, config).await {
+            Ok(storage) => {
+                info!("Successfully initialized Sled storage on port {}", port);
+                println!("===> SUCCESSFULLY INITIALIZED SLED STORAGE ON PORT {}", port);
+                Arc::new(storage)
+            }
+            Err(e) => {
+                error!("Failed to initialize Sled storage on port {}: {}", port, e);
+                println!("===> ERROR: FAILED TO INITIALIZE SLED STORAGE ON PORT {}: {}", port, e);
+                if e.to_string().contains("could not acquire lock") {
+                    warn!("Lock contention detected, attempting force unlock and retry");
+                    println!("===> WARNING: LOCK CONTENTION DETECTED, ATTEMPTING FORCE UNLOCK AND RETRY");
+                    SledStorage::force_unlock(&sled_path).await?;
+                    info!("Force unlock successful, retrying initialization");
+                    println!("===> FORCE UNLOCK SUCCESSFUL, RETRYING INITIALIZATION");
+                    Arc::new(SledStorage::new(&sled_config, config).await.map_err(|retry_error| {
+                        error!("Retry after unlock also failed: {}", retry_error);
+                        println!("===> ERROR: RETRY AFTER UNLOCK ALSO FAILED: {}", retry_error);
+                        retry_error
+                    })?)
+                } else {
+                    return Err(e);
+                }
+            }
+        };
+
+        // Store in singleton
+        let mut singleton_guard = SLED_SINGLETON.lock().await;
+        *singleton_guard = Some(sled_instance.clone());
+
+        // Register SIGTERM handler for graceful shutdown
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let sled_instance_clone = sled_instance.clone();
+            let port_clone = port;
+            tokio::spawn(async move {
+                let mut sigterm = signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
+                sigterm.recv().await;
+                info!("Received SIGTERM, closing Sled instance for port {}", port_clone);
+                println!("===> RECEIVED SIGTERM, CLOSING SLED INSTANCE FOR PORT {}", port_clone);
+                if let Err(e) = sled_instance_clone.close().await {
+                    error!("Failed to close Sled instance on SIGTERM for port {}: {}", port_clone, e);
+                    println!("===> ERROR: FAILED TO CLOSE SLED INSTANCE ON SIGTERM FOR PORT {}: {}", port_clone, e);
+                }
+                // Unregister daemon
+                if let Err(e) = timeout(TokioDuration::from_secs(5), GLOBAL_DAEMON_REGISTRY.unregister_daemon(port_clone)).await {
+                    error!("Failed to unregister daemon on port {} during SIGTERM: {:?}", port_clone, e);
+                    println!("===> ERROR: FAILED TO UNREGISTER DAEMON ON PORT {} DURING SIGTERM: {:?}", port_clone, e);
+                }
+                // Clear singleton
+                let mut singleton_guard = SLED_SINGLETON.lock().await;
+                *singleton_guard = None;
+                info!("Sled instance closed gracefully for port {}", port_clone);
+                println!("===> SLED INSTANCE CLOSED GRACEFULLY FOR PORT {}", port_clone);
+            });
         }
-        println!("IN StorageEngineManager new - STEP 8");
 
-        // Step 9: Create final manager
-        let manager = Self::create_manager(
-            storage_engine,
-            config,
-            config_path_yaml,
-            persistent,
-            permanent,
-            raft_instances,
-        );
-        println!("IN StorageEngineManager new - STEP 9");
-        info!("StorageEngineManager initialized with engine: {:?}", storage_engine);
-        Ok(Arc::new(manager))
+        info!("Successfully initialized and stored Sled singleton instance on port {}", port);
+        println!("===> SUCCESSFULLY INITIALIZED AND STORED SLED SINGLETON INSTANCE ON PORT {}", port);
+        Ok(sled_instance as Arc<dyn GraphStorageEngine + Send + Sync>)
     }
 
     async fn load_and_configure(
@@ -1739,234 +2022,100 @@ impl StorageEngineManager {
         Ok(Arc::new(InMemoryGraphStorage::new(config)))
     }
 
-    #[cfg(feature = "with-sled")]
-    async fn init_sled(config: &StorageConfig) -> GraphResult<Arc<dyn GraphStorageEngine + Send + Sync>> {
-        info!("Initializing Sled engine using raw sled crate");
-        println!("===> INITIALIZING SLED ENGINE");
-        trace!("Sled initialization started with config: {:?}", config);
-
-        // Validate configuration
-        if config.storage_engine_type != StorageEngineType::Sled {
-            warn!("Configuration mismatch: expected Sled, found {:?}", config.storage_engine_type);
-            println!("===> WARNING: CONFIGURATION MISMATCH: EXPECTED SLED, FOUND {:?}", config.storage_engine_type);
-            return Err(GraphError::ConfigurationError(
-                format!("Expected storage_engine_type Sled, found {:?}", config.storage_engine_type)
-            ));
-        }
-
-        let sled_config_inner = config.engine_specific_config.as_ref().map(|c| &c.storage);
-
-        // Get port from config
-        let port = sled_config_inner
-            .and_then(|c| c.port)
-            .unwrap_or(DEFAULT_STORAGE_PORT);
-
-        // Use the path directly from config - no more automatic port suffixing
-        let sled_path = sled_config_inner
-            .and_then(|c| c.path.clone())
-            .unwrap_or_else(|| {
-                // Only fall back to port-suffixed path if no path is configured
-                config.data_directory
-                    .clone()
-                    .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
-                    .join("sled") // Use simple "sled" without port suffix
-            });
-
-        info!("Using Sled path: {:?} for port: {}", sled_path, port);
-        println!("===> USING SLED PATH: {:?} FOR PORT: {}", sled_path, port);
-
-        // Build SledConfig
-        let sled_config = SledConfig {
-            storage_engine_type: StorageEngineType::Sled,
-            path: sled_path.clone(),
-            host: sled_config_inner
-                .and_then(|c| c.host.clone()),
-            port: Some(port),
-            temporary: sled_config_inner
-                .and_then(|c| c.path.as_ref().map(|p| p.to_string_lossy().contains("temporary")))
-                .unwrap_or_else(|| SledConfig::default().temporary),
-            use_compression: sled_config_inner
-                .and_then(|c| Some(c.use_compression))
-                .unwrap_or_else(|| SledConfig::default().use_compression),
-            cache_capacity: sled_config_inner
-                .and_then(|c| c.cache_capacity)
-                .or_else(|| SledConfig::default().cache_capacity),
-        };
-
-        // Clean up any old port-suffixed directories if they exist
-        if let Some(parent_dir) = sled_path.parent() {
-            Self::cleanup_legacy_sled_directories(parent_dir, port).await;
-        }
-
-        // Ensure path exists
-        if !sled_config.path.exists() {
-            debug!("Creating Sled data directory at {:?}", sled_config.path);
-            println!("===> CREATING SLED DATA DIRECTORY AT {:?}", sled_config.path);
-            std::fs::create_dir_all(&sled_config.path).map_err(|e| {
-                error!("Failed to create Sled data directory at {:?}: {}", sled_config.path, e);
-                println!("===> ERROR: FAILED TO CREATE SLED DATA DIRECTORY AT {:?}: {}", sled_config.path, e);
-                GraphError::Io(e)
-            })?;
-        }
-
-        // Log selected port
-        info!("Selected port {:?} for Sled initialization", sled_config.port);
-        println!("===> SELECTED PORT {:?} FOR SLED INITIALIZATION", sled_config.port);
-
-        // Use port-specific singleton key
-        let port_key = sled_config.port.unwrap_or(DEFAULT_STORAGE_PORT);
-        static SLED_SINGLETON_MAP: OnceCell<Arc<TokioMutex<HashMap<u16, Arc<dyn GraphStorageEngine + Send + Sync>>>>> = OnceCell::const_new();
-        
-        let singleton_map = SLED_SINGLETON_MAP
-            .get_or_init(|| async {
-                Arc::new(TokioMutex::new(HashMap::new()))
-            })
-            .await;
-
-        // Check if we already have an instance for this port
-        {
-            let singleton_guard = singleton_map.lock().await;
-            if let Some(existing_storage) = singleton_guard.get(&port_key) {
-                info!("Returning existing Sled singleton instance on port {}", port_key);
-                println!("===> RETURNING EXISTING SLED SINGLETON INSTANCE ON PORT {}", port_key);
-                return Ok(existing_storage.clone());
-            }
-        }
-
-        // Check daemon registry for existing daemon on port and handle path mismatches
-        if let Some(metadata) = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port_key).await? {
-            info!("Found existing daemon metadata on port {} at path {:?}", port_key, metadata.data_dir);
-            println!("===> FOUND EXISTING DAEMON METADATA ON PORT {} AT PATH {:?}", port_key, metadata.data_dir);
-            
-            // Check if the registered path matches our current path
-            if let Some(registered_path) = &metadata.data_dir {
-                if registered_path != &sled_path {
-                    warn!("Path mismatch: daemon registry shows {:?}, but config specifies {:?}", registered_path, sled_path);
-                    println!("===> PATH MISMATCH: DAEMON REGISTRY SHOWS {:?}, BUT CONFIG SPECIFIES {:?}", registered_path, sled_path);
-                    
-                    // Check if the old path exists and try to migrate/cleanup
-                    if registered_path.exists() {
-                        warn!("Old Sled path {:?} still exists. Attempting cleanup.", registered_path);
-                        
-                        // Try to force unlock the old path if it's a Sled database
-                        let old_db_path = registered_path.join("db");
-                        if old_db_path.exists() {
-                            if let Err(e) = SledStorage::force_unlock(&old_db_path).await {
-                                warn!("Failed to unlock old Sled storage at {:?}: {}", old_db_path, e);
-                            } else {
-                                info!("Successfully unlocked old Sled storage at {:?}", old_db_path);
-                            }
-                        }
-                    }
-                    
-                    // Unregister the old daemon entry
-                    GLOBAL_DAEMON_REGISTRY.unregister_daemon(port_key).await?;
-                    info!("Unregistered old daemon entry for port {}", port_key);
-                }
-            }
-        }
-
-        // Initialize Sled storage
-        let sled_instance = match SledStorage::new(&sled_config).await {
-            Ok(storage) => {
-                info!("Successfully initialized Sled storage on port {:?}", sled_config.port);
-                println!("===> SUCCESSFULLY INITIALIZED SLED STORAGE ON PORT {:?}", sled_config.port);
-                Arc::new(storage)
-            }
-            Err(e) => {
-                error!("Failed to initialize Sled storage on port {:?}: {}", sled_config.port, e);
-                println!("===> ERROR: FAILED TO INITIALIZE SLED STORAGE ON PORT {:?}: {}", sled_config.port, e);
-                
-                // If it's a lock error, try to force unlock and retry once
-                if e.to_string().contains("could not acquire lock") {
-                    warn!("Lock contention detected, attempting force unlock and retry");
-                    let db_path = sled_path.join("db");
-                    if let Ok(_) = SledStorage::force_unlock(&db_path).await {
-                        info!("Force unlock successful, retrying initialization");
-                        match SledStorage::new(&sled_config).await {
-                            Ok(storage) => {
-                                info!("Successfully initialized Sled storage after unlock retry");
-                                println!("===> SUCCESSFULLY INITIALIZED SLED STORAGE AFTER UNLOCK RETRY");
-                                Arc::new(storage)
-                            }
-                            Err(retry_error) => {
-                                error!("Retry after unlock also failed: {}", retry_error);
-                                return Err(retry_error);
-                            }
-                        }
-                    } else {
-                        return Err(e);
-                    }
-                } else {
-                    return Err(e);
-                }
-            }
-        };
-
-        // Store in singleton map
-        {
-            let mut singleton_guard = singleton_map.lock().await;
-            singleton_guard.insert(port_key, sled_instance.clone());
-        }
-
-        // Register SIGTERM handler for graceful shutdown
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{signal, SignalKind};
-            let sled_instance_clone = sled_instance.clone();
-            let singleton_map_clone = singleton_map.clone();
-            tokio::spawn(async move {
-                let mut sigterm = signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
-                sigterm.recv().await;
-                info!("Received SIGTERM, closing Sled instance for port {}", port_key);
-                println!("===> RECEIVED SIGTERM, CLOSING SLED INSTANCE FOR PORT {}", port_key);
-                if let Err(e) = sled_instance_clone.close().await {
-                    error!("Failed to close Sled instance on SIGTERM for port {}: {}", port_key, e);
-                    println!("===> ERROR: FAILED TO CLOSE SLED INSTANCE ON SIGTERM FOR PORT {}: {}", port_key, e);
-                }
-                let mut singleton_guard = singleton_map_clone.lock().await;
-                singleton_guard.remove(&port_key);
-                info!("Sled instance closed gracefully for port {}", port_key);
-                println!("===> SLED INSTANCE CLOSED GRACEFULLY FOR PORT {}", port_key);
-            });
-        }
-
-        info!("Successfully initialized and stored Sled singleton instance on port {:?}", sled_config.port);
-        println!("===> SUCCESSFULLY INITIALIZED AND STORED SLED SINGLETON INSTANCE ON PORT {:?}", sled_config.port);
-        Ok(sled_instance as Arc<dyn GraphStorageEngine + Send + Sync>)
-    }
-
-    // Helper method to cleanup legacy port-suffixed Sled directories
     async fn cleanup_legacy_sled_directories(parent_dir: &Path, current_port: u16) {
         info!("Checking for legacy Sled directories in {:?}", parent_dir);
-        
-        if let Ok(entries) = tokio::fs::read_dir(parent_dir).await {
-            let mut entries = entries;
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                if let Some(name) = entry.file_name().to_str() {
-                    // Look for directories matching pattern like "sled_8052", "sled_8053", etc.
-                    if name.starts_with("sled_") && name != "sled" {
-                        if let Some(suffix) = name.strip_prefix("sled_") {
-                            if let Ok(port) = suffix.parse::<u16>() {
-                                info!("Found legacy Sled directory: {:?} (port {})", entry.path(), port);
-                                
-                                // Try to unlock the database first
-                                let db_path = entry.path().join("db");
-                                if db_path.exists() {
-                                    if let Ok(_) = SledStorage::force_unlock(&db_path).await {
-                                        info!("Force unlocked legacy Sled database at {:?}", db_path);
+        println!("===> CHECKING FOR LEGACY SLED DIRECTORIES IN {:?}", parent_dir);
+
+        match fs::read_dir(parent_dir).await {
+            Ok(mut entries) => {
+                let mut errors = Vec::new();
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                            if name.starts_with("sled_") && name != "sled" {
+                                if let Some(suffix) = name.strip_prefix("sled_") {
+                                    if let Ok(port) = suffix.parse::<u16>() {
+                                        if port == current_port {
+                                            info!("Skipping active directory for port {}: {:?}", port, path);
+                                            println!("===> SKIPPING ACTIVE DIRECTORY FOR PORT {}: {:?}", port, path);
+                                            continue;
+                                        }
+                                        info!("Found legacy Sled directory for port {}: {:?}", port, path);
+                                        println!("===> FOUND LEGACY SLED DIRECTORY FOR PORT {}: {:?}", port, path);
+
+                                        // Clean up lock file
+                                        let lock_file = path.join("db.lck");
+                                        if lock_file.exists() {
+                                            match fs::remove_file(&lock_file).await {
+                                                Ok(_) => {
+                                                    info!("Successfully removed stale lock file at {:?}", lock_file);
+                                                    println!("===> SUCCESSFULLY REMOVED STALE LOCK FILE AT {:?}", lock_file);
+                                                }
+                                                Err(e) => {
+                                                    warn!("Failed to remove lock file at {:?}: {}", lock_file, e);
+                                                    println!("===> WARNING: FAILED TO REMOVE LOCK FILE AT {:?}: {}", lock_file, e);
+                                                    errors.push(format!("Failed to remove lock file at {:?}: {}", lock_file, e));
+                                                }
+                                            }
+                                        }
+
+                                        // Clean up invalid /db subdirectory or file
+                                        let invalid_db_path = path.join("db");
+                                        if invalid_db_path.exists() {
+                                            if invalid_db_path.is_dir() {
+                                                match fs::remove_dir_all(&invalid_db_path).await {
+                                                    Ok(_) => {
+                                                        info!("Removed invalid /db directory at {:?}", invalid_db_path);
+                                                        println!("===> REMOVED INVALID /db DIRECTORY AT {:?}", invalid_db_path);
+                                                    }
+                                                    Err(e) => {
+                                                        warn!("Failed to remove invalid /db directory at {:?}: {}", invalid_db_path, e);
+                                                        println!("===> WARNING: FAILED TO REMOVE INVALID /db DIRECTORY AT {:?}: {}", invalid_db_path, e);
+                                                        errors.push(format!("Failed to remove invalid /db directory at {:?}: {}", invalid_db_path, e));
+                                                    }
+                                                }
+                                            } else {
+                                                match fs::remove_file(&invalid_db_path).await {
+                                                    Ok(_) => {
+                                                        info!("Removed invalid /db file at {:?}", invalid_db_path);
+                                                        println!("===> REMOVED INVALID /db FILE AT {:?}", invalid_db_path);
+                                                    }
+                                                    Err(e) => {
+                                                        warn!("Failed to remove invalid /db file at {:?}: {}", invalid_db_path, e);
+                                                        println!("===> WARNING: FAILED TO REMOVE INVALID /db FILE AT {:?}: {}", invalid_db_path, e);
+                                                        errors.push(format!("Failed to remove invalid /db file at {:?}: {}", invalid_db_path, e));
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        // Remove the legacy directory
+                                        match fs::remove_dir_all(&path).await {
+                                            Ok(_) => {
+                                                info!("Successfully cleaned up legacy Sled directory: {:?}", path);
+                                                println!("===> SUCCESSFULLY CLEANED UP LEGACY SLED DIRECTORY: {:?}", path);
+                                            }
+                                            Err(e) => {
+                                                warn!("Failed to clean up legacy Sled directory {:?}: {}", path, e);
+                                                println!("===> WARNING: FAILED TO CLEAN UP LEGACY SLED DIRECTORY {:?}: {}", path, e);
+                                                errors.push(format!("Failed to clean up legacy Sled directory {:?}: {}", path, e));
+                                            }
+                                        }
                                     }
-                                }
-                                
-                                // Attempt to remove the legacy directory
-                                match tokio::fs::remove_dir_all(&entry.path()).await {
-                                    Ok(_) => info!("Cleaned up legacy Sled directory: {:?}", entry.path()),
-                                    Err(e) => warn!("Failed to clean up legacy Sled directory {:?}: {}", entry.path(), e),
                                 }
                             }
                         }
                     }
                 }
+                if !errors.is_empty() {
+                    warn!("Encountered errors during legacy directory cleanup: {:?}", errors);
+                    println!("===> WARNING: ENCOUNTERED ERRORS DURING LEGACY DIRECTORY CLEANUP: {:?}", errors);
+                }
+            }
+            Err(e) => {
+                warn!("Failed to read directory {:?}: {}", parent_dir, e);
+                println!("===> WARNING: FAILED TO READ DIRECTORY {:?}: {}", parent_dir, e);
             }
         }
     }
@@ -3123,7 +3272,7 @@ impl StorageEngineManager {
                                     temporary: false,    // Not in StorageConfigInner, use SledConfig default
                                     use_compression: true, // Not in StorageConfigInner, use SledConfig default
                                 };
-                                match SledStorage::new(&sled_config).await {
+                                match SledStorage::new(&sled_config, &new_config).await {
                                     Ok(storage) => {
                                         info!("Created Sled storage for Hybrid");
                                         Arc::new(storage)
@@ -3250,7 +3399,7 @@ impl StorageEngineManager {
                         Some(instance) => instance.clone(),
                         None => {
                             trace!("Creating new SledStorage singleton");
-                            let storage = SledStorage::new(&sled_config).await?;
+                            let storage = SledStorage::new(&sled_config, &new_config).await?;
                             let instance = Arc::new(storage);
                             *sled_singleton = Some(instance.clone());
                             instance

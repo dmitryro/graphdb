@@ -34,7 +34,7 @@ use crate::cli::daemon_management::{
 
 // Import daemon API and registry
 use daemon_api::{start_daemon};
-use lib::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
+use lib::daemon::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
 
 /// Displays detailed status for a specific GraphDB daemon or lists all running ones.
 /// Enhanced version of display_daemon_status with better formatting and deduplication

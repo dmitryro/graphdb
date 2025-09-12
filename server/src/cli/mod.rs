@@ -25,6 +25,7 @@ pub mod config_impl_storage;
 */
 // Re-export the main CLI entry point from cli.rs
 pub use cli::{start_cli, CliArgs, Commands}; // Corrected: Changed run_cli to start_cli
+pub use lib::daemon::*;
 pub use lib::config::config_structs::*;
 pub use lib::config::config_defaults::*;
 pub use lib::config::config_constants::*;

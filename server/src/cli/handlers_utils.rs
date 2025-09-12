@@ -19,7 +19,7 @@ use crossterm::style::{self, Stylize};
 use crossterm::terminal::{Clear, ClearType, size as terminal_size};
 use crossterm::execute;
 use crossterm::cursor::MoveTo;
-use lib::daemon_registry::{DaemonMetadata};
+use lib::daemon::daemon_registry::{DaemonMetadata};
 
 /// Helper to get the path to the current executable.
 pub fn get_current_exe_path() -> Result<PathBuf> {
