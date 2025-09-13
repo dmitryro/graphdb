@@ -19,8 +19,8 @@ pub use lib::storage_engine::config::{EngineTypeOnly, RocksdbConfig, SledConfig,
                                       RedisConfig, PostgreSQLConfig};
 pub use models::errors::GraphError;
 pub use lib::storage_engine::config::{StorageEngineType, StorageConfig as LibStorageConfig, 
-                                      SelectedStorageConfig as LibSelectedStorageConfig,
-                                      StorageConfigInner as LibStorageConfigInner};
+                                      SelectedStorageConfig,
+                                      StorageConfigInner};
 pub use crate::cli::config_defaults::*;
 pub use crate::cli::serializers::*;
 

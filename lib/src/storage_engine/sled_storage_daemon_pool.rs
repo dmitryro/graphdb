@@ -45,34 +45,6 @@ impl SledDaemon {
         })?;
         println!("===> USING PORT {} FOR SLED DAEMON", port);
 
-        // Clean up any invalid /db subdirectory
-        let invalid_db_path = db_path.join("db");
-        if invalid_db_path.exists() {
-            warn!("Found invalid /db subdirectory at {:?}", invalid_db_path);
-            println!("===> WARNING: FOUND INVALID /DB SUBDIRECTORY AT {:?}", invalid_db_path);
-            if invalid_db_path.is_dir() {
-                fs::remove_dir_all(&invalid_db_path)
-                    .await
-                    .map_err(|e| {
-                        error!("Failed to remove invalid /db directory at {:?}: {}", invalid_db_path, e);
-                        println!("===> ERROR: FAILED TO REMOVE INVALID /DB DIRECTORY AT {:?}", invalid_db_path);
-                        GraphError::StorageError(format!("Failed to remove invalid /db directory at {:?}: {}", invalid_db_path, e))
-                    })?;
-                info!("Removed invalid /db directory at {:?}", invalid_db_path);
-                println!("===> REMOVED INVALID /DB DIRECTORY AT {:?}", invalid_db_path);
-            } else {
-                fs::remove_file(&invalid_db_path)
-                    .await
-                    .map_err(|e| {
-                        error!("Failed to remove invalid /db file at {:?}: {}", invalid_db_path, e);
-                        println!("===> ERROR: FAILED TO REMOVE INVALID /DB FILE AT {:?}", invalid_db_path);
-                        GraphError::StorageError(format!("Failed to remove invalid /db file at {:?}: {}", invalid_db_path, e))
-                    })?;
-                info!("Removed invalid /db file at {:?}", invalid_db_path);
-                println!("===> REMOVED INVALID /DB FILE AT {:?}", invalid_db_path);
-            }
-        }
-
         // Ensure the database directory exists and is writable
         if !db_path.exists() {
             info!("Creating database directory at {:?}", db_path);
@@ -312,7 +284,7 @@ impl SledDaemon {
         println!("===> SLED DAEMON INITIALIZATION COMPLETE FOR PORT {}", port);
         Ok(daemon)
     }
-    
+
     async fn run_zmq_server(&self) -> GraphResult<()> {
         const SOCKET_TIMEOUT_MS: i32 = 5000; // 5 seconds
         const MAX_MESSAGE_SIZE: i32 = 1024 * 1024; // 1MB max message size
@@ -1544,15 +1516,23 @@ impl SledDaemonPool {
 
         // Use CLI-provided port if available, otherwise use config port or default
         let port = cli_port.unwrap_or(config.port.unwrap_or(DEFAULT_STORAGE_PORT));
+        
+        // Create port-specific path: sled/<port> structure to prevent lock contention
         let db_path = if let path = &config.path {
-            path.clone()
+            // If path is explicitly set, ensure it follows sled/<port> structure
+            if path.ends_with(&port.to_string()) {
+                path.clone()
+            } else {
+                path.join(port.to_string())
+            }
         } else {
+            // Create default port-specific path: base_directory/sled/<port>
             storage_config
                 .data_directory
                 .as_ref()
                 .unwrap_or(&PathBuf::from(DEFAULT_DATA_DIRECTORY))
                 .join("sled")
-                .join(port.to_string()) // Ensure unique path per port
+                .join(port.to_string())
         };
 
         info!("Initializing cluster on port {} with path {:?}", port, db_path);
@@ -1669,7 +1649,6 @@ impl SledDaemonPool {
 
         Ok(())
     }
-
     pub async fn shutdown(&self) -> GraphResult<()> {
         info!("Shutting down SledDaemonPool");
         println!("===> SHUTTING DOWN SLED DAEMON POOL");

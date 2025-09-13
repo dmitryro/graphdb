@@ -1093,159 +1093,110 @@ impl StorageEngineManager {
     pub async fn new(
         storage_engine_type: StorageEngineType,
         config_path: &PathBuf,
-        _use_temp: bool,
+        use_temp: bool,
         port: Option<u16>,
     ) -> Result<Arc<Self>, GraphError> {
         info!("Creating new StorageEngineManager with engine type: {:?}", storage_engine_type);
         println!("===> CREATING NEW STORAGE ENGINE MANAGER WITH TYPE {:?}", storage_engine_type);
+        let mut config = crate::config::load_storage_config_from_yaml(Some(config_path.clone())).await?;
 
-        // Load configuration
-        let mut config = load_storage_config_from_yaml(Some(config_path.clone())).await
-            .map_err(|e| {
-                error!("Failed to load storage config from {:?}: {}", config_path, e);
-                GraphError::ConfigurationError(format!("Failed to load storage config: {}", e))
-            })?;
-        println!("====> INITIAL CONFIG: {:?}", config);
-
-        // Override port if provided via CLI
-        let port = port.unwrap_or(
-            config
-                .engine_specific_config
-                .as_ref()
-                .and_then(|c| c.storage.port)
-                .unwrap_or(DEFAULT_STORAGE_PORT),
-        );
-
-        // Construct the port-suffixed path
-        let engine_type_str = storage_engine_type.to_string().to_lowercase();
-        let base_path = config
-            .data_directory
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
-            .join(&engine_type_str);
-        let engine_path = base_path.join(port.to_string());
-
-        // Update config with port-suffixed path
-        if let Some(engine_config) = config.engine_specific_config.as_mut() {
-            engine_config.storage.port = Some(port);
-            if engine_config.storage.path != Some(engine_path.clone()) {
-                info!("Updating engine-specific path to {:?}", engine_path);
-                engine_config.storage.path = Some(engine_path.clone());
-            }
-        } else {
-            config.engine_specific_config = Some(SelectedStorageConfig {
-                storage_engine_type: storage_engine_type.clone(),
-                storage: StorageConfigInner {
-                    path: Some(engine_path.clone()),
-                    port: Some(port),
-                    host: None,
-                    username: None,
-                    password: None,
-                    database: None,
-                    pd_endpoints: None,
-                    use_compression: false,
-                    cache_capacity: None,
-                },
-            });
-        }
-
-        // --- FIX START ---
-        // The original code incorrectly overwrote the data_directory.
-        // This is the line that was removed, as the data_directory should be the root for all engines.
-        // config.data_directory = Some(base_path.clone());
-        // --- FIX END ---
-
-        info!("Calculated engine path: {:?}", engine_path);
-        println!("===> CALCULATED ENGINE PATH: {:?}", engine_path);
-        debug!("Updated config: {:?}", config);
-
-        // Retrieve existing daemon metadata or create new
-        let existing_metadata = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await
-            .map_err(|e| {
-                error!("Failed to retrieve daemon metadata for port {}: {}", port, e);
-                GraphError::StorageError(format!("Failed to retrieve daemon metadata: {}", e))
-            })?;
-
-        let daemon_metadata = if let Some(mut metadata) = existing_metadata {
-            // Daemon exists, update metadata with correct path and preserve PID
-            metadata.data_dir = Some(engine_path.clone());
-            metadata.engine_type = Some(storage_engine_type.to_string());
-            metadata.last_seen_nanos = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as i64)
-                .unwrap_or(0);
-            metadata
-        } else {
-            // No daemon registered, create new metadata
-            let pid = find_pid_by_port(port).await
-                .unwrap_or_else(|_| {
-                    warn!("Failed to find PID for port {}, using current process PID", port);
-                    None
-                })
-                .unwrap_or_else(|| {
-                    warn!("No PID found for port {}, using current process PID", port);
-                    std::process::id()
+        // Override port in config if provided via CLI flag
+        if let Some(cli_port) = port {
+            if let Some(engine_config) = config.engine_specific_config.as_mut() {
+                engine_config.storage.port = Some(cli_port);
+            } else {
+                config.engine_specific_config = Some(SelectedStorageConfig {
+                    storage_engine_type,
+                    storage: StorageConfigInner {
+                        path: None,
+                        host: None,
+                        port: Some(cli_port),
+                        username: None,
+                        password: None,
+                        database: None,
+                        pd_endpoints: None,
+                        use_compression: false,
+                        cache_capacity: None,
+                    },
                 });
-            
-            DaemonMetadata {
-                service_type: "storage".to_string(),
-                port,
-                pid,
-                ip_address: "127.0.0.1".to_string(),
-                data_dir: Some(engine_path.clone()),
-                config_path: Some(config_path.clone()),
-                engine_type: Some(storage_engine_type.to_string()),
-                last_seen_nanos: SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as i64)
-                    .unwrap_or(0),
             }
-        };
-
-        debug!("Updating daemon metadata with data_dir: {:?}, PID: {}", daemon_metadata.data_dir, daemon_metadata.pid);
-        println!("===> UPDATING DAEMON METADATA WITH DATA_DIR: {:?}, PID: {}", daemon_metadata.data_dir, daemon_metadata.pid);
-
-        // Update registry before engine initialization
-        timeout(
-            TokioDuration::from_secs(5),
-            GLOBAL_DAEMON_REGISTRY.update_daemon_metadata(daemon_metadata),
-        )
-        .await
-        .map_err(|_| {
-            error!("Timeout updating daemon metadata on port {}", port);
-            println!("===> ERROR: TIMEOUT UPDATING DAEMON METADATA ON PORT {}", port);
-            GraphError::StorageError(format!("Timeout updating daemon metadata on port {}", port))
-        })??;
-        info!("Successfully updated daemon metadata on port {} with path {:?}", port, engine_path);
-        println!("===> SUCCESSFULLY UPDATED DAEMON METADATA ON PORT {} WITH PATH {:?}", port, engine_path);
-
-        // Save config only if not temporary
-        if !_use_temp {
-            config.save().await.map_err(|e| {
-                error!("Failed to save updated storage config: {}", e);
-                println!("===> ERROR: FAILED TO SAVE UPDATED STORAGE CONFIG: {}", e);
-                GraphError::ConfigurationError(format!("Failed to save updated storage config: {}", e))
-            })?;
-        } else {
-            info!("Temporary mode: Skipping config save for {:?}", config_path);
         }
 
-        // Initialize the storage engine
+        // Get port for path and registration
+        let port = config
+            .engine_specific_config
+            .as_ref()
+            .and_then(|c| c.storage.port)
+            .unwrap_or(DEFAULT_STORAGE_PORT);
+        
+        // Create port-specific path: sled/<port> structure to prevent lock contention
+        let engine_path = config
+            .engine_specific_config
+            .as_ref()
+            .and_then(|c| c.storage.path.clone())
+            .unwrap_or_else(|| {
+                config
+                    .data_directory
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
+                    .join(&storage_engine_type.to_string().to_lowercase())
+                    .join(port.to_string()) // This creates sled/<port>
+            });
+
+        info!("Calculated new engine path: {:?}", engine_path);
+        println!("===> CALCULATED NEW ENGINE PATH: {:?}", engine_path);
+
+        // Update config with port-specific path
+        if let Some(engine_config) = config.engine_specific_config.as_mut() {
+            engine_config.storage.path = Some(engine_path.clone());
+        }
+        config.data_directory = Some(engine_path.parent().unwrap().to_path_buf()); // Points to sled/ directory
+        
+        config.save().await.map_err(|e| {
+            error!("Failed to save updated storage config: {}", e);
+            println!("===> ERROR: FAILED TO SAVE UPDATED STORAGE CONFIG: {}", e);
+            GraphError::ConfigurationError(format!("Failed to save updated storage config: {}", e))
+        })?;
+
+        // Step 5: Initialize the storage engine
         let engine: Arc<dyn GraphStorageEngine + Send + Sync> = match storage_engine_type {
             #[cfg(feature = "with-sled")]
             StorageEngineType::Sled => {
-                info!("Initializing Sled storage");
+                info!("Step 5: Initializing Sled storage");
                 println!("===> INITIALIZING SLED STORAGE");
                 Self::init_sled(&config).await?
             }
             _ => {
                 error!("Unsupported storage engine: {:?}", storage_engine_type);
                 println!("===> ERROR: UNSUPPORTED STORAGE ENGINE: {:?}", storage_engine_type);
-                return Err(GraphError::ConfigurationError(format!(
-                    "Unsupported storage engine: {:?}", storage_engine_type
-                )));
+                return Err(GraphError::ConfigurationError(format!("Unsupported storage engine: {:?}", storage_engine_type)));
             }
         };
+
+        // Step 6: Register the daemon
+        let daemon_metadata = DaemonMetadata {
+            service_type: "storage".to_string(),
+            port,
+            pid: std::process::id(),
+            ip_address: "127.0.0.1".to_string(),
+            data_dir: Some(engine_path.clone()),
+            config_path: Some(config_path.clone()),
+            engine_type: Some(storage_engine_type.to_string()),
+            last_seen_nanos: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as i64)
+                .unwrap_or(0),
+        };
+
+        timeout(TokioDuration::from_secs(5), GLOBAL_DAEMON_REGISTRY.register_daemon(daemon_metadata))
+            .await
+            .map_err(|_| {
+                error!("Timeout registering daemon on port {}", port);
+                println!("===> ERROR: TIMEOUT REGISTERING DAEMON ON PORT {}", port);
+                GraphError::StorageError(format!("Timeout registering daemon on port {}", port))
+            })??;
+        info!("Successfully registered daemon on port {}", port);
+        println!("===> SUCCESSFULLY REGISTERED DAEMON ON PORT {}", port);
 
         // Complete initialization
         let manager = StorageEngineManager {
@@ -1264,7 +1215,7 @@ impl StorageEngineManager {
     #[cfg(feature = "with-sled")]
     async fn init_sled(config: &StorageConfig) -> Result<Arc<dyn GraphStorageEngine + Send + Sync>, GraphError> {
         info!("Initializing Sled engine using raw sled crate");
-        println!("===> INITIALIZING SLED ENGINE: {:?}", config);
+        println!("===> INITIALIZING SLED ENGINE");
         trace!("Sled initialization started with config: {:?}", config);
 
         // Validate configuration
@@ -1276,28 +1227,25 @@ impl StorageEngineManager {
             ));
         }
 
-        // Get the port-suffixed path from config
-        let sled_path = config
-            .engine_specific_config
-            .as_ref()
-            .and_then(|c| c.storage.path.clone())
-            .ok_or_else(|| {
-                error!("Sled storage path is missing from configuration");
-                println!("===> ERROR: SLED STORAGE PATH MISSING FROM CONFIGURATION");
-                GraphError::ConfigurationError("Sled storage path is missing".to_string())
-            })?;
+        let sled_config_inner = config.engine_specific_config.as_ref();
 
-        // Validate path against daemon registry
-        if let Ok(Some(registry_metadata)) = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(config.engine_specific_config.as_ref().and_then(|c| c.storage.port).unwrap_or(DEFAULT_STORAGE_PORT)).await {
-            if registry_metadata.data_dir != Some(sled_path.clone()) {
-                error!("Path mismatch: daemon registry shows {:?}, but config specifies {:?}", registry_metadata.data_dir, sled_path);
-                println!("===> ERROR: PATH MISMATCH: DAEMON REGISTRY SHOWS {:?}, BUT CONFIG SPECIFIES {:?}", registry_metadata.data_dir, sled_path);
-                return Err(GraphError::StorageError(format!(
-                    "Path mismatch: daemon registry shows {:?}, but config specifies {:?}", 
-                    registry_metadata.data_dir, sled_path
-                )));
-            }
-        }
+        // Get port from config
+        let port = sled_config_inner
+            .and_then(|c| c.storage.port)
+            .unwrap_or(DEFAULT_STORAGE_PORT);
+        println!("===> SELECTED PORT {} FOR SLED INITIALIZATION", port);
+
+        // Use port-specific path: base_directory/sled/<port>
+        let sled_path = sled_config_inner
+            .and_then(|c| c.storage.path.clone())
+            .unwrap_or_else(|| {
+                config
+                    .data_directory
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
+                    .join("sled")
+                    .join(port.to_string()) // This ensures sled/<port> structure
+            });
 
         info!("Using Sled path: {:?}", sled_path);
         println!("===> USING SLED PATH: {:?}", sled_path);
@@ -1306,7 +1254,7 @@ impl StorageEngineManager {
         if !sled_path.exists() {
             info!("Creating Sled directory at {:?}", sled_path);
             println!("===> CREATING SLED DIRECTORY AT {:?}", sled_path);
-            tokio::fs::create_dir_all(&sled_path)
+            fs::create_dir_all(&sled_path)
                 .await
                 .map_err(|e| {
                     error!("Failed to create Sled directory at {:?}: {}", sled_path, e);
@@ -1315,94 +1263,35 @@ impl StorageEngineManager {
                 })?;
         }
 
-        // Build SledConfig
+        // Build SledConfig with port-specific path
         let sled_config = SledConfig {
             storage_engine_type: StorageEngineType::Sled,
-            path: sled_path.clone(),
-            host: config.engine_specific_config.as_ref().and_then(|c| c.storage.host.clone()),
-            port: config.engine_specific_config.as_ref().and_then(|c| c.storage.port),
-            temporary: config
-                .engine_specific_config
-                .as_ref()
+            path: Some(sled_path.clone()),
+            host: sled_config_inner.and_then(|c| c.storage.host.clone()),
+            port: Some(port),
+            temporary: sled_config_inner
                 .and_then(|c| c.storage.path.as_ref())
                 .map(|p| p.to_string_lossy().contains("temporary"))
                 .unwrap_or(SledConfig::default().temporary),
-            use_compression: config
-                .engine_specific_config
-                .as_ref()
+            use_compression: sled_config_inner
                 .and_then(|c| Some(c.storage.use_compression))
                 .unwrap_or(SledConfig::default().use_compression),
-            cache_capacity: config
-                .engine_specific_config
-                .as_ref()
+            cache_capacity: sled_config_inner
                 .and_then(|c| c.storage.cache_capacity)
                 .or_else(|| SledConfig::default().cache_capacity),
         };
 
-        // Initialize Sled storage
+        // Initialize Sled storage with port-specific path
         let sled_instance = SledStorage::new(&sled_config, config).await.map_err(|e| {
-            error!("Failed to initialize Sled storage at path {:?}: {}", sled_path, e);
-            println!("===> ERROR: FAILED TO INITIALIZE SLED STORAGE AT PATH {:?}: {}", sled_path, e);
+            error!("Failed to initialize Sled storage on port {} at path {:?}: {}", port, sled_path, e);
+            println!("===> ERROR: FAILED TO INITIALIZE SLED STORAGE ON PORT {} AT PATH {:?}: {}", port, sled_path, e);
             e
         })?;
 
-        info!("Successfully initialized Sled storage at path {:?}", sled_path);
-        println!("===> SUCCESSFULLY INITIALIZED SLED STORAGE AT PATH {:?}", sled_path);
+        info!("Successfully initialized Sled storage on port {} at path {:?}", port, sled_path);
+        println!("===> SUCCESSFULLY INITIALIZED SLED STORAGE ON PORT {} AT PATH {:?}", port, sled_path);
         
         Ok(Arc::new(sled_instance))
-    }
-
-    async fn cleanup_legacy_sled_directories_during_reset(base_data_dir: &Path, current_port: u16) {
-        info!("Cleaning up legacy port-suffixed Sled directories during reset in {:?}", base_data_dir);
-        
-        if !base_data_dir.exists() {
-            return;
-        }
-        
-        if let Ok(entries) = tokio::fs::read_dir(base_data_dir).await {
-            let mut entries = entries;
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                if let Some(name) = entry.file_name().to_str() {
-                    if name.starts_with("sled_") && name != "sled" {
-                        if let Some(suffix) = name.strip_prefix("sled_") {
-                            if let Ok(old_port) = suffix.parse::<u16>() {
-                                if old_port != current_port {
-                                    let old_path = entry.path();
-                                    info!("Found legacy Sled directory during reset: {:?} (port {})", old_path, old_port);
-                                    
-                                    if old_path.exists() {
-                                        if let Err(e) = SledStorage::force_unlock(&old_path).await {
-                                            warn!("Failed to force unlock Sled database during reset at {:?}: {}", old_path, e);
-                                        } else {
-                                            info!("Successfully unlocked Sled database during reset at {:?}", old_path);
-                                        }
-                                    }
-                                    
-                                    match tokio::fs::remove_dir_all(&old_path).await {
-                                        Ok(_) => {
-                                            info!("Successfully removed legacy Sled directory during reset: {:?}", old_path);
-                                            if let Ok(_) = GLOBAL_DAEMON_REGISTRY.unregister_daemon(old_port).await {
-                                                info!("Unregistered daemon registry entry for legacy port {} during reset", old_port);
-                                            }
-                                        }
-                                        Err(e) => {
-                                            warn!("Failed to remove legacy Sled directory during reset {:?}: {}", old_path, e);
-                                            if let Ok(_) = GLOBAL_DAEMON_REGISTRY.unregister_daemon(old_port).await {
-                                                info!("Unregistered daemon registry entry for legacy port {} during reset (directory removal failed)", old_port);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        } else {
-            warn!("Could not read directory entries from {:?} during reset", base_data_dir);
-        }
-        
-        info!("Completed cleanup of legacy port-suffixed Sled directories during reset");
     }
 
     async fn load_and_configure(
@@ -3511,6 +3400,5 @@ async fn cleanup_legacy_sled_paths(base_data_dir: &Path, current_port: u16) {
     
     info!("Completed cleanup of legacy port-suffixed Sled directories");
 }
-
 
 

@@ -149,7 +149,6 @@ pub async fn handle_query_command(engine: Arc<QueryExecEngine>, query: String) -
     println!("Query Result:\n{}", serde_json::to_string_pretty(&result)?);
     Ok(())
 }
-
 pub async fn handle_kv_command(engine: Arc<QueryExecEngine>, operation: String, key: String, value: Option<String>) -> Result<()> {
     let validated_op = parse_kv_operation(&operation)
         .map_err(|e| anyhow!("Invalid KV operation: {}", e))?;
@@ -209,10 +208,6 @@ pub async fn handle_kv_command(engine: Arc<QueryExecEngine>, operation: String, 
     }
 }
 
-// =============================================================================
-// CLIENT SIDE FIXES (handlers_queries.rs)
-// =============================================================================
-
 async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str) -> Result<()> {
     const CONNECT_TIMEOUT_SECS: u64 = 3;
     const REQUEST_TIMEOUT_SECS: u64 = 10;
@@ -231,17 +226,13 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
 
     println!("===> FOUND {} SLED DAEMONS", daemons.len());
 
-    // Simply take the first available Sled daemon from the registry
-    let daemon = daemons.first();
+    if daemons.is_empty() {
+        return Err(anyhow!("No running Sled daemon found. Please start a daemon with 'storage start'"));
+    }
 
-    match daemon {
-        Some(metadata) => {
-            println!("===> SELECTED DAEMON ON PORT: {}", metadata.port);
-        },
-        None => {
-            return Err(anyhow!("No running Sled daemon found. Please start a daemon with 'storage start'"));
-        }
-    };
+    // Select the daemon with the highest port (most recent) for load balancing
+    let daemon = daemons.iter().max_by_key(|m| m.port).unwrap_or(daemons.first().unwrap());
+    println!("===> SELECTED DAEMON ON PORT: {}", daemon.port);
 
     // Use the standard IPC socket path for all GraphDB communication
     let socket_path = "/opt/graphdb/pgraphdb.ipc";
@@ -272,58 +263,63 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
     let request_data = serde_json::to_vec(&request)
         .map_err(|e| anyhow!("Failed to serialize request: {}", e))?;
 
-    // Perform the entire ZMQ interaction in a single blocking task
-    let response_result = tokio::task::spawn_blocking({
-        let addr = addr.clone();
-        let request_data = request_data;
-        move || {
-            // Create zmq_context inside the blocking task as it is not Send
-            let zmq_context = zmq::Context::new();
-            let client_result = zmq_context.socket(zmq::REQ);
+    // Perform the entire ZMQ interaction in a single blocking task with timeout
+    let response_result = tokio::time::timeout(
+        TokioDuration::from_secs(CONNECT_TIMEOUT_SECS + REQUEST_TIMEOUT_SECS + RECEIVE_TIMEOUT_SECS),
+        tokio::task::spawn_blocking({
+            let addr = addr.clone();
+            let request_data = request_data;
+            move || {
+                // Create zmq_context inside the blocking task as it is not Send
+                let zmq_context = zmq::Context::new();
+                let client_result = zmq_context.socket(zmq::REQ);
 
-            if let Err(e) = client_result {
-                return Err(anyhow!("Failed to create ZMQ socket: {}", e));
+                if let Err(e) = client_result {
+                    return Err(anyhow!("Failed to create ZMQ socket: {}", e));
+                }
+
+                let client = client_result.unwrap();
+
+                // Set socket timeouts
+                if let Err(e) = client.set_rcvtimeo((RECEIVE_TIMEOUT_SECS * 1000) as i32) {
+                    return Err(anyhow!("Failed to set receive timeout: {}", e));
+                }
+                if let Err(e) = client.set_sndtimeo((REQUEST_TIMEOUT_SECS * 1000) as i32) {
+                    return Err(anyhow!("Failed to set send timeout: {}", e));
+                }
+
+                if let Err(e) = client.connect(&addr) {
+                    return Err(anyhow!("Failed to connect to {}: {}", addr, e));
+                }
+
+                println!("===> SUCCESSFULLY CONNECTED TO: {}", addr);
+
+                if let Err(e) = client.send(&request_data, 0) {
+                    return Err(anyhow!("Failed to send request to {}: {}", addr, e));
+                }
+
+                println!("===> REQUEST SENT SUCCESSFULLY");
+
+                let mut msg = zmq::Message::new();
+                if let Err(e) = client.recv(&mut msg, 0) {
+                    return Err(anyhow!("Failed to receive response from {}: {}", addr, e));
+                }
+                
+                println!("===> RECEIVED RESPONSE");
+                let response_bytes = msg.to_vec();
+                let response: Value = serde_json::from_slice(&response_bytes)
+                    .map_err(|e| anyhow!("Failed to deserialize response from {}: {}", addr, e))?;
+
+                println!("===> PARSED RESPONSE: {:?}", response);
+                Ok(response)
             }
-
-            let client = client_result.unwrap();
-
-            // Set socket timeouts
-            if let Err(e) = client.set_rcvtimeo((RECEIVE_TIMEOUT_SECS * 1000) as i32) {
-                return Err(anyhow!("Failed to set receive timeout: {}", e));
-            }
-            if let Err(e) = client.set_sndtimeo((REQUEST_TIMEOUT_SECS * 1000) as i32) {
-                return Err(anyhow!("Failed to set send timeout: {}", e));
-            }
-
-            if let Err(e) = client.connect(&addr) {
-                return Err(anyhow!("Failed to connect to {}: {}", addr, e));
-            }
-
-            println!("===> SUCCESSFULLY CONNECTED TO: {}", addr);
-
-            if let Err(e) = client.send(&request_data, 0) {
-                return Err(anyhow!("Failed to send request to {}: {}", addr, e));
-            }
-
-            println!("===> REQUEST SENT SUCCESSFULLY");
-
-            let mut msg = zmq::Message::new();
-            if let Err(e) = client.recv(&mut msg, 0) {
-                return Err(anyhow!("Failed to receive response from {}: {}", addr, e));
-            }
-            
-            println!("===> RECEIVED RESPONSE");
-            let response_bytes = msg.to_vec();
-            let response: Value = serde_json::from_slice(&response_bytes)
-                .map_err(|e| anyhow!("Failed to deserialize response from {}: {}", addr, e))?;
-
-            println!("===> PARSED RESPONSE: {:?}", response);
-            Ok(response)
-        }
-    });
+        })
+    )
+    .await
+    .map_err(|_| anyhow!("ZMQ operation timed out after {} seconds", CONNECT_TIMEOUT_SECS + REQUEST_TIMEOUT_SECS + RECEIVE_TIMEOUT_SECS))?;
 
     // Process the response from the blocking task
-    let response = match response_result.await {
+    let response = match response_result {
         Ok(Ok(response)) => response,
         Ok(Err(e)) => return Err(e),
         Err(e) => return Err(anyhow!("Task join error: {}", e)),

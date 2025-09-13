@@ -14,8 +14,8 @@ use crate::commands::{Commands, CommandType, StatusArgs, RestartArgs, ReloadArgs
                      StartAction, StopAction, StopArgs, DaemonCliCommand, UseAction, SaveAction};
 pub use crate::config::StorageConfig as EngineStorageConfig;
 pub use crate::config::{StorageEngineType, 
-                       SelectedStorageConfig as LibSelectedStorageConfig,
-                       StorageConfigInner as LibStorageConfigInner};
+                       SelectedStorageConfig,
+                       StorageConfigInner};
 use crate::query_exec_engine::query_exec_engine::{QueryExecEngine};
 pub use crate::storage_engine::storage_engine::{StorageEngineManager, GLOBAL_STORAGE_ENGINE_MANAGER};
 pub use crate::config::{EngineTypeOnly, RocksdbConfig, SledConfig, TikvConfig, MySQLConfig, 

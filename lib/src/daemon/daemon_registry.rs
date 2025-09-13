@@ -31,6 +31,33 @@ pub struct DaemonMetadata {
     pub last_seen_nanos: i64,
 }
 
+impl DaemonMetadata {
+    /// Merges non-empty values from another DaemonMetadata into self
+    pub fn merge_non_empty(&mut self, update: &DaemonMetadata) {
+        if !update.service_type.is_empty() {
+            self.service_type = update.service_type.clone();
+        }
+        if update.pid != 0 {
+            self.pid = update.pid;
+        }
+        if !update.ip_address.is_empty() {
+            self.ip_address = update.ip_address.clone();
+        }
+        if update.data_dir.is_some() {
+            self.data_dir = update.data_dir.clone();
+        }
+        if update.config_path.is_some() {
+            self.config_path = update.config_path.clone();
+        }
+        if update.engine_type.is_some() {
+            self.engine_type = update.engine_type.clone();
+        }
+        if update.last_seen_nanos != 0 {
+            self.last_seen_nanos = update.last_seen_nanos;
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ImprovedSledPool {
     db: Arc<Db>,
@@ -137,6 +164,10 @@ impl AsyncRegistryWrapper {
 
     pub async fn register_daemon(&self, metadata: DaemonMetadata) -> Result<()> {
         self.registry.inner.register_daemon(metadata).await
+    }
+
+    pub async fn update_daemon_metadata(&self, update: DaemonMetadata) -> Result<Option<DaemonMetadata>> {
+        self.registry.inner.update_daemon_metadata(update).await
     }
 
     pub async fn get_daemon_metadata(&self, port: u16) -> Result<Option<DaemonMetadata>> {
@@ -355,6 +386,56 @@ impl NonBlockingDaemonRegistry {
 
         info!("Registered daemon: {} on port {}", metadata.service_type, metadata.port);
         Ok(())
+    }
+
+    pub async fn update_daemon_metadata(&self, update: DaemonMetadata) -> Result<Option<DaemonMetadata>> {
+        let port = update.port;
+        
+        // First, check if the daemon exists in memory
+        let mut memory = self.memory_store.write().await;
+        let existing = memory.get_mut(&port);
+        
+        if let Some(existing_metadata) = existing {
+            // Create a copy of the original metadata before updating
+            let original = existing_metadata.clone();
+            
+            // Merge non-empty values
+            existing_metadata.merge_non_empty(&update);
+            
+            let updated_metadata = existing_metadata.clone();
+            drop(memory);
+            
+            // Update storage backend asynchronously
+            let storage = self.storage.clone();
+            let metadata_clone = updated_metadata.clone();
+            
+            let task = tokio::spawn(async move {
+                let storage_guard = storage.read().await;
+                if let Some(pool) = &*storage_guard {
+                    let key = metadata_clone.port.to_string().into_bytes();
+                    let encoded = encode_to_vec(&metadata_clone, config::standard())
+                        .map_err(|e| anyhow::anyhow!("Failed to encode updated metadata for port {}: {}", metadata_clone.port, e))?;
+                    if let Err(e) = pool.insert(&key, &encoded).await {
+                        warn!("Failed to update sled for port {}: {}", metadata_clone.port, e);
+                    }
+                }
+                Ok::<_, anyhow::Error>(())
+            });
+            let _ = task.await;
+            
+            // Update the fallback file
+            let memory = self.memory_store.read().await;
+            let all_metadata: Vec<_> = memory.values().cloned().collect();
+            drop(memory);
+            let _ = Self::save_fallback_file(&self.config.fallback_file, &all_metadata).await;
+            
+            info!("Updated daemon metadata for port {}", port);
+            Ok(Some(updated_metadata))
+        } else {
+            drop(memory);
+            warn!("Attempted to update non-existent daemon on port {}", port);
+            Ok(None)
+        }
     }
     
     // This function now reloads from Sled to guarantee fresh data.
@@ -647,6 +728,10 @@ impl DaemonRegistryWrapper {
     pub async fn register_daemon(&self, metadata: DaemonMetadata) -> Result<()> {
         self.get().await.register_daemon(metadata).await
     }
+
+    pub async fn update_daemon_metadata(&self, update: DaemonMetadata) -> Result<Option<DaemonMetadata>> {
+        self.get().await.update_daemon_metadata(update).await
+    }
     
     pub async fn get_daemon_metadata(&self, port: u16) -> Result<Option<DaemonMetadata>> {
         self.get().await.get_daemon_metadata(port).await
@@ -723,4 +808,3 @@ async fn emergency_cleanup_daemon_registry_internal(db_path: &PathBuf) -> Result
     info!("Finished emergency cleanup of daemon registry");
     Ok(())
 }
-

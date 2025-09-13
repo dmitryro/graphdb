@@ -34,41 +34,9 @@ impl SledStorage {
         println!("===> INITIALIZING SLED DAEMON WITH PATH {:?}", config.path);
 
         // Use base database path directly
-        let db_path = if let path = &config.path {
-            path.clone()
-        } else {
-            PathBuf::from(DEFAULT_DATA_DIRECTORY).join("sled")
-        };
+        let db_path = config.path.clone();
         info!("Using database path {:?}", db_path);
         println!("===> USING SLED PATH {:?}", db_path);
-
-        // Clean up any invalid /db subdirectory
-        let invalid_db_path = db_path.join("db");
-        if invalid_db_path.exists() {
-            warn!("Found invalid /db subdirectory at {:?}", invalid_db_path);
-            println!("===> WARNING: FOUND INVALID /db SUBDIRECTORY AT {:?}", invalid_db_path);
-            if invalid_db_path.is_dir() {
-                fs::remove_dir_all(&invalid_db_path)
-                    .await
-                    .map_err(|e| {
-                        error!("Failed to remove invalid /db directory at {:?}: {}", invalid_db_path, e);
-                        println!("===> ERROR: FAILED TO REMOVE INVALID /db DIRECTORY AT {:?}", invalid_db_path);
-                        GraphError::StorageError(format!("Failed to remove invalid /db directory at {:?}: {}", invalid_db_path, e))
-                    })?;
-                info!("Removed invalid /db directory at {:?}", invalid_db_path);
-                println!("===> REMOVED INVALID /db DIRECTORY AT {:?}", invalid_db_path);
-            } else {
-                fs::remove_file(&invalid_db_path)
-                    .await
-                    .map_err(|e| {
-                        error!("Failed to remove invalid /db file at {:?}: {}", invalid_db_path, e);
-                        println!("===> ERROR: FAILED TO REMOVE INVALID /db FILE AT {:?}", invalid_db_path);
-                        GraphError::StorageError(format!("Failed to remove invalid /db file at {:?}: {}", invalid_db_path, e))
-                    })?;
-                info!("Removed invalid /db file at {:?}", invalid_db_path);
-                println!("===> REMOVED INVALID /db FILE AT {:?}", invalid_db_path);
-            }
-        }
 
         // Ensure base directory exists and is writable
         if !db_path.exists() {
@@ -120,7 +88,7 @@ impl SledStorage {
             info!("Opening Sled database at {:?}", db_path);
             println!("===> ATTEMPTING TO OPEN SLED DB AT {:?}", db_path);
             let db = sled::Config::new()
-                .path(&db_path) // Use base path directly
+                .path(&db_path)
                 .use_compression(config.use_compression)
                 .cache_capacity(config.cache_capacity.unwrap_or(1024 * 1024 * 1024))
                 .open()
@@ -179,6 +147,7 @@ impl SledStorage {
             pool_guard.initialize_cluster(storage_config, config, Some(port)).await?;
             println!("===> INITIALIZED CLUSTER ON PORT {}", port);
         }
+        // CORRECTED: Acquiring a lock on `pool_map` which is the HashMap, not `pool` which is the SledDaemonPool.
         let mut pool_map_guard = pool_map.lock().await;
         pool_map_guard.insert(port, pool.clone());
 
