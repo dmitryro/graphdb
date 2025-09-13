@@ -1096,6 +1096,7 @@ impl StorageEngineManager {
         _use_temp: bool,
         port: Option<u16>,
     ) -> Result<Arc<Self>, GraphError> {
+        println!("===> IN STORAGE MANAGER - Config Path {:?}", config_path);
         info!("Creating new StorageEngineManager with engine type: {:?}", storage_engine_type);
         println!("===> CREATING NEW STORAGE ENGINE MANAGER WITH TYPE {:?}", storage_engine_type);
 
