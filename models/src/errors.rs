@@ -30,23 +30,21 @@ pub enum GraphError {
     #[error("Transaction error: {0}")]
     TransactionError(String), // Error specific to transaction management
     #[error("Configuration error: {0}")]
-    ConfigError(String), // Error with configuration loading or validation
-
-    #[error("Failed to acquire lock: {0}")] // Added LockError
+    ConfigurationError(String), // Error with configuration loading or validation
+    #[error("Failed to acquire lock: {0}")]
     LockError(String),
-    #[error("Feature not implemented: {0}")] // Added NotImplemented
+    #[error("Feature not implemented: {0}")]
     NotImplemented(String),
-    #[error("Entity already exists: {0}")] // Added AlreadyExists
+    #[error("Entity already exists: {0}")]
     AlreadyExists(String),
-    #[error("Invalid data provided: {0}")] // Added InvalidData
+    #[error("Invalid data provided: {0}")]
     InvalidData(String),
-    #[error("An internal error occurred: {0}")] // Added InternalError
+    #[error("An internal error occurred: {0}")]
     InternalError(String),
-
     #[error("entity with identifier {0} was not found")]
     NotFound(Identifier),
     #[error(transparent)]
-    Io(#[from] io::Error), // Correctly defined Io variant
+    Io(#[from] io::Error),
     #[error(transparent)]
     Validation(#[from] ValidationError),
     #[cfg(feature = "rocksdb-errors")]
@@ -67,16 +65,12 @@ pub enum GraphError {
     Unknown,
     #[error("Authentication error: {0}")]
     Auth(String), // General authentication error
-
     #[error("Invalid storage engine: {0}")]
     InvalidStorageEngine(String),
-
-    #[error("Configuration error: {0}")]
-    ConfigurationError(String),
-
     #[error("Network error: {0}")]
     NetworkError(String),
 }
+
 
 // Implement From for serde_json::Error to convert into GraphError variants.
 impl From<serde_json::Error> for GraphError {

@@ -8,6 +8,7 @@ use std::collections::{HashMap};
 use serde::{de::DeserializeOwned, Deserialize, Serialize, Serializer, Deserializer};
 use serde::de::{self, MapAccess, Visitor};
 use serde_yaml2 as serde_yaml;
+use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Map, Value};
 use crate::config::config_defaults::*;
 use crate::config::config_constants::*;
@@ -24,6 +25,40 @@ use openraft_memstore::MemStore;
 use openraft_sled::SledRaftStorage;
 use sled::{Config, Db, Tree};
 use crate::daemon_registry::DaemonMetadata;
+
+/// Replication strategy for data operations
+/// Represents the strategy for replicating data writes.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum ReplicationStrategy {
+    /// Replicate to all available nodes
+    AllNodes,
+    /// Replicate to N nodes (including primary)
+    NNodes(usize),
+    /// Use Raft consensus
+    Raft,
+}
+
+/// Health status of a daemon node
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeHealth {
+    pub port: u16,
+    pub is_healthy: bool,
+    pub last_check: SystemTime,
+    pub response_time_ms: u64,
+    pub error_count: u32,
+}
+
+/// Load balancer for routing requests across healthy nodes
+/// The configuration for the load balancer in a distributed setup.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct LoadBalancer {
+    #[serde(skip)]
+    pub nodes: Arc<RwLock<HashMap<u16, NodeHealth>>>,
+    #[serde(skip)]
+    pub current_index: Arc<TokioMutex<usize>>,
+    pub replication_factor: usize,
+}
+
 
 // StorageEngineType
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -80,6 +115,8 @@ pub struct SledDaemonPool {
     pub daemons: HashMap<u16, Arc<SledDaemon>>,
     pub registry: Arc<RwLock<HashMap<u16, DaemonMetadata>>>,
     pub initialized: Arc<RwLock<bool>>,
+    pub load_balancer: Arc<LoadBalancer>,
+    pub use_raft: bool,
 }
 
 #[derive(Debug, Clone)]

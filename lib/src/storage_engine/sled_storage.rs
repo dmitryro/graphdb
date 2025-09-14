@@ -29,7 +29,7 @@ pub static SLED_DB: LazyLock<OnceCell<TokioMutex<SledDbWithPath>>> = LazyLock::n
 pub static SLED_POOL_MAP: LazyLock<OnceCell<TokioMutex<HashMap<u16, Arc<TokioMutex<SledDaemonPool>>>>>> = LazyLock::new(|| OnceCell::new());
 
 impl SledStorage {
-     /// Initializes a new Sled storage instance.
+    /// Initializes a new Sled storage instance.
     /// This function constructs a unique path for the database based on the provided port number.
     pub async fn new(config: &SledConfig, storage_config: &StorageConfig) -> Result<Self, GraphError> {
         info!("Initializing SledStorage with config: {:?}", config);
@@ -67,7 +67,7 @@ impl SledStorage {
             return Err(GraphError::StorageError(format!("Path {:?} is not a directory", db_path)));
         }
 
-        // Check permissions
+        // Check permissions - Fixed logic
         let metadata = fs::metadata(&db_path)
             .await
             .map_err(|e| {
@@ -75,13 +75,13 @@ impl SledStorage {
                 println!("===> ERROR: FAILED TO ACCESS DIRECTORY METADATA AT {:?}", db_path);
                 GraphError::StorageError(format!("Failed to access directory metadata at {:?}: {}", db_path, e))
             })?;
-        if !metadata.permissions().readonly() {
-            info!("Directory at {:?} is writable", db_path);
-        } else {
+        
+        if metadata.permissions().readonly() {
             error!("Directory at {:?} is not writable", db_path);
             println!("===> ERROR: DIRECTORY AT {:?} IS NOT WRITABLE", db_path);
             return Err(GraphError::StorageError(format!("Directory at {:?} is not writable", db_path)));
         }
+        info!("Directory at {:?} is writable", db_path);
 
         let lock_path = db_path.join("db.lck");
         if lock_path.exists() {
@@ -136,9 +136,11 @@ impl SledStorage {
                     println!("===> REUSING EXISTING DAEMON ON PORT {} WITH MATCHING PATH {:?}", port, db_path);
                     let mut pool_guard = existing_pool.lock().await;
                     if pool_guard.daemons.is_empty() {
-                        info!("Existing pool for port {} is uninitialized, initializing cluster", port);
-                        println!("===> INITIALIZING CLUSTER ON PORT {}", port);
-                        pool_guard.initialize_cluster(storage_config, config, Some(port)).await?;
+                        info!("Existing pool for port {} is uninitialized, initializing cluster with existing DB", port);
+                        println!("===> INITIALIZING CLUSTER ON PORT {} WITH EXISTING DB", port);
+                        // FIX: Use the already-opened database instead of trying to open again
+                        let sled_db_guard = sled_db.lock().await;
+                        (*pool_guard).initialize_cluster_with_db(storage_config, config, Some(port), sled_db_guard.db.clone()).await?;
                     }
                     return Ok(Self {
                         pool: existing_pool.clone(),
@@ -152,8 +154,11 @@ impl SledStorage {
             let mut pool_guard = pool.lock().await;
             info!("Initializing cluster with use_raft_for_scale: {}", storage_config.use_raft_for_scale);
             println!("===> INITIALIZING CLUSTER WITH USE_RAFT_FOR_SCALE: {}", storage_config.use_raft_for_scale);
-            pool_guard.initialize_cluster(storage_config, config, Some(port)).await?;
-            println!("===> INITIALIZED CLUSTER ON PORT {}", port);
+            
+            // FIX: Use the already-opened database instead of trying to open again
+            let sled_db_guard = sled_db.lock().await;
+            (*pool_guard).initialize_cluster_with_db(storage_config, config, Some(port), sled_db_guard.db.clone()).await?;
+            println!("===> INITIALIZED CLUSTER ON PORT {} WITH EXISTING DB", port);
         }
 
         let mut pool_map_guard = pool_map.lock().await;
@@ -198,7 +203,7 @@ impl SledStorage {
             return Err(GraphError::StorageError(format!("Path {:?} is not a directory", db_path)));
         }
 
-        // Check permissions
+        // Check permissions - Fixed logic
         let metadata = fs::metadata(&db_path)
             .await
             .map_err(|e| {
@@ -206,13 +211,13 @@ impl SledStorage {
                 println!("===> ERROR: FAILED TO ACCESS DIRECTORY METADATA AT {:?}", db_path);
                 GraphError::StorageError(format!("Failed to access directory metadata at {:?}: {}", db_path, e))
             })?;
-        if !metadata.permissions().readonly() {
-            info!("Directory at {:?} is writable", db_path);
-        } else {
+        
+        if metadata.permissions().readonly() {
             error!("Directory at {:?} is not writable", db_path);
             println!("===> ERROR: DIRECTORY AT {:?} IS NOT WRITABLE", db_path);
             return Err(GraphError::StorageError(format!("Directory at {:?} is not writable", db_path)));
         }
+        info!("Directory at {:?} is writable", db_path);
 
         // Update SLED_DB singleton with the provided database
         let sled_db = SLED_DB.get_or_try_init(|| async {
@@ -228,16 +233,12 @@ impl SledStorage {
         info!("Successfully updated Sled database singleton at {:?}", db_path);
         println!("===> SUCCESSFULLY UPDATED SLED DATABASE SINGLETON AT {:?}", db_path);
 
-        let port = config.port.unwrap_or(DEFAULT_STORAGE_PORT);
         let pool_map = SLED_POOL_MAP.get_or_init(|| async {
             TokioMutex::new(HashMap::<u16, Arc<TokioMutex<SledDaemonPool>>>::new())
         }).await;
 
-        // Corrected: Removed the strict path equality check as per your request.
-        // It now proceeds even if the paths are not identical, as long as a daemon exists.
         if let Some(metadata) = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await? {
             if let Some(registered_path) = &metadata.data_dir {
-                // Warning is sufficient now. No need to return an error.
                 if registered_path != &db_path {
                     warn!("Path mismatch: daemon registry shows {:?}, but config specifies {:?}", registered_path, db_path);
                     println!("in SledStorage new_with_db ===> PATH MISMATCH: DAEMON REGISTRY SHOWS {:?}, BUT CONFIG SPECIFIES {:?}", registered_path, db_path);
@@ -260,7 +261,8 @@ impl SledStorage {
             }
         }
 
-        let pool = Arc::new(TokioMutex::new(SledDaemonPool::new_with_db(config, existing_db.clone()).await?));
+        // FIX: Create pool with existing database instead of trying to open new one
+        let pool = Arc::new(TokioMutex::new(SledDaemonPool::new()));
         {
             let mut pool_guard = pool.lock().await;
             info!("Initializing cluster with use_raft_for_scale: {}", storage_config.use_raft_for_scale);
