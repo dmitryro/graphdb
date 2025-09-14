@@ -1,20 +1,20 @@
 storage:
-      config_root_directory: "./storage_daemon_server"
-      data_directory: "/opt/graphdb/storage_data"
-      log_directory: "/opt/graphdb/logs"
-      default_port: 8052
-      cluster_range: "8049-8054"
-      max_disk_space_gb: 1000
-      min_disk_space_gb: 10
-      use_raft_for_scale: false
+    config_root_directory: "./storage_daemon_server"
+    data_directory: "/opt/graphdb/storage_data"
+    log_directory: "/opt/graphdb/logs"
+    default_port: 8052
+    cluster_range: "8049-8054"
+    max_disk_space_gb: 1000
+    min_disk_space_gb: 10
+    use_raft_for_scale: false
+    storage_engine_type: "sled"
+    engine_specific_config:
       storage_engine_type: "sled"
-      engine_specific_config:
-        storage_engine_type: "sled"
-        path: "/opt/graphdb/storage_data/sled"
-        host: "127.0.0.1"
-        port: 8053
-        username: ""
-        password: ""
-        pd_endpoints: ""
-      max_open_files: 100
-    
+      path: "/opt/graphdb/storage_data/sled/8052/sled"
+      host: "127.0.0.1"
+      port: 8052
+      username: ""
+      password: ""
+      pd_endpoints: ""
+    max_open_files: 100
+  
