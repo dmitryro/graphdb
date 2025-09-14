@@ -1,10 +1,17 @@
 // models/src/errors.rs
 
 use std::io;
+use std::string::FromUtf8Error;
 pub use thiserror::Error;
 use uuid;
+use uuid::Error as UuidError;
 use bincode::error::{DecodeError, EncodeError};
 use anyhow::Error as AnyhowError;
+use serde_json::Error as SerdeJsonError;
+use rmp_serde::encode::Error as RmpEncodeError;
+use rmp_serde::decode::Error as RmpDecodeError;
+use zmq::Error as ZmqError;
+use tokio::task::JoinError;
 
 use crate::{identifiers::Identifier, properties::PropertyMap, PropertyValue};
 
@@ -23,23 +30,21 @@ pub enum GraphError {
     #[error("Transaction error: {0}")]
     TransactionError(String), // Error specific to transaction management
     #[error("Configuration error: {0}")]
-    ConfigError(String), // Error with configuration loading or validation
-
-    #[error("Failed to acquire lock: {0}")] // Added LockError
+    ConfigurationError(String), // Error with configuration loading or validation
+    #[error("Failed to acquire lock: {0}")]
     LockError(String),
-    #[error("Feature not implemented: {0}")] // Added NotImplemented
+    #[error("Feature not implemented: {0}")]
     NotImplemented(String),
-    #[error("Entity already exists: {0}")] // Added AlreadyExists
+    #[error("Entity already exists: {0}")]
     AlreadyExists(String),
-    #[error("Invalid data provided: {0}")] // Added InvalidData
+    #[error("Invalid data provided: {0}")]
     InvalidData(String),
-    #[error("An internal error occurred: {0}")] // Added InternalError
+    #[error("An internal error occurred: {0}")]
     InternalError(String),
-
     #[error("entity with identifier {0} was not found")]
     NotFound(Identifier),
     #[error(transparent)]
-    Io(#[from] io::Error), // Correctly defined Io variant
+    Io(#[from] io::Error),
     #[error(transparent)]
     Validation(#[from] ValidationError),
     #[cfg(feature = "rocksdb-errors")]
@@ -55,18 +60,17 @@ pub enum GraphError {
     #[error(transparent)]
     BincodeEncode(#[from] EncodeError),
     #[error("UUID parsing or generation error: {0}")]
-    Uuid(#[from] uuid::Error),
+    Uuid(#[from] UuidError),
     #[error("An unknown error occurred.")]
     Unknown,
     #[error("Authentication error: {0}")]
     Auth(String), // General authentication error
-   
     #[error("Invalid storage engine: {0}")]
     InvalidStorageEngine(String),
-
-    #[error("Configuration error: {0}")]
-    ConfigurationError(String),
+    #[error("Network error: {0}")]
+    NetworkError(String),
 }
+
 
 // Implement From for serde_json::Error to convert into GraphError variants.
 impl From<serde_json::Error> for GraphError {
@@ -96,6 +100,19 @@ impl From<AnyhowError> for GraphError {
     }
 }
 
+// NEW: Implement From for zmq::Error
+impl From<ZmqError> for GraphError {
+    fn from(err: ZmqError) -> Self {
+        GraphError::NetworkError(format!("ZeroMQ error: {}", err))
+    }
+}
+
+// THIS IS THE MISSING IMPLEMENTATION THAT THE COMPILER IS ASKING FOR.
+impl From<JoinError> for GraphError {
+    fn from(err: JoinError) -> Self {
+        GraphError::InternalError(format!("Task failed to join: {:?}", err))
+    }
+}
 
 /// A validation error.
 #[derive(Debug, Error, PartialEq)]

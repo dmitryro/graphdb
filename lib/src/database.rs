@@ -57,7 +57,7 @@ impl Database {
                             use_compression: true,
                         }
                     };
-                    Arc::new(SledStorage::new(&sled_config).await?)
+                    Arc::new(SledStorage::new(&sled_config, &config).await?)
                 }
                 #[cfg(not(feature = "with-sled"))]
                 return Err(GraphError::ConfigurationError("Sled feature not enabled".to_string()));
@@ -159,7 +159,7 @@ impl Database {
                                     temporary: false,
                                     use_compression: true,
                                 };
-                                Arc::new(SledStorage::new(&sled_config).await?)
+                                Arc::new(SledStorage::new(&sled_config, &config).await?)
                                     as Arc<dyn GraphStorageEngine + Send + Sync>
                             }
                             #[cfg(not(feature = "with-sled"))]
@@ -228,7 +228,7 @@ impl Database {
                         temporary: false,
                         use_compression: true,
                     };
-                    Arc::new(SledStorage::new(&sled_config).await?)
+                    Arc::new(SledStorage::new(&sled_config, &config_wrapper.storage).await?)
                         as Arc<dyn GraphStorageEngine + Send + Sync>
                 }
                 #[cfg(not(feature = "with-sled"))]
@@ -322,7 +322,7 @@ impl Database {
                                     temporary: false,
                                     use_compression: true,
                                 };
-                                Arc::new(SledStorage::new(&sled_config).await?)
+                                Arc::new(SledStorage::new(&sled_config, &config_wrapper.storage).await?)
                                     as Arc<dyn GraphStorageEngine + Send + Sync>
                             }
                             #[cfg(not(feature = "with-sled"))]

@@ -886,7 +886,7 @@ pub fn format_engine_config(storage_config: &StorageConfig) -> Vec<String> {
     config_lines
 }
 
-fn create_default_yaml_config(yaml_path: &PathBuf, engine_type: StorageEngineType) -> Result<(), GraphError> {
+pub fn create_default_yaml_config(yaml_path: &PathBuf, engine_type: StorageEngineType) -> Result<(), GraphError> {
     info!("Creating default YAML config at {:?}", yaml_path);
     trace!("Creating default config for engine_type: {:?}", engine_type);
     
@@ -968,5 +968,44 @@ fn create_default_yaml_config(yaml_path: &PathBuf, engine_type: StorageEngineTyp
     
     info!("Created default config file at {:?}", yaml_path);
     trace!("Default config file written successfully");
+    Ok(())
+}
+
+/// Creates a default YAML configuration file
+pub async fn create_default_storage_yaml_config(yaml_path: &PathBuf, engine_type: StorageEngineType) -> Result<(), GraphError> {
+    info!("Creating default YAML config at {:?}", yaml_path);
+    let config = StorageConfig {
+        storage_engine_type: engine_type,
+        config_root_directory: Some(PathBuf::from("./storage_daemon_server")),
+        data_directory: Some(PathBuf::from(DEFAULT_DATA_DIRECTORY)),
+        log_directory: Some(PathBuf::from(DEFAULT_LOG_DIRECTORY)),
+        default_port: DEFAULT_STORAGE_PORT,
+        cluster_range: DEFAULT_STORAGE_PORT.to_string(),
+        max_disk_space_gb: 1000,
+        min_disk_space_gb: 10,
+        use_raft_for_scale: true,
+        max_open_files: 100u64,
+        engine_specific_config: Some(SelectedStorageConfig {
+            storage_engine_type: engine_type,
+            storage: StorageConfigInner {
+                path: Some(PathBuf::from(format!("{}/{}", DEFAULT_DATA_DIRECTORY, engine_type.to_string().to_lowercase()))),
+                host: Some("127.0.0.1".to_string()),
+                port: Some(DEFAULT_STORAGE_PORT),
+                username: None,
+                password: None,
+                database: None,
+                pd_endpoints: None,
+                cache_capacity: Some(1024 * 1024 * 1024),
+                use_compression: false, // Fixed: Changed False to false
+            },
+        }),
+    };
+
+    config.save().await
+        .map_err(|e| {
+            error!("Failed to save default YAML config to {:?}: {}", yaml_path, e);
+            GraphError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        })?;
+    info!("Default YAML config created at {:?}", yaml_path);
     Ok(())
 }
