@@ -55,7 +55,7 @@ pub struct EngineConfig {
 // Struct to hold sled::Db and its path
 #[derive(Debug)]
 pub struct SledDbWithPath {
-    pub db: sled::Db,
+    pub db: Arc<sled::Db>,
     pub path: PathBuf,
 }
 

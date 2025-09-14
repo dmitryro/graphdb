@@ -11,6 +11,7 @@ use serde_json::Error as SerdeJsonError;
 use rmp_serde::encode::Error as RmpEncodeError;
 use rmp_serde::decode::Error as RmpDecodeError;
 use zmq::Error as ZmqError;
+use tokio::task::JoinError;
 
 use crate::{identifiers::Identifier, properties::PropertyMap, PropertyValue};
 
@@ -112,6 +113,12 @@ impl From<ZmqError> for GraphError {
     }
 }
 
+// THIS IS THE MISSING IMPLEMENTATION THAT THE COMPILER IS ASKING FOR.
+impl From<JoinError> for GraphError {
+    fn from(err: JoinError) -> Self {
+        GraphError::InternalError(format!("Task failed to join: {:?}", err))
+    }
+}
 
 /// A validation error.
 #[derive(Debug, Error, PartialEq)]

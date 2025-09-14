@@ -2,6 +2,7 @@ use anyhow::{Result, Context, anyhow};
 use std::collections::HashMap;
 use std::path::{PathBuf, Path};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{oneshot, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
 use std::time::Duration;
@@ -15,14 +16,15 @@ use futures::future;
 
 // Import configuration-related items
 use lib::config::{
-    DEFAULT_DAEMON_PORT, DEFAULT_REST_API_PORT, DEFAULT_STORAGE_PORT,
+    DEFAULT_DAEMON_PORT, DEFAULT_REST_API_PORT, DEFAULT_STORAGE_PORT, DEFAULT_DATA_DIRECTORY,
     DEFAULT_STORAGE_CONFIG_PATH_RELATIVE, StorageConfig, load_storage_config_from_yaml, 
     DEFAULT_CONFIG_ROOT_DIRECTORY_STR, StorageEngineType, daemon_api_storage_engine_type_to_string,
 };
 
 // Import daemon management utilities
 use crate::cli::daemon_management::{
-    check_process_status_by_port, is_port_free, parse_cluster_range, stop_process_by_port, is_port_in_cluster_range
+    check_process_status_by_port, is_port_free, parse_cluster_range, stop_process_by_port, 
+    is_port_in_cluster_range, find_pid_by_port,
 };
 
 // Import handler functions for individual components
@@ -544,15 +546,67 @@ pub async fn display_full_status_summary(
     println!("{:<20} {:<15} {:<10} {:<40}", "Component", "Status", "Port", "Details");
     println!("{:-<20} {:-<15} {:-<10} {:-<40}", "", "", "", "");
 
+    // Load storage config to get cluster range
+    let storage_config = load_storage_config_from_yaml(None).await.unwrap_or_else(|e| {
+        warn!("Failed to load storage config: {}, using default", e);
+        StorageConfig::default()
+    });
+    let cluster_ports = parse_cluster_range(&storage_config.cluster_range).unwrap_or_default();
+
+    // Update registry for running storage daemons not in registry
+    let mut running_ports = Vec::new();
+    for port in cluster_ports {
+        if check_process_status_by_port_with_retry("Storage Daemon", port, 3, Duration::from_millis(100)).await {
+            running_ports.push(port);
+            let metadata = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await?;
+            if metadata.is_none() || metadata.as_ref().map(|m| m.service_type != "storage").unwrap_or(true) {
+                warn!("Storage daemon running on port {} but not in registry. Updating metadata...", port);
+                let engine_type = if let Some(manager) = GLOBAL_STORAGE_ENGINE_MANAGER.get() {
+                    manager.current_engine_type().await
+                } else {
+                    storage_config.storage_engine_type.clone()
+                };
+                let instance_path = storage_config
+                    .data_directory
+                    .as_ref()
+                    .unwrap_or(&PathBuf::from(DEFAULT_DATA_DIRECTORY))
+                    .join(daemon_api_storage_engine_type_to_string(&engine_type).to_lowercase())
+                    .join(port.to_string());
+                let pid = find_pid_by_port(port).await.unwrap_or(0);
+
+                let update_metadata = DaemonMetadata {
+                    service_type: "storage".to_string(),
+                    port,
+                    pid,
+                    ip_address: "127.0.0.1".to_string(),
+                    data_dir: Some(instance_path.clone()),
+                    config_path: storage_config.config_root_directory.clone(),
+                    engine_type: Some(engine_type.to_string()),
+                    last_seen_nanos: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as i64)
+                        .unwrap_or(0),
+                };
+
+                if let Err(e) = GLOBAL_DAEMON_REGISTRY.update_daemon_metadata(update_metadata).await {
+                    error!("Failed to update daemon metadata on port {}: {}", port, e);
+                } else {
+                    info!("Successfully updated daemon metadata on port {}", port);
+                }
+            }
+        }
+    }
+
+    // Get all daemon metadata after updating
     let all_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
-    debug!("Registry contents: {:?}", all_daemons);
+    debug!("Registry contents after update: {:?}", all_daemons);
 
     // Concurrently check the status of all registered daemons
     let mut tasks = Vec::new();
     for daemon in all_daemons.iter() {
         let daemon_clone = daemon.clone();
         tasks.push(tokio::spawn(async move {
-            let is_running = check_process_status_by_port(&daemon_clone.service_type, daemon_clone.port).await;
+            let is_running = check_process_status_by_port_with_retry(&daemon_clone.service_type, daemon_clone.port, 3, Duration::from_millis(100)).await;
             (daemon_clone, is_running)
         }));
     }
@@ -565,9 +619,9 @@ pub async fn display_full_status_summary(
     for res in results {
         if let Ok((daemon, is_running)) = res {
             if is_running {
-                running_daemons.push(all_daemons.iter().find(|d| d.pid == daemon.pid).unwrap());
+                running_daemons.push(all_daemons.iter().find(|d| d.pid == daemon.pid && d.port == daemon.port).unwrap());
             } else {
-                down_daemons.push(all_daemons.iter().find(|d| d.pid == daemon.pid).unwrap());
+                down_daemons.push(all_daemons.iter().find(|d| d.pid == daemon.pid && d.port == daemon.port).unwrap());
             }
         }
     }
@@ -624,7 +678,7 @@ pub async fn display_full_status_summary(
             println!("{:<20} {:<15} {:<10} {:<40}", component_name, status, daemon.port, details);
             println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Data Directory: {:?}", daemon.data_dir));
             println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", "Service Type: HTTP REST API");
-            println!(); // Add a blank line for readability between multiple REST APIs
+            println!();
         }
     }
     println!("\n");
@@ -649,12 +703,14 @@ pub async fn display_full_status_summary(
             } else {
                 daemon_api_storage_engine_type_to_string(&storage_config.storage_engine_type)
             };
-            
+
             let details = format!("PID: {} | Engine: {}", daemon.pid, engine_type);
             let component_name = if i == 0 { "Storage Daemon" } else { "" };
             println!("{:<20} {:<15} {:<10} {:<40}", component_name, "Running", daemon.port, details);
-            
+
             // Print configuration details
+            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", "");
+            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", "=== Storage Configuration ===");
             println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Data Path: {}", storage_config.engine_specific_config.as_ref().and_then(|c| c.storage.path.as_ref()).map_or("N/A".to_string(), |p| p.display().to_string())));
             println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Host: {}", storage_config.engine_specific_config.as_ref().map_or("N/A", |c| c.storage.host.as_ref().map_or("N/A", |h| h.as_str()))));
             println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Port: {}", daemon.port));
@@ -662,28 +718,54 @@ pub async fn display_full_status_summary(
             println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Max Disk Space: {} GB", storage_config.max_disk_space_gb));
             println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Min Disk Space: {} GB", storage_config.min_disk_space_gb));
             println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Use Raft: {}", storage_config.use_raft_for_scale));
+            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", "");
+            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", "=== Directory Configuration ===");
             println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Data Directory: {}", storage_config.data_directory.as_ref().map_or("N/A".to_string(), |p| p.display().to_string())));
             println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Log Directory: {}", storage_config.log_directory.as_ref().map_or("N/A".to_string(), |p| p.display().to_string())));
             let config_root_display = storage_config.config_root_directory.as_ref().map_or("N/A".to_string(), |p| p.display().to_string());
             println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Config Root: {}", if config_root_display == "N/A" { DEFAULT_CONFIG_ROOT_DIRECTORY_STR.to_string() } else { config_root_display }));
-            
+            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", "");
+            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", "=== Network & Scaling ===");
+            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Default Port: {}", storage_config.default_port));
             let cluster_range = storage_config.cluster_range.clone();
             if is_port_in_cluster_range(daemon.port, &cluster_range) {
                 println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Cluster Range: {}", cluster_range));
             } else {
                 println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Cluster Range: {} (Port {} is outside this range!)", cluster_range, daemon.port));
             }
-            
-            println!(); // Add a blank line for readability between multiple storage daemons
+            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Use Raft for Scale: {}", storage_config.use_raft_for_scale));
+            println!();
         }
     }
 
     // Set `Arc`s to the first running port, if any
     *storage_daemon_port_arc.lock().await = storage_daemons.first().map(|d| d.port);
     *rest_api_port_arc.lock().await = rest_daemons.first().map(|d| d.port);
-    
+
     println!("--------------------------------------------------");
     Ok(())
+}
+
+// Helper function to retry process status checks
+async fn check_process_status_by_port_with_retry(
+    service_type: &str,
+    port: u16,
+    retries: u32,
+    delay: Duration,
+) -> bool {
+    let mut attempts = retries;
+    while attempts > 0 {
+        if check_process_status_by_port(service_type, port).await {
+            return true;
+        }
+        attempts -= 1;
+        if attempts > 0 {
+            debug!("Retrying process status check for {} on port {} (attempts left: {})", service_type, port, attempts);
+            tokio::time::sleep(delay).await;
+        }
+    }
+    warn!("Process status check failed for {} on port {} after {} attempts", service_type, port, retries);
+    false
 }
 
 /// A handler for the 'show config all' command.

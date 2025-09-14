@@ -23,18 +23,30 @@ use tokio::time::{timeout, Duration};
 use std::fs as std_fs;
 
 // Static OnceCell to hold the single Sled database instance with its path
-static SLED_DB: LazyLock<OnceCell<TokioMutex<SledDbWithPath>>> = LazyLock::new(|| OnceCell::new());
+pub static SLED_DB: LazyLock<OnceCell<TokioMutex<SledDbWithPath>>> = LazyLock::new(|| OnceCell::new());
 
 // Static map to hold SledDaemonPool instances by port
-static SLED_POOL_MAP: LazyLock<OnceCell<TokioMutex<HashMap<u16, Arc<TokioMutex<SledDaemonPool>>>>>> = LazyLock::new(|| OnceCell::new());
+pub static SLED_POOL_MAP: LazyLock<OnceCell<TokioMutex<HashMap<u16, Arc<TokioMutex<SledDaemonPool>>>>>> = LazyLock::new(|| OnceCell::new());
 
 impl SledStorage {
+     /// Initializes a new Sled storage instance.
+    /// This function constructs a unique path for the database based on the provided port number.
     pub async fn new(config: &SledConfig, storage_config: &StorageConfig) -> Result<Self, GraphError> {
         info!("Initializing SledStorage with config: {:?}", config);
         println!("===> INITIALIZING SLED DAEMON WITH PATH {:?}", config.path);
 
-        // Use base database path directly
-        let db_path = config.path.clone();
+        // Get the base data directory from storage_config
+        let default_data_dir = PathBuf::from(DEFAULT_DATA_DIRECTORY);
+        let base_data_dir = storage_config
+            .data_directory
+            .as_ref()
+            .unwrap_or(&default_data_dir);
+        
+        let port = config.port.unwrap_or(DEFAULT_STORAGE_PORT);
+        
+        // Construct proper path: base_data_dir/sled/port
+        let db_path = base_data_dir.join("sled").join(port.to_string());
+
         info!("Using database path {:?}", db_path);
         println!("===> USING SLED PATH {:?}", db_path);
 
@@ -102,26 +114,22 @@ impl SledStorage {
                 })?;
             info!("Successfully opened Sled database at {:?}", db_path);
             println!("===> SUCCESSFULLY OPENED SLED DATABASE AT {:?}", db_path);
-            Ok::<_, GraphError>(TokioMutex::new(SledDbWithPath { db, path: db_path.clone() }))
+            Ok::<_, GraphError>(TokioMutex::new(SledDbWithPath { db: Arc::new(db), path: db_path.clone() }))
         }).await?;
         info!("Successfully initialized or accessed Sled database at {:?}", db_path);
         println!("===> SUCCESSFULLY INITIALIZED SLED DATABASE AT {:?}", db_path);
 
-        let port = config.port.unwrap_or(DEFAULT_STORAGE_PORT);
         let pool_map = SLED_POOL_MAP.get_or_init(|| async {
-            TokioMutex::new(HashMap::<u16, Arc<TokioMutex<SledDaemonPool>>>::new())
+            TokioMutex::new(std::collections::HashMap::<u16, Arc<TokioMutex<SledDaemonPool>>>::new())
         }).await;
 
-        // Simplified registry check
         if let Some(metadata) = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await? {
             if let Some(registered_path) = &metadata.data_dir {
                 if registered_path != &db_path {
                     warn!("Path mismatch: daemon registry shows {:?}, but config specifies {:?}", registered_path, db_path);
-                    println!("===> PATH MISMATCH: DAEMON REGISTRY SHOWS {:?}, BUT CONFIG SPECIFIES {:?}", registered_path, db_path);
-                    return Err(GraphError::StorageError(format!(
-                        "Path mismatch: daemon registry shows {:?}, but config specifies {:?}", registered_path, db_path
-                    )));
+                    println!("in SledStorage new ===> PATH MISMATCH: DAEMON REGISTRY SHOWS {:?}, BUT CONFIG SPECIFIES {:?}", registered_path, db_path);
                 }
+                
                 let pool_map_guard = pool_map.lock().await;
                 if let Some(existing_pool) = pool_map_guard.get(&port) {
                     info!("Reusing existing SledDaemonPool for port {}", port);
@@ -147,13 +155,125 @@ impl SledStorage {
             pool_guard.initialize_cluster(storage_config, config, Some(port)).await?;
             println!("===> INITIALIZED CLUSTER ON PORT {}", port);
         }
-        // CORRECTED: Acquiring a lock on `pool_map` which is the HashMap, not `pool` which is the SledDaemonPool.
+
         let mut pool_map_guard = pool_map.lock().await;
         pool_map_guard.insert(port, pool.clone());
 
         Ok(Self { pool })
     }
+    
+    pub async fn new_with_db(config: &SledConfig, storage_config: &StorageConfig, existing_db: Arc<sled::Db>) -> Result<Self, GraphError> {
+        info!("Initializing SledStorage with existing database at {:?}", config.path);
+        println!("===> INITIALIZING SLED STORAGE WITH EXISTING DB AT {:?}", config.path);
 
+        // Get the base data directory from storage_config
+        let default_data_dir = PathBuf::from(DEFAULT_DATA_DIRECTORY);
+        let base_data_dir = storage_config
+            .data_directory
+            .as_ref()
+            .unwrap_or(&default_data_dir);
+        
+        let port = config.port.unwrap_or(DEFAULT_STORAGE_PORT);
+        
+        // Construct proper path: base_data_dir/sled/port
+        let db_path = base_data_dir.join("sled").join(port.to_string());
+
+        info!("Using database path {:?}", db_path);
+        println!("===> USING SLED PATH {:?}", db_path);
+
+        // Ensure base directory exists and is writable
+        if !db_path.exists() {
+            info!("Creating database directory at {:?}", db_path);
+            println!("===> CREATING SLED DIRECTORY AT {:?}", db_path);
+            fs::create_dir_all(&db_path)
+                .await
+                .map_err(|e| {
+                    error!("Failed to create database directory at {:?}: {}", db_path, e);
+                    println!("===> ERROR: FAILED TO CREATE SLED DIRECTORY AT {:?}", db_path);
+                    GraphError::StorageError(format!("Failed to create database directory at {:?}: {}", db_path, e))
+                })?;
+        } else if !db_path.is_dir() {
+            error!("Path {:?} exists but is not a directory", db_path);
+            println!("===> ERROR: PATH {:?} EXISTS BUT IS NOT A DIRECTORY", db_path);
+            return Err(GraphError::StorageError(format!("Path {:?} is not a directory", db_path)));
+        }
+
+        // Check permissions
+        let metadata = fs::metadata(&db_path)
+            .await
+            .map_err(|e| {
+                error!("Failed to access directory metadata at {:?}: {}", db_path, e);
+                println!("===> ERROR: FAILED TO ACCESS DIRECTORY METADATA AT {:?}", db_path);
+                GraphError::StorageError(format!("Failed to access directory metadata at {:?}: {}", db_path, e))
+            })?;
+        if !metadata.permissions().readonly() {
+            info!("Directory at {:?} is writable", db_path);
+        } else {
+            error!("Directory at {:?} is not writable", db_path);
+            println!("===> ERROR: DIRECTORY AT {:?} IS NOT WRITABLE", db_path);
+            return Err(GraphError::StorageError(format!("Directory at {:?} is not writable", db_path)));
+        }
+
+        // Update SLED_DB singleton with the provided database
+        let sled_db = SLED_DB.get_or_try_init(|| async {
+            info!("Storing provided Sled database in singleton at {:?}", db_path);
+            println!("===> STORING PROVIDED SLED DB IN SINGLETON AT {:?}", db_path);
+            Ok::<_, GraphError>(TokioMutex::new(SledDbWithPath { db: existing_db.clone(), path: db_path.clone() }))
+        }).await?;
+        {
+            let mut sled_db_guard = sled_db.lock().await;
+            sled_db_guard.db = existing_db.clone();
+            sled_db_guard.path = db_path.clone();
+        }
+        info!("Successfully updated Sled database singleton at {:?}", db_path);
+        println!("===> SUCCESSFULLY UPDATED SLED DATABASE SINGLETON AT {:?}", db_path);
+
+        let port = config.port.unwrap_or(DEFAULT_STORAGE_PORT);
+        let pool_map = SLED_POOL_MAP.get_or_init(|| async {
+            TokioMutex::new(HashMap::<u16, Arc<TokioMutex<SledDaemonPool>>>::new())
+        }).await;
+
+        // Corrected: Removed the strict path equality check as per your request.
+        // It now proceeds even if the paths are not identical, as long as a daemon exists.
+        if let Some(metadata) = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await? {
+            if let Some(registered_path) = &metadata.data_dir {
+                // Warning is sufficient now. No need to return an error.
+                if registered_path != &db_path {
+                    warn!("Path mismatch: daemon registry shows {:?}, but config specifies {:?}", registered_path, db_path);
+                    println!("in SledStorage new_with_db ===> PATH MISMATCH: DAEMON REGISTRY SHOWS {:?}, BUT CONFIG SPECIFIES {:?}", registered_path, db_path);
+                }
+                
+                let pool_map_guard = pool_map.lock().await;
+                if let Some(existing_pool) = pool_map_guard.get(&port) {
+                    info!("Reusing existing SledDaemonPool for port {}", port);
+                    println!("===> REUSING EXISTING DAEMON ON PORT {} WITH MATCHING PATH {:?}", port, db_path);
+                    let mut pool_guard = existing_pool.lock().await;
+                    if pool_guard.daemons.is_empty() {
+                        info!("Existing pool for port {} is uninitialized, initializing cluster with existing DB", port);
+                        println!("===> INITIALIZING CLUSTER ON PORT {} WITH EXISTING DB", port);
+                        pool_guard.initialize_cluster_with_db(storage_config, config, Some(port), existing_db.clone()).await?;
+                    }
+                    return Ok(Self {
+                        pool: existing_pool.clone(),
+                    });
+                }
+            }
+        }
+
+        let pool = Arc::new(TokioMutex::new(SledDaemonPool::new_with_db(config, existing_db.clone()).await?));
+        {
+            let mut pool_guard = pool.lock().await;
+            info!("Initializing cluster with use_raft_for_scale: {}", storage_config.use_raft_for_scale);
+            println!("===> INITIALIZING CLUSTER WITH USE_RAFT_FOR_SCALE: {}", storage_config.use_raft_for_scale);
+            pool_guard.initialize_cluster_with_db(storage_config, config, Some(port), existing_db).await?;
+            println!("===> INITIALIZED CLUSTER ON PORT {} WITH EXISTING DB", port);
+        }
+        let mut pool_map_guard = pool_map.lock().await;
+        pool_map_guard.insert(port, pool.clone());
+
+        Ok(Self { pool })
+    }
+    
     pub fn new_pinned(config: &SledConfig, storage_config: &StorageConfig) -> Box<dyn futures::Future<Output = Result<Self, GraphError>> + Send + 'static> {
         let config = config.clone();
         let storage_config = storage_config.clone();

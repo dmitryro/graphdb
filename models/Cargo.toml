@@ -11,6 +11,7 @@ chrono = { version = "0.4.39", features = ["serde"] } # Consistent
 uuid = { version = "1.3.1", features = ["serde", "v4", "v1", "rng"] } # Consistent
 thiserror = "2.0.12" # Consistent
 anyhow = "1.0.98" # Aligned with rest_api and storage_daemon_server
+tokio = { version = "1.44.2", features = ["full"] }
 zmq = "0.10.0"
 
 # FIX: Set bincode to 2.0.1 (stable) with "serde" feature

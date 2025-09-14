@@ -61,16 +61,18 @@ use crate::config::{DEFAULT_DATA_DIRECTORY, DEFAULT_LOG_DIRECTORY, LOCK_FILE_PAT
                                  RedisConfig, MySQLConfig, PostgreSQLConfig, TypeConfig, 
                                  StorageConfigInner, SelectedStorageConfig, StorageConfigWrapper, 
                                  load_storage_config_from_yaml,
+                                 create_default_storage_yaml_config,
                                  load_engine_specific_config};
 use crate::daemon::daemon_utils::{find_pid_by_port, stop_process, parse_cluster_range};
 use crate::daemon::daemon_registry::{GLOBAL_DAEMON_REGISTRY,  NonBlockingDaemonRegistry, DaemonMetadata};
 use crate::storage_engine::inmemory_storage::{InMemoryStorage};
+use crate::storage_engine::storage_utils::{cleanup_legacy_sled_paths, copy_dir};
 use crate::storage_engine::raft_storage::{RaftStorage};
 pub use crate::config::{ StorageEngineType };
 
 pub use crate::storage_engine::inmemory_storage::InMemoryStorage as InMemoryGraphStorage;
 #[cfg(feature = "with-sled")]
-pub use crate::storage_engine::sled_storage::SledStorage;
+pub use crate::storage_engine::sled_storage::{SledStorage, SLED_DB};
 #[cfg(feature = "with-rocksdb")]
 pub use crate::storage_engine::rocksdb_storage::RocksdbStorage;
 #[cfg(feature = "with-tikv")]
@@ -598,20 +600,17 @@ pub async fn init_storage_engine_manager(config_path_yaml: PathBuf) -> Result<()
     }
     
     debug!("Loaded storage_engine_type: {:?}, port: {:?}", storage_engine, port);
-    
     // Initialize StorageEngineManager with the loaded storage_engine_type and port
     let manager = StorageEngineManager::new(storage_engine, &config_path_yaml, false, Some(port)).await
         .map_err(|e| {
             error!("Failed to create StorageEngineManager: {}", e);
             GraphError::StorageError(format!("Failed to create StorageEngineManager: {}", e))
         })?;
-    
-    GLOBAL_STORAGE_ENGINE_MANAGER.set(Arc::new(AsyncStorageEngineManager::from_manager(
-        Arc::try_unwrap(manager)
-            .map_err(|_| GraphError::StorageError("Failed to unwrap Arc<StorageEngineManager>: multiple references exist".to_string()))?
-    )))
+
+    GLOBAL_STORAGE_ENGINE_MANAGER
+        .set(Arc::new(AsyncStorageEngineManager::from_manager(manager)))
         .map_err(|_| GraphError::StorageError("Failed to set StorageEngineManager: already initialized".to_string()))?;
-    
+
     info!("StorageEngineManager initialized successfully with engine: {:?} on port {:?}", storage_engine, port);
     Ok(())
 }
@@ -1006,45 +1005,6 @@ pub async fn emergency_cleanup_storage_engine_manager() -> Result<(), anyhow::Er
     Ok(())
 }
 
-/// Creates a default YAML configuration file
-async fn create_default_yaml_config(yaml_path: &PathBuf, engine_type: StorageEngineType) -> Result<(), GraphError> {
-    info!("Creating default YAML config at {:?}", yaml_path);
-    let config = StorageConfig {
-        storage_engine_type: engine_type,
-        config_root_directory: Some(PathBuf::from("./storage_daemon_server")),
-        data_directory: Some(PathBuf::from(DEFAULT_DATA_DIRECTORY)),
-        log_directory: Some(PathBuf::from(DEFAULT_LOG_DIRECTORY)),
-        default_port: DEFAULT_STORAGE_PORT,
-        cluster_range: DEFAULT_STORAGE_PORT.to_string(),
-        max_disk_space_gb: 1000,
-        min_disk_space_gb: 10,
-        use_raft_for_scale: true,
-        max_open_files: 100u64,
-        engine_specific_config: Some(SelectedStorageConfig {
-            storage_engine_type: engine_type,
-            storage: StorageConfigInner {
-                path: Some(PathBuf::from(format!("{}/{}", DEFAULT_DATA_DIRECTORY, engine_type.to_string().to_lowercase()))),
-                host: Some("127.0.0.1".to_string()),
-                port: Some(DEFAULT_STORAGE_PORT),
-                username: None,
-                password: None,
-                database: None,
-                pd_endpoints: None,
-                cache_capacity: Some(1024 * 1024 * 1024),
-                use_compression: false, // Fixed: Changed False to false
-            },
-        }),
-    };
-
-    config.save().await
-        .map_err(|e| {
-            error!("Failed to save default YAML config to {:?}: {}", yaml_path, e);
-            GraphError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-        })?;
-    info!("Default YAML config created at {:?}", yaml_path);
-    Ok(())
-}
-
 // StorageEngine and GraphStorageEngine traits
 #[async_trait]
 pub trait StorageEngine: Send + Sync + Debug + 'static {
@@ -1093,265 +1053,142 @@ impl StorageEngineManager {
     pub async fn new(
         storage_engine_type: StorageEngineType,
         config_path: &PathBuf,
-        _use_temp: bool,
+        use_temp: bool,
         port: Option<u16>,
-    ) -> Result<Arc<Self>, GraphError> {
-        println!("===> IN STORAGE MANAGER - Config Path {:?}", config_path);
-        info!("Creating new StorageEngineManager with engine type: {:?}", storage_engine_type);
+    ) -> Result<Self, GraphError> {
+        info!("Creating StorageEngineManager with engine: {:?}", storage_engine_type);
         println!("===> CREATING NEW STORAGE ENGINE MANAGER WITH TYPE {:?}", storage_engine_type);
 
-        // Load configuration
         let mut config = load_storage_config_from_yaml(Some(config_path.clone())).await
-            .map_err(|e| {
-                error!("Failed to load storage config from {:?}: {}", config_path, e);
-                GraphError::ConfigurationError(format!("Failed to load storage config: {}", e))
-            })?;
-        println!("====> INITIAL CONFIG: {:?}", config);
+            .map_err(|e| GraphError::ConfigurationError(format!("Failed to load storage config: {}", e)))?;
+        let port = port.unwrap_or(config.default_port);
 
-        // Override port if provided via CLI
-        let port = port.unwrap_or(
-            config
-                .engine_specific_config
-                .as_ref()
-                .and_then(|c| c.storage.port)
-                .unwrap_or(DEFAULT_STORAGE_PORT),
-        );
-
-        // Construct the port-suffixed path
-        let engine_type_str = storage_engine_type.to_string().to_lowercase();
-        let base_path = config
-            .data_directory
+        let engine_path_name = storage_engine_type.to_string().to_lowercase();
+        let base_data_dir = config.data_directory
             .clone()
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
-            .join(&engine_type_str);
-        let engine_path = base_path.join(port.to_string());
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY));
+        let base_engine_path = base_data_dir.join(&engine_path_name);
+        let engine_path = base_engine_path.join(port.to_string());
 
-        // Update config with port-suffixed path
-        if let Some(engine_config) = config.engine_specific_config.as_mut() {
+        if let Some(ref mut engine_config) = config.engine_specific_config {
+            engine_config.storage.path = Some(engine_path.clone());
             engine_config.storage.port = Some(port);
-            if engine_config.storage.path != Some(engine_path.clone()) {
-                info!("Updating engine-specific path to {:?}", engine_path);
-                engine_config.storage.path = Some(engine_path.clone());
-            }
-        } else {
-            config.engine_specific_config = Some(SelectedStorageConfig {
-                storage_engine_type: storage_engine_type.clone(),
-                storage: StorageConfigInner {
-                    path: Some(engine_path.clone()),
-                    port: Some(port),
-                    host: None,
-                    username: None,
-                    password: None,
-                    database: None,
-                    pd_endpoints: None,
-                    use_compression: false,
-                    cache_capacity: None,
-                },
-            });
         }
 
-        // --- FIX START ---
-        // The original code incorrectly overwrote the data_directory.
-        // This is the line that was removed, as the data_directory should be the root for all engines.
-        // config.data_directory = Some(base_path.clone());
-        // --- FIX END ---
-
-        info!("Calculated engine path: {:?}", engine_path);
-        println!("===> CALCULATED ENGINE PATH: {:?}", engine_path);
-        debug!("Updated config: {:?}", config);
-
-        // Retrieve existing daemon metadata or create new
-        let existing_metadata = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await
-            .map_err(|e| {
-                error!("Failed to retrieve daemon metadata for port {}: {}", port, e);
-                GraphError::StorageError(format!("Failed to retrieve daemon metadata: {}", e))
-            })?;
-
-        let daemon_metadata = if let Some(mut metadata) = existing_metadata {
-            // Daemon exists, update metadata with correct path and preserve PID
-            metadata.data_dir = Some(engine_path.clone());
-            metadata.engine_type = Some(storage_engine_type.to_string());
-            metadata.last_seen_nanos = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as i64)
-                .unwrap_or(0);
-            metadata
-        } else {
-            // No daemon registered, create new metadata
-            let pid = find_pid_by_port(port).await
-                .unwrap_or_else(|_| {
-                    warn!("Failed to find PID for port {}, using current process PID", port);
-                    None
-                })
-                .unwrap_or_else(|| {
-                    warn!("No PID found for port {}, using current process PID", port);
-                    std::process::id()
-                });
-            
-            DaemonMetadata {
-                service_type: "storage".to_string(),
-                port,
-                pid,
-                ip_address: "127.0.0.1".to_string(),
-                data_dir: Some(engine_path.clone()),
-                config_path: Some(config_path.clone()),
-                engine_type: Some(storage_engine_type.to_string()),
-                last_seen_nanos: SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as i64)
-                    .unwrap_or(0),
+        // Get or create metadata
+        let metadata = match GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await? {
+            Some(mut existing) => {
+                if existing.data_dir != Some(engine_path.clone()) {
+                    warn!("Updating daemon data_dir from {:?} to {:?}", existing.data_dir, engine_path);
+                    println!("===> UPDATING DAEMON DATA_DIR FROM {:?} TO {:?}", existing.data_dir, engine_path);
+                    existing.data_dir = Some(engine_path.clone());
+                    GLOBAL_DAEMON_REGISTRY.update_daemon_metadata(existing.clone()).await?;
+                }
+                existing
+            }
+            None => {
+                let new_metadata = DaemonMetadata {
+                    service_type: "storage".to_string(),
+                    port,
+                    pid: std::process::id(),
+                    ip_address: "127.0.0.1".to_string(),
+                    data_dir: Some(engine_path.clone()),
+                    config_path: Some(config_path.clone()),
+                    engine_type: Some(storage_engine_type.to_string()),
+                    last_seen_nanos: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as i64)
+                        .unwrap_or(0),
+                };
+                GLOBAL_DAEMON_REGISTRY.register_daemon(new_metadata.clone()).await?;
+                println!("===> REGISTERED NEW DAEMON ENTRY FOR PORT {}", port);
+                new_metadata
             }
         };
 
-        debug!("Updating daemon metadata with data_dir: {:?}, PID: {}", daemon_metadata.data_dir, daemon_metadata.pid);
-        println!("===> UPDATING DAEMON METADATA WITH DATA_DIR: {:?}, PID: {}", daemon_metadata.data_dir, daemon_metadata.pid);
+        if !use_temp {
+            config.save().await.map_err(|e| GraphError::ConfigurationError(format!("Failed to save config: {}", e)))?;
+        }
 
-        // Update registry before engine initialization
-        timeout(
-            TokioDuration::from_secs(5),
-            GLOBAL_DAEMON_REGISTRY.update_daemon_metadata(daemon_metadata),
+        let engine = Self::initialize_storage_engine(storage_engine_type, &config).await?;
+
+        Self::create_manager(
+            storage_engine_type,
+            config,
+            config_path,
+            engine,
+            !use_temp,
+            Arc::new(TokioMutex::new(HashMap::new())),
         )
         .await
-        .map_err(|_| {
-            error!("Timeout updating daemon metadata on port {}", port);
-            println!("===> ERROR: TIMEOUT UPDATING DAEMON METADATA ON PORT {}", port);
-            GraphError::StorageError(format!("Timeout updating daemon metadata on port {}", port))
-        })??;
-        info!("Successfully updated daemon metadata on port {} with path {:?}", port, engine_path);
-        println!("===> SUCCESSFULLY UPDATED DAEMON METADATA ON PORT {} WITH PATH {:?}", port, engine_path);
-
-        // Save config only if not temporary
-        if !_use_temp {
-            config.save().await.map_err(|e| {
-                error!("Failed to save updated storage config: {}", e);
-                println!("===> ERROR: FAILED TO SAVE UPDATED STORAGE CONFIG: {}", e);
-                GraphError::ConfigurationError(format!("Failed to save updated storage config: {}", e))
-            })?;
-        } else {
-            info!("Temporary mode: Skipping config save for {:?}", config_path);
-        }
-
-        // Initialize the storage engine
-        let engine: Arc<dyn GraphStorageEngine + Send + Sync> = match storage_engine_type {
-            #[cfg(feature = "with-sled")]
-            StorageEngineType::Sled => {
-                info!("Initializing Sled storage");
-                println!("===> INITIALIZING SLED STORAGE");
-                Self::init_sled(&config).await?
-            }
-            _ => {
-                error!("Unsupported storage engine: {:?}", storage_engine_type);
-                println!("===> ERROR: UNSUPPORTED STORAGE ENGINE: {:?}", storage_engine_type);
-                return Err(GraphError::ConfigurationError(format!(
-                    "Unsupported storage engine: {:?}", storage_engine_type
-                )));
-            }
-        };
-
-        // Complete initialization
-        let manager = StorageEngineManager {
-            engine: Arc::new(TokioMutex::new(HybridStorage::new(engine.clone()))),
-            persistent_engine: engine,
-            session_engine_type: Some(storage_engine_type),
-            config,
-            config_path: config_path.clone(),
-            raft_instances: Arc::new(TokioMutex::new(HashMap::new())),
-        };
-        info!("StorageEngineManager initialized successfully for port {}", port);
-        println!("===> STORAGE ENGINE MANAGER INITIALIZED SUCCESSFULLY FOR PORT {}", port);
-        Ok(Arc::new(manager))
     }
 
     #[cfg(feature = "with-sled")]
     async fn init_sled(config: &StorageConfig) -> Result<Arc<dyn GraphStorageEngine + Send + Sync>, GraphError> {
-        info!("Initializing Sled engine using raw sled crate");
+        info!("Initializing Sled engine: {:?}", config);
         println!("===> INITIALIZING SLED ENGINE: {:?}", config);
-        trace!("Sled initialization started with config: {:?}", config);
 
-        // Validate configuration
-        if config.storage_engine_type != StorageEngineType::Sled {
-            warn!("Configuration mismatch: expected Sled, found {:?}", config.storage_engine_type);
-            println!("===> WARNING: CONFIGURATION MISMATCH: EXPECTED SLED, FOUND {:?}", config.storage_engine_type);
-            return Err(GraphError::ConfigurationError(
-                format!("Expected storage_engine_type Sled, found {:?}", config.storage_engine_type)
-            ));
-        }
+        let engine_specific = config.engine_specific_config.as_ref()
+            .ok_or_else(|| GraphError::ConfigurationError("Missing engine_specific_config for Sled".to_string()))?;
 
-        // Get the port-suffixed path from config
-        let sled_path = config
-            .engine_specific_config
-            .as_ref()
-            .and_then(|c| c.storage.path.clone())
-            .ok_or_else(|| {
-                error!("Sled storage path is missing from configuration");
-                println!("===> ERROR: SLED STORAGE PATH MISSING FROM CONFIGURATION");
-                GraphError::ConfigurationError("Sled storage path is missing".to_string())
-            })?;
+        let sled_path = engine_specific.storage.path.clone()
+            .ok_or_else(|| GraphError::ConfigurationError("Missing path for Sled".to_string()))?;
 
-        // Validate path against daemon registry
-        if let Ok(Some(registry_metadata)) = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(config.engine_specific_config.as_ref().and_then(|c| c.storage.port).unwrap_or(DEFAULT_STORAGE_PORT)).await {
-            if registry_metadata.data_dir != Some(sled_path.clone()) {
-                error!("Path mismatch: daemon registry shows {:?}, but config specifies {:?}", registry_metadata.data_dir, sled_path);
-                println!("===> ERROR: PATH MISMATCH: DAEMON REGISTRY SHOWS {:?}, BUT CONFIG SPECIFIES {:?}", registry_metadata.data_dir, sled_path);
-                return Err(GraphError::StorageError(format!(
-                    "Path mismatch: daemon registry shows {:?}, but config specifies {:?}", 
-                    registry_metadata.data_dir, sled_path
-                )));
+        let port = engine_specific.storage.port.unwrap_or(DEFAULT_STORAGE_PORT);
+
+        // Attempt to get existing metadata
+        let metadata = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await?;
+
+        if let Some(mut existing_metadata) = metadata {
+            if existing_metadata.data_dir != Some(sled_path.clone()) {
+                warn!("Path mismatch for Sled: registry shows {:?}, but config specifies {:?}", existing_metadata.data_dir, sled_path);
+                println!("===> PATH MISMATCH FOR SLED: REGISTRY SHOWS {:?}, BUT CONFIG SPECIFIES {:?}", existing_metadata.data_dir, sled_path);
+                
+                // Update registry with correct path instead of error
+                existing_metadata.data_dir = Some(sled_path.clone());
+                GLOBAL_DAEMON_REGISTRY.update_daemon_metadata(existing_metadata).await?;
+                info!("Updated daemon registry data_dir to {:?}", sled_path);
+                println!("===> UPDATED DAEMON REGISTRY DATA_DIR TO {:?}", sled_path);
             }
+        } else {
+            // Create new metadata if not exists
+            let new_metadata = DaemonMetadata {
+                service_type: "storage".to_string(),
+                port,
+                pid: std::process::id(),
+                ip_address: "127.0.0.1".to_string(),
+                data_dir: Some(sled_path.clone()),
+                config_path: None,
+                engine_type: Some("Sled".to_string()),
+                last_seen_nanos: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as i64)
+                    .unwrap_or(0),
+            };
+            GLOBAL_DAEMON_REGISTRY.register_daemon(new_metadata).await?;
+            info!("Created new daemon registry entry for port {} with path {:?}", port, sled_path);
+            println!("===> CREATED NEW DAEMON REGISTRY ENTRY FOR PORT {} WITH PATH {:?}", port, sled_path);
         }
-
-        info!("Using Sled path: {:?}", sled_path);
-        println!("===> USING SLED PATH: {:?}", sled_path);
-
-        // Ensure directory exists and is writable
-        if !sled_path.exists() {
-            info!("Creating Sled directory at {:?}", sled_path);
-            println!("===> CREATING SLED DIRECTORY AT {:?}", sled_path);
-            tokio::fs::create_dir_all(&sled_path)
-                .await
-                .map_err(|e| {
-                    error!("Failed to create Sled directory at {:?}: {}", sled_path, e);
-                    println!("===> ERROR: FAILED TO CREATE SLED DIRECTORY AT {:?}", sled_path);
-                    GraphError::Io(e)
-                })?;
-        }
-
-        // Build SledConfig
         let sled_config = SledConfig {
             storage_engine_type: StorageEngineType::Sled,
-            path: sled_path.clone(),
-            host: config.engine_specific_config.as_ref().and_then(|c| c.storage.host.clone()),
-            port: config.engine_specific_config.as_ref().and_then(|c| c.storage.port),
-            temporary: config
-                .engine_specific_config
-                .as_ref()
-                .and_then(|c| c.storage.path.as_ref())
-                .map(|p| p.to_string_lossy().contains("temporary"))
-                .unwrap_or(SledConfig::default().temporary),
-            use_compression: config
-                .engine_specific_config
-                .as_ref()
-                .and_then(|c| Some(c.storage.use_compression))
-                .unwrap_or(SledConfig::default().use_compression),
-            cache_capacity: config
-                .engine_specific_config
-                .as_ref()
-                .and_then(|c| c.storage.cache_capacity)
-                .or_else(|| SledConfig::default().cache_capacity),
+            path: sled_path,
+            host: engine_specific.storage.host.clone(),
+            port: engine_specific.storage.port,
+            temporary: false,
+            use_compression: engine_specific.storage.use_compression,
+            cache_capacity: engine_specific.storage.cache_capacity,
         };
 
-        // Initialize Sled storage
-        let sled_instance = SledStorage::new(&sled_config, config).await.map_err(|e| {
-            error!("Failed to initialize Sled storage at path {:?}: {}", sled_path, e);
-            println!("===> ERROR: FAILED TO INITIALIZE SLED STORAGE AT PATH {:?}: {}", sled_path, e);
-            e
-        })?;
-
-        info!("Successfully initialized Sled storage at path {:?}", sled_path);
-        println!("===> SUCCESSFULLY INITIALIZED SLED STORAGE AT PATH {:?}", sled_path);
-        
-        Ok(Arc::new(sled_instance))
-    }
+        // The previous code had a type mismatch here.
+        // The `map` operation was creating a concrete `Arc<SledStorage>`,
+        // but the function's return type expects a dynamically-dispatched
+        // `Arc<dyn GraphStorageEngine + Send + Sync>`.
+        // The `as` keyword performs the necessary coercion.
+        SledStorage::new(&sled_config, config).await
+            // The fix is right here: we cast the concrete type to the trait object.
+            .map(|s| Arc::new(s) as Arc<dyn GraphStorageEngine + Send + Sync>)
+            .map_err(|e| GraphError::StorageError(format!("Failed to initialize Sled: {}", e)))
+            }
 
     async fn cleanup_legacy_sled_directories_during_reset(base_data_dir: &Path, current_port: u16) {
         info!("Cleaning up legacy port-suffixed Sled directories during reset in {:?}", base_data_dir);
@@ -1823,7 +1660,7 @@ impl StorageEngineManager {
     ) -> Result<StorageConfig, GraphError> {
         warn!("Config file not found at {:?}", config_path_yaml);
         
-        create_default_yaml_config(&config_path_yaml.to_path_buf(), storage_engine).await?;
+        create_default_storage_yaml_config(&config_path_yaml.to_path_buf(), storage_engine).await?;
         
         load_storage_config_from_yaml(Some(config_path_yaml.to_path_buf())).await
             .map_err(|e| {
@@ -2308,14 +2145,14 @@ impl StorageEngineManager {
         Ok(())
     }
 
-    fn create_manager(
+    pub async fn create_manager(
         engine_type: StorageEngineType,
         config: StorageConfig,
         config_path_yaml: &Path,
         persistent: Arc<dyn GraphStorageEngine + Send + Sync>,
         permanent: bool,
         raft_instances: Arc<TokioMutex<HashMap<u64, Arc<dyn Any + Send + Sync>>>>,
-    ) -> StorageEngineManager {
+    ) -> Result<StorageEngineManager, GraphError> {
         let engine = Arc::new(TokioMutex::new(HybridStorage {
             inmemory: Arc::new(InMemoryGraphStorage::new(&config)),
             persistent: persistent.clone(),
@@ -2323,14 +2160,15 @@ impl StorageEngineManager {
             engine_type,
         }));
 
-        StorageEngineManager {
+        let manager = StorageEngineManager {
             engine,
             persistent_engine: persistent,
             session_engine_type: if permanent { None } else { Some(engine_type) },
             config,
             config_path: config_path_yaml.to_path_buf(),
             raft_instances,
-        }
+        };
+        Ok(manager)
     }
 
     // Missing Sled-specific helper methods
@@ -2846,7 +2684,7 @@ impl StorageEngineManager {
             )));
         }
 
-        // Check current engine state
+        // Get old state
         let (was_running, old_persistent_arc, old_engine_type) = {
             let engine_guard = self.engine.lock().await;
             let was_running = (*engine_guard).is_running().await;
@@ -2855,33 +2693,179 @@ impl StorageEngineManager {
             (was_running, Arc::clone(&engine_guard.persistent), (*engine_guard).engine_type)
         };
 
+        // Get paths from config
+        let old_path = new_config.engine_specific_config
+            .as_ref()
+            .and_then(|c| c.storage.path.clone())
+            .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data"));
+        let new_path = new_config.engine_specific_config
+            .as_ref()
+            .and_then(|c| c.storage.path.clone())
+            .unwrap_or_else(|| PathBuf::from(format!("/opt/graphdb/storage_data/{}", new_config.storage_engine_type.to_string().to_lowercase())));
+
         // Skip if no change needed
-        if old_engine_type == new_config.storage_engine_type && self.session_engine_type.is_none() {
-            info!("No switch needed: current engine is already {:?}", new_config.storage_engine_type);
+        if old_engine_type == new_config.storage_engine_type && old_path == new_path && self.session_engine_type.is_none() {
+            info!("No switch needed: same engine {:?} and path {:?}", old_engine_type, old_path);
             trace!("Skipping switch: current engine matches requested and no session override. Elapsed: {}ms", start_time.elapsed().as_millis());
             return Ok(());
         }
 
-        // Cleanup previous engine state only if it was RocksDB and switching to a different engine
-        if old_engine_type == StorageEngineType::RocksDB && old_engine_type != new_config.storage_engine_type {
-            #[cfg(feature = "with-rocksdb")]
-            {
-                let mut rocksdb_singleton = ROCKSDB_SINGLETON.lock().await;
-                if let Some(rocksdb_instance) = rocksdb_singleton.as_ref() {
-                    info!("Closing existing RocksDB instance before switching");
-                    rocksdb_instance.close().await
-                        .map_err(|e| GraphError::StorageError(format!("Failed to close RocksDB: {}", e)))?;
-                    *rocksdb_singleton = None;
-                }
-                let rocksdb_path = PathBuf::from("/opt/graphdb/storage_data/rocksdb");
-                if rocksdb_path.exists() {
-                    warn!("Cleaning up RocksDB directory for switch to {:?}", new_config.storage_engine_type);
-                    recover_rocksdb(&rocksdb_path).await?;
-                }
-            }
-        } else {
-            debug!("Skipping RocksDB cleanup for engine switch to {:?}", new_config.storage_engine_type);
+        // Stop and close the current engine if running, unless Sled-to-Sled with same path
+        if was_running && !(old_engine_type == StorageEngineType::Sled && new_config.storage_engine_type == StorageEngineType::Sled && old_path == new_path) {
+            info!("Stopping current engine {:?} before switch", old_engine_type);
+            let engine = self.engine.lock().await;
+            (*engine).stop().await
+                .map_err(|e| GraphError::StorageError(format!("Failed to stop current engine: {}", e)))?;
         }
+        if !(old_engine_type == StorageEngineType::Sled && new_config.storage_engine_type == StorageEngineType::Sled && old_path == new_path) {
+            info!("Closing old persistent engine to release resources");
+            old_persistent_arc.close().await
+                .map_err(|e| GraphError::StorageError(format!("Failed to close old persistent engine: {}", e)))?;
+        }
+
+        // Engine-specific cleanup (singletons, locks, and daemons), skip for Sled-to-Sled with same path
+        let port = new_config.engine_specific_config
+            .as_ref()
+            .and_then(|c| c.storage.port)
+            .unwrap_or(new_config.default_port);
+        if !(old_engine_type == StorageEngineType::Sled && new_config.storage_engine_type == StorageEngineType::Sled && old_path == new_path) {
+            match old_engine_type {
+                StorageEngineType::RocksDB => {
+                    #[cfg(feature = "with-rocksdb")]
+                    {
+                        let mut singleton = ROCKSDB_SINGLETON.lock().await;
+                        if let Some(rocksdb_instance) = singleton.as_ref() {
+                            info!("Closing existing RocksDB instance before switching");
+                            rocksdb_instance.close().await
+                                .map_err(|e| GraphError::StorageError(format!("Failed to close RocksDB: {}", e)))?;
+                            *singleton = None;
+                        }
+                        if old_path.exists() {
+                            warn!("Cleaning up RocksDB directory at {:?}", old_path);
+                            if let Err(e) = recover_rocksdb(&old_path).await {
+                                warn!("Failed to clean RocksDB locks: {}", e);
+                            }
+                        }
+                        // Forcefully terminate any stale daemon
+                        if let Ok(Some(pid)) = find_pid_by_port(port).await {
+                            if NonBlockingDaemonRegistry::is_pid_running(pid).await.unwrap_or(false) {
+                                info!("Terminating stale RocksDB daemon on PID {} for port {}", pid, port);
+                                stop_process(pid).await
+                                    .map_err(|e| GraphError::StorageError(format!("Failed to stop RocksDB daemon: {}", e)))?;
+                                GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("storage", port).await?;
+                            }
+                        }
+                    }
+                }
+                StorageEngineType::Sled => {
+                    #[cfg(feature = "with-sled")]
+                    {
+                        let mut singleton = SLED_SINGLETON.lock().await;
+                        if let Some(sled_instance) = singleton.as_ref() {
+                            info!("Closing existing Sled instance before switching");
+                            sled_instance.close().await
+                                .map_err(|e| GraphError::StorageError(format!("Failed to close Sled: {}", e)))?;
+                            *singleton = None;
+                        }
+                        if old_path.exists() {
+                            warn!("Cleaning up Sled locks at {:?}", old_path);
+                            let lock_path = old_path.join("db.lck");
+                            if lock_path.exists() {
+                                if let Err(e) = fs::remove_file(&lock_path).await {
+                                    warn!("Failed to remove Sled lock file at {:?}: {}", lock_path, e);
+                                } else {
+                                    info!("Successfully removed Sled lock file at {:?}", lock_path);
+                                }
+                            }
+                        }
+                        // Forcefully terminate any stale daemon
+                        if let Ok(Some(pid)) = find_pid_by_port(port).await {
+                            if NonBlockingDaemonRegistry::is_pid_running(pid).await.unwrap_or(false) {
+                                info!("Terminating stale Sled daemon on PID {} for port {}", pid, port);
+                                stop_process(pid).await
+                                    .map_err(|e| GraphError::StorageError(format!("Failed to stop Sled daemon: {}", e)))?;
+                                GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("storage", port).await?;
+                            }
+                        }
+                    }
+                }
+                StorageEngineType::TiKV => {
+                    #[cfg(feature = "with-tikv")]
+                    {
+                        let mut singleton = TIKV_SINGLETON.lock().await;
+                        if let Some(tikv_instance) = singleton.as_ref() {
+                            info!("Closing existing TiKV instance before switching");
+                            tikv_instance.close().await
+                                .map_err(|e| GraphError::StorageError(format!("Failed to close TiKV: {}", e)))?;
+                            *singleton = None;
+                        }
+                        // No daemon termination for TiKV to avoid disrupting PD
+                    }
+                }
+                StorageEngineType::Redis => {
+                    #[cfg(feature = "redis-datastore")]
+                    {
+                        let redis_instance = REDIS_SINGLETON.get().await;
+                        if let Ok(redis_instance) = redis_instance {
+                            info!("Closing existing Redis instance before switching");
+                            redis_instance.close().await
+                                .map_err(|e| GraphError::StorageError(format!("Failed to close Redis: {}", e)))?;
+                        }
+                        // Terminate Redis daemon
+                        if let Ok(Some(pid)) = find_pid_by_port(port).await {
+                            if NonBlockingDaemonRegistry::is_pid_running(pid).await.unwrap_or(false) {
+                                info!("Terminating stale Redis daemon on PID {} for port {}", pid, port);
+                                stop_process(pid).await
+                                    .map_err(|e| GraphError::StorageError(format!("Failed to stop Redis daemon: {}", e)))?;
+                                GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("storage", port).await?;
+                            }
+                        }
+                    }
+                }
+                StorageEngineType::PostgreSQL => {
+                    #[cfg(feature = "postgres-datastore")]
+                    {
+                        let postgres_instance = POSTGRES_SINGLETON.get().await;
+                        if let Ok(postgres_instance) = postgres_instance {
+                            info!("Closing existing PostgreSQL instance before switching");
+                            postgres_instance.close().await
+                                .map_err(|e| GraphError::StorageError(format!("Failed to close PostgreSQL: {}", e)))?;
+                        }
+                        // Terminate PostgreSQL daemon
+                        if let Ok(Some(pid)) = find_pid_by_port(port).await {
+                            if NonBlockingDaemonRegistry::is_pid_running(pid).await.unwrap_or(false) {
+                                info!("Terminating stale PostgreSQL daemon on PID {} for port {}", pid, port);
+                                stop_process(pid).await
+                                    .map_err(|e| GraphError::StorageError(format!("Failed to stop PostgreSQL daemon: {}", e)))?;
+                                GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("storage", port).await?;
+                            }
+                        }
+                    }
+                }
+                StorageEngineType::MySQL => {
+                    #[cfg(feature = "mysql-datastore")]
+                    {
+                        let mysql_instance = MYSQL_SINGLETON.get().await;
+                        if let Ok(mysql_instance) = mysql_instance {
+                            info!("Closing existing MySQL instance before switching");
+                            mysql_instance.close().await
+                                .map_err(|e| GraphError::StorageError(format!("Failed to close MySQL: {}", e)))?;
+                        }
+                        // Terminate MySQL daemon
+                        if let Ok(Some(pid)) = find_pid_by_port(port).await {
+                            if NonBlockingDaemonRegistry::is_pid_running(pid).await.unwrap_or(false) {
+                                info!("Terminating stale MySQL daemon on PID {} for port {}", pid, port);
+                                stop_process(pid).await
+                                    .map_err(|e| GraphError::StorageError(format!("Failed to stop MySQL daemon: {}", e)))?;
+                                GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("storage", port).await?;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
         println!("===> USE STORAGE HANDLER - STEP 2: Loading configuration...");
 
         // Determine config path
@@ -2900,7 +2884,7 @@ impl StorageEngineManager {
                 })?
         } else {
             warn!("Config file not found at {:?}", config_path);
-            create_default_yaml_config(&config_path, new_config.storage_engine_type).await?;
+            create_default_storage_yaml_config(&config_path, new_config.storage_engine_type).await?;
             load_storage_config_from_yaml(Some(config_path.clone())).await
                 .map_err(|e| {
                     error!("Failed to load newly created YAML config from {:?}: {}", config_path, e);
@@ -2925,7 +2909,7 @@ impl StorageEngineManager {
                 GraphError::ConfigurationError(format!("Configuration validation failed: {}", e))
             })?;
 
-        // If permanent, save the new configuration using StorageConfig::save
+        // If permanent, save the new configuration
         if permanent {
             info!("Saving new configuration for permanent switch to {:?}", new_config.storage_engine_type);
             loaded_config.save().await
@@ -2941,90 +2925,96 @@ impl StorageEngineManager {
         debug!("Final loaded_config before saving: {:?}", loaded_config);
         println!("===> Saving configuration to disk...");
         println!("===> Configuration saved successfully.");
-        println!("------------------------------> SEE IT <-------------------------------- {:?} vs {:?}", new_config.storage_engine_type, StorageEngineType::TiKV);
-        debug!("Reloaded storage config for daemon management: {:?}", loaded_config);
 
-        println!("==> ENGINE TYPE {:?}", new_config.storage_engine_type);
-
-        // Skip daemon cleanup for TiKV to prevent killing PD
-        if new_config.storage_engine_type != StorageEngineType::TiKV {
-            println!("===> USE STORAGE HANDLER - STEP 5: Attempting to stop existing daemon...");
-            let port = loaded_config.engine_specific_config
-                .as_ref()
-                .and_then(|c| c.storage.port)
-                .unwrap_or(loaded_config.default_port);
+        // Stop existing daemon and update registry, skip for Sled-to-Sled with same path
+        if !(old_engine_type == StorageEngineType::Sled && new_config.storage_engine_type == StorageEngineType::Sled && old_path == new_path) {
+            println!("===> USE STORAGE HANDLER - STEP 5: Managing daemon on port {}...", port);
             let max_attempts = 5;
             let mut attempt = 0;
-            let mut pid = None;
-
             while attempt < max_attempts {
                 match find_pid_by_port(port).await {
-                    Ok(opt_pid) => match opt_pid {
-                        Some(found_pid) => {
-                            debug!("Found PID {} for port {} on attempt {}", found_pid, port, attempt);
-                            if NonBlockingDaemonRegistry::is_pid_running(found_pid).await.unwrap_or(false) {
-                                info!("Active daemon found on port {}, skipping stop.", port);
-                                println!("===> Active daemon found on port {}.", port);
-                                pid = None; // Don't stop active daemon
-                                break;
-                            } else {
-                                info!("Stale daemon found on port {}, removing from registry.", port);
-                                GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("storage", port).await?;
-                                pid = Some(found_pid);
-                                break;
-                            }
+                    Ok(Some(found_pid)) => {
+                        debug!("Found PID {} for port {} on attempt {}", found_pid, port, attempt);
+                        if NonBlockingDaemonRegistry::is_pid_running(found_pid).await.unwrap_or(false) {
+                            info!("Active daemon found on port {}, stopping and updating registry.", port);
+                            stop_process(found_pid).await
+                                .map_err(|e| GraphError::StorageError(format!("Failed to stop daemon on PID {}: {}", found_pid, e)))?;
+                            GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("storage", port).await?;
+                            sleep(TokioDuration::from_millis(500)).await;
                         }
-                        None => {
-                            debug!("No process found on port {} on attempt {}", port, attempt);
-                            println!("===> No daemon found on port {}.", port);
-                            break;
-                        }
-                    },
+                        break;
+                    }
+                    Ok(None) => {
+                        debug!("No process found on port {} on attempt {}", port, attempt);
+                        println!("===> No daemon found on port {}.", port);
+                        break;
+                    }
                     Err(e) => {
                         warn!("Failed to check port {} on attempt {}: {}", port, attempt, e);
                         attempt += 1;
-                        time::sleep(TokioDuration::from_millis(100)).await;
+                        sleep(TokioDuration::from_millis(100)).await;
                     }
                 }
             }
-
-            if let Some(found_pid) = pid {
-                info!("Attempting to stop stale Storage Daemon on port {}...", port);
-                if let Err(e) = stop_process(found_pid).await {
-                    error!("Failed to stop daemon on PID {}: {}", found_pid, e);
-                    return Err(GraphError::StorageError(format!("Failed to stop daemon on PID {}: {}", found_pid, e)));
-                }
-                info!("Sent SIGTERM to PID {} for Storage Daemon on port {}.", found_pid, port);
-                time::sleep(TokioDuration::from_millis(500)).await;
-
-                match find_pid_by_port(port).await {
-                    Ok(opt_pid) => match opt_pid {
-                        None => {
-                            info!("Port {} is now free.", port);
-                            println!("Port {} is now free.", port);
-                        }
-                        Some(still_running_pid) => {
-                            warn!("Port {} is still in use after stopping PID {}.", port, still_running_pid);
-                        }
-                    },
-                    Err(e) => {
-                        warn!("Failed to verify port {} after stopping PID {}: {}", port, found_pid, e);
-                    }
-                }
-                println!("Storage daemon on port {} stopped.", port);
-                println!("===> Daemon stopped successfully.");
-            }
-        } else {
-            info!("Skipping daemon cleanup for TiKV to preserve running PD");
-            println!("===> USE STORAGE HANDLER - STEP 5: Skipping daemon cleanup for TiKV");
         }
 
-        // Pre-check PD endpoint for TiKV to ensure cluster is running
+        // Clean up lock files for new engine, skip for Sled-to-Sled with same path
+        if new_config.storage_engine_type != StorageEngineType::TiKV {
+            if let p = new_path.clone() {
+                if !(old_engine_type == StorageEngineType::Sled && new_config.storage_engine_type == StorageEngineType::Sled && old_path == new_path) {
+                    match new_config.storage_engine_type {
+                        StorageEngineType::Sled => {
+                            #[cfg(feature = "with-sled")]
+                            {
+                                println!("===> USE STORAGE HANDLER - STEP 5.5: Cleaning up lock files for Sled");
+                                info!("Cleaning up Sled lock files at {:?}", p);
+                                let lock_path = p.join("db.lck");
+                                if lock_path.exists() {
+                                    if let Err(e) = fs::remove_file(&lock_path).await {
+                                        warn!("Failed to remove Sled lock file at {:?}: {}", lock_path, e);
+                                    } else {
+                                        info!("Successfully removed Sled lock file at {:?}", lock_path);
+                                    }
+                                }
+                            }
+                        }
+                        StorageEngineType::RocksDB => {
+                            #[cfg(feature = "with-rocksdb")]
+                            {
+                                println!("===> USE STORAGE HANDLER - STEP 5.5: Cleaning up lock files for RocksDB");
+                                info!("Cleaning up RocksDB lock files at {:?}", p);
+                                if let Err(e) = recover_rocksdb(&p).await {
+                                    warn!("Failed to clean RocksDB locks at {:?}: {}", p, e);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        } else {
+            println!("===> USE STORAGE HANDLER - STEP 5.5: Cleaning up lock files for TiKV");
+            info!("Cleaning up TiKV lock files...");
+            let tikv_path = new_path.clone();
+            if tikv_path.exists() {
+                #[cfg(feature = "with-tikv")]
+                {
+                    if let Err(e) = TikvStorage::force_unlock().await {
+                        warn!("Failed to clean up TiKV lock files: {}", e);
+                    } else {
+                        info!("Lock files cleaned successfully.");
+                        println!("===> Lock files cleaned successfully.");
+                    }
+                }
+            }
+        }
+
+        // Pre-check PD endpoint for TiKV
         if new_config.storage_engine_type == StorageEngineType::TiKV {
             let pd_endpoints = new_config.engine_specific_config
                 .as_ref()
                 .and_then(|map| map.storage.pd_endpoints.clone())
-                .unwrap_or("127.0.0.1:2382".to_string());
+                .unwrap_or("127.0.0.1:2379".to_string());
             let pd_endpoint_list: Vec<String> = pd_endpoints.split(',').map(|s| s.trim().to_string()).collect();
             let client = Client::new();
             let mut healthy_endpoint = None;
@@ -3054,382 +3044,423 @@ impl StorageEngineManager {
             }
         }
 
-        // Clean up lock files for TiKV
-        if new_config.storage_engine_type == StorageEngineType::TiKV {
-            println!("===> USE STORAGE HANDLER - STEP 5.5: Cleaning up lock files for TiKV");
-            info!("Cleaning up lock files...");
-            let tikv_path = new_config.engine_specific_config
-                .as_ref()
-                .and_then(|map| map.storage.path.clone())
-                .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data/tikv"));
-            if tikv_path.exists() {
-                if let Err(e) = TikvStorage::force_unlock().await {
-                    warn!("Failed to clean up TiKV lock files: {}", e);
-                } else {
-                    info!("Lock files cleaned successfully.");
-                    println!("===> Lock files cleaned successfully.");
+        // Initialize new engine with retry for lock contention
+        async fn retry_init_engine<F, Fut>(init_fn: F, max_retries: u32) -> Result<Arc<dyn GraphStorageEngine + Send + Sync>, GraphError>
+        where
+            F: Fn() -> Fut + Send + 'static,
+            Fut: futures::Future<Output = Result<Arc<dyn GraphStorageEngine + Send + Sync>, GraphError>> + Send,
+        {
+            let mut attempt = 0;
+            while attempt < max_retries {
+                match init_fn().await {
+                    Ok(engine) => return Ok(engine),
+                    Err(e) if e.to_string().contains("WouldBlock") || e.to_string().contains("Resource temporarily unavailable") => {
+                        warn!("Lock contention during init (attempt {}/{}), retrying in 1s...", attempt + 1, max_retries);
+                        sleep(TokioDuration::from_secs(1)).await;
+                        attempt += 1;
+                    }
+                    Err(e) => return Err(e),
                 }
             }
+            Err(GraphError::StorageError("Max retries exceeded for engine init due to lock contention".to_string()))
         }
 
-        // Initialize new engine
         println!("===> USE STORAGE HANDLER - STEP 6: Initializing StorageEngineManager...");
-        println!("===> Creating new instance of StorageEngineManager...");
-        let new_persistent: Arc<dyn GraphStorageEngine + Send + Sync> = match new_config.storage_engine_type {
-            StorageEngineType::InMemory => {
-                info!("Initializing InMemory engine");
-                Arc::new(InMemoryGraphStorage::new(&new_config))
-            }
-            StorageEngineType::Hybrid => {
-                debug!("Attempting to create Hybrid storage");
-                #[cfg(any(feature = "with-sled", feature = "with-rocksdb", feature = "with-tikv"))]
-                {
-                    // persistent_engine is not in StorageConfigInner; use default or error
-                    let persistent_engine = "sled"; // Default to sled, as it's a common choice
-                    let persistent: Arc<dyn GraphStorageEngine + Send + Sync> = match persistent_engine {
-                        "sled" => {
+        let new_config_clone = new_config.clone();
+        let old_engine_type_clone = old_engine_type.clone();
+        let old_path_clone = old_path.clone();
+        let new_persistent = retry_init_engine(
+            move || {
+                let config = new_config_clone.clone();
+                let old_engine_type = old_engine_type_clone.clone();
+                let old_path = old_path_clone.clone();
+                async move {
+                    match config.storage_engine_type {
+                        StorageEngineType::InMemory => {
+                            info!("Initializing InMemory engine");
+                            Ok(Arc::new(InMemoryGraphStorage::new(&config)) as Arc<dyn GraphStorageEngine + Send + Sync>)
+                        }
+                        StorageEngineType::Hybrid => {
+                            #[cfg(any(feature = "with-sled", feature = "with-rocksdb", feature = "with-tikv"))]
+                            {
+                                let persistent_engine = "sled"; // Default to sled
+                                let persistent: Arc<dyn GraphStorageEngine + Send + Sync> = match persistent_engine {
+                                    "sled" => {
+                                        #[cfg(feature = "with-sled")]
+                                        {
+                                            let sled_config = SledConfig {
+                                                storage_engine_type: StorageEngineType::Sled,
+                                                path: config.engine_specific_config
+                                                    .as_ref()
+                                                    .and_then(|map| map.storage.path.clone())
+                                                    .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data/sled")),
+                                                host: config.engine_specific_config
+                                                    .as_ref()
+                                                    .and_then(|map| map.storage.host.clone()),
+                                                port: config.engine_specific_config
+                                                    .as_ref()
+                                                    .and_then(|map| map.storage.port),
+                                                cache_capacity: None,
+                                                temporary: false,
+                                                use_compression: true,
+                                            };
+                                            match SledStorage::new(&sled_config, &config).await {
+                                                Ok(storage) => {
+                                                    info!("Created Sled storage for Hybrid");
+                                                    Arc::new(storage)
+                                                }
+                                                Err(e) => {
+                                                    error!("Failed to create Sled storage for Hybrid: {}", e);
+                                                    return Err(e);
+                                                }
+                                            }
+                                        }
+                                        #[cfg(not(feature = "with-sled"))]
+                                        return Err(GraphError::ConfigurationError("Sled support is not enabled for Hybrid.".to_string()));
+                                    }
+                                    "rocksdb" => {
+                                        #[cfg(feature = "with-rocksdb")]
+                                        {
+                                            let rocksdb_config = RocksdbConfig {
+                                                storage_engine_type: StorageEngineType::RocksDB,
+                                                path: config.engine_specific_config
+                                                    .as_ref()
+                                                    .and_then(|map| map.storage.path.clone())
+                                                    .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data/rocksdb")),
+                                                host: config.engine_specific_config
+                                                    .as_ref()
+                                                    .and_then(|map| map.storage.host.clone()),
+                                                port: config.engine_specific_config
+                                                    .as_ref()
+                                                    .and_then(|map| map.storage.port),
+                                            };
+                                            match RocksdbStorage::new(&rocksdb_config) {
+                                                Ok(storage) => {
+                                                    info!("Created RocksDB storage for Hybrid");
+                                                    Arc::new(storage)
+                                                }
+                                                Err(e) => {
+                                                    error!("Failed to create RocksDB storage for Hybrid: {}", e);
+                                                    return Err(e);
+                                                }
+                                            }
+                                        }
+                                        #[cfg(not(feature = "with-rocksdb"))]
+                                        return Err(GraphError::ConfigurationError("RocksDB support is not enabled for Hybrid.".to_string()));
+                                    }
+                                    "tikv" => {
+                                        #[cfg(feature = "with-tikv")]
+                                        {
+                                            let tikv_config = TikvConfig {
+                                                storage_engine_type: StorageEngineType::TiKV,
+                                                path: config.engine_specific_config
+                                                    .as_ref()
+                                                    .and_then(|map| map.storage.path.clone())
+                                                    .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data/tikv")),
+                                                host: config.engine_specific_config
+                                                    .as_ref()
+                                                    .and_then(|map| map.storage.host.clone()),
+                                                port: config.engine_specific_config
+                                                    .as_ref()
+                                                    .and_then(|map| map.storage.port),
+                                                pd_endpoints: config.engine_specific_config
+                                                    .as_ref()
+                                                    .and_then(|map| map.storage.pd_endpoints.clone()),
+                                                username: config.engine_specific_config
+                                                    .as_ref()
+                                                    .and_then(|map| map.storage.username.clone()),
+                                                password: config.engine_specific_config
+                                                    .as_ref()
+                                                    .and_then(|map| map.storage.password.clone()),
+                                            };
+                                            match TikvStorage::new(&tikv_config).await {
+                                                Ok(storage) => {
+                                                    info!("Created TiKV storage for Hybrid");
+                                                    Arc::new(storage)
+                                                }
+                                                Err(e) => {
+                                                    error!("Failed to create TiKV storage for Hybrid: {}", e);
+                                                    return Err(e);
+                                                }
+                                            }
+                                        }
+                                        #[cfg(not(feature = "with-tikv"))]
+                                        return Err(GraphError::ConfigurationError("TiKV support is not enabled for Hybrid.".to_string()));
+                                    }
+                                    _ => {
+                                        error!("Unsupported persistent engine for Hybrid: {}", persistent_engine);
+                                        return Err(GraphError::ConfigurationError(format!("Unsupported persistent engine for Hybrid: {}", persistent_engine)));
+                                    }
+                                };
+                                info!("Created Hybrid storage with persistent engine: {}", persistent_engine);
+                                Ok(Arc::new(HybridStorage::new(persistent)) as Arc<dyn GraphStorageEngine + Send + Sync>)
+                            }
+                            #[cfg(not(any(feature = "with-sled", feature = "with-rocksdb", feature = "with-tikv")))]
+                            {
+                                error!("No persistent storage engines enabled for Hybrid");
+                                Err(GraphError::ConfigurationError("No persistent storage engines enabled for Hybrid. Enable 'with-sled', 'with-rocksdb', or 'with-tikv'.".to_string()))
+                            }
+                        }
+                        StorageEngineType::Sled => {
                             #[cfg(feature = "with-sled")]
                             {
+                                // The `config` variable is already the `StorageConfig` you need.
+                                // Accessing `config.storage` is incorrect, as the compiler states.
+                                // We'll use the fields directly from `config` and its nested `engine_specific_config`.
+                                let engine_specific = config.engine_specific_config
+                                    .as_ref()
+                                    .context("Sled configuration missing from `engine_specific_config`")?;
+                                
                                 let sled_config = SledConfig {
                                     storage_engine_type: StorageEngineType::Sled,
-                                    path: new_config.engine_specific_config
-                                        .as_ref()
-                                        .and_then(|map| map.storage.path.clone())
-                                        .unwrap_or_else(|| PathBuf::from(format!("{}/sled", DEFAULT_DATA_DIRECTORY))),
-                                    host: new_config.engine_specific_config
-                                        .as_ref()
-                                        .and_then(|map| map.storage.host.clone()),
-                                    port: new_config.engine_specific_config
-                                        .as_ref()
-                                        .and_then(|map| map.storage.port),
-                                    cache_capacity: None, // Not in StorageConfigInner, use SledConfig default
-                                    temporary: false,    // Not in StorageConfigInner, use SledConfig default
-                                    use_compression: true, // Not in StorageConfigInner, use SledConfig default
+                                    path: engine_specific.storage.path.clone()
+                                        .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data/sled")),
+                                    host: engine_specific.storage.host.clone(),
+                                    port: engine_specific.storage.port,
+                                    temporary: false,
+                                    use_compression: engine_specific.storage.use_compression,
+                                    cache_capacity: engine_specific.storage.cache_capacity,
                                 };
-                                match SledStorage::new(&sled_config, &new_config).await {
-                                    Ok(storage) => {
-                                        info!("Created Sled storage for Hybrid");
-                                        Arc::new(storage)
-                                    },
-                                    Err(e) => {
-                                        error!("Failed to create Sled storage for Hybrid: {}", e);
-                                        return Err(e);
+                                
+                                info!("Initializing Sled engine with path: {:?}", sled_config.path);
+                                let mut sled_singleton = SLED_SINGLETON.lock().await;
+
+                                let sled_instance = if old_engine_type == StorageEngineType::Sled && old_path == sled_config.path {
+                                    // Reuse existing Sled database
+                                    let sled_db = SLED_DB.get().ok_or_else(|| GraphError::StorageError("Failed to access existing Sled DB".to_string()))?;
+                                    let sled_db_guard = sled_db.lock().await;
+                                    info!("Reusing existing Sled database at {:?}", sled_db_guard.path);
+
+                                    // Pass `&config` as the `storage_config` argument.
+                                    let storage = SledStorage::new_with_db(&sled_config, &config, Arc::clone(&sled_db_guard.db)).await?;
+                                    let instance = Arc::new(storage);
+                                    *sled_singleton = Some(instance.clone());
+                                    instance
+                                } else {
+                                    // Create new Sled database
+                                    match sled_singleton.as_ref() {
+                                        Some(instance) => {
+                                            info!("Reusing existing Sled instance");
+                                            instance.clone()
+                                        }
+                                        None => {
+                                            trace!("Creating new SledStorage singleton");
+                                            let storage = SledStorage::new(&sled_config, &config).await?;
+                                            let instance = Arc::new(storage);
+                                            *sled_singleton = Some(instance.clone());
+                                            instance
+                                        }
                                     }
-                                }
+                                };
+                                Ok(sled_instance as Arc<dyn GraphStorageEngine + Send + Sync>)
                             }
                             #[cfg(not(feature = "with-sled"))]
-                            return Err(GraphError::ConfigurationError("Sled support is not enabled for Hybrid.".to_string()));
-                        }
-                        "rocksdb" => {
+                            {
+                                error!("Sled support is not enabled in this build");
+                                Err(GraphError::StorageError("Sled support is not enabled. Please enable the 'with-sled' feature.".to_string()))
+                            }
+                        },
+                        StorageEngineType::RocksDB => {
                             #[cfg(feature = "with-rocksdb")]
                             {
+                                let rocksdb_path = config.engine_specific_config
+                                    .as_ref()
+                                    .and_then(|map| map.storage.path.clone())
+                                    .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data/rocksdb"));
+                                if lock_file_exists(rocksdb_path.join("LOCK")).await? {
+                                    warn!("Lock file exists for RocksDB: {:?}", rocksdb_path.join("LOCK"));
+                                    recover_rocksdb(&rocksdb_path).await?;
+                                }
                                 let rocksdb_config = RocksdbConfig {
                                     storage_engine_type: StorageEngineType::RocksDB,
-                                    path: new_config.engine_specific_config
+                                    path: rocksdb_path,
+                                    host: Some(config.engine_specific_config
                                         .as_ref()
-                                        .and_then(|map| map.storage.path.clone())
-                                        .unwrap_or_else(|| PathBuf::from(format!("{}/rocksdb", DEFAULT_DATA_DIRECTORY))),
-                                    host: new_config.engine_specific_config
-                                        .as_ref()
-                                        .and_then(|map| map.storage.host.clone()),
-                                    port: new_config.engine_specific_config
+                                        .and_then(|map| map.storage.host.clone())
+                                        .unwrap_or("127.0.0.1".to_string())),
+                                    port: config.engine_specific_config
                                         .as_ref()
                                         .and_then(|map| map.storage.port),
                                 };
-                                match RocksdbStorage::new(&rocksdb_config) {
-                                    Ok(storage) => {
-                                        info!("Created RocksDB storage for Hybrid");
-                                        Arc::new(storage)
-                                    },
-                                    Err(e) => {
-                                        error!("Failed to create RocksDB storage for Hybrid: {}", e);
-                                        return Err(e);
+                                info!("Initializing RocksDB engine with path: {:?}", rocksdb_config.path);
+                                let mut rocksdb_singleton = ROCKSDB_SINGLETON.lock().await;
+                                let rocksdb_instance = match rocksdb_singleton.as_ref() {
+                                    Some(instance) => {
+                                        info!("Reusing existing RocksDB instance");
+                                        instance.clone()
                                     }
-                                }
+                                    None => {
+                                        trace!("Creating new RocksdbStorage singleton");
+                                        let storage = RocksdbStorage::new(&rocksdb_config)?;
+                                        let instance = Arc::new(storage);
+                                        *rocksdb_singleton = Some(instance.clone());
+                                        instance
+                                    }
+                                };
+                                Ok(rocksdb_instance as Arc<dyn GraphStorageEngine + Send + Sync>)
                             }
                             #[cfg(not(feature = "with-rocksdb"))]
-                            return Err(GraphError::ConfigurationError("RocksDB support is not enabled for Hybrid.".to_string()));
+                            {
+                                error!("RocksDB support is not enabled in this build");
+                                Err(GraphError::StorageError("RocksDB support is not enabled. Please enable the 'with-rocksdb' feature.".to_string()))
+                            }
                         }
-                        "tikv" => {
+                        StorageEngineType::TiKV => {
                             #[cfg(feature = "with-tikv")]
                             {
                                 let tikv_config = TikvConfig {
                                     storage_engine_type: StorageEngineType::TiKV,
-                                    path: new_config.engine_specific_config
+                                    path: config.engine_specific_config
                                         .as_ref()
                                         .and_then(|map| map.storage.path.clone())
-                                        .unwrap_or_else(|| PathBuf::from(format!("{}/tikv", DEFAULT_DATA_DIRECTORY))),
-                                    host: new_config.engine_specific_config
+                                        .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data/tikv")),
+                                    host: Some(config.engine_specific_config
                                         .as_ref()
-                                        .and_then(|map| map.storage.host.clone()),
-                                    port: new_config.engine_specific_config
+                                        .and_then(|map| map.storage.host.clone())
+                                        .unwrap_or("127.0.0.1".to_string())),
+                                    port: config.engine_specific_config
                                         .as_ref()
                                         .and_then(|map| map.storage.port),
-                                    pd_endpoints: new_config.engine_specific_config
+                                    pd_endpoints: config.engine_specific_config
                                         .as_ref()
-                                        .and_then(|map| map.storage.pd_endpoints.clone())
-                                        .or_else(|| {
-                                            warn!("pd_endpoints missing in TiKV configuration, using default: 127.0.0.1:2379");
-                                            Some("127.0.0.1:2379".to_string())
-                                        }),
-                                    username: new_config.engine_specific_config
+                                        .and_then(|map| map.storage.pd_endpoints.clone()),
+                                    username: config.engine_specific_config
                                         .as_ref()
                                         .and_then(|map| map.storage.username.clone()),
-                                    password: new_config.engine_specific_config
+                                    password: config.engine_specific_config
                                         .as_ref()
                                         .and_then(|map| map.storage.password.clone()),
                                 };
-                                match TikvStorage::new(&tikv_config).await {
-                                    Ok(storage) => {
-                                        info!("Created TiKV storage for Hybrid");
-                                        Arc::new(storage)
-                                    },
-                                    Err(e) => {
-                                        error!("Failed to create TiKV storage for Hybrid: {}", e);
-                                        return Err(e);
-                                    }
-                                }
+                                let mut tikv_singleton = TIKV_SINGLETON.lock().await;
+                                let tikv_instance = if let Some(instance) = tikv_singleton.as_ref() {
+                                    info!("Reusing existing TiKV instance");
+                                    instance.clone()
+                                } else {
+                                    trace!("Creating new TiKV instance");
+                                    let storage = TikvStorage::new(&tikv_config).await?;
+                                    let instance = Arc::new(storage);
+                                    *tikv_singleton = Some(instance.clone());
+                                    instance
+                                };
+                                Ok(tikv_instance as Arc<dyn GraphStorageEngine + Send + Sync>)
                             }
                             #[cfg(not(feature = "with-tikv"))]
-                            return Err(GraphError::ConfigurationError("TiKV support is not enabled for Hybrid.".to_string()));
+                            {
+                                error!("TiKV support is not enabled in this build");
+                                Err(GraphError::StorageError("TiKV support is not enabled. Please enable the 'with-tikv' feature.".to_string()))
+                            }
                         }
-                        _ => {
-                            error!("Unsupported persistent engine for Hybrid: {}", persistent_engine);
-                            return Err(GraphError::ConfigurationError(format!("Unsupported persistent engine for Hybrid: {}", persistent_engine)));
+                        StorageEngineType::Redis => {
+                            #[cfg(feature = "redis-datastore")]
+                            {
+                                let redis_config = RedisConfig {
+                                    storage_engine_type: StorageEngineType::Redis,
+                                    path: config.engine_specific_config
+                                        .as_ref()
+                                        .and_then(|map| map.storage.path.clone())
+                                        .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data/redis")),
+                                    host: Some(config.engine_specific_config
+                                        .as_ref()
+                                        .and_then(|map| map.storage.host.clone())
+                                        .unwrap_or("127.0.0.1".to_string())),
+                                    port: config.engine_specific_config
+                                        .as_ref()
+                                        .and_then(|map| map.storage.port)
+                                        .unwrap_or(6379),
+                                };
+                                let redis_instance = REDIS_SINGLETON.get_or_init(|| async {
+                                    trace!("Creating new RedisStorage singleton");
+                                    let storage = RedisStorage::new(&redis_config).await?;
+                                    Ok(Arc::new(storage))
+                                }).await?;
+                                Ok(redis_instance.clone() as Arc<dyn GraphStorageEngine + Send + Sync>)
+                            }
+                            #[cfg(not(feature = "redis-datastore"))]
+                            {
+                                error!("Redis support is not enabled in this build");
+                                Err(GraphError::StorageError("Redis support is not enabled. Please enable the 'redis-datastore' feature.".to_string()))
+                            }
                         }
-                    };
-                    info!("Created Hybrid storage with persistent engine: {}", persistent_engine);
-                    Arc::new(HybridStorage::new(persistent))
-                }
-                #[cfg(not(any(feature = "with-sled", feature = "with-rocksdb", feature = "with-tikv")))]
-                {
-                    error!("No persistent storage engines enabled for Hybrid");
-                    Err(GraphError::ConfigurationError("No persistent storage engines enabled for Hybrid. Enable 'with-sled', 'with-rocksdb', or 'with-tikv'.".to_string()))
-                }
-            }
-            StorageEngineType::Sled => {
-                #[cfg(feature = "with-sled")]
-                {
-                    let sled_config = SledConfig {
-                        storage_engine_type: StorageEngineType::Sled,
-                        path: new_config.engine_specific_config
-                            .as_ref()
-                            .and_then(|map| map.storage.path.clone())
-                            .unwrap_or_else(|| PathBuf::from(format!("{}/sled", DEFAULT_DATA_DIRECTORY))),
-                        host: new_config.engine_specific_config
-                            .as_ref()
-                            .and_then(|map| map.storage.host.clone()),
-                        port: new_config.engine_specific_config
-                            .as_ref()
-                            .and_then(|map| map.storage.port),
-                        temporary: false,    // Not in StorageConfigInner, use SledConfig default
-                        use_compression: true, // Not in StorageConfigInner, use SledConfig default
-                        cache_capacity: None, // Not in StorageConfigInner, use SledConfig default
-                    };
-                    println!("===> USE STORAGE HANDLER - STEP 3.1 - SLED");
-                    info!("Initializing Sled engine with path: {:?}", sled_config.path);
-                    let mut sled_singleton = SLED_SINGLETON.lock().await;
-                    let sled_instance = match sled_singleton.as_ref() {
-                        Some(instance) => instance.clone(),
-                        None => {
-                            trace!("Creating new SledStorage singleton");
-                            let storage = SledStorage::new(&sled_config, &new_config).await?;
-                            let instance = Arc::new(storage);
-                            *sled_singleton = Some(instance.clone());
-                            instance
+                        StorageEngineType::PostgreSQL => {
+                            #[cfg(feature = "postgres-datastore")]
+                            {
+                                let postgres_config = PostgreSQLConfig {
+                                    storage_engine_type: StorageEngineType::PostgreSQL,
+                                    path: config.engine_specific_config
+                                        .as_ref()
+                                        .and_then(|map| map.storage.path.clone())
+                                        .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data/postgresql")),
+                                    host: Some(config.engine_specific_config
+                                        .as_ref()
+                                        .and_then(|map| map.storage.host.clone())
+                                        .unwrap_or("127.0.0.1".to_string())),
+                                    port: config.engine_specific_config
+                                        .as_ref()
+                                        .and_then(|map| map.storage.port)
+                                        .unwrap_or(5432),
+                                };
+                                let postgres_instance = POSTGRES_SINGLETON.get_or_init(|| async {
+                                    trace!("Creating new PostgresStorage singleton");
+                                    let storage = PostgresStorage::new(&postgres_config).await?;
+                                    Ok(Arc::new(storage))
+                                }).await?;
+                                Ok(postgres_instance.clone() as Arc<dyn GraphStorageEngine + Send + Sync>)
+                            }
+                            #[cfg(not(feature = "postgres-datastore"))]
+                            {
+                                error!("PostgreSQL support is not enabled in this build");
+                                Err(GraphError::StorageError("PostgreSQL support is not enabled. Please enable the 'postgres-datastore' feature.".to_string()))
+                            }
                         }
-                    };
-                    sled_instance
-                }
-                #[cfg(not(feature = "with-sled"))]
-                {
-                    error!("Sled support is not enabled in this build");
-                    return Err(GraphError::StorageError("Sled support is not enabled. Please enable the 'with-sled' feature.".to_string()));
-                }
-            }
-            StorageEngineType::RocksDB => {
-                #[cfg(feature = "with-rocksdb")]
-                {
-                    let rocksdb_path = new_config.engine_specific_config
-                        .as_ref()
-                        .and_then(|map| map.storage.path.clone())
-                        .unwrap_or_else(|| PathBuf::from(format!("{}/rocksdb", DEFAULT_DATA_DIRECTORY)));
-                    if lock_file_exists(rocksdb_path.join("LOCK")).await? {
-                        warn!("Lock file exists for RocksDB: {:?}", rocksdb_path.join("LOCK"));
-                        recover_rocksdb(&rocksdb_path).await?;
-                    }
-                    let rocksdb_config = RocksdbConfig {
-                        storage_engine_type: StorageEngineType::RocksDB,
-                        path: rocksdb_path,
-                        host: new_config.engine_specific_config
-                            .as_ref()
-                            .and_then(|map| map.storage.host.clone()),
-                        port: new_config.engine_specific_config
-                            .as_ref()
-                            .and_then(|map| map.storage.port),
-                    };
-                    info!("Initializing RocksDB engine with path: {:?}", rocksdb_config.path);
-                    let mut rocksdb_singleton = ROCKSDB_SINGLETON.lock().await;
-                    let rocksdb_instance = match rocksdb_singleton.as_ref() {
-                        Some(instance) => instance.clone(),
-                        None => {
-                            trace!("Creating new RocksdbStorage singleton");
-                            let storage = RocksdbStorage::new(&rocksdb_config)?;
-                            let instance = Arc::new(storage);
-                            *rocksdb_singleton = Some(instance.clone());
-                            instance
+                        StorageEngineType::MySQL => {
+                            #[cfg(feature = "mysql-datastore")]
+                            {
+                                let mysql_config = MySQLConfig {
+                                    storage_engine_type: StorageEngineType::MySQL,
+                                    path: config.engine_specific_config
+                                        .as_ref()
+                                        .and_then(|map| map.storage.path.clone())
+                                        .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data/mysql")),
+                                    host: Some(config.engine_specific_config
+                                        .as_ref()
+                                        .and_then(|map| map.storage.host.clone())
+                                        .unwrap_or("127.0.0.1".to_string())),
+                                    port: config.engine_specific_config
+                                        .as_ref()
+                                        .and_then(|map| map.storage.port)
+                                        .unwrap_or(3306),
+                                };
+                                let mysql_instance = MYSQL_SINGLETON.get_or_init(|| async {
+                                    trace!("Creating new MySQLStorage singleton");
+                                    let storage = MySQLStorage::new(&mysql_config).await?;
+                                    Ok(Arc::new(storage))
+                                }).await?;
+                                Ok(mysql_instance.clone() as Arc<dyn GraphStorageEngine + Send + Sync>)
+                            }
+                            #[cfg(not(feature = "mysql-datastore"))]
+                            {
+                                error!("MySQL support is not enabled in this build");
+                                Err(GraphError::StorageError("MySQL support is not enabled. Please enable the 'mysql-datastore' feature.".to_string()))
+                            }
                         }
-                    };
-                    rocksdb_instance
-                }
-                #[cfg(not(feature = "with-rocksdb"))]
-                {
-                    error!("RocksDB support is not enabled in this build");
-                    return Err(GraphError::StorageError("RocksDB support is not enabled. Please enable the 'with-rocksdb' feature.".to_string()));
-                }
-            }
-            StorageEngineType::TiKV => {
-                #[cfg(feature = "with-tikv")]
-                {
-                    let mut tikv_singleton = TIKV_SINGLETON.lock().await;
-                    if let Some(tikv_instance) = tikv_singleton.as_ref() {
-                        info!("Reusing existing TiKV instance");
-                        tikv_instance.clone()
-                    } else {
-                        Self::init_tikv(&new_config).await?
                     }
                 }
-                #[cfg(not(feature = "with-tikv"))]
-                {
-                    error!("TiKV support is not enabled in this build");
-                    return Err(GraphError::StorageError("TiKV support is not enabled. Please enable the 'with-tikv' feature.".to_string()));
-                }
-            }
-            StorageEngineType::Redis => {
-                #[cfg(feature = "redis-datastore")]
-                {
-                    let redis_config = RedisConfig {
-                        storage_engine_type: StorageEngineType::Redis,
-                        host: new_config.engine_specific_config
-                            .as_ref()
-                            .and_then(|map| map.storage.host.clone())
-                            .unwrap_or("127.0.0.1".to_string()),
-                        port: new_config.engine_specific_config
-                            .as_ref()
-                            .and_then(|map| map.storage.port)
-                            .unwrap_or(6379),
-                        database: new_config.engine_specific_config
-                            .as_ref()
-                            .and_then(|map| map.storage.database.clone())
-                            .unwrap_or("0".to_string()),
-                        username: None,
-                        password: None,
-                    };
-                    let redis_instance = REDIS_SINGLETON.get_or_init(|| async {
-                        trace!("Creating new RedisStorage singleton");
-                        let storage = RedisStorage::new(&redis_config).await?;
-                        Ok(Arc::new(storage))
-                    }).await?;
-                    redis_instance.clone()
-                }
-                #[cfg(not(feature = "redis-datastore"))]
-                {
-                    error!("Redis support is not enabled in this build");
-                    return Err(GraphError::StorageError("Redis support is not enabled. Please enable the 'redis-datastore' feature.".to_string()));
-                }
-            }
-            StorageEngineType::PostgreSQL => {
-                #[cfg(feature = "postgres-datastore")]
-                {
-                    let postgres_config = PostgreSQLConfig {
-                        storage_engine_type: StorageEngineType::PostgreSQL,
-                        host: new_config.engine_specific_config
-                            .as_ref()
-                            .and_then(|map| map.storage.host.clone())
-                            .unwrap_or("127.0.0.1".to_string()),
-                        port: new_config.engine_specific_config
-                            .as_ref()
-                            .and_then(|map| map.storage.port)
-                            .unwrap_or(5432),
-                        username: new_config.engine_specific_config
-                            .as_ref()
-                            .and_then(|map| map.storage.username.clone())
-                            .unwrap_or("graphdb_user".to_string()),
-                        password: new_config.engine_specific_config
-                            .as_ref()
-                            .and_then(|map| map.storage.password.clone())
-                            .unwrap_or("secure_password".to_string()),
-                        database: new_config.engine_specific_config
-                            .as_ref()
-                            .and_then(|map| map.storage.database.clone())
-                            .unwrap_or("graphdb".to_string()),
-                    };
-                    let postgres_instance = POSTGRES_SINGLETON.get_or_init(|| async {
-                        trace!("Creating new PostgresStorage singleton");
-                        let storage = PostgresStorage::new(&postgres_config).await?;
-                        Ok(Arc::new(storage))
-                    }).await?;
-                    postgres_instance.clone()
-                }
-                #[cfg(not(feature = "postgres-datastore"))]
-                {
-                    error!("PostgreSQL support is not enabled in this build");
-                    return Err(GraphError::StorageError("PostgreSQL support is not enabled. Please enable the 'postgres-datastore' feature.".to_string()));
-                }
-            }
-            StorageEngineType::MySQL => {
-                #[cfg(feature = "mysql-datastore")]
-                {
-                    let mysql_config = MySQLConfig {
-                        storage_engine_type: StorageEngineType::MySQL,
-                        host: new_config.engine_specific_config
-                            .as_ref()
-                            .and_then(|map| map.storage.host.clone())
-                            .unwrap_or("127.0.0.1".to_string()),
-                        port: new_config.engine_specific_config
-                            .as_ref()
-                            .and_then(|map| map.storage.port)
-                            .unwrap_or(3306),
-                        username: new_config.engine_specific_config
-                            .as_ref()
-                            .and_then(|map| map.storage.username.clone())
-                            .unwrap_or("graphdb_user".to_string()),
-                        password: new_config.engine_specific_config
-                            .as_ref()
-                            .and_then(|map| map.storage.password.clone())
-                            .unwrap_or("secure_password".to_string()),
-                        database: new_config.engine_specific_config
-                            .as_ref()
-                            .and_then(|map| map.storage.database.clone())
-                            .unwrap_or("graphdb".to_string()),
-                    };
-                    let mysql_instance = MYSQL_SINGLETON.get_or_init(|| async {
-                        trace!("Creating new MySQLStorage singleton");
-                        let storage = MySQLStorage::new(&mysql_config).await?;
-                        Ok(Arc::new(storage))
-                    }).await?;
-                    mysql_instance.clone()
-                }
-                #[cfg(not(feature = "mysql-datastore"))]
-                {
-                    error!("MySQL support is not enabled in this build");
-                    return Err(GraphError::StorageError("MySQL support is not enabled. Please enable the 'mysql-datastore' feature.".to_string()));
-                }
-            }
-        };
+            },
+            5,
+        ).await?;
 
-        // Migrate data if switching engines
-        if old_engine_type != new_config.storage_engine_type {
-            info!("Migrating data from {} to {}", old_persistent_arc.get_type(), new_persistent.get_type());
-            self.migrate_data(&old_persistent_arc, &new_persistent).await?;
-        }
-
-        // Stop the current engine if it was running
-        if was_running {
-            info!("Stopping current engine before switching");
-            let engine = self.engine.lock().await;
-            (*engine).stop().await
-                .map_err(|e| GraphError::StorageError(format!("Failed to stop current engine: {}", e)))?;
+        // Migrate or copy data if needed
+        if old_engine_type != new_config.storage_engine_type || old_path != new_path {
+            info!("Handling data transfer from old {:?} (path {:?}) to new {:?} (path {:?})", 
+                  old_engine_type, old_path, new_config.storage_engine_type, new_path);
+            if old_engine_type != new_config.storage_engine_type {
+                info!("Migrating data from {} to {}", old_persistent_arc.get_type(), new_persistent.get_type());
+                self.migrate_data(&old_persistent_arc, &new_persistent).await?;
+            } else if let (old_p, new_p) = (old_path, new_path) {
+                info!("Copying data directory for same-engine path change");
+                copy_dir(&old_p, &new_p).await
+                    .map_err(|e| GraphError::Io(e))?;
+            }
         }
 
         // Update the engine
@@ -3441,77 +3472,33 @@ impl StorageEngineManager {
         }));
         self.persistent_engine = new_persistent;
 
-        // Start the new engine
+        // Start the new engine and register daemon
         {
             let engine = self.engine.lock().await;
             (*engine).start().await
                 .map_err(|e| GraphError::StorageError(format!("Failed to start new engine: {}", e)))?;
+            let meta = DaemonMetadata {
+                service_type: "storage".to_string(),
+                port,
+                pid: std::process::id(),
+                ip_address: "127.0.0.1".to_string(),
+                data_dir: new_config.engine_specific_config
+                    .as_ref()
+                    .and_then(|c| c.storage.path.clone()),
+                config_path: Some(config_path),
+                engine_type: Some(new_config.storage_engine_type.to_string()),
+                last_seen_nanos: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|e| GraphError::StorageError(format!("System time error: {}", e)))?
+                    .as_nanos() as i64,
+            };
+            GLOBAL_DAEMON_REGISTRY.register_daemon(meta).await
+                .map_err(|e| GraphError::StorageError(format!("Failed to register daemon: {}", e)))?;
+            info!("Registered new daemon for engine {:?} on port {}", new_config.storage_engine_type, port);
         }
 
         info!("Successfully switched to storage engine: {:?}", new_config.storage_engine_type);
         trace!("use_storage completed in {}ms", start_time.elapsed().as_millis());
         Ok(())
     }
-
 }
-
-/// Helper function to clean up legacy port-suffixed Sled directories
-async fn cleanup_legacy_sled_paths(base_data_dir: &Path, current_port: u16) {
-    info!("Cleaning up legacy port-suffixed Sled directories in {:?}", base_data_dir);
-    
-    if !base_data_dir.exists() {
-        return;
-    }
-    
-    if let Ok(entries) = tokio::fs::read_dir(base_data_dir).await {
-        let mut entries = entries;
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            if let Some(name) = entry.file_name().to_str() {
-                // Look for directories matching pattern like "sled_8052", "sled_8053", etc.
-                if name.starts_with("sled_") && name != "sled" {
-                    if let Some(suffix) = name.strip_prefix("sled_") {
-                        if let Ok(old_port) = suffix.parse::<u16>() {
-                            let old_path = entry.path();
-                            info!("Found legacy Sled directory: {:?} (port {})", old_path, old_port);
-                            
-                            // Try to force unlock any database locks first
-                            if old_path.exists() {
-                                if let Err(e) = SledStorage::force_unlock(&old_path).await {
-                                    warn!("Failed to force unlock Sled database at {:?}: {}", old_path, e);
-                                } else {
-                                    info!("Successfully unlocked Sled database at {:?}", old_path);
-                                }
-                            }
-                            
-                            // Attempt to remove the entire legacy directory
-                            match tokio::fs::remove_dir_all(&old_path).await {
-                                Ok(_) => {
-                                    info!("Successfully removed legacy Sled directory: {:?}", old_path);
-                                    
-                                    // Also clean up daemon registry entry for the old port if it exists
-                                    if let Ok(_) = GLOBAL_DAEMON_REGISTRY.unregister_daemon(old_port).await {
-                                        info!("Unregistered daemon registry entry for legacy port {}", old_port);
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!("Failed to remove legacy Sled directory {:?}: {}", old_path, e);
-                                    // If we can't remove it, at least try to clean up the registry
-                                    if let Ok(_) = GLOBAL_DAEMON_REGISTRY.unregister_daemon(old_port).await {
-                                        info!("Unregistered daemon registry entry for legacy port {} (directory removal failed)", old_port);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    } else {
-        warn!("Could not read directory entries from {:?}", base_data_dir);
-    }
-    
-    info!("Completed cleanup of legacy port-suffixed Sled directories");
-}
-
-
-

@@ -149,6 +149,7 @@ pub async fn handle_query_command(engine: Arc<QueryExecEngine>, query: String) -
     println!("Query Result:\n{}", serde_json::to_string_pretty(&result)?);
     Ok(())
 }
+
 pub async fn handle_kv_command(engine: Arc<QueryExecEngine>, operation: String, key: String, value: Option<String>) -> Result<()> {
     let validated_op = parse_kv_operation(&operation)
         .map_err(|e| anyhow!("Invalid KV operation: {}", e))?;
@@ -234,13 +235,13 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
     let daemon = daemons.iter().max_by_key(|m| m.port).unwrap_or(daemons.first().unwrap());
     println!("===> SELECTED DAEMON ON PORT: {}", daemon.port);
 
-    // Use the standard IPC socket path for all GraphDB communication
-    let socket_path = "/opt/graphdb/pgraphdb.ipc";
+    // Construct port-specific IPC socket path
+    let socket_path = format!("/opt/graphdb/pgraphdb-{}.ipc", daemon.port);
     let addr = format!("ipc://{}", socket_path);
     
     // Check if socket file exists
     if !tokio::fs::metadata(&socket_path).await.is_ok() {
-        return Err(anyhow!("IPC socket file {} does not exist. Daemon may not be running properly.", socket_path));
+        return Err(anyhow!("IPC socket file {} does not exist. Daemon may not be running properly on port {}.", socket_path, daemon.port));
     }
 
     println!("===> CONNECTING TO SLED DAEMON AT: {}", addr);
@@ -502,19 +503,29 @@ pub async fn initialize_storage_for_query(
     let config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
     let absolute_config_path = cwd.join(&config_path);
     
-    // Now, pass the *path* to the StorageEngineManager, as its signature expects.
-    let manager = StorageEngineManager::new(engine_type.clone(), 
-                                           &absolute_config_path,
-                                           false, Some(port))
-        .await
-        .context(format!("Failed to initialize StorageEngineManager for engine {:?}", engine_type))?;
+    let manager = StorageEngineManager::new(
+        engine_type.clone(),
+        &absolute_config_path,
+        false,
+        Some(port),
+    )
+    .await
+    .context(format!(
+        "Failed to initialize StorageEngineManager for engine {:?}",
+        engine_type
+    ))?;
 
+    // Pass plain manager (not Arc) into from_manager
+    let async_manager = AsyncStorageEngineManager::from_manager(manager);
+
+    // Register global manager, wrapped in Arc
     GLOBAL_STORAGE_ENGINE_MANAGER
-        .set(Arc::new(AsyncStorageEngineManager::from_manager(
-            Arc::try_unwrap(manager)
-                .map_err(|_| GraphError::ConfigurationError("Failed to unwrap Arc<StorageEngineManager>: multiple references exist".to_string()))?
-        )))
-        .context("Failed to set GLOBAL_STORAGE_ENGINE_MANAGER")?;
+        .set(Arc::new(async_manager))
+        .map_err(|_| {
+            GraphError::ConfigurationError(
+                "Failed to set GLOBAL_STORAGE_ENGINE_MANAGER: already initialized".to_string(),
+            )
+    })?;
 
     info!("Successfully connected to storage engine on port {:?}", daemon.port);
 
