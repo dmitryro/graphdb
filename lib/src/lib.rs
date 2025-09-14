@@ -15,9 +15,7 @@ pub mod query_exec_engine;
 pub mod storage_engine; // This declares the directory `storage_engine`
 pub mod transact_indexing;
 pub mod indexing_caching;
-pub mod daemon_registry;
-pub mod daemon_config;
-pub mod daemon_utils;
+pub mod daemon;
 pub mod util;
 pub use config::StorageEngineType;
 pub mod config;
@@ -33,6 +31,7 @@ pub use models::properties::{EdgeProperties, NamedProperty, PropertyValue, Verte
 pub use models::queries::{Query, QueryOutputValue};
 pub use models::medical::{Login, User};
 pub use commands::*;
+pub use daemon::*;
 
 #[cfg(feature = "bench-suite")]
 extern crate test;

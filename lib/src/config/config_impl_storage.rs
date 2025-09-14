@@ -1,5 +1,6 @@
 use std::fs;
 use std::fs::File;
+use std::ffi::OsStr;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
@@ -15,6 +16,33 @@ use crate::config::config_constants::*;
 use crate::config::config_helpers::{load_engine_specific_config, hashmap_to_engine_specific_config};
 use models::errors::GraphError;
 use crate::storage_engine::storage_engine::StorageEngineManager;
+
+// Helper function to normalize the engine path
+fn normalize_engine_path(mut path: PathBuf, engine_type_str: &str) -> PathBuf {
+    let engine_low = engine_type_str.to_lowercase();
+
+    // If the last component is exactly the engine_low, remove it (handles duplicates like sled/sled)
+    if let Some(last) = path.file_name() {
+        if let Some(last_str) = last.to_str() {
+            if last_str == engine_low {
+                let _ = path.pop();
+            }
+        }
+    }
+
+    // Check if the path now ends with the engine directory (case-insensitive)
+    let path_str = path.to_str().unwrap_or("").to_lowercase();
+    let ends_with_engine = path_str.ends_with(&format!("/{}", engine_low))
+        || path_str.ends_with(&engine_low)
+        || path.components().last().map(|c| c.as_os_str() == OsStr::new(&engine_low)).unwrap_or(false);
+
+    // If not, append the engine directory
+    if !ends_with_engine {
+        path.push(&engine_low);
+    }
+
+    path
+}
 
 // Main wrapper struct for top-level `storage` key
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -175,13 +203,18 @@ impl StorageConfig {
                 config.storage_engine_type = engine_config.storage_engine_type;
             }
 
-            // Normalize the path to ensure it matches data_directory/<engine_type>.
+            // Normalize the path to ensure it matches data_directory/<engine_type>, but only if the engine type is not already the last path component.
             let engine_path_name = config.storage_engine_type.to_string().to_lowercase();
             let data_dir_path = config.data_directory.as_ref().map_or(
                 PathBuf::from(DEFAULT_DATA_DIRECTORY),
                 |p| p.clone()
             );
-            let engine_data_path = data_dir_path.join(&engine_path_name);
+
+            let engine_data_path = if data_dir_path.ends_with(&engine_path_name) {
+                data_dir_path
+            } else {
+                data_dir_path.join(&engine_path_name)
+            };
 
             if engine_config.storage.path.is_none() || engine_config.storage.path != Some(engine_data_path.clone()) {
                 info!(
@@ -225,61 +258,68 @@ impl StorageConfig {
         Ok(validated_config)
     }
 
-    // Refactored `save` method to use serde_yaml::to_string for robustness
     pub async fn save(&self) -> Result<(), anyhow::Error> {
         let config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
         debug!("Saving configuration to {:?}", config_path);
 
+        let engine_type_str = self.storage_engine_type.to_string().to_lowercase();
+
         let (engine_path, engine_host, engine_port, engine_username, engine_password, engine_pd_endpoints) = match self.engine_specific_config.as_ref() {
-            Some(es) => (
-                es.storage.path.clone().unwrap_or_else(|| PathBuf::from(format!(
-                    "{}/{}",
-                    DEFAULT_DATA_DIRECTORY,
-                    self.storage_engine_type.to_string().to_lowercase()
-                ))),
-                es.storage.host.clone().unwrap_or_else(|| "127.0.0.1".to_string()),
-                es.storage.port.unwrap_or(self.default_port),
-                es.storage.username.clone().unwrap_or_default(),
-                es.storage.password.clone().unwrap_or_default(),
-                es.storage.pd_endpoints.clone().unwrap_or_default(),
-            ),
-            None => (
-                PathBuf::from(format!(
-                    "{}/{}",
-                    DEFAULT_DATA_DIRECTORY,
-                    self.storage_engine_type.to_string().to_lowercase()
-                )),
-                "127.0.0.1".to_string(),
-                self.default_port,
-                String::new(),
-                String::new(),
-                String::new(),
-            ),
+            Some(es) => {
+                let base_path = es.storage.path.clone().unwrap_or_else(|| {
+                    self.data_directory.as_ref().cloned().unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
+                });
+                let normalized_path = normalize_engine_path(base_path, &engine_type_str);
+                (
+                    normalized_path,
+                    es.storage.host.clone().unwrap_or_else(|| "127.0.0.1".to_string()),
+                    es.storage.port.unwrap_or(self.default_port),
+                    es.storage.username.clone().unwrap_or_default(),
+                    es.storage.password.clone().unwrap_or_default(),
+                    es.storage.pd_endpoints.clone().unwrap_or_default(),
+                )
+            },
+            None => {
+                let base_path = self.data_directory.as_ref().cloned().unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY));
+                let normalized_path = normalize_engine_path(base_path, &engine_type_str);
+                (
+                    normalized_path,
+                    "127.0.0.1".to_string(),
+                    self.default_port,
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                )
+            },
         };
 
+        let data_directory_str = self.data_directory.as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| DEFAULT_DATA_DIRECTORY.to_string());
+
         let yaml_string = format!(
-    r#"storage:
-      config_root_directory: "{}"
-      data_directory: "{}"
-      log_directory: "{}"
-      default_port: {}
-      cluster_range: "{}"
-      max_disk_space_gb: {}
-      min_disk_space_gb: {}
-      use_raft_for_scale: {}
+            r#"storage:
+    config_root_directory: "{}"
+    data_directory: "{}"
+    log_directory: "{}"
+    default_port: {}
+    cluster_range: "{}"
+    max_disk_space_gb: {}
+    min_disk_space_gb: {}
+    use_raft_for_scale: {}
+    storage_engine_type: "{}"
+    engine_specific_config:
       storage_engine_type: "{}"
-      engine_specific_config:
-        storage_engine_type: "{}"
-        path: "{}"
-        host: "{}"
-        port: {}
-        username: "{}"
-        password: "{}"
-        pd_endpoints: "{}"
-      max_open_files: {}
-    "#,
+      path: "{}"
+      host: "{}"
+      port: {}
+      username: "{}"
+      password: "{}"
+      pd_endpoints: "{}"
+    max_open_files: {}
+  "#,
             self.config_root_directory.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
-            self.data_directory.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+            data_directory_str,
             self.log_directory.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
             self.default_port,
             self.cluster_range,
@@ -297,22 +337,18 @@ impl StorageConfig {
             self.max_open_files
         );
 
-        fs::create_dir_all(config_path.parent().unwrap())
+        tokio::fs::create_dir_all(config_path.parent().unwrap())
+            .await
             .context(format!("Failed to create parent directories for {}", config_path.display()))?;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&config_path)
-            .context(format!("Failed to open config file for writing: {}", config_path.display()))?;
-        file.write_all(yaml_string.as_bytes())
+        
+        tokio::fs::write(&config_path, yaml_string.as_bytes())
+            .await
             .context(format!("Failed to write StorageConfig to file: {}", config_path.display()))?;
-        file.flush()
-            .context(format!("Failed to flush config file: {}", config_path.display()))?;
+        
         info!("Saved storage configuration to {:?}", config_path);
 
-        // Verify the written content
-        let written_content = fs::read_to_string(&config_path)
+        let written_content = tokio::fs::read_to_string(&config_path)
+            .await
             .context(format!("Failed to read back storage config file: {}", config_path.display()))?;
         if written_content != yaml_string {
             error!("Written config does not match expected content at {:?}", config_path);
@@ -322,6 +358,7 @@ impl StorageConfig {
 
         Ok(())
     }
+
 
     pub fn validate(self) -> Result<Self, GraphError> {
         let available_engines = StorageEngineManager::available_engines();

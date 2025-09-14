@@ -57,7 +57,7 @@ pub use crate::cli::handlers_queries::{handle_interactive_query, handle_unified_
                                        handle_exec_command, handle_query_command};
 
 use daemon_api::{stop_daemon, start_daemon};
-use lib::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};                                    
+use crate::cli::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};                                    
 
 /// Displays the Raft status for a storage daemon running on the specified port.
 pub async fn display_raft_status(port: Option<u16>) -> Result<()> {

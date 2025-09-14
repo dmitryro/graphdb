@@ -631,11 +631,10 @@ pub async fn init_storage_engine_manager(config_path_yaml: PathBuf) -> Result<()
             GraphError::StorageError(format!("Failed to create StorageEngineManager: {}", e))
         })?;
     
-    GLOBAL_STORAGE_ENGINE_MANAGER.set(Arc::new(AsyncStorageEngineManager::from_manager(
-        Arc::try_unwrap(manager)
-            .map_err(|_| GraphError::StorageError("Failed to unwrap Arc<StorageEngineManager>: multiple references exist".to_string()))?
-    )))
+    GLOBAL_STORAGE_ENGINE_MANAGER
+        .set(Arc::new(AsyncStorageEngineManager::from_manager(manager)))
         .map_err(|_| GraphError::StorageError("Failed to set StorageEngineManager: already initialized".to_string()))?;
+
     
     info!("StorageEngineManager initialized successfully with engine: {:?} on port {:?}", storage_engine, port);
     Ok(())

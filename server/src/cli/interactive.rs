@@ -28,7 +28,7 @@ use crate::cli::cli::CliArgs;
 use lib::commands::{
     CommandType, DaemonCliCommand, RestCliCommand, StorageAction, StatusArgs, StopArgs,
     ReloadArgs, ReloadAction, StartAction, RestartArgs, RestartAction, HelpArgs, ShowAction,
-    ConfigAction, parse_kv_operation, KvAction,
+    ConfigAction, parse_kv_operation, KvAction, 
 };
 use crate::cli::handlers;
 use crate::cli::help_display::{
@@ -92,7 +92,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
         "start", "stop", "status", "auth", "authenticate", "register",
         "version", "health", "reload", "restart", "clear", "help", "exit",
         "daemon", "rest", "storage", "use", "quit", "q", "clean", "save", "show",
-        "kv", "exec", "query", "unified",
+        "kv", "exec", "query", "unified", "set", "get", "delete",
     ];
 
     const FUZZY_MATCH_THRESHOLD: usize = 2;
@@ -1203,13 +1203,12 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                 }
             }
         },
-        // The updated match arm for "kv"
         "kv" => {
             let mut key = None;
             let mut value = None;
             let mut operation = None;
             let mut i = 0;
-            
+
             // First, check for the operation which can be positional or flagged
             if let Some(op_str) = remaining_args.get(0) {
                 if !op_str.starts_with('-') {
@@ -1217,7 +1216,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                     i += 1;
                 }
             }
-            
+
             // Now, parse the remaining arguments for flags and values
             while i < remaining_args.len() {
                 match remaining_args[i].as_str() {
@@ -1227,7 +1226,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                             i += 2;
                         } else {
                             eprintln!("Warning: Flag '--key' requires a value.");
-                            return (CommandType::Unknown, remaining_args);
+                            return (CommandType::Unknown, parsed_remaining_args);
                         }
                     }
                     "--value" => {
@@ -1236,7 +1235,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                             i += 2;
                         } else {
                             eprintln!("Warning: Flag '--value' requires a value.");
-                            return (CommandType::Unknown, remaining_args);
+                            return (CommandType::Unknown, parsed_remaining_args);
                         }
                     }
                     // Handle positional arguments after the operation
@@ -1253,55 +1252,82 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                 i += 1;
                             } else {
                                 eprintln!("Warning: Unrecognized argument: {}", remaining_args[i]);
-                                return (CommandType::Unknown, remaining_args);
+                                return (CommandType::Unknown, parsed_remaining_args);
                             }
                         } else {
                             eprintln!("Warning: Unrecognized argument: {}", remaining_args[i]);
-                            return (CommandType::Unknown, remaining_args);
+                            return (CommandType::Unknown, parsed_remaining_args);
                         }
                     }
                 }
             }
-            
-            // Validate and construct the command based on parsed values
-            if operation.is_none() {
-                eprintln!("Usage: kv <get|set|delete> <key> [<value>]");
-                return (CommandType::Unknown, remaining_args);
+
+            match operation {
+                Some(op) => match parse_kv_operation(&op) {
+                    Ok(op) => match op.as_str() {
+                        "get" => {
+                            if let Some(key) = key {
+                                CommandType::Kv { action: KvAction::Get { key } }
+                            } else {
+                                eprintln!("Usage: kv get [--key] <key>");
+                                CommandType::Unknown
+                            }
+                        }
+                        "set" => {
+                            if let (Some(key), Some(value)) = (key, value) {
+                                CommandType::Kv { action: KvAction::Set { key, value } }
+                            } else {
+                                eprintln!("Usage: kv set [--key] <key> [--value] <value>");
+                                CommandType::Unknown
+                            }
+                        }
+                        "delete" => {
+                            if let Some(key) = key {
+                                CommandType::Kv { action: KvAction::Delete { key } }
+                            } else {
+                                eprintln!("Usage: kv delete [--key] <key>");
+                                CommandType::Unknown
+                            }
+                        }
+                        _ => {
+                            eprintln!("Invalid KV operation: '{}'. Supported operations: get, set, delete", op);
+                            CommandType::Unknown
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("{}", e);
+                        CommandType::Unknown
+                    }
+                },
+                None => {
+                    eprintln!("Usage: kv [get|set|delete] [--key] <key> [--value <value>]");
+                    CommandType::Unknown
+                }
             }
-            
-            let op_str = operation.unwrap();
-            let action = match op_str.to_lowercase().as_str() {
-                "get" => {
-                    if let Some(k) = key {
-                        KvAction::Get { key: k }
-                    } else {
-                        eprintln!("Missing key for 'kv get' command.");
-                        return (CommandType::Unknown, remaining_args);
-                    }
-                }
-                "set" => {
-                    if let (Some(k), Some(v)) = (key, value) {
-                        KvAction::Set { key: k, value: v }
-                    } else {
-                        eprintln!("Missing key or value for 'kv set' command.");
-                        return (CommandType::Unknown, remaining_args);
-                    }
-                }
-                "delete" => {
-                    if let Some(k) = key {
-                        KvAction::Delete { key: k }
-                    } else {
-                        eprintln!("Missing key for 'kv delete' command.");
-                        return (CommandType::Unknown, remaining_args);
-                    }
-                }
-                _ => {
-                    eprintln!("Invalid KV operation: {}. Supported: get, set, delete", op_str);
-                    return (CommandType::Unknown, remaining_args);
-                }
-            };
-            
-            CommandType::Kv { action }
+        },
+        "set" => {
+            if remaining_args.len() >= 2 {
+                CommandType::Kv { action: KvAction::Set { key: remaining_args[0].clone(), value: remaining_args[1].clone() } }
+            } else {
+                eprintln!("Usage: set <key> <value>");
+                CommandType::Unknown
+            }
+        },
+        "get" => {
+            if remaining_args.len() >= 1 {
+                CommandType::Kv { action: KvAction::Get { key: remaining_args[0].clone() } }
+            } else {
+                eprintln!("Usage: get <key>");
+                CommandType::Unknown
+            }
+        },
+        "delete" => {
+            if remaining_args.len() >= 1 {
+                CommandType::Kv { action: KvAction::Delete { key: remaining_args[0].clone() } }
+            } else {
+                eprintln!("Usage: delete <key>");
+                CommandType::Unknown
+            }
         },
         "exec" => {
             if remaining_args.is_empty() {
@@ -1853,16 +1879,12 @@ pub async fn handle_interactive_command(
             Ok(())
         }
         CommandType::Kv { action } => {
-            // Determine the operation, key, and value from the nested KvAction enum
             let (operation, key, value) = match action {
                 KvAction::Get { key } => ("get".to_string(), key, None),
                 KvAction::Set { key, value } => ("set".to_string(), key, Some(value)),
                 KvAction::Delete { key } => ("delete".to_string(), key, None),
             };
-
-            // Call the existing unified handler function with the extracted parameters
             handlers::handle_kv_command(state.query_engine.clone(), operation, key, value).await?;
-            
             Ok(())
         }
         CommandType::Exec { command } => {
@@ -1883,7 +1905,6 @@ pub async fn handle_interactive_command(
         }
     }
 }
-
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run_cli_interactive(

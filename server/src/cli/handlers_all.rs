@@ -2,6 +2,7 @@ use anyhow::{Result, Context, anyhow};
 use std::collections::HashMap;
 use std::path::{PathBuf, Path};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{oneshot, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
 use std::time::Duration;
@@ -11,17 +12,19 @@ use config::Config;
 use reqwest::Client;
 use chrono::Utc;
 use nix::sys::signal;
+use futures::future;
 
 // Import configuration-related items
 use lib::config::{
-    DEFAULT_DAEMON_PORT, DEFAULT_REST_API_PORT, DEFAULT_STORAGE_PORT,
+    DEFAULT_DAEMON_PORT, DEFAULT_REST_API_PORT, DEFAULT_STORAGE_PORT, DEFAULT_DATA_DIRECTORY,
     DEFAULT_STORAGE_CONFIG_PATH_RELATIVE, StorageConfig, load_storage_config_from_yaml, 
     DEFAULT_CONFIG_ROOT_DIRECTORY_STR, StorageEngineType, daemon_api_storage_engine_type_to_string,
 };
 
 // Import daemon management utilities
 use crate::cli::daemon_management::{
-    check_process_status_by_port, is_port_free, parse_cluster_range, stop_process_by_port, is_port_in_cluster_range
+    check_process_status_by_port, is_port_free, parse_cluster_range, stop_process_by_port, 
+    is_port_in_cluster_range, find_pid_by_port,
 };
 
 // Import handler functions for individual components
@@ -32,7 +35,7 @@ use crate::cli::handlers_main::{start_daemon_instance_interactive, stop_main_int
 use lib::storage_engine::{StorageEngineManager, GLOBAL_STORAGE_ENGINE_MANAGER,
                           emergency_cleanup_storage_engine_manager};
 // Import daemon registry
-use lib::daemon_registry::{GLOBAL_DAEMON_REGISTRY};
+use lib::daemon::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
 
 // Static lock to prevent concurrent storage daemon startups
 lazy_static::lazy_static! {
@@ -528,20 +531,12 @@ pub async fn handle_start_all_interactive(
     }
 }
 
-/// This function relies exclusively on the `GLOBAL_DAEMON_REGISTRY` to find
-/// running components. It first retrieves all registered daemons, then checks
-/// the live status of each one by its PID and port. It provides detailed
-/// information for each component type, including health checks for the REST API
-/// and configuration details for the Storage daemons.
-/// Displays full status summary of all components.
-/// This function relies exclusively on the `GLOBAL_DAEMON_REGISTRY` to find
-/// running components. It first retrieves all registered daemons, then checks
-/// the live status of each one by its PID and port. It provides detailed
-/// information for each component type, including health checks for the REST API
-/// and configuration details for the Storage daemons.
-/// Displays full status summary of all components.
-/// Enhanced version of display_full_status_summary with better storage formatting
 /// Displays the full status summary for all GraphDB components.
+/// This function relies exclusively on the `GLOBAL_DAEMON_REGISTRY` to find
+/// running components. It first retrieves all registered daemons, then checks
+/// the live status of each one by its PID and port. It provides detailed
+/// information for each component type, including health checks for the REST API
+/// and configuration details for the Storage daemons.
 pub async fn display_full_status_summary(
     rest_api_port_arc: Arc<TokioMutex<Option<u16>>>,
     storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
@@ -551,64 +546,102 @@ pub async fn display_full_status_summary(
     println!("{:<20} {:<15} {:<10} {:<40}", "Component", "Status", "Port", "Details");
     println!("{:-<20} {:-<15} {:-<10} {:-<40}", "", "", "", "");
 
+    // Load storage config to get cluster range
+    let storage_config = load_storage_config_from_yaml(None).await.unwrap_or_else(|e| {
+        warn!("Failed to load storage config: {}, using default", e);
+        StorageConfig::default()
+    });
+    let cluster_ports = parse_cluster_range(&storage_config.cluster_range).unwrap_or_default();
+
+    // Update registry for running storage daemons not in registry
+    let mut running_ports = Vec::new();
+    for port in cluster_ports {
+        if check_process_status_by_port_with_retry("Storage Daemon", port, 3, Duration::from_millis(100)).await {
+            running_ports.push(port);
+            let metadata = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await?;
+            if metadata.is_none() || metadata.as_ref().map(|m| m.service_type != "storage").unwrap_or(true) {
+                warn!("Storage daemon running on port {} but not in registry. Updating metadata...", port);
+                let engine_type = if let Some(manager) = GLOBAL_STORAGE_ENGINE_MANAGER.get() {
+                    manager.current_engine_type().await
+                } else {
+                    storage_config.storage_engine_type.clone()
+                };
+                let instance_path = storage_config
+                    .data_directory
+                    .as_ref()
+                    .unwrap_or(&PathBuf::from(DEFAULT_DATA_DIRECTORY))
+                    .join(daemon_api_storage_engine_type_to_string(&engine_type).to_lowercase())
+                    .join(port.to_string());
+                let pid = find_pid_by_port(port).await.unwrap_or(0);
+
+                let update_metadata = DaemonMetadata {
+                    service_type: "storage".to_string(),
+                    port,
+                    pid,
+                    ip_address: "127.0.0.1".to_string(),
+                    data_dir: Some(instance_path.clone()),
+                    config_path: storage_config.config_root_directory.clone(),
+                    engine_type: Some(engine_type.to_string()),
+                    last_seen_nanos: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as i64)
+                        .unwrap_or(0),
+                };
+
+                if let Err(e) = GLOBAL_DAEMON_REGISTRY.update_daemon_metadata(update_metadata).await {
+                    error!("Failed to update daemon metadata on port {}: {}", port, e);
+                } else {
+                    info!("Successfully updated daemon metadata on port {}", port);
+                }
+            }
+        }
+    }
+
+    // Get all daemon metadata after updating
     let all_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
-    debug!("Registry contents: {:?}", all_daemons);
+    debug!("Registry contents after update: {:?}", all_daemons);
+
+    // Concurrently check the status of all registered daemons
+    let mut tasks = Vec::new();
+    for daemon in all_daemons.iter() {
+        let daemon_clone = daemon.clone();
+        tasks.push(tokio::spawn(async move {
+            let is_running = check_process_status_by_port_with_retry(&daemon_clone.service_type, daemon_clone.port, 3, Duration::from_millis(100)).await;
+            (daemon_clone, is_running)
+        }));
+    }
+
+    let results = future::join_all(tasks).await;
+
+    let mut running_daemons: Vec<&DaemonMetadata> = Vec::new();
+    let mut down_daemons: Vec<&DaemonMetadata> = Vec::new();
+
+    for res in results {
+        if let Ok((daemon, is_running)) = res {
+            if is_running {
+                running_daemons.push(all_daemons.iter().find(|d| d.pid == daemon.pid && d.port == daemon.port).unwrap());
+            } else {
+                down_daemons.push(all_daemons.iter().find(|d| d.pid == daemon.pid && d.port == daemon.port).unwrap());
+            }
+        }
+    }
 
     // GraphDB Daemon status
-    let daemon_ports: Vec<u16> = futures::stream::iter(all_daemons.iter().filter(|d| d.service_type == "main"))
-        .filter_map(|d| async move {
-            let mut attempts = 0;
-            let max_attempts = 5;
-            while attempts < max_attempts {
-                if check_process_status_by_port("GraphDB Daemon", d.port).await {
-                    debug!("Found running GraphDB Daemon on port {}", d.port);
-                    return Some(d.port);
-                }
-                debug!("No process found for GraphDB Daemon on port {} (attempt {})", d.port, attempts + 1);
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                attempts += 1;
-            }
-            None
-        })
-        .collect::<Vec<u16>>()
-        .await;
-
-    if daemon_ports.is_empty() {
+    let main_daemons: Vec<&DaemonMetadata> = running_daemons.iter().filter(|d| d.service_type == "main").copied().collect();
+    if main_daemons.is_empty() {
         println!("{:<20} {:<15} {:<10} {:<40}", "GraphDB Daemon", "Down", "N/A", "No daemons found in registry.");
     } else {
-        for (i, &port) in daemon_ports.iter().enumerate() {
-            let metadata = all_daemons.iter().find(|d| d.port == port && d.service_type == "main");
-            let details = if let Some(meta) = metadata {
-                format!("PID: {} | Core Graph Processing", meta.pid)
-            } else {
-                "Core Graph Processing".to_string()
-            };
+        for (i, &daemon) in main_daemons.iter().enumerate() {
+            let details = format!("PID: {} | Core Graph Processing", daemon.pid);
             let component_name = if i == 0 { "GraphDB Daemon" } else { "" };
-            println!("{:<20} {:<15} {:<10} {:<40}", component_name, "Running", port, details);
+            println!("{:<20} {:<15} {:<10} {:<40}", component_name, "Running", daemon.port, details);
         }
     }
     println!("\n");
 
     // REST API status
-    let rest_ports: Vec<u16> = futures::stream::iter(all_daemons.iter().filter(|d| d.service_type == "rest"))
-        .filter_map(|d| async move {
-            let mut attempts = 0;
-            let max_attempts = 5;
-            while attempts < max_attempts {
-                if check_process_status_by_port("REST API", d.port).await {
-                    debug!("Found running REST API on port {}", d.port);
-                    return Some(d.port);
-                }
-                debug!("No process found for REST API on port {} (attempt {})", d.port, attempts + 1);
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                attempts += 1;
-            }
-            None
-        })
-        .collect::<Vec<u16>>()
-        .await;
-
-    if rest_ports.is_empty() {
+    let rest_daemons: Vec<&DaemonMetadata> = running_daemons.iter().filter(|d| d.service_type == "rest").copied().collect();
+    if rest_daemons.is_empty() {
         println!("{:<20} {:<15} {:<10} {:<40}", "REST API", "Down", "N/A", "No REST API servers found in registry.");
     } else {
         let client = Client::builder()
@@ -616,85 +649,47 @@ pub async fn display_full_status_summary(
             .build()
             .context("Failed to build reqwest client")?;
 
-        for (i, &port) in rest_ports.iter().enumerate() {
-            let mut rest_api_status = "Running";
-            let mut rest_api_details = String::new();
+        for (i, &daemon) in rest_daemons.iter().enumerate() {
+            let mut status = "Running";
+            let mut details = String::new();
 
-            let health_url = format!("http://127.0.0.1:{}/api/v1/health", port);
+            let health_url = format!("http://127.0.0.1:{}/api/v1/health", daemon.port);
             match client.get(&health_url).send().await {
                 Ok(resp) if resp.status().is_success() => {
-                    rest_api_details = "Health: OK".to_string();
-                    let version_url = format!("http://127.0.0.1:{}/api/v1/version", port);
+                    details = "Health: OK".to_string();
+                    let version_url = format!("http://127.0.0.1:{}/api/v1/version", daemon.port);
                     if let Ok(v_resp) = client.get(&version_url).send().await {
                         if v_resp.status().is_success() {
                             if let Ok(v_json) = v_resp.json::<serde_json::Value>().await {
                                 let version = v_json["version"].as_str().unwrap_or("N/A");
-                                rest_api_details = format!("{}; Version: {}", rest_api_details, version);
+                                details = format!("{}; Version: {}", details, version);
                             }
                         }
                     }
                 },
                 _ => {
-                    rest_api_status = "Down";
-                    rest_api_details = "Health check failed".to_string();
+                    status = "Down";
+                    details = "Health check failed".to_string();
                 }
             }
 
-            let metadata = all_daemons.iter().find(|d| d.port == port && d.service_type == "rest");
-            if let Some(meta) = metadata {
-                rest_api_details = format!("PID: {} | {}", meta.pid, rest_api_details);
-            }
-
+            details = format!("PID: {} | {}", daemon.pid, details);
             let component_name = if i == 0 { "REST API" } else { "" };
-            println!("{:<20} {:<15} {:<10} {:<40}", component_name, rest_api_status, port, rest_api_details);
-
-            if let Some(meta) = metadata {
-                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Data Directory: {:?}", meta.data_dir));
-                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", "Service Type: HTTP REST API");
-            }
-
-            if rest_ports.len() > 1 && i < rest_ports.len() - 1 {
-                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", "");
-            }
+            println!("{:<20} {:<15} {:<10} {:<40}", component_name, status, daemon.port, details);
+            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Data Directory: {:?}", daemon.data_dir));
+            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", "Service Type: HTTP REST API");
+            println!();
         }
     }
     println!("\n");
 
     // Storage Daemon status
-    let storage_ports: Vec<u16> = futures::stream::iter(all_daemons.iter().filter(|d| d.service_type == "storage"))
-        .filter_map(|d| async move {
-            let mut attempts = 0;
-            let max_attempts = 5;
-            while attempts < max_attempts {
-                if check_process_status_by_port("Storage Daemon", d.port).await {
-                    debug!("Found running Storage Daemon on port {}", d.port);
-                    return Some(d.port);
-                }
-                debug!("No process found for Storage Daemon on port {} (attempt {})", d.port, attempts + 1);
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                attempts += 1;
-            }
-            None
-        })
-        .collect::<Vec<u16>>()
-        .await;
-
-    if storage_ports.is_empty() {
+    let storage_daemons: Vec<&DaemonMetadata> = running_daemons.iter().filter(|d| d.service_type == "storage").copied().collect();
+    if storage_daemons.is_empty() {
         println!("{:<20} {:<15} {:<10} {:<40}", "Storage Daemon", "Down", "N/A", "No storage daemons found in registry.");
     } else {
-        for (i, &port) in storage_ports.iter().enumerate() {
-            let storage_daemon_status = if check_process_status_by_port("Storage Daemon", port).await {
-                "Running".to_string()
-            } else {
-                "Down".to_string()
-            };
-
-            let metadata = all_daemons.iter().find(|d| d.port == port && d.service_type == "storage");
-            let pid_info = metadata.map_or("PID: Unknown".to_string(), |meta| format!("PID: {}", meta.pid));
-
-            // Load StorageConfig from DaemonMetadata or default path
-            let config_path = metadata
-                .and_then(|meta| meta.config_path.clone())
+        for (i, &daemon) in storage_daemons.iter().enumerate() {
+            let config_path = daemon.config_path.clone()
                 .unwrap_or_else(|| PathBuf::from("./storage_daemon_server/storage_config.yaml"));
             let storage_config = load_storage_config_from_yaml(Some(config_path.clone())).await
                 .unwrap_or_else(|e| {
@@ -702,84 +697,75 @@ pub async fn display_full_status_summary(
                     StorageConfig::default()
                 });
 
-            // Use StorageEngineManager for engine type
             let engine_type = if let Some(manager) = GLOBAL_STORAGE_ENGINE_MANAGER.get() {
                 let current_engine = manager.current_engine_type().await;
-                let engine_type_str = daemon_api_storage_engine_type_to_string(&current_engine);
-                // Update DaemonMetadata if engine_type or config_path is outdated
-                if let Some(meta) = metadata {
-                    if meta.engine_type.as_ref().map_or(true, |et| et.to_lowercase() != engine_type_str.to_lowercase()) ||
-                       meta.config_path.as_ref().map_or(true, |cp| cp != &config_path) {
-                        let mut updated_metadata = (*meta).clone();
-                        updated_metadata.engine_type = Some(engine_type_str.clone());
-                        updated_metadata.config_path = Some(config_path.clone());
-                        updated_metadata.last_seen_nanos = Utc::now().timestamp_nanos_opt().unwrap_or(0);
-                        if let Err(e) = GLOBAL_DAEMON_REGISTRY.register_daemon(updated_metadata).await {
-                            warn!("Failed to update DaemonMetadata engine_type to {} or config_path to {:?} for port {}: {}", engine_type_str, config_path, port, e);
-                        } else {
-                            info!("Updated DaemonMetadata engine_type to {} and config_path to {:?} for port {}", engine_type_str, config_path, port);
-                        }
-                    }
-                }
-                engine_type_str
+                daemon_api_storage_engine_type_to_string(&current_engine)
             } else {
-                warn!("StorageEngineManager not initialized for port {}; falling back to config engine type.", port);
                 daemon_api_storage_engine_type_to_string(&storage_config.storage_engine_type)
             };
 
+            let details = format!("PID: {} | Engine: {}", daemon.pid, engine_type);
             let component_name = if i == 0 { "Storage Daemon" } else { "" };
-            println!("{:<20} {:<15} {:<10} {:<40}", component_name, storage_daemon_status, port, format!("{} | Engine: {}", pid_info, engine_type));
+            println!("{:<20} {:<15} {:<10} {:<40}", component_name, "Running", daemon.port, details);
 
-            // Check if configuration is valid
-            let config_loaded = storage_config.data_directory.is_some() &&
-                               storage_config.log_directory.is_some() &&
-                               storage_config.config_root_directory.is_some();
-            if config_loaded {
-                // Print configuration details directly, avoiding format_engine_config
-                let data_path = storage_config.engine_specific_config
-                    .as_ref()
-                    .and_then(|c| c.storage.path.as_ref())
-                    .map_or("N/A".to_string(), |p| p.display().to_string());
-                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Data Path: {}", data_path));
-                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Host: {}", storage_config.engine_specific_config.as_ref().map_or("N/A", |c| c.storage.host.as_ref().map_or("N/A", |h| h.as_str()))));
-                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Port: {}", port)); // Use actual daemon port
-                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Max Open Files: {}", storage_config.max_open_files));
-                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Max Disk Space: {} GB", storage_config.max_disk_space_gb));
-                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Min Disk Space: {} GB", storage_config.min_disk_space_gb));
-                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Use Raft: {}", storage_config.use_raft_for_scale));
-
-                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Data Directory: {}", storage_config.data_directory.as_ref().map_or("N/A".to_string(), |p| p.display().to_string())));
-                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Log Directory: {}", storage_config.log_directory.as_ref().map_or("N/A".to_string(), |p| p.display().to_string())));
-
-                let config_root_display = storage_config.config_root_directory.as_ref().map_or("N/A".to_string(), |p| p.display().to_string());
-                let final_config_root = if config_root_display == "N/A" {
-                    DEFAULT_CONFIG_ROOT_DIRECTORY_STR.to_string()
-                } else {
-                    config_root_display
-                };
-                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Config Root: {}", final_config_root));
-
-                let cluster_range = storage_config.cluster_range.clone();
-                if is_port_in_cluster_range(port, &cluster_range) {
-                    println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Cluster Range: {}", cluster_range));
-                } else {
-                    println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Cluster Range: {} (Port {} is outside this range!)", cluster_range, port));
-                }
-                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Use Raft for Scale: {}", storage_config.use_raft_for_scale));
+            // Print configuration details
+            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", "");
+            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", "=== Storage Configuration ===");
+            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Data Path: {}", storage_config.engine_specific_config.as_ref().and_then(|c| c.storage.path.as_ref()).map_or("N/A".to_string(), |p| p.display().to_string())));
+            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Host: {}", storage_config.engine_specific_config.as_ref().map_or("N/A", |c| c.storage.host.as_ref().map_or("N/A", |h| h.as_str()))));
+            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Port: {}", daemon.port));
+            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Max Open Files: {}", storage_config.max_open_files));
+            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Max Disk Space: {} GB", storage_config.max_disk_space_gb));
+            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Min Disk Space: {} GB", storage_config.min_disk_space_gb));
+            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Use Raft: {}", storage_config.use_raft_for_scale));
+            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", "");
+            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", "=== Directory Configuration ===");
+            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Data Directory: {}", storage_config.data_directory.as_ref().map_or("N/A".to_string(), |p| p.display().to_string())));
+            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Log Directory: {}", storage_config.log_directory.as_ref().map_or("N/A".to_string(), |p| p.display().to_string())));
+            let config_root_display = storage_config.config_root_directory.as_ref().map_or("N/A".to_string(), |p| p.display().to_string());
+            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Config Root: {}", if config_root_display == "N/A" { DEFAULT_CONFIG_ROOT_DIRECTORY_STR.to_string() } else { config_root_display }));
+            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", "");
+            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", "=== Network & Scaling ===");
+            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Default Port: {}", storage_config.default_port));
+            let cluster_range = storage_config.cluster_range.clone();
+            if is_port_in_cluster_range(daemon.port, &cluster_range) {
+                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Cluster Range: {}", cluster_range));
             } else {
-                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", "Configuration not loaded due to error");
+                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Cluster Range: {} (Port {} is outside this range!)", cluster_range, daemon.port));
             }
-
-            if storage_ports.len() > 1 && i < storage_ports.len() - 1 {
-                println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", "");
-            }
+            println!("{:<20} {:<15} {:<10} {:<40}", "", "", "", format!("Use Raft for Scale: {}", storage_config.use_raft_for_scale));
+            println!();
         }
     }
 
-    *storage_daemon_port_arc.lock().await = storage_ports.first().copied();
-    *rest_api_port_arc.lock().await = rest_ports.first().copied();
+    // Set `Arc`s to the first running port, if any
+    *storage_daemon_port_arc.lock().await = storage_daemons.first().map(|d| d.port);
+    *rest_api_port_arc.lock().await = rest_daemons.first().map(|d| d.port);
+
     println!("--------------------------------------------------");
     Ok(())
+}
+
+// Helper function to retry process status checks
+async fn check_process_status_by_port_with_retry(
+    service_type: &str,
+    port: u16,
+    retries: u32,
+    delay: Duration,
+) -> bool {
+    let mut attempts = retries;
+    while attempts > 0 {
+        if check_process_status_by_port(service_type, port).await {
+            return true;
+        }
+        attempts -= 1;
+        if attempts > 0 {
+            debug!("Retrying process status check for {} on port {} (attempts left: {})", service_type, port, attempts);
+            tokio::time::sleep(delay).await;
+        }
+    }
+    warn!("Process status check failed for {} on port {} after {} attempts", service_type, port, retries);
+    false
 }
 
 /// A handler for the 'show config all' command.
@@ -794,5 +780,3 @@ pub async fn handle_show_all_config_command() -> Result<()> {
     println!("==================================================");
     Ok(())
 }
-
-

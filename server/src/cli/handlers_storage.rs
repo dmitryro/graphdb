@@ -16,6 +16,7 @@ use fs2::FileExt;
 use chrono::Utc;
 use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::time::{self, timeout, Duration as TokioDuration};
 use log::{info, debug, warn, error, trace};
 use futures::stream::StreamExt;
 use serde_json::{Value, Map};
@@ -49,6 +50,7 @@ use lib::config::{
     DEFAULT_STORAGE_PORT,
     MAX_SHUTDOWN_RETRIES,
     SHUTDOWN_RETRY_DELAY_MS,
+    SelectedStorageConfigWrapper,
     CliTomlStorageConfig,
     load_storage_config_from_yaml,
     load_engine_specific_config,
@@ -69,7 +71,7 @@ use lib::storage_engine::{AsyncStorageEngineManager, StorageEngineManager, GLOBA
                           emergency_cleanup_storage_engine_manager,  SledStorage, RocksdbStorage, TikvStorage, 
                           log_lock_file_diagnostics};
 
-use crate::cli::daemon_management::{
+use lib::daemon::daemon_management::{
     is_port_free,
     find_pid_by_port,
     check_process_status_by_port,
@@ -196,43 +198,51 @@ fn is_engine_specific_config_complete(config: &Option<SelectedStorageConfig>) ->
 
 /// Helper function to synchronize the daemon registry with the latest config from the StorageEngineManager.
 /// This ensures the 'status' command always shows the correct engine type.
-async fn sync_daemon_registry_with_manager(port: u16) -> Result<()> {
-    trace!("Starting synchronization of daemon registry for port {}", port);
-
-    // First, read the latest configuration from the YAML file, which is the source of truth.
-    let config_path = PathBuf::from("./storage_daemon_server/storage_config.yaml");
-    let storage_config = load_storage_config_from_yaml(Some(config_path)).await
-        .map_err(|e| {
-            error!("Failed to load storage config for synchronization: {}", e);
-            anyhow!("Failed to load storage config for synchronization: {}", e)
-        })?;
-
-    let manager = GLOBAL_STORAGE_ENGINE_MANAGER
-        .get()
+// Updated sync_daemon_registry_with_manager function
+// Updated sync_daemon_registry_with_manager function
+async fn sync_daemon_registry_with_manager(
+    port: u16,
+    config: &StorageConfig,
+    _shutdown_tx_opt: &Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
+) -> Result<(), anyhow::Error> {
+    let manager = GLOBAL_STORAGE_ENGINE_MANAGER.get()
         .ok_or_else(|| anyhow!("StorageEngineManager not initialized"))?;
-
-    // Get the current engine type and data path from the manager
     let engine_type = manager.current_engine_type().await;
-    let engine_type_str = daemon_api_storage_engine_type_to_string(&engine_type);
-    let data_path = manager.get_current_engine_data_path().await;
+    
+    let base_data_dir = config.data_directory
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY));
+    let engine_path_name = daemon_api_storage_engine_type_to_string(&engine_type).to_lowercase();
+    let instance_path = base_data_dir.join(&engine_path_name).join(port.to_string());
 
-    // Get the existing metadata from the registry
-    if let Ok(Some(mut metadata)) = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await {
-        // Update the engine_type and last_seen_nanos fields
-        metadata.engine_type = Some(engine_type_str.clone());
-        metadata.data_dir = data_path;
-        metadata.last_seen_nanos = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let daemon_metadata = DaemonMetadata {
+        service_type: "storage".to_string(),
+        port,
+        pid: std::process::id(),
+        ip_address: "127.0.0.1".to_string(),
+        data_dir: Some(instance_path.clone()),
+        config_path: config.config_root_directory.clone(),
+        engine_type: Some(engine_type.to_string()),
+        last_seen_nanos: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0),
+    };
 
-        info!("Synchronizing daemon registry: Updating engine type to '{}' for port {}", engine_type_str, port);
-
-        // Re-register the daemon with the updated metadata
-        if let Err(e) = GLOBAL_DAEMON_REGISTRY.register_daemon(metadata).await {
-            warn!("Failed to update DaemonMetadata for port {} during sync: {}", port, e);
+    // Check if daemon is already registered
+    if let Some(existing_metadata) = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await? {
+        if existing_metadata.data_dir != Some(instance_path.clone()) || existing_metadata.engine_type != Some(engine_type.to_string()) {
+            warn!("Updating daemon metadata for port {} from path {:?} to {:?}", port, existing_metadata.data_dir, instance_path);
+            GLOBAL_DAEMON_REGISTRY.update_daemon_metadata(daemon_metadata).await?;
+            info!("Updated daemon metadata for port {} with path {:?}", port, instance_path);
         } else {
-            info!("Successfully synchronized DaemonMetadata engine_type to '{}' for port {}", engine_type_str, port);
+            info!("Daemon metadata for port {} already correct", port);
         }
     } else {
-        warn!("Could not find daemon metadata for port {} to sync. This may not be an issue if the daemon is not running.", port);
+        timeout(Duration::from_secs(5), GLOBAL_DAEMON_REGISTRY.register_daemon(daemon_metadata))
+            .await
+            .map_err(|_| anyhow!("Timeout registering daemon on port {}", port))??;
+        info!("Registered daemon on port {} with path {:?}", port, instance_path);
     }
 
     Ok(())
@@ -248,11 +258,9 @@ pub async fn start_storage_interactive(
     storage_daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
     storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
 ) -> Result<(), anyhow::Error> {
-    // --- STEP 0: CONFIRM FUNCTION EXECUTION ---
     trace!("Entering start_storage_interactive with port: {:?}", port);
-    info!("handlers_storage.rs version: 2025-09-10");
+    info!("handlers_storage.rs version: 2025-09-14");
 
-    // --- STEP 1: LOAD CLI CONFIGURATION ---
     let command = CommandType::StartStorage {
         port,
         config_file: config_file.clone(),
@@ -265,7 +273,6 @@ pub async fn start_storage_interactive(
     info!("SUCCESS: CLI config loaded: {:?}", cli_config);
     println!("SUCCESS: CLI config loaded.");
 
-    // --- STEP 2: DETERMINE CONFIG FILE PATH ---
     let get_config_path = |cli_config_file: Option<PathBuf>| {
         cli_config_file.or(config_file.clone()).unwrap_or_else(|| {
             PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH)
@@ -281,7 +288,6 @@ pub async fn start_storage_interactive(
     debug!("Determined config path: {:?}", config_path);
     println!("==> STARTING STORAGE - STEP 3");
 
-    // --- STEP 3: LOAD STORAGE CONFIGURATION ---
     let mut storage_config = if let Some(config) = new_config {
         info!("Using provided StorageConfig object, ignoring config_file.");
         config
@@ -294,30 +300,22 @@ pub async fn start_storage_interactive(
             },
             Err(e) => {
                 error!("Failed to load storage config from {:?}: {}", config_path, e);
-                if config_path.exists() {
-                    match std::fs::read_to_string(&config_path) {
-                        Ok(content) => error!("Config file content: {}", content),
-                        Err(e) => error!("Config file exists but cannot be read at {:?}: {}", config_path, e),
-                    }
-                } else {
-                    error!("Config file does not exist at {:?}", config_path);
-                }
                 warn!("Using default StorageConfig due to config load failure");
                 StorageConfig::default()
             }
         }
     };
+    println!("=========> IN STEP 3 CONFIG IS {:?}", storage_config);
 
-    // If a config root directory isn't specified, derive it from the config file's parent directory.
     if storage_config.config_root_directory.is_none() {
         storage_config.config_root_directory = Some(config_path.parent().unwrap_or(&PathBuf::from("./storage_daemon_server")).to_path_buf());
         debug!("Set config_root_directory to {:?}", storage_config.config_root_directory);
     }
     info!("Loaded Storage Config: {:?}", storage_config);
     info!("Storage engine type from config: {:?}", storage_config.storage_engine_type);
+    println!("=========> BEFORE STEP 3.1 CONFIG IS {:?}", storage_config);
     println!("==> STARTING STORAGE - STEP 3.1");
 
-    // --- STEP 3.1: LOAD ENGINE-SPECIFIC CONFIG ---
     let engine_specific_config_path = match daemon_api_storage_engine_type_to_string(&storage_config.storage_engine_type).to_lowercase().as_str() {
         "sled" => Some(PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_SLED)),
         "rocksdb" => Some(PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_ROCKSDB)),
@@ -331,49 +329,43 @@ pub async fn start_storage_interactive(
     if let Some(engine_config_path) = engine_specific_config_path {
         if engine_config_path.exists() {
             debug!("Loading engine-specific config from {:?}", engine_config_path);
-            match SelectedStorageConfig::load_from_yaml(&engine_config_path) {
-                Ok(engine_specific) => {
-                    let should_override = storage_config.engine_specific_config.is_none() ||
-                        storage_config.engine_specific_config.as_ref()
-                            .map(|c| c.storage_engine_type != storage_config.storage_engine_type)
-                            .unwrap_or(true);
-                    if should_override {
-                        println!("Overriding engine-specific config with values from {:?}", engine_config_path);
-                        storage_config.engine_specific_config = Some(engine_specific.clone());
-                        storage_config.save().await.context("Failed to save StorageConfig with overridden engine-specific config")?;
-                        info!("Saved updated storage config with engine-specific config to {:?}", config_path);
-                    } else {
-                        println!("Loaded engine-specific config from {:?}", engine_config_path);
-                        info!("Merged engine-specific config from {:?}", engine_config_path);
+            match tokio::fs::read_to_string(&engine_config_path).await {
+                Ok(content) => {
+                    match serde_yaml::from_str::<SelectedStorageConfigWrapper>(&content) {
+                        Ok(engine_specific) => {
+                            let should_override = storage_config.engine_specific_config.is_none() ||
+                                storage_config.engine_specific_config.as_ref()
+                                    .map(|c| c.storage_engine_type != storage_config.storage_engine_type)
+                                    .unwrap_or(true);
+                            if should_override {
+                                println!("Overriding engine-specific config with values from {:?}", engine_config_path);
+                                storage_config.engine_specific_config = Some(engine_specific.storage.clone());
+                            } else {
+                                println!("Loaded engine-specific config from {:?}", engine_config_path);
+                                info!("Merged engine-specific config from {:?}", engine_config_path);
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to deserialize engine-specific config from {:?}: {}. Using default config.", engine_config_path, e);
+                            storage_config.engine_specific_config = Some(create_default_selected_storage_config(&storage_config.storage_engine_type));
+                        }
                     }
                 }
                 Err(e) => {
-                    warn!("Failed to load engine-specific config from {:?}: {}. Using default config.", engine_config_path, e);
-                    if engine_config_path.exists() {
-                        match std::fs::read_to_string(&engine_config_path) {
-                            Ok(content) => warn!("Engine-specific config file content: {}", content),
-                            Err(e) => warn!("Engine-specific config file exists but cannot be read at {:?} - {:?}", engine_config_path, e),
-                        }
-                    }
+                    warn!("Failed to read engine-specific config file {:?}: {}. Using default config.", engine_config_path, e);
                     storage_config.engine_specific_config = Some(create_default_selected_storage_config(&storage_config.storage_engine_type));
-                    storage_config.save().await.context("Failed to save StorageConfig with default engine-specific config")?;
-                    info!("Saved default storage config to {:?}", config_path);
                 }
             }
         } else {
             debug!("No engine-specific config found at {:?}", engine_config_path);
             storage_config.engine_specific_config = Some(create_default_selected_storage_config(&storage_config.storage_engine_type));
-            storage_config.save().await.context("Failed to save StorageConfig with default engine-specific config")?;
-            info!("Saved default storage config to {:?}", config_path);
         }
     } else {
         debug!("No engine-specific config path defined for engine {:?}", storage_config.storage_engine_type);
         storage_config.engine_specific_config = Some(create_default_selected_storage_config(&storage_config.storage_engine_type));
-        storage_config.save().await.context("Failed to save StorageConfig with default engine-specific config")?;
-        info!("Saved default storage config to {:?}", config_path);
     }
+    println!("=========> BEFORE STEP 3.2 CONFIG IS {:?}", storage_config);
 
-    // --- STEP 3.2: NORMALIZE PATH AND UPDATE PORT ---
     let selected_port = port.unwrap_or(storage_config.default_port);
     if let Some(ref mut engine_config) = storage_config.engine_specific_config {
         let engine_path_name = storage_config.storage_engine_type.to_string().to_lowercase();
@@ -381,74 +373,36 @@ pub async fn start_storage_interactive(
             PathBuf::from(DEFAULT_DATA_DIRECTORY),
             |p| p.clone()
         );
-        let engine_data_path = if storage_config.storage_engine_type == StorageEngineType::Sled {
-            data_dir_path.join(format!("sled_{}", selected_port))
-        } else {
-            data_dir_path.join(&engine_path_name)
-        };
-        
-        let mut needs_save = false;
-        
+        let engine_data_path = data_dir_path.join(&engine_path_name);
+
         if engine_config.storage.path.is_none() || engine_config.storage.path != Some(engine_data_path.clone()) {
             info!("Setting engine-specific path to {:?}", engine_data_path);
             engine_config.storage.path = Some(engine_data_path.clone());
-            needs_save = true;
         }
-        
+
         if engine_config.storage.port != Some(selected_port) {
             info!("Updating engine-specific port from {:?} to {}", engine_config.storage.port, selected_port);
             engine_config.storage.port = Some(selected_port);
-            needs_save = true;
-        }
-        
-        // Drop the mutable borrow before calling save()
-        drop(engine_config);
-        
-        if needs_save {
-            storage_config.save().await.context("Failed to save StorageConfig with normalized path and port")?;
-            info!("Saved storage config with updated configuration to {:?}", config_path);
-        }
-        
-        // Verify directory exists and is writable
-        if engine_data_path.exists() {
-            info!("Data directory exists at {:?}", engine_data_path);
-            if std::fs::metadata(&engine_data_path).map(|m| m.permissions().readonly()).unwrap_or(true) {
-                error!("Data directory at {:?} is not writable", engine_data_path);
-                return Err(anyhow!("Data directory at {:?} is not writable", engine_data_path));
-            }
-        } else {
-            warn!("Data directory does not exist at {:?}", engine_data_path);
-            match std::fs::create_dir_all(&engine_data_path) {
-                Ok(_) => info!("Created data directory at {:?}", engine_data_path),
-                Err(e) => {
-                    error!("Failed to create data directory at {:?}: {}", engine_data_path, e);
-                    return Err(anyhow!("Failed to create data directory at {:?}: {}", engine_data_path, e));
-                }
-            }
         }
     }
     debug!("Storage config after path normalization: {:?}", storage_config);
     println!("==> STARTING STORAGE - STEP 3.2 {:?}", storage_config);
 
-    // --- STEP 3.3: HANDLE --permanent FLAG FOR STORAGE ENGINE TYPE ---
     let is_permanent = matches!(
         &cli_config.command,
         Commands::Use(UseAction::Storage { permanent: true, .. })
     );
     if is_permanent {
         debug!("--permanent flag detected, setting storage engine to {:?}", storage_config.storage_engine_type);
-        storage_config.save().await.context("Failed to save StorageConfig with permanent engine")?;
         info!("Saved storage config with engine {:?}", storage_config.storage_engine_type);
     }
     println!("==> STARTING STORAGE - STEP 4 - and engine specific config here is {:?}", storage_config.engine_specific_config);
 
-    // --- STEP 4: DETERMINE PORT FOR DAEMON COMMUNICATION ---
     info!("===> SELECTED PORT {} FOR DAEMON COMMUNICATION (CLI: {:?}, Default: {})",
         selected_port, port, storage_config.default_port);
     println!("===> SELECTED PORT {} FOR DAEMON COMMUNICATION", selected_port);
     println!("===> USING ENGINE-SPECIFIC PORT {} FROM CONFIG", selected_port);
 
-    // --- STEP 4.1: UPDATE CLUSTER RANGE ---
     let mut current_ports = parse_port_cluster_range(&storage_config.cluster_range)?;
     if storage_config.storage_engine_type != StorageEngineType::TiKV {
         if !current_ports.contains(&selected_port) {
@@ -461,11 +415,9 @@ pub async fn start_storage_interactive(
                 format!("{}-{}", current_ports.iter().min().unwrap_or(&selected_port), current_ports.iter().max().unwrap_or(&selected_port))
             };
             info!("Updated cluster range to {} to include selected port {}", storage_config.cluster_range, selected_port);
-            storage_config.save().await.context("Failed to save StorageConfig with updated cluster range")?;
         }
     }
 
-    // Extract TiKV PD port
     let tikv_pd_port = if storage_config.storage_engine_type == StorageEngineType::TiKV {
         storage_config.engine_specific_config
             .as_ref()
@@ -496,7 +448,6 @@ pub async fn start_storage_interactive(
     };
     debug!("TiKV PD port: {:?}", tikv_pd_port);
 
-    // Skip daemon startup if selected port is TiKV PD port and engine is TiKV
     if storage_config.storage_engine_type == StorageEngineType::TiKV {
         if let Some(pd_port) = tikv_pd_port {
             if Some(selected_port) == Some(pd_port) {
@@ -507,7 +458,6 @@ pub async fn start_storage_interactive(
         }
     }
 
-    // Ensure selected port is not reserved for TiKV PD
     if storage_config.storage_engine_type != StorageEngineType::TiKV {
         if let Some(pd_port) = tikv_pd_port {
             if selected_port == pd_port {
@@ -516,29 +466,42 @@ pub async fn start_storage_interactive(
         }
     }
 
-    storage_config.save().await.context("Failed to save port-specific StorageConfig")?;
-
     let ip = "127.0.0.1";
     let ip_addr: IpAddr = ip.parse().with_context(|| format!("Invalid IP address: {}", ip))?;
     let addr = SocketAddr::new(ip_addr, selected_port);
     println!("==> STARTING STORAGE - STEP 5");
 
-    // --- STEP 5: VALIDATE PORT AND CLEANUP ---
     let all_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
-    debug!("Registry state before cleanup for port {}: {:?}", selected_port, all_daemons);
+    debug!("Registry state before startup for port {}: {:?}", selected_port, all_daemons);
     let is_graphdb_process = all_daemons.iter().any(|d| d.port == selected_port && d.service_type == "storage");
 
     if is_graphdb_process {
         info!("Port {} is in use by an existing GraphDB storage daemon. Checking health...", selected_port);
         if tokio::net::TcpStream::connect(&addr).await.is_ok() {
-            info!("Storage daemon on port {} is already running and healthy. Skipping startup.", selected_port);
+            info!("Storage daemon on port {} is already running and healthy. Updating metadata...", selected_port);
+            let pid = find_pid_by_port(selected_port).await.unwrap_or(0);
+            if pid > 0 {
+                let update_metadata = DaemonMetadata {
+                    service_type: "storage".to_string(),
+                    port: selected_port,
+                    pid,
+                    ip_address: "127.0.0.1".to_string(),
+                    data_dir: storage_config.engine_specific_config.as_ref().and_then(|c| c.storage.path.clone()),
+                    config_path: Some(config_path.clone()),
+                    engine_type: Some(storage_config.storage_engine_type.to_string()),
+                    last_seen_nanos: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as i64)
+                        .unwrap_or(0),
+                };
+                GLOBAL_DAEMON_REGISTRY.update_daemon_metadata(update_metadata).await?;
+                println!("===> UPDATED DAEMON METADATA FOR PORT {}", selected_port);
+            }
             println!("Storage Daemon already running on port {}.", selected_port);
             return Ok(());
         } else {
             info!("Port {} is in use by a stale GraphDB storage daemon. Removing registry entry.", selected_port);
-            if let Err(e) = GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("storage", selected_port).await {
-                warn!("Failed to remove stale storage daemon from registry: {}", e);
-            }
+            GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("storage", selected_port).await?;
         }
     }
 
@@ -570,18 +533,33 @@ pub async fn start_storage_interactive(
         info!("No storage process found running on port {}", selected_port);
     }
 
-    // Sled-specific cleanup
     if storage_config.storage_engine_type == StorageEngineType::Sled {
-        let sled_path = storage_config.engine_specific_config
-            .as_ref()
-            .map(|c| c.storage.path.clone())
-            .unwrap_or_else(|| Some(PathBuf::from(DEFAULT_DATA_DIRECTORY).join(format!("sled_{}", selected_port))))
-            .ok_or_else(|| anyhow!("Sled path is None"))?;
+        let selected_config = storage_config.engine_specific_config.clone()
+            .unwrap_or_else(|| SelectedStorageConfig {
+                storage_engine_type: StorageEngineType::Sled,
+                storage: StorageConfigInner {
+                    path: Some(PathBuf::from(DEFAULT_DATA_DIRECTORY).join("sled")),
+                    host: None,
+                    port: None,
+                    username: None,
+                    password: None,
+                    database: None,
+                    pd_endpoints: None,
+                    use_compression: false,
+                    cache_capacity: None,
+                },
+            });
+
+        let sled_path = selected_config.storage.path.unwrap();
         info!("Sled path set to {:?}", sled_path);
-        println!("===> SLED PATH SET TO {:?}", sled_path);
+        println!("===> USING SLED PATH: {:?}", sled_path);
+        if let Err(e) = SledStorage::force_unlock(&sled_path).await {
+            warn!("Failed to force unlock Sled at {:?}: {}", sled_path, e);
+        } else {
+            info!("Successfully performed Sled force unlock at {:?}", sled_path);
+        }
     }
 
-    // TiKV-specific cleanup
     if storage_config.storage_engine_type == StorageEngineType::TiKV {
         let pd_endpoints = storage_config.engine_specific_config
             .as_ref()
@@ -612,14 +590,12 @@ pub async fn start_storage_interactive(
     debug!("Converted engine_type: {}", engine_type);
     println!("==> STARTING STORAGE - STEP 5.2 {}", engine_type);
 
-    // --- STEP 5.2: MAP STORAGE CONFIG ---
     debug!("storage_config: {:?}", storage_config);
     let daemon_config_string = serde_yaml::to_string(&storage_config)
         .context("Failed to serialize daemon config to YAML")?;
     debug!("daemon_config_string: {}", daemon_config_string);
     println!("==> STARTING STORAGE - STEP 5.3");
 
-    // --- STEP 5.3: START DAEMON WITH RETRY ---
     let max_attempts = 3;
     let retry_interval = Duration::from_millis(1000);
     let health_check_timeout = Duration::from_secs(20);
@@ -673,143 +649,130 @@ pub async fn start_storage_interactive(
     }
 
     let pid = pid.ok_or_else(|| anyhow!("Failed to start storage daemon on port {} after {} attempts", selected_port, max_attempts))?;
-    // --- STEP 6: INITIALIZE STORAGE ENGINE MANAGER ---
+
+    println!("==> STARTING STORAGE - STEP 6 (PREPARE PATHS)");
+    let engine_type_str = daemon_api_storage_engine_type_to_string(&storage_config.storage_engine_type);
+    let engine_path_name = engine_type_str.to_lowercase();
+
+    let base_data_dir = storage_config.data_directory
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY));
+    let base_engine_path = base_data_dir.join(&engine_path_name);
+    let instance_path = base_engine_path.join(selected_port.to_string());
+
+    let mut manager_config = storage_config.clone();
+    if let Some(ref mut engine_config) = manager_config.engine_specific_config {
+        engine_config.storage.path = Some(instance_path.clone());
+        engine_config.storage.port = Some(selected_port);
+    }
+    manager_config.data_directory = Some(base_engine_path.clone());
+
+    info!("Prepared paths - base: {:?}", base_engine_path);
+    info!("Prepared paths - instance: {:?}", instance_path);
+    println!("=====> Instance path for daemon: {:?}", instance_path);
+
+    println!("==> STARTING STORAGE - STEP 7 (INITIALIZE MANAGER AND REGISTER)");
     trace!("Checking if GLOBAL_STORAGE_ENGINE_MANAGER is initialized");
-    if GLOBAL_STORAGE_ENGINE_MANAGER.get().is_none() {
+    let manager = if GLOBAL_STORAGE_ENGINE_MANAGER.get().is_none() {
         trace!("GLOBAL_STORAGE_ENGINE_MANAGER not initialized, creating new instance");
-        // Create a modified StorageConfig with the updated port and path
-        let mut storage_config_for_manager = storage_config.clone();
-        if let Some(ref mut engine_config) = storage_config_for_manager.engine_specific_config {
-            engine_config.storage.port = Some(selected_port);
-            if storage_config_for_manager.storage_engine_type == StorageEngineType::Sled {
-                let base_path = storage_config_for_manager.data_directory
-                    .clone()
-                    .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
-                    .join(format!("sled_{}", selected_port));
-                engine_config.storage.path = Some(base_path);
-            }
-        }
         let manager = StorageEngineManager::new(
-            storage_config_for_manager.storage_engine_type.clone(),
-            config_path.as_ref(),
+            manager_config.storage_engine_type.clone(),
+            &config_path,
             is_permanent,
             Some(selected_port),
-        ).await
-            .map_err(|e| {
-                error!("Failed to create StorageEngineManager with config path {:?}: {}", config_path, e);
-                if config_path.exists() {
-                    match std::fs::read_to_string(&config_path) {
-                        Ok(content) => error!("Config file content: {}", content),
-                        Err(e) => error!("Config file exists but cannot be read at {:?}: {}", config_path, e),
-                    }
-                } else {
-                    error!("Config file does not exist at {:?}", config_path);
-                }
-                anyhow!("Failed to create StorageEngineManager: {}", e)
-            })?;
-        let inner_manager = Arc::try_unwrap(manager)
-            .map_err(|_| anyhow!("Failed to unwrap Arc<StorageEngineManager>: multiple references exist"))?;
-        GLOBAL_STORAGE_ENGINE_MANAGER.set(Arc::new(AsyncStorageEngineManager::from_manager(inner_manager)))
+        )
+        .await
+        .map_err(|e| {
+            error!(
+                "Failed to create StorageEngineManager with config path {:?}: {}",
+                config_path, e
+            );
+            anyhow!("Failed to create StorageEngineManager: {}", e)
+        })?;
+
+        let arc_manager = Arc::new(AsyncStorageEngineManager::from_manager(manager));
+        GLOBAL_STORAGE_ENGINE_MANAGER
+            .set(arc_manager.clone())
             .map_err(|_| anyhow!("Failed to set StorageEngineManager"))?;
+
         trace!("GLOBAL_STORAGE_ENGINE_MANAGER has been initialized");
-        info!("Initialized StorageEngineManager with engine type: {:?} on port {}", storage_config.storage_engine_type, selected_port);
-        println!("===> TRYING TO INITIALIZE POOL");
+        arc_manager
     } else {
         trace!("GLOBAL_STORAGE_ENGINE_MANAGER already initialized, updating engine");
         let manager = GLOBAL_STORAGE_ENGINE_MANAGER.get().unwrap();
-        // Update the engine with the correct port and path
-        let mut storage_config_for_manager = storage_config.clone();
-        if let Some(ref mut engine_config) = storage_config_for_manager.engine_specific_config {
-            engine_config.storage.port = Some(selected_port);
-            if storage_config_for_manager.storage_engine_type == StorageEngineType::Sled {
-                let base_path = storage_config_for_manager.data_directory
-                    .clone()
-                    .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
-                    .join(format!("sled_{}", selected_port));
-                engine_config.storage.path = Some(base_path);
-            }
-        }
-        manager.use_storage(storage_config_for_manager.clone(), is_permanent)
+        manager
+            .use_storage(manager_config.clone(), is_permanent)
             .await
-            .context(format!("Failed to update storage engine to {:?}", storage_config.storage_engine_type))?;
-        info!("Updated storage engine to type: {:?} on port {}", storage_config.storage_engine_type, selected_port);
-    }
+            .context(format!(
+                "Failed to update storage engine to {:?}",
+                manager_config.storage_engine_type
+            ))?;
+        manager.clone()
+    };
 
-    println!("==> STARTING STORAGE - STEP 7");
-    // --- STEP 7: REGISTER DAEMON ---
-    let manager = GLOBAL_STORAGE_ENGINE_MANAGER.get().ok_or_else(|| {
-        error!("StorageEngineManager not initialized after Step 6");
-        anyhow!("StorageEngineManager not initialized")
-    })?;
-    let engine_type = manager.current_engine_type().await;
-    let current_data_path = manager.get_current_engine_data_path().await;
-    let engine_type_str = daemon_api_storage_engine_type_to_string(&engine_type);
+    info!("Initialized/Updated StorageEngineManager with engine type: {:?} on port {}", storage_config.storage_engine_type, selected_port);
+    println!("===> STORAGE ENGINE MANAGER INITIALIZED SUCCESSFULLY FOR PORT {}", selected_port);
 
-    let metadata = DaemonMetadata {
+    let daemon_metadata = DaemonMetadata {
         service_type: "storage".to_string(),
         port: selected_port,
         pid,
-        ip_address: ip.to_string(),
-        data_dir: current_data_path,
+        ip_address: "127.0.0.1".to_string(),
+        data_dir: Some(instance_path.clone()),
         config_path: Some(config_path.clone()),
-        engine_type: Some(engine_type_str.clone()),
-        last_seen_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
+        engine_type: Some(storage_config.storage_engine_type.to_string()),
+        last_seen_nanos: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0),
     };
 
-    let fallback_path = PathBuf::from("/tmp/graphdb/daemon_registry_fallback.json");
-    let fallback_dir = fallback_path.parent().ok_or_else(|| anyhow!("Invalid fallback path: {:?}", fallback_path))?;
+    let pre_register_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
+    debug!("Registry state before registering daemon on port {}: {:?}", selected_port, pre_register_daemons);
 
-    retry_operation(|| async {
-        tokio::fs::create_dir_all(fallback_dir).await.map_err(anyhow::Error::from)
-    }, 3, "create fallback directory").await?;
-
-    for attempt in 1..=3 {
-        let pre_registry = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
-        debug!("Registry state before registering daemon on port {} (attempt {}): {:?}", selected_port, attempt, pre_registry);
-        match GLOBAL_DAEMON_REGISTRY.register_daemon(metadata.clone()).await {
-            Ok(_) => {
-                let post_registry = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
-                info!("Successfully registered storage daemon with PID {} on port {} with engine type {}", pid, selected_port, engine_type_str);
-                debug!("Registry state after registering daemon on port {}: {:?}", selected_port, post_registry);
-                println!("==> Successfully registered storage daemon with PID {} on port {}", pid, selected_port);
-                break;
-            }
-            Err(e) => {
-                error!("Failed to register daemon on port {} (attempt {}/3): {}", selected_port, attempt, e);
-                if attempt == 3 {
-                    return Err(anyhow!("Failed to register daemon on port {} after 3 attempts: {}", selected_port, e));
-                }
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-        }
+    if let Some(existing) = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(selected_port).await? {
+        let update_metadata = DaemonMetadata {
+            service_type: "storage".to_string(),
+            port: selected_port,
+            pid,
+            ip_address: "127.0.0.1".to_string(),
+            data_dir: Some(instance_path.clone()),
+            config_path: Some(config_path.clone()),
+            engine_type: Some(storage_config.storage_engine_type.to_string()),
+            last_seen_nanos: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as i64)
+                .unwrap_or(0),
+        };
+        GLOBAL_DAEMON_REGISTRY.update_daemon_metadata(update_metadata).await?;
+        info!("Updated existing daemon metadata on port {}", selected_port);
+        println!("===> UPDATED DAEMON ON PORT {} WITH PATH {:?}", selected_port, instance_path);
+    } else {
+        timeout(Duration::from_secs(5), GLOBAL_DAEMON_REGISTRY.register_daemon(daemon_metadata))
+            .await
+            .map_err(|_| {
+                error!("Timeout registering daemon on port {}", selected_port);
+                println!("===> ERROR: TIMEOUT REGISTERING DAEMON ON PORT {}", selected_port);
+                anyhow!("Timeout registering daemon on port {}", selected_port)
+            })??;
+        info!("Registered daemon on port {} with path {:?}", selected_port, instance_path);
+        println!("===> REGISTERED DAEMON ON PORT {} WITH PATH {:?}", selected_port, instance_path);
     }
 
-    let new_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
-    debug!("Registry state after registering storage daemon: {:?}", new_daemons);
+    let post_register_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
+    debug!("Registry state after registering daemon on port {}: {:?}", selected_port, post_register_daemons);
+    if !post_register_daemons.iter().any(|d| d.port == selected_port && d.service_type == "storage") {
+        error!("Daemon on port {} not found in registry after registration!", selected_port);
+        println!("===> ERROR: DAEMON ON PORT {} NOT FOUND IN REGISTRY AFTER REGISTRATION!", selected_port);
+    }
 
-    let lock_path = PathBuf::from("/tmp/graphdb/daemon_registry_fallback.lock");
-    let lock_file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(&lock_path)
-        .with_context(|| format!("Failed to open lock file {:?}", lock_path))?;
+    sync_daemon_registry_with_manager(selected_port, &manager_config, &storage_daemon_shutdown_tx_opt).await?;
+    println!("==> STEP 7 COMPLETE: Registry synced with manager paths");
 
-    retry_operation(|| async {
-        lock_file.try_lock_exclusive().map_err(anyhow::Error::from).map(|_| ())
-    }, 3, "acquire exclusive lock").await?;
-
-    retry_operation(|| async {
-        write_registry_fallback(&new_daemons, &fallback_path).await
-    }, 3, "write registry fallback").await?;
-
-    fs2::FileExt::unlock(&lock_file).with_context(|| format!("Failed to release lock on {:?}", lock_path))?;
-    let _ = fs::remove_file(&lock_path);
-
-    // --- STEP 8: FINAL HEALTH CHECK ---
     let start_time = tokio::time::Instant::now();
     while start_time.elapsed() < health_check_timeout {
         if tokio::net::TcpStream::connect(&addr).await.is_ok() {
-            info!("Completed storage daemon health check on port {} (PID {}) with engine type {}", selected_port, pid, engine_type_str);
+            info!("Completed storage daemon health check on port {} (PID {}) with engine type {} and path {:?}", selected_port, pid, engine_type_str, instance_path);
             *storage_daemon_port_arc.lock().await = Some(selected_port);
             let (tx, rx) = oneshot::channel();
             *storage_daemon_shutdown_tx_opt.lock().await = Some(tx);
@@ -819,6 +782,14 @@ pub async fn start_storage_interactive(
             });
             *storage_daemon_handle.lock().await = Some(handle);
             debug!("Completed storage daemon startup");
+
+            let final_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
+            debug!("Final registry state for port {}: {:?}", selected_port, final_daemons);
+            if !final_daemons.iter().any(|d| d.port == selected_port && d.service_type == "storage") {
+                error!("Daemon on port {} still not found in registry after startup!", selected_port);
+                println!("===> ERROR: DAEMON ON PORT {} STILL NOT FOUND IN REGISTRY AFTER STARTUP!", selected_port);
+            }
+
             return Ok(());
         }
         debug!("Final health check attempt for port {} (elapsed: {:?}", selected_port, start_time.elapsed());
@@ -933,10 +904,12 @@ pub async fn stop_storage_interactive(
 }
 
 /// Displays status of storage daemons only.
+/// Displays status of storage daemons only.
 pub async fn display_storage_daemon_status(
     port_arg: Option<u16>,
     storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
 ) {
+    // Load CLI storage config
     let cli_storage_config = match load_storage_config_from_yaml(None).await {
         Ok(config) => Some(config),
         Err(e) => {
@@ -945,31 +918,97 @@ pub async fn display_storage_daemon_status(
         }
     };
 
-    let all_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
-    debug!("Registry contents for storage status: {:?}", all_daemons);
-
+    // Get all daemons and filter for storage type
+    let all_daemons = GLOBAL_DAEMON_REGISTRY
+        .get_all_daemon_metadata()
+        .await
+        .unwrap_or_default();
     let storage_daemons: Vec<_> = all_daemons.iter().filter(|d| d.service_type == "storage").collect();
 
+    // Collect running ports from cluster configuration
+    let mut running_ports = Vec::new();
+    if let Some(config) = &cli_storage_config {
+        let cluster_ports = parse_port_cluster_range(&config.cluster_range).unwrap_or_default();
+        for port in cluster_ports {
+            if check_process_status_by_port("Storage Daemon", port).await {
+                running_ports.push(port);
+            }
+        }
+    }
+
+    // Include port_arg if specified and running
+    if let Some(p) = port_arg {
+        if check_process_status_by_port("Storage Daemon", p).await && !running_ports.contains(&p) {
+            running_ports.push(p);
+        }
+    }
+
+    // Update registry for running daemons not present
+    if let Some(config) = &cli_storage_config {
+        for port in &running_ports {
+            if !storage_daemons.iter().any(|d| d.port == *port) {
+                warn!("Storage daemon running on port {} but not in registry. Updating metadata...", port);
+                let engine_type = if let Some(manager) = GLOBAL_STORAGE_ENGINE_MANAGER.get() {
+                    manager.current_engine_type().await
+                } else {
+                    config.storage_engine_type.clone()
+                };
+
+                let instance_path = config
+                    .data_directory
+                    .as_ref()
+                    .unwrap_or(&PathBuf::from(DEFAULT_DATA_DIRECTORY))
+                    .join(daemon_api_storage_engine_type_to_string(&engine_type).to_lowercase())
+                    .join(port.to_string());
+
+                let pid = find_pid_by_port(*port).await.unwrap_or(0);
+
+                let update_metadata = DaemonMetadata {
+                    service_type: "storage".to_string(),
+                    port: *port,
+                    pid,
+                    ip_address: "127.0.0.1".to_string(),
+                    data_dir: Some(instance_path.clone()),
+                    config_path: config.config_root_directory.clone(),
+                    engine_type: Some(engine_type.to_string()),
+                    last_seen_nanos: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as i64)
+                        .unwrap_or(0),
+                };
+
+                if let Err(e) = GLOBAL_DAEMON_REGISTRY.update_daemon_metadata(update_metadata).await {
+                    error!("Failed to update daemon metadata on port {}: {}", port, e);
+                    println!("===> ERROR: Failed to update daemon metadata on port {}: {}", port, e);
+                } else {
+                    info!("Successfully updated daemon metadata on port {}", port);
+                    println!("===> Successfully updated daemon metadata on port {}", port);
+                }
+            }
+        }
+    }
+
+    // Refresh storage daemon list
+    let all_daemons = GLOBAL_DAEMON_REGISTRY
+        .get_all_daemon_metadata()
+        .await
+        .unwrap_or_default();
+    let storage_daemons: Vec<_> = all_daemons.iter().filter(|d| d.service_type == "storage").collect();
+
+    // Determine ports to display
     let ports_to_display = match port_arg {
         Some(p) => {
-            if storage_daemons.iter().any(|d| d.port == p) {
+            if storage_daemons.iter().any(|d| d.port == p) || running_ports.contains(&p) {
                 vec![p]
             } else {
                 println!("No Storage Daemon found on port {}.", p);
                 vec![]
             }
-        },
-        None => {
-            let mut running_ports: Vec<u16> = Vec::new();
-            for daemon in &storage_daemons {
-                if check_process_status_by_port("Storage Daemon", daemon.port).await {
-                    running_ports.push(daemon.port);
-                }
-            }
-            running_ports
         }
+        None => running_ports.clone(),
     };
 
+    // Display header
     println!("\n--- Storage Daemon Status ---");
     println!("{:<15} {:<10} {:<50}", "Status", "Port", "Configuration Details");
     println!("{:-<15} {:-<10} {:-<50}", "", "", "");
@@ -977,81 +1016,50 @@ pub async fn display_storage_daemon_status(
     if ports_to_display.is_empty() {
         println!("{:<15} {:<10} {:<50}", "Down", "N/A", "No storage daemons found in registry.");
     } else {
-        for &port in &ports_to_display {
+        for (i, &port) in ports_to_display.iter().enumerate() {
             let storage_daemon_status = if check_process_status_by_port("Storage Daemon", port).await {
-                "Running".to_string()
+                "Running"
             } else {
-                "Down".to_string()
+                "Down"
             };
 
             let metadata = storage_daemons.iter().find(|d| d.port == port);
 
+            let (engine_type_str, data_path_display) = if let Some(manager) = GLOBAL_STORAGE_ENGINE_MANAGER.get() {
+                let engine = manager.current_engine_type().await;
+                let data_path = manager.get_current_engine_data_path().await;
+                let data_path_str = data_path
+                    .map_or("N/A".to_string(), |p| p.display().to_string());
+                (daemon_api_storage_engine_type_to_string(&engine), data_path_str)
+            } else {
+                warn!("StorageEngineManager not initialized; falling back to daemon metadata.");
+                let engine = metadata.as_ref().and_then(|meta| meta.engine_type.clone())
+                    .unwrap_or_else(|| "unknown".to_string());
+                let data_path_str = metadata.as_ref()
+                    .and_then(|meta| meta.data_dir.clone())
+                    .map_or("N/A".to_string(), |p| p.display().to_string());
+                (engine, data_path_str)
+            };
+
+            let pid_info = metadata.map_or("PID: Unknown".to_string(), |m| format!("PID: {}", m.pid));
+
             if let Some(storage_config) = &cli_storage_config {
-                let mut pid_info = "PID: Unknown".to_string();
-                if let Some(meta) = metadata {
-                    pid_info = format!("PID: {}", meta.pid);
-                }
-
-                let (engine_type_str, data_path_display) = if let Some(manager) = GLOBAL_STORAGE_ENGINE_MANAGER.get() {
-                    let engine = manager.current_engine_type().await;
-                    let data_path = manager.get_current_engine_data_path().await;
-                    let data_path_str = data_path.map_or("N/A".to_string(), |p| p.display().to_string());
-                    (daemon_api_storage_engine_type_to_string(&engine), data_path_str)
-                } else {
-                    warn!("StorageEngineManager not initialized; falling back to daemon metadata.");
-                    let engine = metadata.as_ref().and_then(|meta| meta.engine_type.clone()).unwrap_or_else(|| "unknown".to_string());
-                    let data_path = metadata.as_ref().and_then(|meta| meta.data_dir.clone());
-                    let data_path_str = data_path.map_or("N/A".to_string(), |p| p.display().to_string());
-                    (engine, data_path_str)
-                };
-
                 println!("{:<15} {:<10} {:<50}", storage_daemon_status, port, format!("{} | Engine: {}", pid_info, engine_type_str));
                 println!("{:<15} {:<10} {:<50}", "", "", "");
                 println!("{:<15} {:<10} {:<50}", "", "", "=== Storage Configuration ===");
                 println!("{:<15} {:<10} {:<50}", "", "", format!("Data Path: {}", data_path_display));
-                println!("{:<15} {:<10} {:<50}", "", "", format!("Host: {}", storage_config.engine_specific_config.as_ref().map_or("N/A", |c| c.storage.host.as_ref().map_or("N/A", |h| h.as_str()))));
-                println!("{:<15} {:<10} {:<50}", "", "", format!("Port: {}", port)); // Use actual daemon port
+                println!("{:<15} {:<10} {:<50}", "", "", format!("Host: {}", storage_config.engine_specific_config.as_ref().map_or("N/A", |c| c.storage.host.as_deref().unwrap_or("N/A"))));
+                println!("{:<15} {:<10} {:<50}", "", "", format!("Port: {}", port));
                 println!("{:<15} {:<10} {:<50}", "", "", format!("Max Open Files: {}", storage_config.max_open_files));
                 println!("{:<15} {:<10} {:<50}", "", "", format!("Max Disk Space: {} GB", storage_config.max_disk_space_gb));
                 println!("{:<15} {:<10} {:<50}", "", "", format!("Min Disk Space: {} GB", storage_config.min_disk_space_gb));
                 println!("{:<15} {:<10} {:<50}", "", "", format!("Use Raft: {}", storage_config.use_raft_for_scale));
-
-                println!("{:<15} {:<10} {:<50}", "", "", "");
-                println!("{:<15} {:<10} {:<50}", "", "", "=== Directory Configuration ===");
-                let data_dir_display = storage_config.data_directory
-                    .as_ref()
-                    .map_or("N/A".to_string(), |p| p.display().to_string());
-                println!("{:<15} {:<10} {:<50}", "", "", format!("Data Directory: {}", data_dir_display));
-                let log_dir_display = storage_config.log_directory
-                    .as_ref()
-                    .map_or("N/A".to_string(), |p| p.display().to_string());
-                println!("{:<15} {:<10} {:<50}", "", "", format!("Log Directory: {}", log_dir_display));
-
-                let config_root_display = storage_config.config_root_directory
-                    .as_ref()
-                    .map_or("N/A".to_string(), |p| p.display().to_string());
-                let final_config_root = if config_root_display == "N/A" {
-                    DEFAULT_CONFIG_ROOT_DIRECTORY_STR.to_string()
-                } else {
-                    config_root_display
-                };
-                println!("{:<15} {:<10} {:<50}", "", "", format!("Config Root: {}", final_config_root));
-
-                println!("{:<15} {:<10} {:<50}", "", "", "");
-                println!("{:<15} {:<10} {:<50}", "", "", "=== Network & Scaling ===");
-                println!("{:<15} {:<10} {:<50}", "", "", format!("Default Port: {}", storage_config.default_port));
-
-                let cluster_range = &storage_config.cluster_range;
-                if is_port_in_cluster_range(port, cluster_range) {
-                    println!("{:<15} {:<10} {:<50}", "", "", format!("Cluster Range: {}", cluster_range));
-                } else {
-                    println!("{:<15} {:<10} {:<50}", "", "", format!("Cluster Range: {} (Port {} is outside this range!)", cluster_range, port));
-                }
-                println!("{:<15} {:<10} {:<50}", "", "", format!("Use Raft for Scale: {}", storage_config.use_raft_for_scale));
             } else {
-                println!("{:<15} {:<10} {:<50}", "", "", "Configuration not loaded due to error");
+                println!("{:<15} {:<10} {:<50}", storage_daemon_status, port, "Configuration not loaded due to error");
             }
-            if ports_to_display.len() > 1 && port != *ports_to_display.last().unwrap() {
+
+            // Print separator between multiple ports
+            if ports_to_display.len() > 1 && i < ports_to_display.len() - 1 {
                 println!("{:-<15} {:-<10} {:-<50}", "", "", "");
             }
         }
@@ -1318,7 +1326,7 @@ pub async fn stop_storage(
 }
 
 /// Updates the storage engine configuration and applies it via StorageEngineManager.
-pub async fn use_storage_engine(engine_type_str: &str, permanent: bool) -> Result<()> {
+pub async fn use_storage_engine(engine_type_str: &str, permanent: bool) -> Result<(), anyhow::Error> {
     // Map string to StorageEngineType
     let engine_type = match engine_type_str.to_lowercase().as_str() {
         "sled" => StorageEngineType::Sled,
@@ -1327,39 +1335,62 @@ pub async fn use_storage_engine(engine_type_str: &str, permanent: bool) -> Resul
         "redis" => StorageEngineType::Redis,
         "postgresql" => StorageEngineType::PostgreSQL,
         "mysql" => StorageEngineType::MySQL,
-        _ => return Err(anyhow!("Unknown storage engine: {}", engine_type_str)), // Fixed wildcard pattern
+        _ => return Err(anyhow!("Unknown storage engine: {}", engine_type_str)),
     };
     println!("===> WE GONNA TRY TO CHANGE ENGINE HERE!");
+
     // Validate engine type against available engines
     let available_engines = StorageEngineManager::available_engines();
     if !available_engines.contains(&engine_type) {
         return Err(anyhow!("Storage engine {} is not enabled. Available engines: {:?}", engine_type_str, available_engines));
     }
-    // Ensure storage daemon is running
+
+    // Load storage configuration
     let config_path = PathBuf::from("./storage_daemon_server/storage_config.yaml");
-    let storage_config = load_storage_config_from_yaml(Some(config_path.clone()))
-        .await // Added .await
+    let mut storage_config = load_storage_config_from_yaml(Some(config_path.clone()))
+        .await
         .unwrap_or_else(|_| StorageConfig::default());
+
+    // Update storage_config with the new engine type
+    storage_config.storage_engine_type = engine_type.clone();
+    // Ensure engine-specific config is initialized
+    if storage_config.engine_specific_config.is_none() {
+        storage_config.engine_specific_config = Some(create_default_selected_storage_config(&engine_type));
+    }
+
+    // Ensure storage daemon is running
+    let shutdown_tx_opt = Arc::new(TokioMutex::new(None));
+    let handle = Arc::new(TokioMutex::new(None));
+    let port_arc = Arc::new(TokioMutex::new(None));
     ensure_storage_daemon_running(
         Some(storage_config.default_port),
         Some(config_path.clone()),
-        Arc::new(TokioMutex::new(None)),
-        Arc::new(TokioMutex::new(None)),
-        Arc::new(TokioMutex::new(None)),
+        shutdown_tx_opt.clone(),
+        handle,
+        port_arc,
     ).await?;
+
     // Update StorageEngineManager
     info!("Executing use storage command for {} (permanent: {})", engine_type_str, permanent);
     let manager = GLOBAL_STORAGE_ENGINE_MANAGER
         .get()
         .ok_or_else(|| anyhow!("StorageEngineManager not initialized. Run 'graphdb-cli storage start' to initialize it."))?;
-   
+
+    manager.use_storage(storage_config.clone(), permanent)
+        .await
+        .context(format!("Failed to update storage engine to {}", engine_type_str))?;
+
     // After successfully switching the engine, synchronize the daemon registry with the new state.
     if permanent {
         let port = storage_config.default_port;
-        if let Err(e) = sync_daemon_registry_with_manager(port).await {
+        if let Err(e) = sync_daemon_registry_with_manager(port, &storage_config, &shutdown_tx_opt).await {
             warn!("Failed to synchronize daemon registry: {}", e);
+        } else {
+            info!("Successfully synchronized daemon registry for port {}", port);
+            println!("===> Successfully synchronized daemon registry for port {}", port);
         }
     }
+
     println!("==> Switched to storage engine {} (persisted: {})", engine_type_str, permanent);
     Ok(())
 }
@@ -1701,7 +1732,7 @@ pub async fn handle_use_storage_command(
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             if engine == StorageEngineType::Sled {
-                PathBuf::from(format!("{}/sled_{}", DEFAULT_DATA_DIRECTORY, new_port))
+                PathBuf::from(format!("{}/sled", DEFAULT_DATA_DIRECTORY))
             } else {
                 PathBuf::from(format!("{}/{}", DEFAULT_DATA_DIRECTORY, engine.to_string().to_lowercase()))
             }
@@ -1905,8 +1936,8 @@ pub async fn handle_use_storage_command(
         }
     } else {
         let lock_path = new_config.data_directory.as_ref()
-            .map(|d| PathBuf::from(d).join(format!("sled_{}", new_port)).join("db.lck"))
-            .unwrap_or_else(|| PathBuf::from(format!("/opt/graphdb/storage_data/sled_{}/db.lck", new_port)));
+            .map(|d| PathBuf::from(d).join("sled").join("db.lck"))
+            .unwrap_or_else(|| PathBuf::from(format!("/opt/graphdb/storage_data/sled/db.lck")));
         debug!("Checking Sled lock file at {:?}", lock_path);
         if lock_path.exists() {
             info!("Removing Sled lock file at {:?}", lock_path);
@@ -1925,17 +1956,24 @@ pub async fn handle_use_storage_command(
             expected_engine_type.clone(),
             &absolute_config_path,
             permanent,
-            Some(new_port)
-        ).await
-            .context("Failed to initialize StorageEngineManager")?;
-        debug!("StorageEngineManager created: engine_type={:?}, config_path={:?}, port={:?}", expected_engine_type, absolute_config_path, new_port);
+            Some(new_port),
+        )
+        .await
+        .context("Failed to initialize StorageEngineManager")?;
+
+        debug!(
+            "StorageEngineManager created: engine_type={:?}, config_path={:?}, port={:?}",
+            expected_engine_type, absolute_config_path, new_port
+        );
+
+        // Pass the plain manager into from_manager
+        let async_manager = AsyncStorageEngineManager::from_manager(manager);
+
+        // Store the async manager wrapped in Arc
         GLOBAL_STORAGE_ENGINE_MANAGER
-            .set(Arc::new(AsyncStorageEngineManager::from_manager(
-                Arc::try_unwrap(manager)
-                    .map_err(|_| GraphError::ConfigurationError("Failed to unwrap Arc<StorageEngineManager>: multiple references exist".to_string()))?
-            )))
+            .set(Arc::new(async_manager))
             .context("Failed to set GLOBAL_STORAGE_ENGINE_MANAGER")?;
-        println!("===> StorageEngineManager initialized successfully.");
+                println!("===> StorageEngineManager initialized successfully.");
     } else {
         println!("===> Updating existing StorageEngineManager...");
         let async_manager = GLOBAL_STORAGE_ENGINE_MANAGER
@@ -1977,7 +2015,7 @@ pub async fn handle_use_storage_command(
                 let base_path = port_specific_config.data_directory
                     .clone()
                     .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
-                    .join(format!("sled_{}", config_port));
+                    .join("sled");
                 engine_config.storage.path = Some(base_path);
             }
         }
@@ -2011,7 +2049,7 @@ pub async fn handle_use_storage_command(
                     let base_path = port_specific_config.data_directory
                         .clone()
                         .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
-                        .join(format!("sled_{}", port));
+                        .join("sled");
                     engine_config.storage.path = Some(base_path);
                 }
             }
