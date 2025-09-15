@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use anyhow::{Result, Context, anyhow};
 use tokio::sync::{Mutex as TokioMutex, RwLock};
+use tokio::time::Duration;
 use clap::{Args, Parser, Subcommand};
 use log::{debug, error, info, warn, trace};
 use std::path::{Path, PathBuf};
@@ -59,6 +60,22 @@ pub struct LoadBalancer {
     pub replication_factor: usize,
 }
 
+#[derive(Clone)]
+pub struct HealthCheckConfig {
+    pub interval: Duration,
+    pub connect_timeout: Duration,
+    pub response_buffer_size: usize,
+}
+
+impl Default for HealthCheckConfig {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(10),
+            connect_timeout: Duration::from_secs(2),
+            response_buffer_size: 1024,
+        }
+    }
+}
 
 // StorageEngineType
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

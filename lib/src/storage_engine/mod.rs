@@ -22,6 +22,7 @@ pub mod inmemory_storage;
 pub mod raft_storage;
 pub mod storage_utils;
 pub mod storage_engine;
+pub mod load_balancer;
 #[cfg(feature = "with-rocksdb")]
 pub mod rocksdb_storage;
 #[cfg(feature = "with-tikv")]

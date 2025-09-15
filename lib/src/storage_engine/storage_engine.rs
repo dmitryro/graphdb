@@ -239,6 +239,27 @@ pub struct SurrealdbGraphStorage {
     pub backend_type: StorageEngineType,
 }
 
+
+#[cfg(feature = "with-rocksdb")]
+impl SurrealdbGraphStorage {
+    pub async fn force_unlock(path: &PathBuf) -> Result<(), GraphError> {
+        let lock_file = path.join("LOCK");
+        if lock_file.exists() {
+            info!("Removing RocksDB lock file at {:?}", lock_file);
+            tokio::fs::remove_file(&lock_file).await
+                .map_err(|e| GraphError::StorageError(format!("Failed to remove RocksDB lock file at {:?}: {}", lock_file, e)))?;
+        }
+        // Verify the database can be opened to ensure no other locks
+        match Surreal::new::<RocksDb>(path.clone()).await {
+            Ok(_) => {
+                info!("RocksDB database at {:?} is accessible after lock removal", path);
+                Ok(())
+            }
+            Err(e) => Err(GraphError::StorageError(format!("RocksDB database at {:?} still locked or inaccessible: {}", path, e)))
+        }
+    }
+}
+
 /// A simple struct to represent the key-value data we're storing.
 /// This helps SurrealDB serialize and deserialize the data correctly.
 #[derive(Debug, Serialize, Deserialize)]
@@ -1070,6 +1091,47 @@ impl StorageEngineManager {
         let base_engine_path = base_data_dir.join(&engine_path_name);
         let engine_path = base_engine_path.join(port.to_string());
 
+        // Check and release any existing locks before proceeding
+        match storage_engine_type {
+            #[cfg(feature = "with-sled")]
+            StorageEngineType::Sled => {
+                if engine_path.exists() {
+                    if let Err(e) = SledStorage::force_unlock(&engine_path).await {
+                        warn!("Failed to unlock Sled database at {:?}: {}", engine_path, e);
+                        return Err(GraphError::StorageError(format!("Failed to unlock Sled database at {:?}: {}", engine_path, e)));
+                    } else {
+                        info!("Successfully unlocked Sled database at {:?}", engine_path);
+                        println!("===> SUCCESSFULLY UNLOCKED SLED DATABASE AT {:?}", engine_path);
+                    }
+                    // Verify no lock file exists
+                    let lock_file = engine_path.join("db.lck");
+                    if lock_file.exists() {
+                        return Err(GraphError::StorageError(format!("Lock file still exists at {:?} after unlock attempt", lock_file)));
+                    }
+                    println!("===> NO LOCK FILE FOUND AT {:?}", lock_file);
+                }
+            }
+            #[cfg(feature = "with-rocksdb")]
+            StorageEngineType::RocksDB => {
+                if engine_path.exists() {
+                    if let Err(e) = SurrealdbGraphStorage::force_unlock(&engine_path).await {
+                        warn!("Failed to unlock RocksDB database at {:?}: {}", engine_path, e);
+                        return Err(GraphError::StorageError(format!("Failed to unlock RocksDB database at {:?}: {}", engine_path, e)));
+                    } else {
+                        info!("Successfully unlocked RocksDB database at {:?}", engine_path);
+                        println!("===> SUCCESSFULLY UNLOCKED ROCKSDB DATABASE AT {:?}", engine_path);
+                    }
+                    // Verify no lock file exists
+                    let lock_file = engine_path.join("LOCK");
+                    if lock_file.exists() {
+                        return Err(GraphError::StorageError(format!("Lock file still exists at {:?} after unlock attempt", lock_file)));
+                    }
+                    println!("===> NO LOCK FILE FOUND AT {:?}", lock_file);
+                }
+            }
+            _ => {}
+        }
+
         if let Some(ref mut engine_config) = config.engine_specific_config {
             engine_config.storage.path = Some(engine_path.clone());
             engine_config.storage.port = Some(port);
@@ -1136,6 +1198,21 @@ impl StorageEngineManager {
 
         let port = engine_specific.storage.port.unwrap_or(DEFAULT_STORAGE_PORT);
 
+        // Check and release any existing locks
+        if sled_path.exists() {
+            if let Err(e) = SledStorage::force_unlock(&sled_path).await {
+                return Err(GraphError::StorageError(format!("Failed to unlock Sled database at {:?}: {}", sled_path, e)));
+            }
+            info!("Successfully unlocked Sled database at {:?}", sled_path);
+            println!("===> SUCCESSFULLY UNLOCKED SLED DATABASE AT {:?}", sled_path);
+            // Verify no lock file exists
+            let lock_file = sled_path.join("db.lck");
+            if lock_file.exists() {
+                return Err(GraphError::StorageError(format!("Lock file still exists at {:?} after unlock attempt", lock_file)));
+            }
+            println!("===> NO LOCK FILE FOUND AT {:?}", lock_file);
+        }
+
         // Attempt to get existing metadata
         let metadata = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await?;
 
@@ -1144,7 +1221,7 @@ impl StorageEngineManager {
                 warn!("Path mismatch for Sled: registry shows {:?}, but config specifies {:?}", existing_metadata.data_dir, sled_path);
                 println!("===> PATH MISMATCH FOR SLED: REGISTRY SHOWS {:?}, BUT CONFIG SPECIFIES {:?}", existing_metadata.data_dir, sled_path);
                 
-                // Update registry with correct path instead of error
+                // Update registry with correct path
                 existing_metadata.data_dir = Some(sled_path.clone());
                 GLOBAL_DAEMON_REGISTRY.update_daemon_metadata(existing_metadata).await?;
                 info!("Updated daemon registry data_dir to {:?}", sled_path);
@@ -1169,6 +1246,7 @@ impl StorageEngineManager {
             info!("Created new daemon registry entry for port {} with path {:?}", port, sled_path);
             println!("===> CREATED NEW DAEMON REGISTRY ENTRY FOR PORT {} WITH PATH {:?}", port, sled_path);
         }
+
         let sled_config = SledConfig {
             storage_engine_type: StorageEngineType::Sled,
             path: sled_path,
@@ -1179,16 +1257,11 @@ impl StorageEngineManager {
             cache_capacity: engine_specific.storage.cache_capacity,
         };
 
-        // The previous code had a type mismatch here.
-        // The `map` operation was creating a concrete `Arc<SledStorage>`,
-        // but the function's return type expects a dynamically-dispatched
-        // `Arc<dyn GraphStorageEngine + Send + Sync>`.
-        // The `as` keyword performs the necessary coercion.
+        // Attempt to open Sled database
         SledStorage::new(&sled_config, config).await
-            // The fix is right here: we cast the concrete type to the trait object.
             .map(|s| Arc::new(s) as Arc<dyn GraphStorageEngine + Send + Sync>)
             .map_err(|e| GraphError::StorageError(format!("Failed to initialize Sled: {}", e)))
-            }
+    }
 
     async fn cleanup_legacy_sled_directories_during_reset(base_data_dir: &Path, current_port: u16) {
         info!("Cleaning up legacy port-suffixed Sled directories during reset in {:?}", base_data_dir);
@@ -1213,6 +1286,14 @@ impl StorageEngineManager {
                                             warn!("Failed to force unlock Sled database during reset at {:?}: {}", old_path, e);
                                         } else {
                                             info!("Successfully unlocked Sled database during reset at {:?}", old_path);
+                                            println!("===> SUCCESSFULLY UNLOCKED SLED DATABASE DURING RESET AT {:?}", old_path);
+                                        }
+                                        // Verify no lock file exists
+                                        let lock_file = old_path.join("db.lck");
+                                        if lock_file.exists() {
+                                            warn!("Lock file still exists at {:?} after unlock attempt during reset", lock_file);
+                                        } else {
+                                            println!("===> NO LOCK FILE FOUND AT {:?}", lock_file);
                                         }
                                     }
                                     
@@ -1913,12 +1994,27 @@ impl StorageEngineManager {
         println!("IT'S TIME TO INITIALIZE ROCKSDB");
         info!("Initializing RocksDB engine with SurrealDB backend");
 
-        // Get the path for the RocksDB engine.
+        // Get the path for the RocksDB engine
         let engine_path = Self::get_engine_path(config, StorageEngineType::RocksDB)?;
         
-        // Ensure the directory exists to avoid filesystem errors.
+        // Ensure the directory exists to avoid filesystem errors
         info!("Ensuring directory exists: {:?}", engine_path);
         Self::ensure_directory_exists(&engine_path).await?;
+
+        // Check and release any existing locks
+        if engine_path.exists() {
+            if let Err(e) = SurrealdbGraphStorage::force_unlock(&engine_path).await {
+                return Err(GraphError::StorageError(format!("Failed to unlock RocksDB database at {:?}: {}", engine_path, e)));
+            }
+            info!("Successfully unlocked RocksDB database at {:?}", engine_path);
+            println!("===> SUCCESSFULLY UNLOCKED ROCKSDB DATABASE AT {:?}", engine_path);
+            // Verify no lock file exists
+            let lock_file = engine_path.join("LOCK");
+            if lock_file.exists() {
+                return Err(GraphError::StorageError(format!("Lock file still exists at {:?} after unlock attempt", lock_file)));
+            }
+            println!("===> NO LOCK FILE FOUND AT {:?}", lock_file);
+        }
 
         let mut db_instance = None;
         let mut attempt = 0;
@@ -1932,14 +2028,12 @@ impl StorageEngineManager {
                 Ok(db) => {
                     info!("Successfully connected to SurrealDB RocksDB backend on attempt {}.", attempt + 1);
                     db_instance = Some(db);
-                    break; // Connection successful, exit the loop.
+                    break; // Connection successful, exit the loop
                 },
                 Err(e) => {
                     let error_string = e.to_string();
                     
-                    // We're looking for a specific kind of lock error. These often contain keywords
-                    // like "lock", "busy", or "occupied". The SurrealDB error message might not be
-                    // exact, so we'll check for keywords.
+                    // Check for lock-related errors
                     if error_string.contains("lock") || error_string.contains("occupied") {
                         warn!("Detected a potential RocksDB lock conflict. Attempting retry after a delay. Error: {}", error_string);
                         let delay = TokioDuration::from_millis(base_delay_ms * 2u64.pow(attempt));
@@ -1947,8 +2041,6 @@ impl StorageEngineManager {
                         time::sleep(delay).await;
                         attempt += 1;
                     } else {
-                        // For any other type of error, we should fail immediately as it's likely
-                        // a permanent issue (e.g., corrupt data, invalid config).
                         error!("A non-retryable error occurred while connecting to RocksDB: {}", error_string);
                         return Err(GraphError::StorageError(format!("Failed to connect to SurrealDB RocksDB backend: {}", error_string)));
                     }
@@ -1956,7 +2048,7 @@ impl StorageEngineManager {
             }
         }
 
-        // After the loop, check if we have a valid database instance.
+        // After the loop, check if we have a valid database instance
         let db = db_instance.ok_or_else(|| {
             error!("Failed to connect to RocksDB after {} attempts.", max_attempts);
             GraphError::StorageError(format!("Failed to open RocksDB after {} attempts due to lock error.", max_attempts))
@@ -2744,6 +2836,8 @@ impl StorageEngineManager {
                             warn!("Cleaning up RocksDB directory at {:?}", old_path);
                             if let Err(e) = recover_rocksdb(&old_path).await {
                                 warn!("Failed to clean RocksDB locks: {}", e);
+                            } else {
+                                info!("Successfully cleaned RocksDB locks at {:?}", old_path);
                             }
                         }
                         // Forcefully terminate any stale daemon
@@ -2771,10 +2865,22 @@ impl StorageEngineManager {
                             warn!("Cleaning up Sled locks at {:?}", old_path);
                             let lock_path = old_path.join("db.lck");
                             if lock_path.exists() {
-                                if let Err(e) = fs::remove_file(&lock_path).await {
-                                    warn!("Failed to remove Sled lock file at {:?}: {}", lock_path, e);
+                                if let Ok(Some(pid)) = find_pid_by_port(port).await {
+                                    if NonBlockingDaemonRegistry::is_pid_running(pid).await.unwrap_or(false) {
+                                        warn!("Sled lock file exists at {:?} and process PID {} is running; skipping cleanup", lock_path, pid);
+                                    } else {
+                                        if let Err(e) = fs::remove_file(&lock_path).await {
+                                            warn!("Failed to remove Sled lock file at {:?}: {}", lock_path, e);
+                                        } else {
+                                            info!("Successfully removed Sled lock file at {:?}", lock_path);
+                                        }
+                                    }
                                 } else {
-                                    info!("Successfully removed Sled lock file at {:?}", lock_path);
+                                    if let Err(e) = fs::remove_file(&lock_path).await {
+                                        warn!("Failed to remove Sled lock file at {:?}: {}", lock_path, e);
+                                    } else {
+                                        info!("Successfully removed Sled lock file at {:?}", lock_path);
+                                    }
                                 }
                             }
                         }
@@ -2799,7 +2905,7 @@ impl StorageEngineManager {
                                 .map_err(|e| GraphError::StorageError(format!("Failed to close TiKV: {}", e)))?;
                             *singleton = None;
                         }
-                        // No daemon termination for TiKV to avoid disrupting PD
+                        // No lock cleanup for TiKV as it is remote
                     }
                 }
                 StorageEngineType::Redis => {
@@ -2959,52 +3065,51 @@ impl StorageEngineManager {
         }
 
         // Clean up lock files for new engine, skip for Sled-to-Sled with same path
-        if new_config.storage_engine_type != StorageEngineType::TiKV {
+        if !(old_engine_type == StorageEngineType::Sled && new_config.storage_engine_type == StorageEngineType::Sled && old_path == new_path) {
             if let p = new_path.clone() {
-                if !(old_engine_type == StorageEngineType::Sled && new_config.storage_engine_type == StorageEngineType::Sled && old_path == new_path) {
-                    match new_config.storage_engine_type {
-                        StorageEngineType::Sled => {
-                            #[cfg(feature = "with-sled")]
-                            {
-                                println!("===> USE STORAGE HANDLER - STEP 5.5: Cleaning up lock files for Sled");
-                                info!("Cleaning up Sled lock files at {:?}", p);
-                                let lock_path = p.join("db.lck");
-                                if lock_path.exists() {
+                match new_config.storage_engine_type {
+                    StorageEngineType::Sled => {
+                        #[cfg(feature = "with-sled")]
+                        {
+                            println!("===> USE STORAGE HANDLER - STEP 5.5: Cleaning up lock files for Sled");
+                            info!("Cleaning up Sled lock files at {:?}", p);
+                            let lock_path = p.join("db.lck");
+                            if lock_path.exists() {
+                                if let Ok(Some(pid)) = find_pid_by_port(port).await {
+                                    if NonBlockingDaemonRegistry::is_pid_running(pid).await.unwrap_or(false) {
+                                        warn!("Sled lock file exists at {:?} and process PID {} is running; skipping cleanup", lock_path, pid);
+                                    } else {
+                                        if let Err(e) = fs::remove_file(&lock_path).await {
+                                            warn!("Failed to remove Sled lock file at {:?}: {}", lock_path, e);
+                                        } else {
+                                            info!("Successfully removed Sled lock file at {:?}", lock_path);
+                                        }
+                                    }
+                                } else {
                                     if let Err(e) = fs::remove_file(&lock_path).await {
                                         warn!("Failed to remove Sled lock file at {:?}: {}", lock_path, e);
                                     } else {
                                         info!("Successfully removed Sled lock file at {:?}", lock_path);
                                     }
                                 }
+                            } else {
+                                info!("No Sled lock file found at {:?}", lock_path);
                             }
                         }
-                        StorageEngineType::RocksDB => {
-                            #[cfg(feature = "with-rocksdb")]
-                            {
-                                println!("===> USE STORAGE HANDLER - STEP 5.5: Cleaning up lock files for RocksDB");
-                                info!("Cleaning up RocksDB lock files at {:?}", p);
-                                if let Err(e) = recover_rocksdb(&p).await {
-                                    warn!("Failed to clean RocksDB locks at {:?}: {}", p, e);
-                                }
+                    }
+                    StorageEngineType::RocksDB => {
+                        #[cfg(feature = "with-rocksdb")]
+                        {
+                            println!("===> USE STORAGE HANDLER - STEP 5.5: Cleaning up lock files for RocksDB");
+                            info!("Cleaning up RocksDB lock files at {:?}", p);
+                            if let Err(e) = recover_rocksdb(&p).await {
+                                warn!("Failed to clean RocksDB locks at {:?}: {}", p, e);
+                            } else {
+                                info!("Successfully cleaned RocksDB locks at {:?}", p);
                             }
                         }
-                        _ => {}
                     }
-                }
-            }
-        } else {
-            println!("===> USE STORAGE HANDLER - STEP 5.5: Cleaning up lock files for TiKV");
-            info!("Cleaning up TiKV lock files...");
-            let tikv_path = new_path.clone();
-            if tikv_path.exists() {
-                #[cfg(feature = "with-tikv")]
-                {
-                    if let Err(e) = TikvStorage::force_unlock().await {
-                        warn!("Failed to clean up TiKV lock files: {}", e);
-                    } else {
-                        info!("Lock files cleaned successfully.");
-                        println!("===> Lock files cleaned successfully.");
-                    }
+                    _ => {}
                 }
             }
         }
@@ -3204,12 +3309,9 @@ impl StorageEngineManager {
                         StorageEngineType::Sled => {
                             #[cfg(feature = "with-sled")]
                             {
-                                // The `config` variable is already the `StorageConfig` you need.
-                                // Accessing `config.storage` is incorrect, as the compiler states.
-                                // We'll use the fields directly from `config` and its nested `engine_specific_config`.
                                 let engine_specific = config.engine_specific_config
                                     .as_ref()
-                                    .context("Sled configuration missing from `engine_specific_config`")?;
+                                    .ok_or_else(|| GraphError::ConfigurationError("Sled configuration missing from `engine_specific_config`".to_string()))?;
                                 
                                 let sled_config = SledConfig {
                                     storage_engine_type: StorageEngineType::Sled,
@@ -3226,18 +3328,15 @@ impl StorageEngineManager {
                                 let mut sled_singleton = SLED_SINGLETON.lock().await;
 
                                 let sled_instance = if old_engine_type == StorageEngineType::Sled && old_path == sled_config.path {
-                                    // Reuse existing Sled database
                                     let sled_db = SLED_DB.get().ok_or_else(|| GraphError::StorageError("Failed to access existing Sled DB".to_string()))?;
                                     let sled_db_guard = sled_db.lock().await;
                                     info!("Reusing existing Sled database at {:?}", sled_db_guard.path);
 
-                                    // Pass `&config` as the `storage_config` argument.
                                     let storage = SledStorage::new_with_db(&sled_config, &config, Arc::clone(&sled_db_guard.db)).await?;
                                     let instance = Arc::new(storage);
                                     *sled_singleton = Some(instance.clone());
                                     instance
                                 } else {
-                                    // Create new Sled database
                                     match sled_singleton.as_ref() {
                                         Some(instance) => {
                                             info!("Reusing existing Sled instance");
@@ -3259,7 +3358,7 @@ impl StorageEngineManager {
                                 error!("Sled support is not enabled in this build");
                                 Err(GraphError::StorageError("Sled support is not enabled. Please enable the 'with-sled' feature.".to_string()))
                             }
-                        },
+                        }
                         StorageEngineType::RocksDB => {
                             #[cfg(feature = "with-rocksdb")]
                             {
@@ -3456,10 +3555,12 @@ impl StorageEngineManager {
             if old_engine_type != new_config.storage_engine_type {
                 info!("Migrating data from {} to {}", old_persistent_arc.get_type(), new_persistent.get_type());
                 self.migrate_data(&old_persistent_arc, &new_persistent).await?;
-            } else if let (old_p, new_p) = (old_path, new_path) {
-                info!("Copying data directory for same-engine path change");
-                copy_dir(&old_p, &new_p).await
-                    .map_err(|e| GraphError::Io(e))?;
+            } else if let (Some(old_p), Some(new_p)) = (old_path.to_str(), new_path.to_str()) {
+                if old_p != new_p {
+                    info!("Copying data directory for same-engine path change");
+                    copy_dir(&old_path, &new_path).await
+                        .map_err(|e| GraphError::Io(e))?;
+                }
             }
         }
 

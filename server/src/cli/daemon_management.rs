@@ -68,6 +68,19 @@ pub async fn check_process_status_by_pid(pid: Pid) -> bool {
     system.process(pid).is_some()
 }
 
+pub async fn check_pid_validity(pid: u64) -> bool {
+    #[cfg(unix)]
+    {
+        let pid = NixPid::from_raw(pid as i32);
+        matches!(kill(pid, None), Ok(()))
+    }
+    #[cfg(not(unix))]
+    {
+        // Implement Windows equivalent if needed
+        false
+    }
+}
+
 // Helper to get process ID by port provided
 pub async fn get_pid_for_port(port: u16) -> Result<u32, anyhow::Error> {
     let output = Command::new("lsof")
@@ -173,6 +186,57 @@ pub async fn check_process_status_by_port(
             true
         }
         None => false,
+    }
+}
+
+
+pub async fn stop_process_by_pid(process_name: &str, pid: u64) -> Result<(), anyhow::Error> {
+    info!("Attempting to stop process {} with PID {}", process_name, pid);
+    #[cfg(unix)]
+    {
+        let nix_pid = NixPid::from_raw(pid as i32);
+        // Check if process exists
+        if !check_pid_validity(pid).await {
+            info!("Process {} with PID {} is already terminated", process_name, pid);
+            return Ok(());
+        }
+
+        // Send SIGTERM
+        kill(nix_pid, Signal::SIGTERM)
+            .map_err(|e| anyhow!("Failed to send SIGTERM to {} (PID {}): {}", process_name, pid, e))?;
+
+        // Wait for process to terminate
+        let max_wait = Duration::from_secs(2);
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < max_wait {
+            if !check_pid_validity(pid).await {
+                info!("Process {} with PID {} terminated successfully", process_name, pid);
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // If still running, send SIGKILL
+        warn!("Process {} with PID {} did not terminate after SIGTERM, sending SIGKILL", process_name, pid);
+        kill(nix_pid, Signal::SIGKILL)
+            .map_err(|e| anyhow!("Failed to send SIGKILL to {} (PID {}): {}", process_name, pid, e))?;
+
+        // Verify termination
+        let max_wait_kill = Duration::from_secs(1);
+        let start_kill = tokio::time::Instant::now();
+        while start_kill.elapsed() < max_wait_kill {
+            if !check_pid_validity(pid).await {
+                info!("Process {} with PID {} terminated successfully after SIGKILL", process_name, pid);
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        Err(anyhow!("Failed to terminate {} (PID {}) after SIGKILL", process_name, pid))
+    }
+    #[cfg(not(unix))]
+    {
+        Err(anyhow!("Process termination by PID not supported on non-Unix systems"))
     }
 }
 
@@ -1847,6 +1911,7 @@ pub async fn find_all_running_rest_api_ports() -> Vec<u16> {
     running_ports
 }
 
+/*
 // Helper function to check if PID is still valid
 pub async fn check_pid_validity(pid: u32) -> bool {
     use nix::sys::signal::{kill, Signal};
@@ -1863,6 +1928,7 @@ pub async fn check_pid_validity(pid: u32) -> bool {
         }
     }
 }
+*/
 
 pub async fn is_pid_running(pid: u32) -> bool {
     let mut sys = sysinfo::System::new();
