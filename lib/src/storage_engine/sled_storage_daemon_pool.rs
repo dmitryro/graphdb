@@ -38,6 +38,7 @@ use {
 impl SledDaemon {
 
     pub async fn new(config: SledConfig) -> GraphResult<Self> {
+        println!("SledDaemon =================> LET US SEE IF THIS WAS EVER CALLED");
         let port = config.port.ok_or_else(|| {
             GraphError::ConfigurationError("No port specified in SledConfig".to_string())
         })?;
@@ -325,7 +326,7 @@ impl SledDaemon {
         responder.set_maxmsgsize(MAX_MESSAGE_SIZE as i64)
             .map_err(|e| GraphError::StorageError(format!("Failed to set max message size for port {}: {}", self.port, e)))?;
 
-        let socket_path = format!("/opt/graphdb/pgraphdb-{}.ipc", self.port);
+        let socket_path = format!("/opt/graphdb/graphdb-{}.ipc", self.port);
         let socket_dir = Path::new("/opt/graphdb");
 
         if !socket_dir.exists() {
@@ -466,6 +467,14 @@ impl SledDaemon {
             };
 
             let response = match request.get("command").and_then(|c| c.as_str()) {
+                Some("status") => {
+                    println!("===> PROCESSING STATUS FOR PORT {}", self.port);
+                    json!({ "status": "success", "port": self.port })
+                }
+                Some("ping") => {
+                    println!("===> PROCESSING PING FOR PORT {}", self.port);
+                    json!({ "status": "success", "port": self.port })  // Return "success" not "ok"
+                }
                 Some("set_key") => {
                     let key = match request.get("key").and_then(|k| k.as_str()) {
                         Some(k) => k,
@@ -712,7 +721,7 @@ impl SledDaemon {
         socket.set_sndtimeo(10000)
             .map_err(|e| GraphError::StorageError(format!("Failed to set send timeout: {}", e)))?;
 
-        let endpoint = format!("ipc:///opt/graphdb/pgraphdb-{}.ipc", port);
+        let endpoint = format!("ipc:///opt/graphdb/graphdb-{}.ipc", port);
         println!("===> SLED STORAGE: CONNECTING TO ZMQ ENDPOINT {} FOR PORT {}", endpoint, port);
         
         socket.connect(&endpoint)
@@ -1347,7 +1356,7 @@ impl SledDaemon {
         let context = ZmqContext::new();
         let socket = context.socket(zmq::REQ)
             .map_err(|e| GraphError::StorageError(format!("Failed to create ZeroMQ socket: {}", e)))?;
-        let endpoint = format!("ipc:///opt/graphdb/pgraphdb-{}.ipc", self.port);
+        let endpoint = format!("ipc:///opt/graphdb/graphdb-{}.ipc", self.port);
         socket.connect(&endpoint)
             .map_err(|e| GraphError::StorageError(format!("Failed to connect to ZeroMQ socket {}: {}", endpoint, e)))?;
 
@@ -1376,7 +1385,7 @@ impl SledDaemon {
         let context = ZmqContext::new();
         let socket = context.socket(zmq::REQ)
             .map_err(|e| GraphError::StorageError(format!("Failed to create ZeroMQ socket: {}", e)))?;
-        let endpoint = format!("ipc:///opt/graphdb/pgraphdb-{}.ipc", self.port);
+        let endpoint = format!("ipc:///opt/graphdb/graphdb-{}.ipc", self.port);
         socket.connect(&endpoint)
             .map_err(|e| GraphError::StorageError(format!("Failed to connect to ZeroMQ socket {}: {}", endpoint, e)))?;
 
@@ -1407,7 +1416,7 @@ impl SledDaemon {
         let context = ZmqContext::new();
         let socket = context.socket(zmq::REQ)
             .map_err(|e| GraphError::StorageError(format!("Failed to create ZeroMQ socket: {}", e)))?;
-        let endpoint = format!("ipc:///opt/graphdb/pgraphdb-{}.ipc", self.port);
+        let endpoint = format!("ipc:///opt/graphdb/graphdb-{}.ipc", self.port);
         socket.connect(&endpoint)
             .map_err(|e| GraphError::StorageError(format!("Failed to connect to ZeroMQ socket {}: {}", endpoint, e)))?;
 
@@ -1438,7 +1447,7 @@ impl SledDaemon {
         let context = ZmqContext::new();
         let socket = context.socket(zmq::REQ)
             .map_err(|e| GraphError::StorageError(format!("Failed to create ZeroMQ socket: {}", e)))?;
-        let endpoint = format!("ipc:///opt/graphdb/pgraphdb-{}.ipc", self.port);
+        let endpoint = format!("ipc:///opt/graphdb/graphdb-{}.ipc", self.port);
         socket.connect(&endpoint)
             .map_err(|e| GraphError::StorageError(format!("Failed to connect to ZeroMQ socket {}: {}", endpoint, e)))?;
 
@@ -1466,6 +1475,7 @@ impl SledDaemonPool {
 
 
     pub fn new() -> Self {
+        println!("SledDaemonPool =================> LET US SEE IF THIS WAS EVER CALLED");
         Self {
             daemons: HashMap::new(),
             registry: Arc::new(RwLock::new(HashMap::new())),
@@ -1547,7 +1557,7 @@ impl SledDaemonPool {
         socket.set_sndtimeo(5000)
             .map_err(|e| GraphError::StorageError(format!("Failed to set send timeout: {}", e)))?;
 
-        let endpoint = format!("ipc:///opt/graphdb/pgraphdb-{}.ipc", port);
+        let endpoint = format!("ipc:///opt/graphdb/graphdb-{}.ipc", port);
         socket.connect(&endpoint)
             .map_err(|e| GraphError::StorageError(format!("Failed to connect to {}: {}", endpoint, e)))?;
 
@@ -1616,7 +1626,7 @@ impl SledDaemonPool {
         socket.set_sndtimeo(5000)
             .map_err(|e| GraphError::StorageError(format!("Failed to set send timeout: {}", e)))?;
 
-        let endpoint = format!("ipc:///opt/graphdb/pgraphdb-{}.ipc", port);
+        let endpoint = format!("ipc:///opt/graphdb/graphdb-{}.ipc", port);
         socket.connect(&endpoint)
             .map_err(|e| GraphError::StorageError(format!("Failed to connect to {}: {}", endpoint, e)))?;
 
@@ -2334,7 +2344,7 @@ impl SledDaemonPool {
         let context = ZmqContext::new();
         let socket = context.socket(zmq::REQ)
             .map_err(|e| GraphError::StorageError(format!("Failed to create ZeroMQ socket: {}", e)))?;
-        let endpoint = format!("ipc:///opt/graphdb/pgraphdb-{}.ipc", port);
+        let endpoint = format!("ipc:///opt/graphdb/graphdb-{}.ipc", port);
         socket.connect(&endpoint)
             .map_err(|e| GraphError::StorageError(format!("Failed to connect to ZeroMQ socket {}: {}", endpoint, e)))?;
 
@@ -2365,7 +2375,7 @@ impl SledDaemonPool {
         let context = ZmqContext::new();
         let socket = context.socket(zmq::REQ)
             .map_err(|e| GraphError::StorageError(format!("Failed to create ZeroMQ socket: {}", e)))?;
-        let endpoint = format!("ipc:///opt/graphdb/pgraphdb-{}.ipc", port);
+        let endpoint = format!("ipc:///opt/graphdb/graphdb-{}.ipc", port);
         socket.connect(&endpoint)
             .map_err(|e| GraphError::StorageError(format!("Failed to connect to ZeroMQ socket {}: {}", endpoint, e)))?;
 
@@ -2398,7 +2408,7 @@ impl SledDaemonPool {
         let context = ZmqContext::new();
         let socket = context.socket(zmq::REQ)
             .map_err(|e| GraphError::StorageError(format!("Failed to create ZeroMQ socket: {}", e)))?;
-        let endpoint = format!("ipc:///opt/graphdb/pgraphdb-{}.ipc", port);
+        let endpoint = format!("ipc:///opt/graphdb/graphdb-{}.ipc", port);
         socket.connect(&endpoint)
             .map_err(|e| GraphError::StorageError(format!("Failed to connect to ZeroMQ socket {}: {}", endpoint, e)))?;
 
@@ -2431,7 +2441,7 @@ impl SledDaemonPool {
         let context = ZmqContext::new();
         let socket = context.socket(zmq::REQ)
             .map_err(|e| GraphError::StorageError(format!("Failed to create ZeroMQ socket: {}", e)))?;
-        let endpoint = format!("ipc:///opt/graphdb/pgraphdb-{}.ipc", port);
+        let endpoint = format!("ipc:///opt/graphdb/graphdb-{}.ipc", port);
         socket.connect(&endpoint)
             .map_err(|e| GraphError::StorageError(format!("Failed to connect to ZeroMQ socket {}: {}", endpoint, e)))?;
 

@@ -3,7 +3,7 @@ use anyhow::{Result, Context, anyhow};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::{Mutex as TokioMutex, OnceCell, oneshot};
+use tokio::sync::{Mutex as TokioMutex, oneshot};
 use tokio::task::JoinHandle;
 use std::process;
 use std::env;
@@ -13,8 +13,9 @@ use serde_json::{Map, Value};
 use serde_yaml2 as serde_yaml;
 use std::fs;
 use storage_daemon_server::{StorageSettings, StorageSettingsWrapper};
-use log::{info, debug, warn};
+use log::{info, debug, warn, error};
 use models::errors::GraphError;
+use tokio::time::{timeout, Duration as TokioDuration};
 
 // Import modules
 use lib::commands::{
@@ -34,7 +35,7 @@ use lib::config::{
 use lib::config as config_mod;
 use crate::cli::daemon_management;
 use crate::cli::handlers as handlers_mod;
-use crate::cli::handlers_storage::{ start_storage_interactive, stop_storage_interactive, };
+use crate::cli::handlers_storage::{ start_storage_interactive, stop_storage_interactive };
 use crate::cli::handlers_utils::parse_storage_engine;
 use crate::cli::help_display as help_display_mod;
 use crate::cli::interactive as interactive_mod;
@@ -45,7 +46,7 @@ use lib::query_parser::{parse_query_from_string, QueryType};
 use lib::query_exec_engine::QueryExecEngine;
 use lib::storage_engine::storage_engine::{StorageEngineManager, AsyncStorageEngineManager, GLOBAL_STORAGE_ENGINE_MANAGER};
 
-/// GraphDB Command Line Interface
+// GraphDB Command Line Interface
 #[derive(Parser, Debug)]
 #[clap(author, version, about = "GraphDB Command Line Interface", long_about = None)]
 #[clap(propagate_version = true)]
@@ -162,8 +163,8 @@ pub enum Commands {
     },
 }
 
-// Use a OnceCell to manage the singleton instance of the QueryExecEngine.
-static QUERY_ENGINE_SINGLETON: OnceCell<Arc<QueryExecEngine>> = OnceCell::const_new();
+// Use a TokioMutex to manage the singleton instance of the QueryExecEngine.
+static QUERY_ENGINE_SINGLETON: TokioMutex<Option<Arc<QueryExecEngine>>> = TokioMutex::const_new(None);
 
 fn start_wrapper(
     port: Option<u16>,
@@ -199,28 +200,86 @@ fn stop_wrapper(
     ))
 }
 
-pub async fn get_query_engine_singleton() -> Result<&'static Arc<QueryExecEngine>> {
-    initialize_storage_for_query(start_wrapper, stop_wrapper).await?;
-    
-    QUERY_ENGINE_SINGLETON.get_or_try_init(|| async {
+
+/// This function implements the singleton pattern for the QueryExecEngine.
+/// It ensures that the QueryExecEngine is initialized only once, even with concurrent access.
+pub async fn get_query_engine_singleton() -> Result<Arc<QueryExecEngine>> {
+    // Acquire the mutex with a minimal timeout to check if the singleton is already initialized.
+    let mutex_timeout = TokioDuration::from_secs(5);
+    let mut singleton_guard = timeout(mutex_timeout, QUERY_ENGINE_SINGLETON.lock())
+        .await
+        .map_err(|_| anyhow!("Failed to acquire query engine singleton mutex after {} seconds", mutex_timeout.as_secs()))?;
+
+    // Check if the singleton is already initialized.
+    if let Some(engine) = singleton_guard.as_ref() {
+        info!("Query engine singleton already initialized, returning existing instance");
+        println!("===> Query engine singleton already initialized, returning existing instance");
+        // The lock is automatically released when `singleton_guard` goes out of scope here.
+        return Ok(Arc::clone(engine));
+    }
+
+    // Since the singleton is not initialized, we will now do the work.
+    // We must drop the lock here to allow other threads to potentially access the state
+    // and prevent deadlocks during the long initialization process.
+    drop(singleton_guard);
+
+    // Perform the initialization of the query engine outside of the lock
+    let query_engine = async move {
+        info!("Starting query engine singleton initialization...");
+        println!("===> Starting query engine singleton initialization...");
+
+        // Initialize storage for query execution with a timeout to prevent hanging.
+        info!("Calling initialize_storage_for_query with a timeout...");
+        println!("===> Calling initialize_storage_for_query with a timeout...");
+        timeout(TokioDuration::from_secs(60), initialize_storage_for_query(start_wrapper, stop_wrapper)).await
+            .context("Storage initialization timed out after 60 seconds")?
+            .context("Failed to initialize storage for query execution")?;
+
+        // Load storage configuration with a timeout.
         let storage_config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
+        info!("Loading storage config from {}", storage_config_path.display());
+        println!("===> Loading storage config from {}", storage_config_path.display());
         let storage_config = if storage_config_path.exists() {
-            println!("Loading storage config from {}", storage_config_path.display());
-            load_storage_config_from_yaml(Some(storage_config_path.clone())).await
+            timeout(TokioDuration::from_secs(10), load_storage_config_from_yaml(Some(storage_config_path.clone()))).await
+                .context("Loading storage config timed out after 10 seconds")?
                 .with_context(|| format!("Failed to load storage config from {}", storage_config_path.display()))?
         } else {
-            println!("No storage configuration file found at {}. Defaulting to InMemory storage. Use 'use storage <engine_name>' and 'save storage' to persist your configuration.", storage_config_path.display());
+            info!("No storage configuration file found at {}. Defaulting to InMemory storage.", storage_config_path.display());
+            println!("===> No storage configuration file found at {}. Defaulting to InMemory storage. Use 'use storage <engine_name>' and 'save storage' to persist your configuration.", storage_config_path.display());
             StorageConfig::new_in_memory()
         };
+
+        // Initialize database with a timeout.
+        info!("Creating new Database instance...");
+        println!("===> Creating new Database instance...");
+        let database = timeout(TokioDuration::from_secs(60), Database::new(storage_config)).await
+            .context("Database creation timed out after 60 seconds")?
+            .map_err(|e| anyhow!("Failed to create Database: {}", e))?;
+
+        // Create query engine
+        info!("Creating new QueryExecEngine instance...");
+        println!("===> Creating new QueryExecEngine instance...");
+        let query_engine = Arc::new(QueryExecEngine::new(Arc::new(database)));
         
-        let database = Arc::new(
-            Database::new(storage_config)
-                .await
-                .map_err(|e| anyhow!("Failed to create Database: {}", e))?,
-        );
-        Ok(Arc::new(QueryExecEngine::new(database)))
-    }).await
+        // Use the turbofish to explicitly state the error type for the Result
+        Ok::<Arc<QueryExecEngine>, anyhow::Error>(query_engine)
+    }.await?;
+
+    // Now that the engine is initialized, re-acquire the lock to store the result.
+    // This lock is only held for a very short time.
+    let mut singleton_guard = QUERY_ENGINE_SINGLETON.lock().await;
+
+    // Store the query engine in the singleton.
+    info!("Storing query engine in singleton...");
+    println!("===> Storing query engine in singleton...");
+    *singleton_guard = Some(Arc::clone(&query_engine));
+
+    info!("Query engine singleton initialization completed.");
+    println!("===> Query engine singleton initialization completed.");
+
+    Ok(query_engine)
 }
+
 
 // Re-usable function to handle all commands.
 pub async fn run_single_command(
@@ -233,14 +292,8 @@ pub async fn run_single_command(
     storage_daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
     storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
 ) -> Result<()> {
-    // Initialize query engine for commands that need it
-    let query_engine = match command {
-        Commands::Exec { .. } | Commands::Query { .. } | Commands::Kv { .. } |
-        Commands::Set { .. } | Commands::Get { .. } | Commands::Delete { .. } => {
-            Some(get_query_engine_singleton().await?)
-        }
-        _ => None,
-    };
+    info!("Running command: {:?}", command);
+    println!("===> Running command: {:?}", command);
 
     match command {
         Commands::Start {
@@ -609,18 +662,28 @@ pub async fn run_single_command(
             }
         }
         Commands::Exec { command } => {
-            handlers_mod::handle_exec_command(query_engine.unwrap().clone(), command).await?;
+            info!("Executing Exec command: {}", command);
+            println!("===> Executing Exec command: {}", command);
+            let query_engine = get_query_engine_singleton().await?;
+            handlers_mod::handle_exec_command(query_engine, command).await?;
         }
         Commands::Query { query } => {
-            handlers_mod::handle_query_command(query_engine.unwrap().clone(), query).await?;
+            info!("Executing Query command: {}", query);
+            println!("===> Executing Query command: {}", query);
+            let query_engine = get_query_engine_singleton().await?;
+            handlers_mod::handle_query_command(query_engine, query).await?;
         }
         Commands::Kv { operation, key, value } => {
+            info!("Executing KV command: operation={}, key={:?}, value={:?}", operation, key, value);
+            println!("===> Executing KV command: operation={}, key={:?}, value={:?}", operation, key, value);
+            let query_engine = get_query_engine_singleton().await?;
+            println!("Out of get_query_engine_singleton - moving on");
             match parse_kv_operation(&operation) {
                 Ok(op) => {
                     match op.as_str() {
                         "get" => {
                             if let Some(key) = key {
-                                handlers_mod::handle_kv_command(query_engine.unwrap().clone(), op, key, None)
+                                handlers_mod::handle_kv_command(query_engine, op, key, None)
                                     .await?;
                             } else {
                                 return Err(anyhow!("Missing key for 'kv get' command. Usage: kv get <key> or kv get --key <key>"));
@@ -629,7 +692,7 @@ pub async fn run_single_command(
                         "set" => {
                             match (key, value) {
                                 (Some(key), Some(value)) => {
-                                    handlers_mod::handle_kv_command(query_engine.unwrap().clone(), op, key, Some(value))
+                                    handlers_mod::handle_kv_command(query_engine, op, key, Some(value))
                                         .await?;
                                 }
                                 (Some(_), None) => {
@@ -642,7 +705,7 @@ pub async fn run_single_command(
                         }
                         "delete" => {
                             if let Some(key) = key {
-                                handlers_mod::handle_kv_command(query_engine.unwrap().clone(), op, key, None)
+                                handlers_mod::handle_kv_command(query_engine, op, key, None)
                                     .await?;
                             } else {
                                 return Err(anyhow!("Missing key for 'kv delete' command. Usage: kv delete <key> or kv delete --key <key>"));
@@ -659,18 +722,29 @@ pub async fn run_single_command(
             }
         }
         Commands::Set { key, value } => {
-            handlers_mod::handle_kv_command(query_engine.unwrap().clone(), "set".to_string(), key, Some(value))
+            info!("Executing Set command: key={}, value={}", key, value);
+            println!("===> Executing Set command: key={}, value={}", key, value);
+            let query_engine = get_query_engine_singleton().await?;
+            handlers_mod::handle_kv_command(query_engine, "set".to_string(), key, Some(value))
                 .await?;
         }
         Commands::Get { key } => {
-            handlers_mod::handle_kv_command(query_engine.unwrap().clone(), "get".to_string(), key, None)
+            info!("Executing Get command: key={}", key);
+            println!("===> Executing Get command: key={}", key);
+            let query_engine = get_query_engine_singleton().await?;
+            handlers_mod::handle_kv_command(query_engine, "get".to_string(), key, None)
                 .await?;
         }
         Commands::Delete { key } => {
-            handlers_mod::handle_kv_command(query_engine.unwrap().clone(), "delete".to_string(), key, None)
+            info!("Executing Delete command: key={}", key);
+            println!("===> Executing Delete command: key={}", key);
+            let query_engine = get_query_engine_singleton().await?;
+            handlers_mod::handle_kv_command(query_engine, "delete".to_string(), key, None)
                 .await?;
         }
     }
+    info!("Command execution completed successfully");
+    println!("===> Command execution completed successfully");
     Ok(())
 }
 
@@ -713,6 +787,7 @@ pub async fn start_cli() -> Result<()> {
     let storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>> = Arc::new(TokioMutex::new(None));
 
     if let Some(command) = args.command {
+        // Here, we call run_single_command and let it handle its own lazy initialization
         run_single_command(
             command,
             daemon_handles.clone(),
@@ -730,6 +805,8 @@ pub async fn start_cli() -> Result<()> {
     }
 
     if should_enter_interactive_mode {
+        let query_engine = get_query_engine_singleton().await?;
+
         interactive_mod::run_cli_interactive(
             daemon_handles.clone(),
             rest_api_shutdown_tx_opt.clone(),
@@ -738,7 +815,7 @@ pub async fn start_cli() -> Result<()> {
             storage_daemon_shutdown_tx_opt.clone(),
             storage_daemon_handle.clone(),
             storage_daemon_port_arc.clone(),
-            get_query_engine_singleton().await?.clone(),
+            query_engine.clone(),
         ).await?;
     }
 

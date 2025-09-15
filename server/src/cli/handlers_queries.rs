@@ -7,9 +7,10 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::fs;
-use tokio::task::JoinHandle;
+use tokio::task::{self, JoinHandle};
 use tokio::sync::{oneshot, Mutex as TokioMutex};
 use tokio::time::{self, timeout, Duration as TokioDuration};
+use lib::daemon::daemon_management::check_pid_validity;
 use lib::daemon::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
 use lib::query_exec_engine::query_exec_engine::QueryExecEngine;
 use lib::query_parser::{parse_query_from_string, QueryType};
@@ -24,7 +25,6 @@ pub use crate::cli::daemon_management::is_storage_daemon_running;
 pub use models::errors::GraphError;
 pub use lib::config::config_defaults::default_config_root_directory;
 use zmq::{Context as ZmqContext};
-use zmq::Error::EPROTO;
 
 async fn execute_and_print(engine: &Arc<QueryExecEngine>, query_string: &str) -> Result<()> {
     match engine.execute(query_string).await {
@@ -44,7 +44,7 @@ pub async fn handle_unified_query(
     query_string: String,
     language: Option<String>,
 ) -> Result<()> {
-    println!("Executing query: {}", query_string);
+    info!("Executing query: {}", query_string);
 
     let normalized_query = query_string.trim().to_uppercase();
 
@@ -150,14 +150,187 @@ pub async fn handle_query_command(engine: Arc<QueryExecEngine>, query: String) -
     Ok(())
 }
 
+// Helper function to perform a single ZMQ request within a blocking task.
+fn do_zmq_request(addr: &str, request_data: &[u8]) -> Result<Value> {
+    let zmq_context = zmq::Context::new();
+    let client = zmq_context
+        .socket(zmq::REQ)
+        .context("Failed to create ZMQ socket")?;
+
+    client.set_rcvtimeo((15 * 1000) as i32)
+        .context("Failed to set receive timeout")?;
+    client.set_sndtimeo((10 * 1000) as i32)
+        .context("Failed to set send timeout")?;
+
+    client.connect(addr)
+        .context(format!("Failed to connect to {}", addr))?;
+    
+    debug!("Successfully connected to: {}", addr);
+
+    client.send(request_data, 0)
+        .context(format!("Failed to send request to {}", addr))?;
+
+    debug!("Request sent successfully");
+
+    let mut msg = zmq::Message::new();
+    client.recv(&mut msg, 0)
+        .context(format!("Failed to receive response from {}", addr))?;
+
+    debug!("Received response");
+    
+    let response: Value = serde_json::from_slice(&msg)
+        .context(format!("Failed to deserialize response from {}", addr))?;
+
+    debug!("Parsed response: {:?}", response);
+
+    Ok(response)
+}
+
+async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str) -> Result<()> {
+    const CONNECT_TIMEOUT_SECS: u64 = 3;
+    const REQUEST_TIMEOUT_SECS: u64 = 10;
+    const RECEIVE_TIMEOUT_SECS: u64 = 15;
+    const MAX_RETRIES: u32 = 3;
+    const BASE_RETRY_DELAY_MS: u64 = 500;
+
+    info!("Starting ZMQ KV operation: {} for key: {}", operation, key);
+
+    let registry = GLOBAL_DAEMON_REGISTRY.get().await;
+    let daemons = registry
+        .get_all_daemon_metadata()
+        .await
+        .map_err(|e| anyhow!("Failed to retrieve daemon metadata: {}", e))?
+        .into_iter()
+        .filter(|metadata| metadata.engine_type == Some(StorageEngineType::Sled.to_string()))
+        .collect::<Vec<_>>();
+
+    if daemons.is_empty() {
+        return Err(anyhow!("No running Sled daemon found. Please start a daemon with 'storage start'"));
+    }
+
+    // Select the daemon with the highest port (most recent) for load balancing
+    let daemon = daemons.iter().max_by_key(|m| m.port).unwrap_or(daemons.first().unwrap());
+    info!("Selected daemon on port: {}", daemon.port);
+
+    // Construct port-specific IPC socket path
+    let socket_path = format!("/opt/graphdb/graphdb-{}.ipc", daemon.port);
+    let addr = format!("ipc://{}", socket_path);
+
+    // Check if socket file exists
+    if !tokio::fs::metadata(&socket_path).await.is_ok() {
+        return Err(anyhow!("IPC socket file {} does not exist. Daemon may not be running properly on port {}.", socket_path, daemon.port));
+    }
+
+    debug!("Connecting to Sled daemon at: {}", addr);
+
+    // Prepare request
+    let request = match operation {
+        "set" => {
+            if let Some(ref value) = value {
+                json!({ "command": "set_key", "key": key, "value": value })
+            } else {
+                return Err(anyhow!("Missing value for 'set' operation"));
+            }
+        }
+        "get" => json!({ "command": "get_key", "key": key }),
+        "delete" => json!({ "command": "delete_key", "key": key }),
+        _ => return Err(anyhow!("Unsupported operation: {}", operation)),
+    };
+
+    debug!("Sending request: {:?}", request);
+    let request_data = serde_json::to_vec(&request)
+        .map_err(|e| anyhow!("Failed to serialize request: {}", e))?;
+
+    // Retry loop
+    let mut last_error: Option<anyhow::Error> = None;
+    for attempt in 1..=MAX_RETRIES {
+        debug!("Attempt {}/{} to send ZMQ request", attempt, MAX_RETRIES);
+
+        let response_result = tokio::time::timeout(
+            TokioDuration::from_secs(CONNECT_TIMEOUT_SECS + REQUEST_TIMEOUT_SECS + RECEIVE_TIMEOUT_SECS),
+            tokio::task::spawn_blocking({
+                let addr = addr.clone();
+                let request_data = request_data.clone();
+                move || do_zmq_request(&addr, &request_data)
+            })
+        )
+        .await;
+
+        match response_result {
+            Ok(Ok(response)) => {
+                // Extract the Value from the Result
+                let response_value = response?;
+                // Process the response
+                match response_value.get("status").and_then(|s| s.as_str()) {
+                    Some("success") => {
+                        info!("Operation successful");
+                        match operation {
+                            "get" => {
+                                if let Some(response_value) = response_value.get("value") {
+                                    let display_value = if response_value.is_null() {
+                                        "not found".to_string()
+                                    } else {
+                                        response_value.as_str().unwrap_or("<non-string value>").to_string()
+                                    };
+                                    println!("Key '{}': {}", key, display_value);
+                                } else {
+                                    println!("Key '{}': no value in response", key);
+                                }
+                            }
+                            "set" => {
+                                println!("Set key '{}' successfully", key);
+                            }
+                            "delete" => {
+                                println!("Deleted key '{}' successfully", key);
+                            }
+                            _ => {}
+                        }
+                        return Ok(());
+                    }
+                    Some("error") => {
+                        let message = response_value.get("message").and_then(|m| m.as_str()).unwrap_or("Unknown error");
+                        error!("Daemon error: {}", message);
+                        return Err(anyhow!("Daemon error: {}", message));
+                    }
+                    _ => {
+                        error!("Invalid response: {:?}", response_value);
+                        return Err(anyhow!("Invalid response from {}: {:?}", addr, response_value));
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                last_error = Some(e.into());
+                warn!("Attempt {}/{} failed: {}", attempt, MAX_RETRIES, last_error.as_ref().unwrap());
+            }
+            Err(_) => {
+                last_error = Some(anyhow!("ZMQ operation timed out after {} seconds", CONNECT_TIMEOUT_SECS + REQUEST_TIMEOUT_SECS + RECEIVE_TIMEOUT_SECS));
+                warn!("Attempt {}/{} timed out", attempt, MAX_RETRIES);
+            }
+        }
+
+        // Exponential backoff
+        if attempt < MAX_RETRIES {
+            let delay = BASE_RETRY_DELAY_MS * 2u64.pow(attempt - 1);
+            debug!("Retrying after {}ms", delay);
+            tokio::time::sleep(TokioDuration::from_millis(delay)).await;
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow!("Failed to complete ZMQ operation after {} attempts", MAX_RETRIES)))
+}
+
+// Updated main handler function
 pub async fn handle_kv_command(engine: Arc<QueryExecEngine>, operation: String, key: String, value: Option<String>) -> Result<()> {
+    debug!("In handle_kv_command: operation={}, key={}", operation, key);
     let validated_op = parse_kv_operation(&operation)
         .map_err(|e| anyhow!("Invalid KV operation: {}", e))?;
 
     let config = lib::config::load_cli_config().await?;
+    debug!("Loaded config: {:?}", config);
     if config.storage.storage_engine_type == Some(StorageEngineType::Sled) {
         info!("Using Sled-specific ZeroMQ handler for KV operation: {}", validated_op);
-        handle_kv_sled_zmq(key, value, &validated_op).await
+        handle_kv_sled_zmq(key.clone(), value, &validated_op).await?;
+        Ok(())
     } else {
         match validated_op.as_str() {
             "get" => {
@@ -209,160 +382,81 @@ pub async fn handle_kv_command(engine: Arc<QueryExecEngine>, operation: String, 
     }
 }
 
-async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str) -> Result<()> {
-    const CONNECT_TIMEOUT_SECS: u64 = 3;
-    const REQUEST_TIMEOUT_SECS: u64 = 10;
-    const RECEIVE_TIMEOUT_SECS: u64 = 15;
+async fn check_daemon_health(addr: &str) -> Result<bool> {
+    const HEALTH_TIMEOUT_SECS: u64 = 5;
+    const MAX_RETRIES: u32 = 2;
+    const BASE_RETRY_DELAY_MS: u64 = 200;
 
-    println!("===> STARTING ZMQ KV OPERATION: {} for key: {}", operation, key);
-
-    let registry = GLOBAL_DAEMON_REGISTRY.get().await;
-    let daemons = registry
-        .get_all_daemon_metadata()
-        .await
-        .map_err(|e| anyhow!("Failed to retrieve daemon metadata: {}", e))?
-        .into_iter()
-        .filter(|metadata| metadata.engine_type == Some(StorageEngineType::Sled.to_string()))
-        .collect::<Vec<_>>();
-
-    println!("===> FOUND {} SLED DAEMONS", daemons.len());
-
-    if daemons.is_empty() {
-        return Err(anyhow!("No running Sled daemon found. Please start a daemon with 'storage start'"));
-    }
-
-    // Select the daemon with the highest port (most recent) for load balancing
-    let daemon = daemons.iter().max_by_key(|m| m.port).unwrap_or(daemons.first().unwrap());
-    println!("===> SELECTED DAEMON ON PORT: {}", daemon.port);
-
-    // Construct port-specific IPC socket path
-    let socket_path = format!("/opt/graphdb/pgraphdb-{}.ipc", daemon.port);
-    let addr = format!("ipc://{}", socket_path);
-    
-    // Check if socket file exists
-    if !tokio::fs::metadata(&socket_path).await.is_ok() {
-        return Err(anyhow!("IPC socket file {} does not exist. Daemon may not be running properly on port {}.", socket_path, daemon.port));
-    }
-
-    println!("===> CONNECTING TO SLED DAEMON AT: {}", addr);
-
-    // Prepare request
-    let request = match operation {
-        "set" => {
-            if let Some(ref value) = value {
-                json!({ "command": "set_key", "key": key, "value": value })
-            } else {
-                return Err(anyhow!("Missing value for 'set' operation"));
-            }
-        }
-        "get" => json!({ "command": "get_key", "key": key }),
-        "delete" => json!({ "command": "delete_key", "key": key }),
-        _ => return Err(anyhow!("Unsupported operation: {}", operation)),
-    };
-
-    println!("===> SENDING REQUEST: {:?}", request);
+    let request = json!({ "command": "ping" });
     let request_data = serde_json::to_vec(&request)
-        .map_err(|e| anyhow!("Failed to serialize request: {}", e))?;
+        .map_err(|e| anyhow!("Failed to serialize health check request: {}", e))?;
 
-    // Perform the entire ZMQ interaction in a single blocking task with timeout
-    let response_result = tokio::time::timeout(
-        TokioDuration::from_secs(CONNECT_TIMEOUT_SECS + REQUEST_TIMEOUT_SECS + RECEIVE_TIMEOUT_SECS),
-        tokio::task::spawn_blocking({
-            let addr = addr.clone();
-            let request_data = request_data;
-            move || {
-                // Create zmq_context inside the blocking task as it is not Send
-                let zmq_context = zmq::Context::new();
-                let client_result = zmq_context.socket(zmq::REQ);
+    let mut last_error: Option<anyhow::Error> = None;
+    for attempt in 1..=MAX_RETRIES {
+        debug!("Health check attempt {}/{} for {}", attempt, MAX_RETRIES, addr);
 
-                if let Err(e) = client_result {
-                    return Err(anyhow!("Failed to create ZMQ socket: {}", e));
+        let response_result = tokio::time::timeout(
+            TokioDuration::from_secs(HEALTH_TIMEOUT_SECS),
+            tokio::task::spawn_blocking({
+                let addr = addr.to_string();
+                let request_data = request_data.clone();
+                move || {
+                    let zmq_context = zmq::Context::new();
+                    let client = zmq_context.socket(zmq::REQ)
+                        .map_err(|e| anyhow!("Failed to create ZMQ socket: {}", e))?;
+
+                    client.set_rcvtimeo((HEALTH_TIMEOUT_SECS * 1000) as i32)
+                        .map_err(|e| anyhow!("Failed to set receive timeout: {}", e))?;
+                    client.set_sndtimeo((HEALTH_TIMEOUT_SECS * 1000) as i32)
+                        .map_err(|e| anyhow!("Failed to set send timeout: {}", e))?;
+
+                    client.connect(&addr)
+                        .map_err(|e| anyhow!("Failed to connect to {}: {}", addr, e))?;
+
+                    client.send(&request_data, 0)
+                        .map_err(|e| anyhow!("Failed to send ping request to {}: {}", addr, e))?;
+
+                    let mut msg = zmq::Message::new();
+                    client.recv(&mut msg, 0)
+                        .map_err(|e| anyhow!("Failed to receive ping response from {}: {}", addr, e))?;
+
+                    let response: Value = serde_json::from_slice(&msg.to_vec())
+                        .map_err(|e| anyhow!("Failed to deserialize ping response from {}: {}", addr, e))?;
+
+                    Ok::<bool, anyhow::Error>(response.get("status").and_then(|s| s.as_str()) == Some("success"))
                 }
+            })
+        )
+        .await;
 
-                let client = client_result.unwrap();
-
-                // Set socket timeouts
-                if let Err(e) = client.set_rcvtimeo((RECEIVE_TIMEOUT_SECS * 1000) as i32) {
-                    return Err(anyhow!("Failed to set receive timeout: {}", e));
-                }
-                if let Err(e) = client.set_sndtimeo((REQUEST_TIMEOUT_SECS * 1000) as i32) {
-                    return Err(anyhow!("Failed to set send timeout: {}", e));
-                }
-
-                if let Err(e) = client.connect(&addr) {
-                    return Err(anyhow!("Failed to connect to {}: {}", addr, e));
-                }
-
-                println!("===> SUCCESSFULLY CONNECTED TO: {}", addr);
-
-                if let Err(e) = client.send(&request_data, 0) {
-                    return Err(anyhow!("Failed to send request to {}: {}", addr, e));
-                }
-
-                println!("===> REQUEST SENT SUCCESSFULLY");
-
-                let mut msg = zmq::Message::new();
-                if let Err(e) = client.recv(&mut msg, 0) {
-                    return Err(anyhow!("Failed to receive response from {}: {}", addr, e));
-                }
-                
-                println!("===> RECEIVED RESPONSE");
-                let response_bytes = msg.to_vec();
-                let response: Value = serde_json::from_slice(&response_bytes)
-                    .map_err(|e| anyhow!("Failed to deserialize response from {}: {}", addr, e))?;
-
-                println!("===> PARSED RESPONSE: {:?}", response);
-                Ok(response)
+        match response_result {
+            Ok(Ok(Ok(true))) => {
+                info!("Health check succeeded for {}", addr);
+                return Ok(true);
             }
-        })
-    )
-    .await
-    .map_err(|_| anyhow!("ZMQ operation timed out after {} seconds", CONNECT_TIMEOUT_SECS + REQUEST_TIMEOUT_SECS + RECEIVE_TIMEOUT_SECS))?;
-
-    // Process the response from the blocking task
-    let response = match response_result {
-        Ok(Ok(response)) => response,
-        Ok(Err(e)) => return Err(e),
-        Err(e) => return Err(anyhow!("Task join error: {}", e)),
-    };
-
-    // Process the final `Value` response
-    match response.get("status").and_then(|s| s.as_str()) {
-        Some("success") => {
-            println!("===> OPERATION SUCCESSFUL");
-            match operation {
-                "get" => {
-                    if let Some(response_value) = response.get("value") {
-                        let display_value = if response_value.is_null() {
-                            "not found".to_string()
-                        } else {
-                            response_value.as_str().unwrap_or("<non-string value>").to_string()
-                        };
-                        println!("Key '{}': {}", key, display_value);
-                    } else {
-                        println!("Key '{}': no value in response", key);
-                    }
-                }
-                "set" => {
-                    println!("Set key '{}' successfully", key);
-                }
-                "delete" => {
-                    println!("Deleted key '{}' successfully", key);
-                }
-                _ => {}
+            Ok(Ok(Ok(false))) => {
+                last_error = Some(anyhow!("Health check failed: Invalid response from {}", addr));
             }
-            Ok(())
+            Ok(Ok(Err(e))) => {
+                last_error = Some(e);
+            }
+            Ok(Err(e)) => {
+                last_error = Some(e.into());
+            }
+            Err(_) => {
+                last_error = Some(anyhow!("Health check timed out after {} seconds", HEALTH_TIMEOUT_SECS));
+            }
         }
-        Some("error") => {
-            let message = response.get("message").and_then(|m| m.as_str()).unwrap_or("Unknown error");
-            println!("===> DAEMON ERROR: {}", message);
-            Err(anyhow!("Daemon error: {}", message))
-        }
-        _ => {
-            println!("===> INVALID RESPONSE: {:?}", response);
-            Err(anyhow!("Invalid response from {}: {:?}", addr, response))
+
+        if attempt < MAX_RETRIES {
+            let delay = BASE_RETRY_DELAY_MS * 2u64.pow(attempt - 1);
+            debug!("Retrying health check after {}ms", delay);
+            tokio::time::sleep(TokioDuration::from_millis(delay)).await;
         }
     }
+
+    error!("Health check failed after {} attempts", MAX_RETRIES);
+    Err(last_error.unwrap_or_else(|| anyhow!("Health check failed after {} attempts", MAX_RETRIES)))
 }
 
 type StartStorageFn = fn(
@@ -386,148 +480,222 @@ pub async fn initialize_storage_for_query(
     start_storage_interactive: StartStorageFn,
     stop_storage_interactive: StopStorageFn,
 ) -> Result<(), anyhow::Error> {
+    // Check if already initialized first
     if GLOBAL_STORAGE_ENGINE_MANAGER.get().is_some() {
         debug!("StorageEngineManager is already initialized. Skipping initialization.");
         return Ok(());
     }
 
+    // Use a static mutex to ensure only one initialization happens at a time
+    static INIT_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _guard = INIT_MUTEX.lock().await;
+
+    // Double-check after acquiring the lock
+    if GLOBAL_STORAGE_ENGINE_MANAGER.get().is_some() {
+        debug!("StorageEngineManager was initialized by another task while waiting for lock.");
+        return Ok(());
+    }
+
     info!("Initializing StorageEngineManager for non-interactive command execution.");
-    println!("===> Initializing Storage Engine...");
+    println!("Initializing Storage Engine...");
 
     let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
-    let mut running_daemons: Vec<DaemonMetadata> = daemon_registry
+
+    // Clean up stale daemon entries to prevent conflicts
+    debug!("Cleaning up stale daemon registry entries");
+    daemon_registry
+        .clear_all_daemons()
+        .await
+        .context("Failed to clear stale daemon registry entries")?;
+
+    let running_daemons: Vec<DaemonMetadata> = daemon_registry
         .get_all_daemon_metadata()
         .await
         .unwrap_or_default()
         .into_iter()
-        .filter(|d| d.service_type == "storage" && d.engine_type == Some(StorageEngineType::Sled.to_string()))
+        .filter(|d| {
+            // Accept ANY storage daemon, not just Sled
+            d.service_type == "storage" && d.engine_type.is_some()
+        })
         .collect();
 
-    if running_daemons.is_empty() {
-        info!("No running Sled daemon found, starting a new storage daemon...");
-        println!("===> No running Sled daemon found, starting a new storage daemon...");
-
-        let cwd = std::env::current_dir().context("Failed to get current working directory")?;
-        let config_path = cwd.join(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
-
-        let config = match load_storage_config_from_yaml(Some(config_path.clone())).await {
-            Ok(config) => {
-                info!("Successfully loaded existing storage config: {:?}", config);
-                config
-            },
-            Err(e) => {
-                warn!("Failed to load existing config from {:?}, using default values. Error: {}", config_path, e);
-                StorageConfig::default()
-            }
-        };
-
-        // If a default port is present in the config, use it, otherwise use the CLI's default
-        let port = config.default_port;
-
-        let storage_daemon_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>> = Arc::new(TokioMutex::new(None));
-        let storage_daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>> = Arc::new(TokioMutex::new(None));
-        let storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>> = Arc::new(TokioMutex::new(None));
-
-        start_storage_interactive(
-            Some(port),
-            Some(config_path),
-            Some(config),
-            None,
-            storage_daemon_shutdown_tx_opt,
-            storage_daemon_handle,
-            storage_daemon_port_arc,
-        ).await.context("Failed to start storage daemon")?;
-
-        info!("Successfully started a new storage daemon on port {}.", port);
-        println!("===> New storage daemon started successfully on port {}.", port);
-        
-        // No need to initialize the manager here, the user's flow will re-call this function
-        // after the daemon has been started, at which point it will enter the `if let Some(daemon)` block below.
-        return Ok(())
-    }
-
-    // Correcting the daemon registry state before proceeding.
-    for daemon in &mut running_daemons {
-        if let Some(mut data_path) = daemon.data_dir.take() {
-            // Find the parent directory to get the path without the port
-            if let Some(parent) = data_path.parent() {
-                daemon.data_dir = Some(parent.to_path_buf());
-            }
+    let config = match load_storage_config_from_yaml(None).await {
+        Ok(config) => {
+            info!("Successfully loaded storage config: {:?}", config);
+            config
+        },
+        Err(e) => {
+            warn!("Failed to load storage config, using default values. Error: {}", e);
+            StorageConfig::default()
         }
-        info!("Synchronizing daemon registry: Updating data path to '{:?}' for port {}", daemon.data_dir, daemon.port);
-        if let Err(e) = daemon_registry.update_daemon_metadata(daemon.clone()).await {
-            warn!("Failed to update DaemonMetadata for port {} during sync: {}", daemon.port, e);
+    };
+
+    let desired_port = config.default_port;
+
+    // Look for daemon on the desired port specifically
+    let daemon = running_daemons.iter().find(|d| d.port == desired_port);
+
+    if let Some(daemon) = daemon {
+        // Validate PID and health
+        let pid = daemon.pid;
+        if pid == 0 || !lib::daemon::daemon_management::check_pid_validity(pid).await {
+            println!("Daemon on port {} has invalid PID ({}), stopping it...", daemon.port, pid);
+            let storage_daemon_shutdown_tx = Arc::new(TokioMutex::new(None));
+            let storage_daemon_handle = Arc::new(TokioMutex::new(None));
+            let storage_daemon_port = Arc::new(TokioMutex::new(None));
+            stop_storage_interactive(
+                Some(daemon.port),
+                storage_daemon_shutdown_tx,
+                storage_daemon_handle,
+                storage_daemon_port,
+            ).await.context("Failed to stop unresponsive daemon")?;
         } else {
-            info!("Successfully synchronized DaemonMetadata for port {}", daemon.port);
+            // Get the engine type from daemon metadata
+            let engine_type_str = daemon.engine_type.as_ref()
+                .ok_or_else(|| anyhow!("Daemon has no engine type"))?;
+
+            println!("Found running {} daemon on port {} (PID {})", engine_type_str, daemon.port, pid);
+
+            // For KV operations with existing daemon, verify it's responsive
+            if engine_type_str == "Sled" {
+                let socket_path = format!("/opt/graphdb/graphdb-{}.ipc", daemon.port);
+                let addr = format!("ipc://{}", socket_path);
+
+                if tokio::fs::metadata(&socket_path).await.is_ok() {
+                    // Check daemon health with retries
+                    let max_health_attempts = 3;
+                    let health_delay_ms = 1000;
+                    let mut is_healthy = false;
+                    for attempt in 1..=max_health_attempts {
+                        debug!("Checking daemon health on port {} (attempt {}/{})", daemon.port, attempt, max_health_attempts);
+                        if check_daemon_health(&addr).await.unwrap_or(false) {
+                            info!("Daemon on port {} is healthy and responsive via ZeroMQ", daemon.port);
+                            is_healthy = true;
+                            break;
+                        }
+                        if attempt < max_health_attempts {
+                            debug!("Retrying health check after {}ms", health_delay_ms);
+                            tokio::time::sleep(TokioDuration::from_millis(health_delay_ms)).await;
+                        }
+                    }
+
+                    if is_healthy {
+                        // For KV operations, we don't need StorageEngineManager when daemon exists
+                        // The KV operations will route directly through ZeroMQ
+                        info!("Using existing daemon for operations - no StorageEngineManager initialization needed");
+                        return Ok(());
+                    } else {
+                        println!("Daemon on port {} is not responsive via ZeroMQ, stopping it...", daemon.port);
+                    }
+                } else {
+                    println!("Daemon on port {} has no IPC socket, may not be fully started", daemon.port);
+                }
+            } else {
+                // For non-Sled engines, create StorageEngineManager to connect to existing daemon
+                println!("Creating StorageEngineManager for existing {} daemon", engine_type_str);
+
+                let engine_type: StorageEngineType = engine_type_str.parse()
+                    .map_err(|_| anyhow!("Invalid engine type: {}", engine_type_str))?;
+
+                let cwd = std::env::current_dir().context("Failed to get current working directory")?;
+                let config_path = cwd.join(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
+
+                let manager = StorageEngineManager::new(
+                    engine_type,
+                    &config_path,
+                    false,
+                    Some(desired_port),
+                )
+                .await
+                .context(format!("Failed to initialize StorageEngineManager for engine {:?}", engine_type))?;
+
+                let async_manager = AsyncStorageEngineManager::from_manager(manager);
+
+                match GLOBAL_STORAGE_ENGINE_MANAGER.set(Arc::new(async_manager)) {
+                    Ok(_) => {
+                        info!("Successfully connected to existing storage engine on port {}", desired_port);
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        debug!("GLOBAL_STORAGE_ENGINE_MANAGER was set by another thread - continuing");
+                        return Ok(());
+                    }
+                }
+            }
+            // If we get here, the daemon needs to be stopped and restarted
+            let storage_daemon_shutdown_tx = Arc::new(TokioMutex::new(None));
+            let storage_daemon_handle = Arc::new(TokioMutex::new(None));
+            let storage_daemon_port = Arc::new(TokioMutex::new(None));
+            stop_storage_interactive(
+                Some(daemon.port),
+                storage_daemon_shutdown_tx,
+                storage_daemon_handle,
+                storage_daemon_port,
+            ).await.context("Failed to stop unresponsive daemon")?;
         }
     }
-    
-    // Now, find the most recent daemon (highest port) to connect to.
-    let daemon = running_daemons.iter().max_by_key(|m| m.port).or_else(|| running_daemons.first()).unwrap();
-    info!("Found running Sled storage daemon on port {}, connecting to it...", daemon.port);
-    println!("===> Connected to storage daemon on port {}.", daemon.port);
 
-    let engine_type = daemon.engine_type
-        .as_ref()
-        .and_then(|s| s.parse::<StorageEngineType>().ok())
-        .ok_or_else(|| anyhow!("Failed to parse engine type from running daemon: {}", daemon.engine_type.as_deref().unwrap_or("n/a")))?;
-    
-    let daemon_path = daemon.data_dir.clone().ok_or_else(|| anyhow!("Daemon metadata has no data directory path."))?;
-    let port = daemon.port;
+    // No running daemon on desired port, or daemon was stopped - start a new one
+    println!("No running daemon found on port {}, starting new storage daemon...", desired_port);
+    let cwd = std::env::current_dir().context("Failed to get current working directory")?;
+    let config_path = cwd.join(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
 
-    // Clean up any old lock files for the storage engine type
-    match engine_type {
-        StorageEngineType::Sled => {
-            // Reconstruct the full path with the port to check for the lock file
-            let full_daemon_path = daemon_path.join(port.to_string());
-            let lock_path = full_daemon_path.join("db.lck");
-            if lock_path.exists() {
-                info!("Removing Sled lock file at {:?}", lock_path);
-                fs::remove_file(&lock_path).context(format!("Failed to remove Sled lock file at {:?}", lock_path))?;
-            }
-        },
-        StorageEngineType::TiKV => {
-            if let Err(e) = TikvStorage::force_unlock().await {
-                warn!("Failed to clean up TiKV lock files: {}", e);
-            }
-        },
-        _ => {
-            debug!("No specific lock file cleanup implemented for engine type: {:?}", engine_type);
+    let storage_daemon_shutdown_tx = Arc::new(TokioMutex::new(None));
+    let storage_daemon_handle = Arc::new(TokioMutex::new(None));
+    let storage_daemon_port = Arc::new(TokioMutex::new(None));
+
+    start_storage_interactive(
+        Some(desired_port),
+        Some(config_path.clone()),
+        Some(config.clone()),
+        None,
+        storage_daemon_shutdown_tx,
+        storage_daemon_handle,
+        storage_daemon_port,
+    ).await.context("Failed to start storage daemon")?;
+
+    // Wait for daemon to become healthy
+    let socket_path = format!("/opt/graphdb/graphdb-{}.ipc", desired_port);
+    let addr = format!("ipc://{}", socket_path);
+    let max_attempts = 5;
+    let delay_ms = 1000;
+    for attempt in 1..=max_attempts {
+        debug!("Waiting for daemon on port {} to be ready (attempt {}/{})", desired_port, attempt, max_attempts);
+        if check_daemon_health(&addr).await.unwrap_or(false) {
+            info!("Daemon on port {} is ready", desired_port);
+            break;
         }
+        if attempt == max_attempts {
+            return Err(anyhow!("Daemon on port {} failed to become ready after {} attempts", desired_port, max_attempts));
+        }
+        debug!("Retrying daemon health check after {}ms", delay_ms);
+        tokio::time::sleep(TokioDuration::from_millis(delay_ms)).await;
     }
 
-    println!("===> BEFORE CALLING STORAGE MANGER");
-    let cwd = std::env::current_dir()
-        .map_err(|e| anyhow!("Failed to get current working directory: {}", e))?;
+    info!("Successfully started a new storage daemon on port {}.", desired_port);
+    println!("New storage daemon started successfully on port {}.", desired_port);
 
-    let config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
-    let absolute_config_path = cwd.join(&config_path);
-    
+    // Initialize StorageEngineManager for the newly started daemon
+    let engine_type = config.storage_engine_type;
     let manager = StorageEngineManager::new(
-        engine_type.clone(),
-        &absolute_config_path,
+        engine_type,
+        &config_path,
         false,
-        Some(port),
+        Some(desired_port),
     )
     .await
-    .context(format!(
-        "Failed to initialize StorageEngineManager for engine {:?}",
-        engine_type
-    ))?;
+    .context(format!("Failed to initialize StorageEngineManager for engine {:?}", engine_type))?;
 
-    // Pass plain manager (not Arc) into from_manager
     let async_manager = AsyncStorageEngineManager::from_manager(manager);
 
-    // Register global manager, wrapped in Arc
-    GLOBAL_STORAGE_ENGINE_MANAGER
-        .set(Arc::new(async_manager))
-        .map_err(|_| {
-            GraphError::ConfigurationError(
-                "Failed to set GLOBAL_STORAGE_ENGINE_MANAGER: already initialized".to_string(),
-            )
-    })?;
-
-    info!("Successfully connected to storage engine on port {:?}", daemon.port);
-
-    Ok(())
+    match GLOBAL_STORAGE_ENGINE_MANAGER.set(Arc::new(async_manager)) {
+        Ok(_) => {
+            info!("Successfully connected to storage engine on port {}", desired_port);
+            Ok(())
+        }
+        Err(_) => {
+            debug!("GLOBAL_STORAGE_ENGINE_MANAGER was set by another thread - continuing");
+            Ok(())
+        }
+    }
 }
