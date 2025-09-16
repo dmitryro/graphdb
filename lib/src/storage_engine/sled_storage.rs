@@ -40,7 +40,7 @@ impl SledStorage {
         let db_path = base_data_dir.join("sled").join(port.to_string());
 
         println!("===> USING SLED PATH {:?}", db_path);
-
+        
         fs::create_dir_all(&db_path)
             .await
             .map_err(|e| {
@@ -67,6 +67,8 @@ impl SledStorage {
         
         println!("===> Directory at {:?} is writable", db_path);
 
+        // This check is now here, but its logic has been simplified and moved.
+        // The main daemon start logic will handle checking the registry before calling this method.
         let daemon_metadata_opt = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await.ok().flatten();
 
         let pool = if let Some(_daemon_metadata) = daemon_metadata_opt {
@@ -135,7 +137,7 @@ impl SledStorage {
         println!("===> SUCCESSFULLY INITIALIZED SledStorage in {}ms", start_time.elapsed().as_millis());
         Ok(Self { pool })
     }
-
+    
     pub async fn new_with_db(config: &SledConfig, storage_config: &StorageConfig, existing_db: Arc<sled::Db>) -> Result<Self, GraphError> {
         let start_time = Instant::now();
         info!("Initializing SledStorage with existing database at {:?}", config.path);

@@ -1010,24 +1010,26 @@ pub async fn start_storage_interactive(
     Err(anyhow!("Storage daemon failed to start on port {}: health check failed", selected_port))
 }
 
-/// Stops the Storage Daemon on the specified port or all storage daemons if no port is provided.
+
 pub async fn stop_storage_interactive(
     port: Option<u16>,
     storage_daemon_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
     storage_daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
     storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
 ) -> Result<()> {
+    let config_path = PathBuf::from("./storage_daemon_server/storage_config.yaml");
+    let storage_config = load_storage_config_from_yaml(Some(config_path))
+        .await
+        .unwrap_or_else(|_| StorageConfig::default());
+    let default_port = if storage_config.default_port != 0 {
+        storage_config.default_port
+    } else {
+        DEFAULT_STORAGE_PORT
+    };
+
     let ports_to_stop = if let Some(p) = port {
         vec![p]
     } else {
-        let config_path = PathBuf::from("./storage_daemon_server/storage_config.yaml");
-        let storage_config = load_storage_config_from_yaml(Some(config_path)).await
-            .unwrap_or_else(|_| StorageConfig::default());
-        let default_port = if storage_config.default_port != 0 {
-            storage_config.default_port
-        } else {
-            DEFAULT_STORAGE_PORT
-        };
         let mut ports = GLOBAL_DAEMON_REGISTRY
             .get_all_daemon_metadata()
             .await
@@ -1043,11 +1045,11 @@ pub async fn stop_storage_interactive(
     };
 
     let mut errors = Vec::new();
-    for actual_port in ports_to_stop {
+    for actual_port in ports_to_stop.iter() {
         info!("Attempting to stop storage daemon on port {}", actual_port);
 
         // Check if the port is managed
-        let is_managed_port = storage_daemon_port_arc.lock().await.as_ref() == Some(&actual_port);
+        let is_managed_port = storage_daemon_port_arc.lock().await.as_ref() == Some(actual_port);
         if is_managed_port {
             let mut shutdown_tx_lock = storage_daemon_shutdown_tx_opt.lock().await;
             let mut handle_lock = storage_daemon_handle.lock().await;
@@ -1067,13 +1069,13 @@ pub async fn stop_storage_interactive(
         }
 
         // Check if the daemon is running
-        let is_running = check_process_status_by_port("Storage Daemon", actual_port).await;
+        let is_running = check_process_status_by_port("Storage Daemon", *actual_port).await;
         if !is_running {
             info!("No storage daemon running on port {}", actual_port);
             println!("No storage daemon running on port {}.", actual_port);
         } else {
             // Stop the process
-            if let Err(e) = stop_process_by_port("Storage Daemon", actual_port).await {
+            if let Err(e) = stop_process_by_port("Storage Daemon", *actual_port).await {
                 errors.push(anyhow!("Failed to stop storage daemon process on port {}: {}", actual_port, e));
             } else {
                 info!("Successfully stopped storage daemon process on port {}", actual_port);
@@ -1082,7 +1084,7 @@ pub async fn stop_storage_interactive(
         }
 
         // Retrieve metadata to get the storage engine type and path
-        let metadata = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(actual_port).await?;
+        let metadata = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(*actual_port).await?;
         if let Some(metadata) = metadata {
             let engine_type = metadata.engine_type.as_ref().map(|s| s.as_str());
             let engine_path = metadata.data_dir.as_ref();
@@ -1133,12 +1135,12 @@ pub async fn stop_storage_interactive(
             }
         }
 
-        // Always attempt to deregister the daemon
-        if let Err(e) = GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("storage", actual_port).await {
-            warn!("Failed to remove storage daemon (port: {}) from registry: {}", actual_port, e);
-            errors.push(anyhow!("Failed to remove storage daemon (port: {}) from registry: {}", actual_port, e));
+        // Remove only the specific daemon from the registry
+        if let Err(e) = GLOBAL_DAEMON_REGISTRY.unregister_daemon(*actual_port).await {
+            warn!("Failed to unregister storage daemon (port: {}) from registry: {}", actual_port, e);
+            errors.push(anyhow!("Failed to unregister storage daemon (port: {}) from registry: {}", actual_port, e));
         } else {
-            info!("Successfully removed storage daemon on port {} from registry", actual_port);
+            info!("Successfully unregistered storage daemon on port {} from registry", actual_port);
             println!("Storage daemon on port {} removed from registry.", actual_port);
         }
 
@@ -1147,7 +1149,7 @@ pub async fn stop_storage_interactive(
         let max_attempts = 7;
         let mut port_free = false;
         while attempts < max_attempts {
-            if is_port_free(actual_port).await {
+            if is_port_free(*actual_port).await {
                 port_free = true;
                 info!("Storage daemon on port {} stopped successfully", actual_port);
                 println!("Storage daemon on port {} stopped.", actual_port);
@@ -1160,6 +1162,25 @@ pub async fn stop_storage_interactive(
 
         if !port_free {
             errors.push(anyhow!("Port {} is still in use after attempting to stop storage daemon", actual_port));
+        }
+    }
+
+    // Verify other storage daemons are still running
+    let all_daemons = GLOBAL_DAEMON_REGISTRY
+        .get_all_daemon_metadata()
+        .await
+        .unwrap_or_default();
+    let ports_to_stop_ref = ports_to_stop.clone();
+    let remaining_daemons: Vec<_> = all_daemons
+        .iter()
+        .filter(|d| d.service_type == "storage" && !ports_to_stop_ref.contains(&d.port))
+        .collect();
+    for daemon in remaining_daemons {
+        if !check_process_status_by_port("Storage Daemon", daemon.port).await {
+            warn!("Storage daemon on port {} is unexpectedly down", daemon.port);
+            errors.push(anyhow!("Storage daemon on port {} is unexpectedly down", daemon.port));
+        } else {
+            info!("Storage daemon on port {} remains running", daemon.port);
         }
     }
 

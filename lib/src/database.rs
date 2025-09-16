@@ -28,8 +28,8 @@ use crate::storage_engine::mysql_storage::MySQLStorage;
 use crate::storage_engine::{GraphStorageEngine, StorageEngine};
 
 pub struct Database {
-    storage: Arc<dyn GraphStorageEngine + Send + Sync>,
-    config: StorageConfig,
+    pub storage: Arc<dyn GraphStorageEngine + Send + Sync>,
+    pub config: StorageConfig,
 }
 
 impl Database {
