@@ -42,7 +42,7 @@ use crate::util::{build as util_build_key, UtilComponent, read_uuid, read_identi
 use std::io::Cursor;
 #[cfg(feature = "with-rocksdb")]
 use log::{info, debug, error, warn};
-
+use crate::config::{ QueryPlan, QueryResult };
 #[cfg(feature = "with-rocksdb")]
 const CF_NAMES: &[&str] = &[
     "vertices",
@@ -274,6 +274,12 @@ impl GraphStorageEngine for RocksdbStorage {
             "query": query_string,
             "result": "RocksDB query execution placeholder"
         }))
+    }
+
+    async fn execute_query(&self, query_plan: QueryPlan) -> Result<QueryResult, GraphError> {
+        info!("Executing query on SledStorage (returning null as not implemented)");
+        println!("===> EXECUTING QUERY ON RocksDB STORAGE (NOT IMPLEMENTED)");
+        Ok(QueryResult::Null)
     }
 
     async fn create_vertex(&self, vertex: Vertex) -> GraphResult<()> {

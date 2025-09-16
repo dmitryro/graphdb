@@ -4,6 +4,7 @@ use std::time::SystemTime;
 use tokio::sync::{Mutex as TokioMutex, RwLock};
 use crate::config::{ReplicationStrategy, NodeHealth};
 use models::errors::{GraphResult, GraphError};
+use log::{info, debug, warn, error, trace};
 pub use crate::config::config_structs::{ LoadBalancer };
 
 
@@ -38,7 +39,7 @@ impl LoadBalancer {
             node_health.error_count += 1;
         }
         
-        println!("===> LOAD BALANCER: Updated node {} health: healthy={}, response_time={}ms, errors={}", 
+        info!("===> LOAD BALANCER: Updated node {} health: healthy={}, response_time={}ms, errors={}", 
                  port, is_healthy, response_time_ms, node_health.error_count);
     }
 
@@ -58,7 +59,7 @@ impl LoadBalancer {
         let selected_port = healthy_nodes[*index % healthy_nodes.len()];
         *index = (*index + 1) % healthy_nodes.len();
         
-        println!("===> LOAD BALANCER: Selected read node {}", selected_port);
+        info!("===> LOAD BALANCER: Selected read node {}", selected_port);
         Some(selected_port)
     }
 
@@ -89,7 +90,7 @@ impl LoadBalancer {
             }
         };
         
-        println!("===> LOAD BALANCER: Selected write nodes {:?} for strategy {:?}", 
+        info!("===> LOAD BALANCER: Selected write nodes {:?} for strategy {:?}", 
                  selected_nodes, strategy);
         selected_nodes
     }
@@ -119,7 +120,7 @@ impl LoadBalancer {
         healthy_nodes.sort_by_key(|node| node.response_time_ms);
         let selected_port = healthy_nodes[0].port;
 
-        println!("===> LOAD BALANCER: Selected least loaded node {}", selected_port);
+        info!("===> LOAD BALANCER: Selected least loaded node {}", selected_port);
         Some(selected_port)
     }
 
@@ -133,9 +134,9 @@ impl LoadBalancer {
     pub async fn remove_node(&self, port: u16) {
         let mut nodes = self.nodes.write().await;
         if nodes.remove(&port).is_some() {
-            println!("===> LOAD BALANCER: Removed node {}", port);
+            info!("===> LOAD BALANCER: Removed node {}", port);
         } else {
-            println!("===> LOAD BALANCER: Node {} not found, nothing to remove", port);
+            info!("===> LOAD BALANCER: Node {} not found, nothing to remove", port);
         }
     }
 

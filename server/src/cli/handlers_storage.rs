@@ -24,7 +24,8 @@ use serde_yaml2 as serde_yaml;
 use rocksdb::{DB, Options};
 use reqwest::Client;
 use nix::sys::signal::{kill, Signal};
-use sysinfo::{System, Process, Pid};
+use sysinfo::{System, Process, Pid as NixPid};
+use nix::unistd::Pid;
 use std::time::Instant;
 use lib::commands::{CommandType, Commands, StartAction, StorageAction, UseAction};
 use lib::config::{
@@ -1013,182 +1014,81 @@ pub async fn start_storage_interactive(
 
 pub async fn stop_storage_interactive(
     port: Option<u16>,
-    storage_daemon_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
-    storage_daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
-    storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
+    shutdown_tx: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
+    daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
+    daemon_port: Arc<TokioMutex<Option<u16>>>,
 ) -> Result<()> {
-    let config_path = PathBuf::from("./storage_daemon_server/storage_config.yaml");
-    let storage_config = load_storage_config_from_yaml(Some(config_path))
-        .await
-        .unwrap_or_else(|_| StorageConfig::default());
-    let default_port = if storage_config.default_port != 0 {
-        storage_config.default_port
-    } else {
-        DEFAULT_STORAGE_PORT
+    let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
+
+    let port = match port {
+        Some(p) => p,
+        None => {
+            return Err(anyhow::anyhow!("No port specified for stopping storage daemon"));
+        }
     };
 
-    let ports_to_stop = if let Some(p) = port {
-        vec![p]
-    } else {
-        let mut ports = GLOBAL_DAEMON_REGISTRY
-            .get_all_daemon_metadata()
-            .await
-            .unwrap_or_default()
-            .iter()
-            .filter(|d| d.service_type == "storage")
-            .map(|d| d.port)
-            .collect::<Vec<u16>>();
-        if !ports.contains(&default_port) {
-            ports.push(default_port);
-        }
-        ports
-    };
-
-    let mut errors = Vec::new();
-    for actual_port in ports_to_stop.iter() {
-        info!("Attempting to stop storage daemon on port {}", actual_port);
-
-        // Check if the port is managed
-        let is_managed_port = storage_daemon_port_arc.lock().await.as_ref() == Some(actual_port);
-        if is_managed_port {
-            let mut shutdown_tx_lock = storage_daemon_shutdown_tx_opt.lock().await;
-            let mut handle_lock = storage_daemon_handle.lock().await;
-            if let Some(tx) = shutdown_tx_lock.take() {
-                if tx.send(()).is_ok() {
-                    info!("Sent shutdown signal to storage daemon on port {}", actual_port);
-                } else {
-                    warn!("Failed to send shutdown signal to storage daemon on port {}", actual_port);
-                }
-            }
-            if let Some(handle) = handle_lock.take() {
-                if let Err(e) = handle.await {
-                    warn!("Failed to join storage daemon handle on port {}: {}", actual_port, e);
-                }
-                *storage_daemon_port_arc.lock().await = None;
-            }
-        }
-
-        // Check if the daemon is running
-        let is_running = check_process_status_by_port("Storage Daemon", *actual_port).await;
-        if !is_running {
-            info!("No storage daemon running on port {}", actual_port);
-            println!("No storage daemon running on port {}.", actual_port);
-        } else {
-            // Stop the process
-            if let Err(e) = stop_process_by_port("Storage Daemon", *actual_port).await {
-                errors.push(anyhow!("Failed to stop storage daemon process on port {}: {}", actual_port, e));
-            } else {
-                info!("Successfully stopped storage daemon process on port {}", actual_port);
-                println!("Storage daemon process on port {} stopped.", actual_port);
-            }
-        }
-
-        // Retrieve metadata to get the storage engine type and path
-        let metadata = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(*actual_port).await?;
-        if let Some(metadata) = metadata {
-            let engine_type = metadata.engine_type.as_ref().map(|s| s.as_str());
-            let engine_path = metadata.data_dir.as_ref();
-
-            // Release locks based on engine type
-            if let (Some(engine_type), Some(engine_path)) = (engine_type, engine_path) {
-                match engine_type {
-                    "Sled" => {
-                        if engine_path.exists() {
-                            if let Err(e) = SledStorage::force_unlock(engine_path).await {
-                                warn!("Failed to unlock Sled database at {:?}: {}", engine_path, e);
-                                errors.push(anyhow!("Failed to unlock Sled database at {:?}: {}", engine_path, e));
-                            } else {
-                                info!("Successfully unlocked Sled database at {:?}", engine_path);
-                                println!("===> SUCCESSFULLY UNLOCKED SLED DATABASE AT {:?}", engine_path);
-                            }
-                            // Verify no lock file exists
-                            let lock_file = engine_path.join("db.lck");
-                            if lock_file.exists() {
-                                errors.push(anyhow!("Lock file still exists at {:?} after unlock attempt", lock_file));
-                            } else {
-                                println!("===> NO LOCK FILE FOUND AT {:?}", lock_file);
-                            }
-                        }
-                    }
-                    "RocksDB" => {
-                        if engine_path.exists() {
-                            if let Err(e) = SurrealdbGraphStorage::force_unlock(engine_path).await {
-                                warn!("Failed to unlock RocksDB database at {:?}: {}", engine_path, e);
-                                errors.push(anyhow!("Failed to unlock RocksDB database at {:?}: {}", engine_path, e));
-                            } else {
-                                info!("Successfully unlocked RocksDB database at {:?}", engine_path);
-                                println!("===> SUCCESSFULLY UNLOCKED ROCKSDB DATABASE AT {:?}", engine_path);
-                            }
-                            // Verify no lock file exists
-                            let lock_file = engine_path.join("LOCK");
-                            if lock_file.exists() {
-                                errors.push(anyhow!("Lock file still exists at {:?} after unlock attempt", lock_file));
-                            } else {
-                                println!("===> NO LOCK FILE FOUND AT {:?}", lock_file);
-                            }
-                        }
-                    }
-                    _ => {
-                        warn!("Unknown engine type {} for port {}", engine_type, actual_port);
-                    }
-                }
-            }
-        }
-
-        // Remove only the specific daemon from the registry
-        if let Err(e) = GLOBAL_DAEMON_REGISTRY.unregister_daemon(*actual_port).await {
-            warn!("Failed to unregister storage daemon (port: {}) from registry: {}", actual_port, e);
-            errors.push(anyhow!("Failed to unregister storage daemon (port: {}) from registry: {}", actual_port, e));
-        } else {
-            info!("Successfully unregistered storage daemon on port {} from registry", actual_port);
-            println!("Storage daemon on port {} removed from registry.", actual_port);
-        }
-
-        // Verify port is free with retries
-        let mut attempts = 0;
-        let max_attempts = 7;
-        let mut port_free = false;
-        while attempts < max_attempts {
-            if is_port_free(*actual_port).await {
-                port_free = true;
-                info!("Storage daemon on port {} stopped successfully", actual_port);
-                println!("Storage daemon on port {} stopped.", actual_port);
-                break;
-            }
-            debug!("Port {} still in use after attempt {}", actual_port, attempts + 1);
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            attempts += 1;
-        }
-
-        if !port_free {
-            errors.push(anyhow!("Port {} is still in use after attempting to stop storage daemon", actual_port));
-        }
-    }
-
-    // Verify other storage daemons are still running
-    let all_daemons = GLOBAL_DAEMON_REGISTRY
+    // Find the daemon for the specified port
+    let daemon = daemon_registry
         .get_all_daemon_metadata()
         .await
-        .unwrap_or_default();
-    let ports_to_stop_ref = ports_to_stop.clone();
-    let remaining_daemons: Vec<_> = all_daemons
-        .iter()
-        .filter(|d| d.service_type == "storage" && !ports_to_stop_ref.contains(&d.port))
-        .collect();
-    for daemon in remaining_daemons {
-        if !check_process_status_by_port("Storage Daemon", daemon.port).await {
-            warn!("Storage daemon on port {} is unexpectedly down", daemon.port);
-            errors.push(anyhow!("Storage daemon on port {} is unexpectedly down", daemon.port));
-        } else {
-            info!("Storage daemon on port {} remains running", daemon.port);
+        .context("Failed to access daemon registry")?
+        .into_iter()
+        .find(|d| d.service_type == "storage" && d.port == port);
+
+    match daemon {
+        Some(d) if d.pid != 0 && check_pid_validity(d.pid).await => {
+            info!("Attempting to stop Storage Daemon on port {} (PID {})...", port, d.pid);
+            // Send SIGTERM to the daemon's PID
+            kill(Pid::from_raw(d.pid as i32), Signal::SIGTERM)
+                .context(format!("Failed to send SIGTERM to PID {} for port {}", d.pid, port))?;
+            info!("Sent SIGTERM to PID {} for Storage Daemon on port {}.", d.pid, port);
+
+            // Wait briefly to ensure the process exits
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if is_port_free(port).await {
+                info!("Port {} is now free.", port);
+            } else {
+                warn!("Port {} is still in use after SIGTERM.", port);
+            }
+
+            // Remove the daemon from the registry
+            daemon_registry
+                .unregister_daemon(port)
+                .await
+                .context(format!("Failed to remove daemon on port {} from registry", port))?;
+            info!("Storage daemon on port {} removed from registry.", port);
+        }
+        Some(_) => {
+            info!("No valid PID found for Storage Daemon on port {}. Removing from registry.", port);
+            daemon_registry
+                .unregister_daemon(port)
+                .await
+                .context(format!("Failed to remove daemon on port {} from registry", port))?;
+        }
+        None => {
+            info!("No Storage Daemon found on port {} in registry.", port);
         }
     }
 
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(anyhow!("Failed to stop storage daemon: {:?}", errors))
+    // Clear shutdown_tx and daemon_handle for the specified port
+    let mut shutdown_tx_guard = shutdown_tx.lock().await;
+    if shutdown_tx_guard.is_some() {
+        if let Some(tx) = shutdown_tx_guard.take() {
+            let _ = tx.send(());
+        }
     }
+
+    let mut daemon_handle_guard = daemon_handle.lock().await;
+    if let Some(handle) = daemon_handle_guard.take() {
+        let _ = handle.await;
+    }
+
+    let mut daemon_port_guard = daemon_port.lock().await;
+    *daemon_port_guard = None;
+
+    info!("Storage daemon on port {} stopped.", port);
+    println!("Storage daemon on port {} stopped.", port);
+    Ok(())
 }
 
 /// Displays status of storage daemons only.
@@ -1826,7 +1726,7 @@ async fn ensure_process_terminated(pid: u32) -> Result<()> {
     
     while attempt <= max_attempts {
         system.refresh_all();
-        if let Some(process) = system.process(Pid::from(pid as usize)) {
+        if let Some(process) = system.process(NixPid::from(pid as usize)) {
             warn!("Process {} still running, attempting to terminate (attempt {})", pid, attempt);
             process.kill();
             tokio::time::sleep(Duration::from_millis(200)).await;

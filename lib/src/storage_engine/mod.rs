@@ -18,11 +18,18 @@ use serde_json::Value;
 
 // Declare submodules
 pub mod config;
+pub mod errors;
 pub mod inmemory_storage;
 pub mod raft_storage;
 pub mod storage_utils;
 pub mod storage_engine;
 pub mod load_balancer;
+pub mod sled_client;
+pub mod zmq_client;
+pub mod edge;
+pub mod node;
+pub mod types;
+
 #[cfg(feature = "with-rocksdb")]
 pub mod rocksdb_storage;
 #[cfg(feature = "with-tikv")]
@@ -70,6 +77,11 @@ pub use mysql_storage::MySQLStorage;
 #[cfg(any(feature = "with-sled", feature = "with-rocksdb", feature = "with-tikv"))]
 pub use hybrid_storage::HybridStorage;
 pub use inmemory_storage::InMemoryStorage;
+pub use zmq_client::*;
+pub use node::*;
+pub use edge::*;
+pub use types::*;
+pub use errors::*;
 
 /// Creates a storage engine instance based on the provided configuration.
 ///

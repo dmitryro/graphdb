@@ -58,7 +58,7 @@ use openraft_memstore::TypeConfig as RaftMemStoreTypeConfig;
 use crate::daemon::daemon_config::DAEMON_REGISTRY_DB_PATH; // Corrected import
 use crate::config::{DEFAULT_DATA_DIRECTORY, DEFAULT_LOG_DIRECTORY, LOCK_FILE_PATH,
                                  DEFAULT_STORAGE_PORT, StorageConfig, SledConfig, RocksdbConfig, TikvConfig,
-                                 RedisConfig, MySQLConfig, PostgreSQLConfig, TypeConfig, 
+                                 RedisConfig, MySQLConfig, PostgreSQLConfig, TypeConfig, QueryPlan, QueryResult,
                                  StorageConfigInner, SelectedStorageConfig, StorageConfigWrapper, 
                                  load_storage_config_from_yaml,
                                  create_default_storage_yaml_config,
@@ -374,6 +374,12 @@ impl GraphStorageEngine for SurrealdbGraphStorage {
         
         Ok(value)
     }
+
+
+    async fn execute_query(&self, query_plan: QueryPlan) -> Result<QueryResult, GraphError> {
+        info!("Executing query on Surreal (returning null as not implemented)");
+        Ok(QueryResult::Null)
+    }       
 
     async fn create_vertex(&self, vertex: Vertex) -> Result<(), GraphError> {
         let created: Option<Vertex> = self.db.create(("vertices", vertex.id.0.to_string()))
@@ -1054,6 +1060,7 @@ pub trait GraphStorageEngine: StorageEngine + Send + Sync + Debug + 'static {
     async fn delete_edge(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> Result<(), GraphError>;
     async fn get_all_edges(&self) -> Result<Vec<Edge>, GraphError>;
     async fn clear_data(&self) -> Result<(), GraphError>;
+    async fn execute_query(&self, query_plan: QueryPlan) -> Result<QueryResult, GraphError>;
     fn as_any(&self) -> &dyn Any;
     async fn close(&self) -> Result<(), GraphError>;
 }

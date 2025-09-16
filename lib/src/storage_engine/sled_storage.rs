@@ -7,8 +7,9 @@ use tokio::fs;
 use tokio::sync::{OnceCell, Mutex as TokioMutex};
 use log::{info, debug, warn, error, trace};
 pub use crate::config::{
-    SledDbWithPath, SledConfig, SledStorage, SledDaemonPool, load_storage_config_from_yaml, 
-    DEFAULT_DATA_DIRECTORY, DEFAULT_STORAGE_PORT, StorageConfig, StorageEngineType
+    SledDbWithPath, SledConfig, SledStorage, SledDaemon, SledDaemonPool, load_storage_config_from_yaml, 
+    DEFAULT_DATA_DIRECTORY, DEFAULT_STORAGE_PORT, StorageConfig, StorageEngineType,
+    QueryResult, QueryPlan,
 };
 use crate::storage_engine::storage_utils::{serialize_vertex, deserialize_vertex, serialize_edge, deserialize_edge, create_edge_key};
 use models::{Vertex, Edge, Identifier, identifiers::SerializableUuid};
@@ -22,6 +23,7 @@ use serde_json::Value;
 use std::any::Any;
 use futures::future::join_all;
 use tokio::time::{timeout, Duration};
+use crate::storage_engine::sled_client::{ SledClient };
 
 pub static SLED_DB: LazyLock<OnceCell<TokioMutex<SledDbWithPath>>> = LazyLock::new(|| OnceCell::new());
 pub static SLED_POOL_MAP: LazyLock<OnceCell<TokioMutex<HashMap<u16, Arc<TokioMutex<SledDaemonPool>>>>>> = LazyLock::new(|| OnceCell::new());
@@ -137,7 +139,7 @@ impl SledStorage {
         println!("===> SUCCESSFULLY INITIALIZED SledStorage in {}ms", start_time.elapsed().as_millis());
         Ok(Self { pool })
     }
-    
+
     pub async fn new_with_db(config: &SledConfig, storage_config: &StorageConfig, existing_db: Arc<sled::Db>) -> Result<Self, GraphError> {
         let start_time = Instant::now();
         info!("Initializing SledStorage with existing database at {:?}", config.path);
@@ -274,6 +276,10 @@ impl SledStorage {
         println!("===> SUCCESSFULLY INITIALIZED SLED STORAGE WITH EXISTING DB IN {}ms", start_time.elapsed().as_millis());
         Ok(Self { pool })
     }
+
+    /// Creates a new `SledStorage` instance using an existing, connected `SledClient`.
+    /// This method bypasses the complex setup of `SledStorage::new` and is
+    /// intended for cases where the client connection is managed externally.
 
     pub fn new_pinned(config: &SledConfig, storage_config: &StorageConfig) -> Box<dyn futures::Future<Output = Result<Self, GraphError>> + Send + 'static> {
         let config = config.clone();
@@ -946,6 +952,13 @@ impl GraphStorageEngine for SledStorage {
         println!("===> EXECUTING QUERY ON SLED STORAGE (NOT IMPLEMENTED)");
         Ok(Value::Null)
     }
+
+    async fn execute_query(&self, query_plan: QueryPlan) -> Result<QueryResult, GraphError> {
+        info!("Executing query on SledStorage (returning null as not implemented)");
+        println!("===> EXECUTING QUERY ON SLED STORAGE (NOT IMPLEMENTED)");
+        Ok(QueryResult::Null)
+    }
+
 
     async fn get_all_vertices(&self) -> Result<Vec<Vertex>, GraphError> {
         let db = SLED_DB.get().ok_or_else(|| GraphError::StorageError("Sled database not initialized".to_string()))?;

@@ -27,6 +27,29 @@ use openraft_sled::SledRaftStorage;
 use sled::{Config, Db, Tree};
 use crate::daemon_registry::DaemonMetadata;
 
+
+/// Represents a plan for a graph query.
+/// In this context, it's a simple container for the query string itself,
+/// which would be interpreted by the remote storage engine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryPlan {
+    /// The string representation of the query to be executed.
+    pub query: String,
+}
+
+/// Represents the result of an executed graph query.
+/// It contains the raw data returned by the storage engine,
+/// typically as a string that can be deserialized into a more
+/// complex data structure later.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QueryResult {
+    /// A successful query result containing a string of data.
+    Success(String),
+    /// Represents a null or empty result.
+    Null,
+}
+
+
 /// Replication strategy for data operations
 /// Represents the strategy for replicating data writes.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

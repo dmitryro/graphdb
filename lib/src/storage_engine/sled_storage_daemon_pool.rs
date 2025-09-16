@@ -1491,6 +1491,12 @@ impl SledDaemonPool {
         Ok(pool)
     }
 
+    /// Adds a new SledDaemon instance to the pool.
+    /// This method is essential for `SledStorage::new_with_client` to work.
+    pub fn add_daemon(&mut self, daemon: Arc<SledDaemon>) {
+        self.daemons.insert(daemon.port, daemon);
+    }
+
     /// Enhanced insert with replication across multiple nodes
     pub async fn insert_replicated(&self, key: &[u8], value: &[u8], use_raft: bool) -> GraphResult<()> {
         let strategy = if use_raft && self.use_raft {

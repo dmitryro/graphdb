@@ -1190,9 +1190,9 @@ pub fn is_port_within_range(port: u16, cluster_ports: &[u16]) -> bool {
     cluster_ports.contains(&port)
 }
 
-pub async fn is_port_free(port: u16) -> bool {
-    !is_port_listening(port).await
-}
+//pub async fn is_port_free(port: u16) -> bool {
+//   !is_port_listening(port).await
+//}
 
 pub async fn is_port_listening(port: u16) -> bool {
     tokio::time::timeout(Duration::from_secs(1), async {
@@ -1249,23 +1249,34 @@ pub async fn find_all_running_rest_api_ports() -> Vec<u16> {
     running_ports
 }
 
-// Helper function to check if PID is still valid
+/// Helper function to check if a process ID is valid by sending a signal 0.
+/// This works on most Unix-like systems.
 pub async fn check_pid_validity(pid: u32) -> bool {
-    use nix::sys::signal::{kill, Signal};
-    use nix::unistd::Pid;
-    match kill(Pid::from_raw(pid as i32), None) {
-        Ok(_) => true,
-        Err(nix::Error::ESRCH) => {
-            debug!("PID {} is no longer valid (process does not exist)", pid);
-            false
-        }
-        Err(e) => {
-            warn!("Failed to check PID {} validity: {}", pid, e);
-            false
-        }
-    }
+    // We send signal 0, which is a way to check if a process exists and we have permissions.
+    // It will return a zero exit code if the process exists.
+    let output = tokio::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .output()
+        .await
+        .unwrap_or_else(|_| {
+            debug!("Failed to run 'kill -0' command to check PID {}", pid);
+            std::process::Output {
+                status: std::process::ExitStatus::default(),
+                stdout: b"".to_vec(),
+                stderr: b"".to_vec(),
+            }
+        });
+
+    output.status.success()
 }
 
+/// Helper function to check if a port is free.
+pub async fn is_port_free(port: u16) -> bool {
+    tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
+        .await
+        .is_ok()
+}
 
 pub async fn stop_process_by_pid(process_name: &str, pid: u32) -> Result<(), anyhow::Error> {
     info!("Attempting to stop process {} with PID {}", process_name, pid);
@@ -1316,6 +1327,25 @@ pub async fn stop_process_by_pid(process_name: &str, pid: u32) -> Result<(), any
         Err(anyhow!("Process termination by PID not supported on non-Unix systems"))
     }
 }
+
+// Helper function to parse cluster range
+pub fn parse_port_cluster_range(range: &str) -> Result<Vec<u16>, anyhow::Error> {
+    if range.is_empty() {
+        return Ok(vec![]);
+    }
+    if range.contains('-') {
+        let parts: Vec<&str> = range.split('-').collect();
+        if parts.len() != 2 {
+            return Err(anyhow!("Invalid cluster range format: {}", range));
+        }                        
+        let start: u16 = parts[0].parse().context("Failed to parse cluster range start")?;
+        let end: u16 = parts[1].parse().context("Failed to parse cluster range end")?;
+        Ok((start..=end).collect())
+    } else {
+        let port: u16 = range.parse().context("Failed to parse single port")?;
+        Ok(vec![port])            
+    }
+}        
 
 pub async fn is_pid_running(pid: u32) -> bool {
     let mut sys = sysinfo::System::new();

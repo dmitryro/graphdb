@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use tokio::sync::Mutex; // Use Tokio's Mutex
 use uuid::Uuid;
 use log::info;
-
+use crate::config::{ QueryPlan, QueryResult };
 #[derive(Debug)]
 pub struct InMemoryStorage {
     config: StorageConfig,
@@ -123,6 +123,12 @@ impl GraphStorageEngine for InMemoryStorage {
             "result": "In-memory query execution placeholder"
         }))
     }
+
+    async fn execute_query(&self, query_plan: QueryPlan) -> Result<QueryResult, GraphError> {
+        info!("Executing query on InMemoryStorage (returning null as not implemented)");
+        println!("===> EXECUTING QUERY ON InMemory STORAGE (NOT IMPLEMENTED)");
+        Ok(QueryResult::Null)
+    }       
 
     async fn create_vertex(&self, vertex: Vertex) -> GraphResult<()> {
         let mut vertices = self.vertices.lock().await;
