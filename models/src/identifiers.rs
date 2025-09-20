@@ -23,12 +23,14 @@ impl Encode for SerializableUuid {
         self.0.as_bytes().encode(encoder)
     }
 }
+
 impl<CTX> Decode<CTX> for SerializableUuid {
     fn decode<D: bincode::de::Decoder>(decoder: &mut D) -> Result<Self, bincode::error::DecodeError> {
         let arr: [u8; 16] = Decode::decode(decoder)?;
         Ok(SerializableUuid(Uuid::from_bytes(arr)))
     }
 }
+
 impl<'de, CTX> BorrowDecode<'de, CTX> for SerializableUuid {
     fn borrow_decode<D: bincode::de::BorrowDecoder<'de>>(decoder: &mut D) -> Result<Self, bincode::error::DecodeError> {
         let arr: [u8; 16] = BorrowDecode::borrow_decode(decoder)?;
@@ -41,6 +43,7 @@ impl From<Uuid> for SerializableUuid {
         SerializableUuid(uuid)
     }
 }
+
 impl From<SerializableUuid> for Uuid {
     fn from(s_uuid: SerializableUuid) -> Self {
         s_uuid.0
@@ -56,12 +59,14 @@ impl Encode for SerializableInternString {
         self.0.as_ref().encode(encoder)
     }
 }
+
 impl<CTX> Decode<CTX> for SerializableInternString {
     fn decode<D: bincode::de::Decoder>(decoder: &mut D) -> Result<Self, bincode::error::DecodeError> {
         let s: String = Decode::decode(decoder)?;
         Ok(SerializableInternString(Intern::new(s)))
     }
 }
+
 impl<'de, CTX> BorrowDecode<'de, CTX> for SerializableInternString {
     fn borrow_decode<D: bincode::de::BorrowDecoder<'de>>(decoder: &mut D) -> Result<Self, bincode::error::DecodeError> {
         let s: String = BorrowDecode::borrow_decode(decoder)?;
@@ -74,9 +79,29 @@ impl From<Intern<String>> for SerializableInternString {
         SerializableInternString(intern_str)
     }
 }
+
 impl From<SerializableInternString> for Intern<String> {
     fn from(s_intern_str: SerializableInternString) -> Self {
         s_intern_str.0
+    }
+}
+
+impl AsRef<str> for SerializableInternString {
+    fn as_ref(&self) -> &str {
+        self.0.as_ref()
+    }
+}
+
+impl Deref for SerializableInternString {
+    type Target = str;
+    fn deref(&self) -> &Self::Target {
+        self.0.deref()
+    }
+}
+
+impl fmt::Display for SerializableInternString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -102,6 +127,7 @@ impl Identifier {
         }
         Ok(Self(SerializableInternString(Intern::new(value))))
     }
+
     #[allow(unsafe_code)]
     pub unsafe fn new_unchecked(value: String) -> Self {
         Self(SerializableInternString(Intern::new(value)))
@@ -110,31 +136,36 @@ impl Identifier {
 
 impl AsRef<str> for Identifier {
     fn as_ref(&self) -> &str {
-        self.0.0.as_ref()
+        self.0.as_ref()
     }
 }
+
 impl Deref for Identifier {
     type Target = str;
     fn deref(&self) -> &Self::Target {
-        self.0.0.deref()
+        self.0.deref()
     }
 }
+
 impl FromStr for Identifier {
     type Err = ValidationError;
     fn from_str(s: &str) -> ValidationResult<Self> {
         Self::new(s.to_string())
     }
 }
+
 impl fmt::Display for Identifier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0.0)
+        write!(f, "{}", self.0)
     }
 }
+
 impl PartialOrd for Identifier {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         self.0.partial_cmp(&other.0)
     }
 }
+
 impl Ord for Identifier {
     fn cmp(&self, other: &Self) -> Ordering {
         self.0.cmp(&other.0)
@@ -143,8 +174,7 @@ impl Ord for Identifier {
 
 #[cfg(test)]
 mod tests {
-    use super::Identifier;
-    use crate::errors::ValidationError;
+    use super::{Identifier, ValidationError};
     use core::str::FromStr;
 
     #[test]
@@ -165,14 +195,14 @@ mod tests {
     fn should_create_identifier() {
         let identifier = Identifier::new("test".to_string());
         assert!(identifier.is_ok());
-        assert_eq!(identifier.unwrap().0.0.as_ref(), "test");
+        assert_eq!(identifier.unwrap().as_ref(), "test");
     }
 
     #[test]
     fn should_convert_identifier_from_str() {
         let identifier = Identifier::from_str("test");
         assert!(identifier.is_ok());
-        assert_eq!(identifier.unwrap().0.0.as_ref(), "test");
+        assert_eq!(identifier.unwrap().as_ref(), "test");
     }
 }
 
@@ -187,6 +217,7 @@ impl VertexId {
         VertexId(id)
     }
 }
+
 impl EdgeId {
     pub fn new(id: u64) -> Self {
         EdgeId(id)

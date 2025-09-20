@@ -11,7 +11,7 @@ use uuid::Uuid;
 use models::{Edge, Identifier, Vertex};
 use models::errors::{GraphError, GraphResult};
 use models::identifiers::SerializableUuid;
-use crate::config::{TikvConfig, StorageEngineType};
+use crate::config::{TikvConfig, StorageEngineType, QueryResult, QueryPlan,};
 use crate::storage_engine::storage_utils::{
     serialize_vertex, deserialize_vertex, serialize_edge, deserialize_edge,
 };
@@ -288,6 +288,12 @@ impl GraphStorageEngine for TikvStorage {
     async fn query(&self, _query_string: &str) -> Result<Value, GraphError> {
         Err(GraphError::StorageError("Direct queries are not supported with the tikv-client backend. Use the specific graph methods instead.".to_string()))
     }
+
+    async fn execute_query(&self, query_plan: QueryPlan) -> Result<QueryResult, GraphError> {
+        info!("Executing query on SledStorage (returning null as not implemented)");
+        println!("===> EXECUTING QUERY ON SLED STORAGE (NOT IMPLEMENTED)");
+        Ok(QueryResult::Null)
+    }       
 
     async fn create_vertex(&self, vertex: Vertex) -> Result<(), GraphError> {
         let key = create_vertex_key(&vertex.id.0);

@@ -4,11 +4,13 @@
 // Added: 2025-08-13 - Added storage_utils module
 // Fixed: 2025-08-15 - Corrected re-export of InMemoryStorage and removed non-existent open_sled_db function
 // Updated: 2025-08-14 - Added detailed debugging for create_storage to trace RocksDB failures
-// Fixed: 2025-08-14 - Fixed type mismatch for RocksdbStorage::new error handling
+// Fixed: 2025-08-14 - Fixed type mismatch for RocksDBStorage::new error handling
 // Updated: 2025-09-01 - Implemented Hybrid match arm, fixed TiKV branch to use TikvConfig
 // Updated: 2025-09-01 - Fixed TiKV deserialization, restored InMemoryGraphStorage alias, added start calls, improved Hybrid config and error messages
 // Fixed: 2025-09-09 - Replaced incorrect enum variant matching on SelectedStorageConfig with struct field access,
 //                     fixed Hybrid storage to default to Sled as persistent engine, and handled data_directory type mismatch
+// Fixed: 2025-09-17 - Added missing storage_config argument to RocksDBStorage::new and awaited the async result
+// Fixed: 2025-09-18 - Added missing fields to RocksDBConfig initializers to resolve compilation errors
 
 use log::{info, error, warn, debug};
 use std::sync::Arc;
@@ -18,10 +20,19 @@ use serde_json::Value;
 
 // Declare submodules
 pub mod config;
+pub mod errors;
 pub mod inmemory_storage;
 pub mod raft_storage;
 pub mod storage_utils;
 pub mod storage_engine;
+pub mod load_balancer;
+pub mod sled_client;
+pub mod zmq_client;
+pub mod edge;
+pub mod node;
+pub mod types;
+#[cfg(feature = "with-rocksdb")]
+pub mod rocksdb_raft_storage;
 #[cfg(feature = "with-rocksdb")]
 pub mod rocksdb_storage;
 #[cfg(feature = "with-tikv")]
@@ -36,9 +47,13 @@ pub mod mysql_storage;
 pub mod hybrid_storage;
 #[cfg(feature = "with-sled")]
 pub mod sled_storage_daemon_pool;
+#[cfg(feature = "with-rocksdb")]
+pub mod rocksdb_storage_daemon_pool;
+#[cfg(feature = "with-rocksdb")]
+pub mod rocksdb_client;
 // Re-export key items
 pub use crate::config::{
-    CliConfigToml, StorageConfig, StorageEngineType, RocksdbConfig, SledConfig, TikvConfig, HybridConfig,
+    CliConfigToml, StorageConfig, StorageEngineType, RocksDBConfig, SledConfig, TikvConfig, HybridConfig,
     format_engine_config, load_storage_config_from_yaml, SelectedStorageConfig,
 };
 pub use inmemory_storage::{InMemoryStorage as InMemoryGraphStorage};
@@ -57,7 +72,7 @@ pub use storage_utils::{serialize_vertex, deserialize_vertex, serialize_edge, de
 
 // Correctly re-export storage engines under feature flags
 #[cfg(feature = "with-rocksdb")]
-pub use rocksdb_storage::RocksdbStorage;
+pub use config::RocksDBStorage;
 #[cfg(feature = "with-tikv")]
 pub use tikv_storage::TikvStorage;
 #[cfg(feature = "redis-datastore")]
@@ -69,6 +84,12 @@ pub use mysql_storage::MySQLStorage;
 #[cfg(any(feature = "with-sled", feature = "with-rocksdb", feature = "with-tikv"))]
 pub use hybrid_storage::HybridStorage;
 pub use inmemory_storage::InMemoryStorage;
+pub use zmq_client::*;
+pub use node::*;
+pub use edge::*;
+pub use types::*;
+pub use errors::*;
+pub use rocksdb_client::*;
 
 /// Creates a storage engine instance based on the provided configuration.
 ///
@@ -87,20 +108,25 @@ pub async fn create_storage(config: &StorageConfig) -> Result<Arc<dyn GraphStora
             debug!("Attempting to create RocksDB storage");
             #[cfg(feature = "with-rocksdb")]
             {
-                let rocksdb_config: RocksdbConfig = match config.engine_specific_config.as_ref() {
+                let rocksdb_config: RocksDBConfig = match config.engine_specific_config.as_ref() {
                     Some(selected) if selected.storage_engine_type == StorageEngineType::RocksDB => {
                         serde_json::from_value(serde_json::to_value(&selected.storage)?)
                             .map_err(|e| anyhow!("Failed to deserialize RocksDB config: {}", e))?
                     }
-                    _ => RocksdbConfig {
+                    _ => RocksDBConfig {
                         storage_engine_type: StorageEngineType::RocksDB,
                         path: config.data_directory.clone().unwrap_or(PathBuf::from(config::DEFAULT_DATA_DIRECTORY)),
                         host: None,
                         port: None,
+                        cache_capacity: None,
+                        temporary: false, // Added missing field
+                        use_compression: true, // Added missing field
+                        use_raft_for_scale: false, // Added missing field
+                        max_background_jobs: Some(1000),
                     },
                 };
 
-                match RocksdbStorage::new(&rocksdb_config) {
+                match RocksDBStorage::new(&rocksdb_config, &config).await {
                     Ok(storage) => {
                         info!("Created RocksDB storage");
                         Arc::new(storage)
@@ -172,20 +198,25 @@ pub async fn create_storage(config: &StorageConfig) -> Result<Arc<dyn GraphStora
                     "rocksdb" => {
                         #[cfg(feature = "with-rocksdb")]
                         {
-                            let rocksdb_config: RocksdbConfig = match config.engine_specific_config.as_ref() {
+                            let rocksdb_config: RocksDBConfig = match config.engine_specific_config.as_ref() {
                                 Some(selected) if selected.storage_engine_type == StorageEngineType::Hybrid => {
                                     serde_json::from_value(serde_json::to_value(&selected.storage)?)
                                         .map_err(|e| anyhow!("Failed to deserialize RocksDB config for Hybrid: {}", e))?
                                 }
-                                _ => RocksdbConfig {
+                                _ => RocksDBConfig {
                                     storage_engine_type: StorageEngineType::RocksDB,
                                     path: config.data_directory.clone().unwrap_or(PathBuf::from(config::DEFAULT_DATA_DIRECTORY)).join("rocksdb"),
                                     host: None,
                                     port: None,
+                                    cache_capacity: None,
+                                    temporary: false, // Added missing field
+                                    use_compression: true, // Added missing field
+                                    use_raft_for_scale: false, // Added missing field
+                                    max_background_jobs: Some(1000),
                                 },
                             };
 
-                            match RocksdbStorage::new(&rocksdb_config) {
+                            match RocksDBStorage::new(&rocksdb_config, &config).await {
                                 Ok(storage) => {
                                     info!("Created RocksDB storage for Hybrid");
                                     Arc::new(storage)

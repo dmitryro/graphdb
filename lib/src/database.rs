@@ -10,11 +10,11 @@ use uuid::Uuid;
 use std::collections::HashMap;
 
 use crate::config::{
-    StorageConfig, SledConfig, RocksdbConfig, TikvConfig, StorageEngineType, StorageConfigWrapper, DEFAULT_DATA_DIRECTORY
+    StorageConfig, SledConfig, RocksDBConfig, TikvConfig, StorageEngineType, StorageConfigWrapper, DEFAULT_DATA_DIRECTORY
 };
 use crate::storage_engine::{
     SledStorage,
-    RocksdbStorage,
+    RocksDBStorage,
     TikvStorage,
     HybridStorage,
     InMemoryStorage,
@@ -28,8 +28,8 @@ use crate::storage_engine::mysql_storage::MySQLStorage;
 use crate::storage_engine::{GraphStorageEngine, StorageEngine};
 
 pub struct Database {
-    storage: Arc<dyn GraphStorageEngine + Send + Sync>,
-    config: StorageConfig,
+    pub storage: Arc<dyn GraphStorageEngine + Send + Sync>,
+    pub config: StorageConfig,
 }
 
 impl Database {
@@ -69,16 +69,21 @@ impl Database {
                         let config_value = serde_json::to_value(engine_config)
                             .map_err(|e| GraphError::ConfigurationError(format!("Failed to serialize map: {}", e)))?;
                         serde_json::from_value(config_value)
-                            .map_err(|e| GraphError::ConfigurationError(format!("Failed to parse RocksdbConfig: {}", e)))?
+                            .map_err(|e| GraphError::ConfigurationError(format!("Failed to parse RocksDBConfig: {}", e)))?
                     } else {
-                        RocksdbConfig {
+                        RocksDBConfig {
                             storage_engine_type: config.storage_engine_type.clone(),
                             path: config.data_directory.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY)),
                             host: None,
                             port: None,
+                            cache_capacity: None,
+                            temporary: false,
+                            use_compression: true,
+                            use_raft_for_scale: false,
+                            max_background_jobs: Some(1000),
                         }
                     };
-                    Arc::new(RocksdbStorage::new(&rocksdb_config)?)
+                    Arc::new(RocksDBStorage::new(&rocksdb_config, &config).await?)
                 }
                 #[cfg(not(feature = "with-rocksdb"))]
                 return Err(GraphError::ConfigurationError("RocksDB feature not enabled".to_string()));
@@ -168,13 +173,18 @@ impl Database {
                         Some(StorageEngineType::RocksDB) => {
                             #[cfg(feature = "with-rocksdb")]
                             {
-                                let rocksdb_config = RocksdbConfig {
+                                let rocksdb_config = RocksDBConfig {
                                     storage_engine_type: StorageEngineType::RocksDB,
                                     path: config.data_directory.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY)),
                                     host: None,
                                     port: None,
+                                    cache_capacity: None,
+                                    temporary: false,
+                                    use_compression: true,
+                                    use_raft_for_scale: false,
+                                    max_background_jobs: Some(1000),
                                 };
-                                Arc::new(RocksdbStorage::new(&rocksdb_config)?)
+                                Arc::new(RocksDBStorage::new(&rocksdb_config, &config).await?)
                                     as Arc<dyn GraphStorageEngine + Send + Sync>
                             }
                             #[cfg(not(feature = "with-rocksdb"))]
@@ -237,13 +247,18 @@ impl Database {
             StorageEngineType::RocksDB => {
                 #[cfg(feature = "with-rocksdb")]
                 {
-                    let rocksdb_config = RocksdbConfig {
+                    let rocksdb_config = RocksDBConfig {
                         storage_engine_type: StorageEngineType::RocksDB,
                         path: config_wrapper.storage.data_directory.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY)),
                         host: None,
                         port: None,
+                        cache_capacity: None,
+                        temporary: false,
+                        use_compression: true,
+                        use_raft_for_scale: false,
+                        max_background_jobs: Some(1000),
                     };
-                    Arc::new(RocksdbStorage::new(&rocksdb_config)?)
+                    Arc::new(RocksDBStorage::new(&rocksdb_config, &config_wrapper.storage).await?)
                         as Arc<dyn GraphStorageEngine + Send + Sync>
                 }
                 #[cfg(not(feature = "with-rocksdb"))]
@@ -331,13 +346,18 @@ impl Database {
                         Some(StorageEngineType::RocksDB) => {
                             #[cfg(feature = "with-rocksdb")]
                             {
-                                let rocksdb_config = RocksdbConfig {
+                                let rocksdb_config = RocksDBConfig {
                                     storage_engine_type: StorageEngineType::RocksDB,
                                     path: config_wrapper.storage.data_directory.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY)),
                                     host: None,
                                     port: None,
+                                    cache_capacity: None,
+                                    temporary: false,
+                                    use_compression: true,
+                                    use_raft_for_scale: false,
+                                    max_background_jobs: Some(1000),
                                 };
-                                Arc::new(RocksdbStorage::new(&rocksdb_config)?)
+                                Arc::new(RocksDBStorage::new(&rocksdb_config, &config_wrapper.storage).await?)
                                     as Arc<dyn GraphStorageEngine + Send + Sync>
                             }
                             #[cfg(not(feature = "with-rocksdb"))]

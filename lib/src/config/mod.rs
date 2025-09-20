@@ -7,6 +7,8 @@ pub mod config_impl_cli;
 pub mod config_impl_storage;
 pub mod config_serializers;
 pub mod config_constants;
+pub mod config_traits;
+
 pub use config::*;
 pub use config_structs::*;
 pub use config_helpers::*;
@@ -15,3 +17,4 @@ pub use config_impl_cli::*;
 pub use config_impl_storage::*;
 pub use config_serializers::*;
 pub use config_constants::*;
+pub use config_traits::*;

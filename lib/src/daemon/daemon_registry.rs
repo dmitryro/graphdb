@@ -6,11 +6,14 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, Semaphore, OnceCell};
 use std::collections::HashMap;
 use log::{info, warn, debug, error};
-use sysinfo::{Pid, System};
+use sysinfo::{Pid, System, ProcessRefreshKind};
 use bincode::{encode_to_vec, decode_from_slice, config, Encode, Decode};
 use std::time::Duration;
 use tokio::fs;
+#[cfg(feature = "with-sled")]
 use sled::{Db, IVec, Config};
+use std::fs as std_fs;
+use std::io;
 
 use crate::daemon_config::{
     DAEMON_REGISTRY_DB_PATH,
@@ -64,6 +67,7 @@ struct ImprovedSledPool {
     _semaphore: Arc<Semaphore>,
 }
 
+#[cfg(feature = "with-sled")]
 impl ImprovedSledPool {
     async fn new(db_path: PathBuf, max_concurrent: usize) -> Result<Self> {
         Self::validate_environment(&db_path).await?;
@@ -182,6 +186,10 @@ impl AsyncRegistryWrapper {
         self.registry.inner.get_all_daemon_metadata().await
     }
 
+    pub async fn clear_stale_daemons(&self) -> Result<()> {
+        self.registry.inner.clear_stale_daemons().await
+    }
+
     pub async fn clear_all_daemons(&self) -> Result<()> {
         self.registry.inner.clear_all_daemons().await
     }
@@ -287,11 +295,8 @@ impl NonBlockingDaemonRegistry {
             }
         });
 
-        if let Err(e) = task.await {
-            warn!("Storage initialization task failed: {}", e);
-        } else {
-            let mut tasks = self.background_tasks.write().await;
-        }
+        let mut tasks = self.background_tasks.write().await;
+        tasks.push(task);
     }
 
     async fn load_initial_data(&self) -> Result<()> {
@@ -314,13 +319,40 @@ impl NonBlockingDaemonRegistry {
 
     async fn schedule_storage_sync(&self) {
         let storage = self.storage.clone();
+        let memory_store = self.memory_store.clone();
+        let fallback_file = self.config.fallback_file.clone();
 
         let task = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            loop {
+                // Wait for a bit before syncing to batch changes
+                tokio::time::sleep(Duration::from_millis(100)).await;
 
-            let storage_guard = storage.read().await;
-            if let Some(pool) = &*storage_guard {
-                info!("Background storage sync completed");
+                let memory = memory_store.read().await;
+                let all_metadata: Vec<_> = memory.values().cloned().collect();
+                drop(memory);
+
+                let storage_guard = storage.read().await;
+                if let Some(pool) = &*storage_guard {
+                    info!("Performing background storage sync");
+                    for metadata in &all_metadata {
+                        let key = metadata.port.to_string().into_bytes();
+                        match encode_to_vec(metadata, config::standard()) {
+                            Ok(encoded) => {
+                                if let Err(e) = pool.insert(&key, &encoded).await {
+                                    warn!("Failed to sync daemon to sled for port {}: {}", metadata.port, e);
+                                }
+                            },
+                            Err(e) => {
+                                warn!("Failed to encode metadata for port {}: {}", metadata.port, e);
+                            }
+                        }
+                    }
+                }
+                drop(storage_guard);
+
+                let _ = Self::save_fallback_file(&fallback_file, &all_metadata).await;
+
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
         });
 
@@ -331,18 +363,28 @@ impl NonBlockingDaemonRegistry {
     async fn validate_process_fast(&self, pid: u32, _port: u16) -> Result<bool> {
         let validation_result = tokio::spawn(async move {
             NonBlockingDaemonRegistry::is_pid_running(pid).await
-        }).await?;
+        }).await??;
 
-        validation_result
+        Ok(validation_result)
     }
 
     pub async fn is_pid_running(pid: u32) -> Result<bool> {
         tokio::task::spawn_blocking(move || {
+            // Create a new System instance.
             let mut sys = System::new();
             let sysinfo_pid = Pid::from_u32(pid);
-            sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[sysinfo_pid]), false);
+
+            // Pass all three arguments: processes to update, refresh kind, and recursive flag.
+            sys.refresh_processes_specifics(
+                sysinfo::ProcessesToUpdate::Some(&[sysinfo_pid]),
+                false,
+                ProcessRefreshKind::everything(),
+            );
+
+            // Return true if the process exists
             Ok(sys.process(sysinfo_pid).is_some())
-        }).await?
+        })
+        .await?
     }
 
     pub async fn register_daemon(&self, metadata: DaemonMetadata) -> Result<()> {
@@ -455,7 +497,10 @@ impl NonBlockingDaemonRegistry {
         self.discover_daemon(port).await
     }
     
-    async fn discover_daemon(&self, _port: u16) -> Result<Option<DaemonMetadata>> {
+    async fn discover_daemon(&self, port: u16) -> Result<Option<DaemonMetadata>> {
+        debug!("Attempting to discover daemon on port {}", port);
+        // This is a placeholder for a more complex discovery mechanism
+        // For now, it just returns None
         Ok(None)
     }
     
@@ -542,19 +587,54 @@ impl NonBlockingDaemonRegistry {
     }
     
     async fn terminate_process(pid: u32) -> Result<()> {
-        tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let mut system = System::new();
             let sysinfo_pid = Pid::from_u32(pid);
-            system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[sysinfo_pid]), true);
-            
+            // Provide all three args: which processes, refresh kind, recursive flag
+            system.refresh_processes_specifics(
+                sysinfo::ProcessesToUpdate::All,
+                false,
+                ProcessRefreshKind::everything(),
+            );
             if let Some(process) = system.process(sysinfo_pid) {
-                let _ = process.kill_with(sysinfo::Signal::Term);
+                let _ = process.kill();
             }
-        }).await?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
+        .map_err(|e| anyhow::anyhow!("Process termination error: {}", e))?;
         
         Ok(())
     }
-    
+
+    pub async fn clear_stale_daemons(&self) -> Result<()> {
+        let mut memory = self.memory_store.write().await;
+        let mut to_remove = Vec::new();
+        for (port, metadata) in memory.iter() {
+            if !self.validate_process_fast(metadata.pid, *port).await.unwrap_or(false) {
+                to_remove.push(*port);
+            }
+        }
+        
+        let mut removed_count = 0;
+        for port in to_remove {
+            if let Some(metadata) = memory.remove(&port) {
+                self.cleanup_daemon_background(metadata).await;
+                info!("Removed stale daemon entry for port {}", port);
+                removed_count += 1;
+            }
+        }
+        
+        if removed_count > 0 {
+            info!("Cleared {} stale daemons from registry", removed_count);
+        } else {
+            info!("No stale daemons found to clear");
+        }
+        
+        Ok(())
+    }
+
     pub async fn clear_all_daemons(&self) -> Result<()> {
         let metadata_list = {
             let mut memory = self.memory_store.write().await;
@@ -575,8 +655,16 @@ impl NonBlockingDaemonRegistry {
         
         let task = tokio::spawn(async move {
             let storage_guard = storage.read().await;
-            if let Some(_pool) = &*storage_guard {
+            if let Some(pool) = &*storage_guard {
                 debug!("Clearing storage backend");
+                match pool.iter_all().await {
+                    Ok(entries) => {
+                        for (key, _) in entries {
+                            let _ = pool.remove(&key).await;
+                        }
+                    },
+                    Err(e) => warn!("Failed to iterate and clear sled database: {}", e)
+                }
             }
             drop(storage_guard);
             
@@ -745,6 +833,11 @@ impl DaemonRegistryWrapper {
         self.get().await.get_all_daemon_metadata().await
     }
     
+    pub async fn clear_stale_daemons(&self) -> Result<()> {
+            self.get().await.clear_stale_daemons().await;
+            Ok(())
+    }
+
     pub async fn clear_all_daemons(&self) -> Result<()> {
         self.get().await.clear_all_daemons().await
     }
@@ -794,14 +887,22 @@ async fn emergency_cleanup_daemon_registry_internal(db_path: &PathBuf) -> Result
     if db_path.exists() {
         let db_path_clone = db_path.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
-            std::fs::remove_dir_all(&db_path_clone)?;
+            // Attempt to remove the directory and its contents
+            if let Err(e) = std_fs::remove_dir_all(&db_path_clone) {
+                if e.kind() != io::ErrorKind::NotFound {
+                    return Err(anyhow::anyhow!("Failed to remove directory {:?}: {}", db_path_clone, e));
+                }
+            }
             info!("Removed database directory {:?}", db_path_clone);
-            std::fs::create_dir_all(&db_path_clone)?;
-            let metadata = std::fs::metadata(&db_path_clone)?;
+
+            // Recreate the directory
+            std_fs::create_dir_all(&db_path_clone)?;
+            let metadata = std_fs::metadata(&db_path_clone)?;
             let mut perms = metadata.permissions();
             perms.set_mode(0o755);
-            std::fs::set_permissions(&db_path_clone, perms)?;
+            std_fs::set_permissions(&db_path_clone, perms)?;
             info!("Recreated clean database directory at {:?}", db_path_clone);
+
             Ok(())
         }).await??;
     }

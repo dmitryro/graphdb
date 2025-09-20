@@ -10,11 +10,14 @@ storage:
     storage_engine_type: "sled"
     engine_specific_config:
       storage_engine_type: "sled"
-      path: "/opt/graphdb/storage_data/sled/8052/sled"
+      path: "/opt/graphdb/storage_data/sled/8053/sled"
       host: "127.0.0.1"
-      port: 8052
+      port: 8053
       username: ""
       password: ""
       pd_endpoints: ""
+      max_background_jobs: 0
+      temporary: false
+      use_compression: false
     max_open_files: 100
   

@@ -17,6 +17,7 @@ regex = "1.11.1"
 daemon = { path = "../daemon" }
 daemon_api = { path = "../daemon_api" }
 
+
 # Crucial direct dependencies for `rest_api/src/lib.rs`
 jsonwebtoken = "9.3.0"
 argon2 = "0.5.3"
