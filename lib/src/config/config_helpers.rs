@@ -16,6 +16,7 @@ pub use crate::config::config_constants::*;
 pub use crate::config::config_serializers::*;
 use crate::daemon_utils::{is_port_in_cluster_range, is_valid_cluster_range, parse_cluster_range};
 use crate::query_exec_engine::query_exec_engine::{QueryExecEngine};
+use models::errors::{GraphError, GraphResult};
 
 pub fn deserialize_engine_config<'de, D>(deserializer: D) -> Result<Option<SelectedStorageConfig>, D::Error>
 where
@@ -319,7 +320,7 @@ pub fn load_engine_specific_config(
                 "Failed to read engine-specific YAML file at {:?}: {}",
                 engine_config_path, e
             );
-            GraphError::Io(e)
+            GraphError::Io(e.to_string())
         })?;
         debug!(
             "Raw engine-specific YAML content from {:?}:\n{}",
@@ -955,7 +956,7 @@ pub fn create_default_yaml_config(yaml_path: &PathBuf, engine_type: StorageEngin
             .map_err(|e| {
                 error!("Failed to create parent directories for {:?}: {}", yaml_path, e);
                 trace!("Directory creation error: {:?}", e);
-                GraphError::Io(e)
+                GraphError::Io(e.to_string())
             })?;
     }
     
@@ -963,7 +964,7 @@ pub fn create_default_yaml_config(yaml_path: &PathBuf, engine_type: StorageEngin
         .map_err(|e| {
             error!("Failed to write YAML config to {:?}: {}", yaml_path, e);
             trace!("Write error: {:?}", e);
-            GraphError::Io(e)
+            GraphError::Io(e.to_string())
         })?;
     
     info!("Created default config file at {:?}", yaml_path);
@@ -972,7 +973,7 @@ pub fn create_default_yaml_config(yaml_path: &PathBuf, engine_type: StorageEngin
 }
 
 /// Creates a default YAML configuration file
-pub async fn create_default_storage_yaml_config(yaml_path: &PathBuf, engine_type: StorageEngineType) -> Result<(), GraphError> {
+pub async fn create_default_storage_yaml_config(yaml_path: &PathBuf, engine_type: StorageEngineType) -> GraphResult<()> {
     info!("Creating default YAML config at {:?}", yaml_path);
     let config = StorageConfig {
         storage_engine_type: engine_type,
@@ -996,7 +997,7 @@ pub async fn create_default_storage_yaml_config(yaml_path: &PathBuf, engine_type
                 database: None,
                 pd_endpoints: None,
                 cache_capacity: Some(1024 * 1024 * 1024),
-                use_compression: false, // Fixed: Changed False to false
+                use_compression: false,
             },
         }),
     };
@@ -1004,8 +1005,10 @@ pub async fn create_default_storage_yaml_config(yaml_path: &PathBuf, engine_type
     config.save().await
         .map_err(|e| {
             error!("Failed to save default YAML config to {:?}: {}", yaml_path, e);
-            GraphError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+            // This is the corrected line. It converts the error `e` into a String.
+            GraphError::Io(e.to_string())
         })?;
+
     info!("Default YAML config created at {:?}", yaml_path);
     Ok(())
 }

@@ -1190,9 +1190,9 @@ pub fn is_port_within_range(port: u16, cluster_ports: &[u16]) -> bool {
     cluster_ports.contains(&port)
 }
 
-pub async fn is_port_free(port: u16) -> bool {
-    !is_port_listening(port).await
-}
+//pub async fn is_port_free(port: u16) -> bool {
+//   !is_port_listening(port).await
+//}
 
 pub async fn is_port_listening(port: u16) -> bool {
     tokio::time::timeout(Duration::from_secs(1), async {
@@ -1249,22 +1249,103 @@ pub async fn find_all_running_rest_api_ports() -> Vec<u16> {
     running_ports
 }
 
-// Helper function to check if PID is still valid
+/// Helper function to check if a process ID is valid by sending a signal 0.
+/// This works on most Unix-like systems.
 pub async fn check_pid_validity(pid: u32) -> bool {
-    use nix::sys::signal::{kill, Signal};
-    use nix::unistd::Pid;
-    match kill(Pid::from_raw(pid as i32), None) {
-        Ok(_) => true,
-        Err(nix::Error::ESRCH) => {
-            debug!("PID {} is no longer valid (process does not exist)", pid);
-            false
+    // We send signal 0, which is a way to check if a process exists and we have permissions.
+    // It will return a zero exit code if the process exists.
+    let output = tokio::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .output()
+        .await
+        .unwrap_or_else(|_| {
+            debug!("Failed to run 'kill -0' command to check PID {}", pid);
+            std::process::Output {
+                status: std::process::ExitStatus::default(),
+                stdout: b"".to_vec(),
+                stderr: b"".to_vec(),
+            }
+        });
+
+    output.status.success()
+}
+
+/// Helper function to check if a port is free.
+pub async fn is_port_free(port: u16) -> bool {
+    tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
+        .await
+        .is_ok()
+}
+
+pub async fn stop_process_by_pid(process_name: &str, pid: u32) -> Result<(), anyhow::Error> {
+    info!("Attempting to stop process {} with PID {}", process_name, pid);
+    #[cfg(unix)]
+    {
+        let nix_pid = NixPid::from_raw(pid as i32);
+        // Check if process exists
+        if !check_pid_validity(pid).await {
+            info!("Process {} with PID {} is already terminated", process_name, pid);
+            return Ok(());
         }
-        Err(e) => {
-            warn!("Failed to check PID {} validity: {}", pid, e);
-            false
+
+        // Send SIGTERM
+        kill(nix_pid, Signal::SIGTERM)
+            .map_err(|e| anyhow!("Failed to send SIGTERM to {} (PID {}): {}", process_name, pid, e))?;
+
+        // Wait for process to terminate
+        let max_wait = Duration::from_secs(2);
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < max_wait {
+            if !check_pid_validity(pid).await {
+                info!("Process {} with PID {} terminated successfully", process_name, pid);
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
+
+        // If still running, send SIGKILL
+        warn!("Process {} with PID {} did not terminate after SIGTERM, sending SIGKILL", process_name, pid);
+        kill(nix_pid, Signal::SIGKILL)
+            .map_err(|e| anyhow!("Failed to send SIGKILL to {} (PID {}): {}", process_name, pid, e))?;
+
+        // Verify termination
+        let max_wait_kill = Duration::from_secs(1);
+        let start_kill = tokio::time::Instant::now();
+        while start_kill.elapsed() < max_wait_kill {
+            if !check_pid_validity(pid).await {
+                info!("Process {} with PID {} terminated successfully after SIGKILL", process_name, pid);
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        Err(anyhow!("Failed to terminate {} (PID {}) after SIGKILL", process_name, pid))
+    }
+    #[cfg(not(unix))]
+    {
+        Err(anyhow!("Process termination by PID not supported on non-Unix systems"))
     }
 }
+
+// Helper function to parse cluster range
+pub fn parse_port_cluster_range(range: &str) -> Result<Vec<u16>, anyhow::Error> {
+    if range.is_empty() {
+        return Ok(vec![]);
+    }
+    if range.contains('-') {
+        let parts: Vec<&str> = range.split('-').collect();
+        if parts.len() != 2 {
+            return Err(anyhow!("Invalid cluster range format: {}", range));
+        }                        
+        let start: u16 = parts[0].parse().context("Failed to parse cluster range start")?;
+        let end: u16 = parts[1].parse().context("Failed to parse cluster range end")?;
+        Ok((start..=end).collect())
+    } else {
+        let port: u16 = range.parse().context("Failed to parse single port")?;
+        Ok(vec![port])            
+    }
+}        
 
 pub async fn is_pid_running(pid: u32) -> bool {
     let mut sys = sysinfo::System::new();

@@ -228,20 +228,18 @@ pub async fn get_query_engine_singleton() -> Result<Arc<QueryExecEngine>> {
         info!("Starting query engine singleton initialization...");
         println!("===> Starting query engine singleton initialization...");
 
-        // Initialize storage for query execution with a timeout to prevent hanging.
-        info!("Calling initialize_storage_for_query with a timeout...");
-        println!("===> Calling initialize_storage_for_query with a timeout...");
-        timeout(TokioDuration::from_secs(60), initialize_storage_for_query(start_wrapper, stop_wrapper)).await
-            .context("Storage initialization timed out after 60 seconds")?
+        // Initialize storage for query execution
+        info!("Calling initialize_storage_for_query...");
+        println!("===> Calling initialize_storage_for_query...");
+        initialize_storage_for_query(start_wrapper, stop_wrapper).await
             .context("Failed to initialize storage for query execution")?;
 
-        // Load storage configuration with a timeout.
+        // Load storage configuration
         let storage_config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
         info!("Loading storage config from {}", storage_config_path.display());
         println!("===> Loading storage config from {}", storage_config_path.display());
         let storage_config = if storage_config_path.exists() {
-            timeout(TokioDuration::from_secs(10), load_storage_config_from_yaml(Some(storage_config_path.clone()))).await
-                .context("Loading storage config timed out after 10 seconds")?
+            load_storage_config_from_yaml(Some(storage_config_path.clone())).await
                 .with_context(|| format!("Failed to load storage config from {}", storage_config_path.display()))?
         } else {
             info!("No storage configuration file found at {}. Defaulting to InMemory storage.", storage_config_path.display());
@@ -249,11 +247,11 @@ pub async fn get_query_engine_singleton() -> Result<Arc<QueryExecEngine>> {
             StorageConfig::new_in_memory()
         };
 
-        // Initialize database with a timeout.
+        // Initialize database
         info!("Creating new Database instance...");
         println!("===> Creating new Database instance...");
-        let database = timeout(TokioDuration::from_secs(60), Database::new(storage_config)).await
-            .context("Database creation timed out after 60 seconds")?
+        let database = Database::new(storage_config)
+            .await
             .map_err(|e| anyhow!("Failed to create Database: {}", e))?;
 
         // Create query engine
@@ -279,7 +277,6 @@ pub async fn get_query_engine_singleton() -> Result<Arc<QueryExecEngine>> {
 
     Ok(query_engine)
 }
-
 
 // Re-usable function to handle all commands.
 pub async fn run_single_command(
@@ -677,7 +674,6 @@ pub async fn run_single_command(
             info!("Executing KV command: operation={}, key={:?}, value={:?}", operation, key, value);
             println!("===> Executing KV command: operation={}, key={:?}, value={:?}", operation, key, value);
             let query_engine = get_query_engine_singleton().await?;
-            println!("Out of get_query_engine_singleton - moving on");
             match parse_kv_operation(&operation) {
                 Ok(op) => {
                     match op.as_str() {

@@ -5,13 +5,13 @@ use std::io::{Cursor, Read, Write};
 use sled::{Config, Db, IVec, Tree, Batch};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex as TokioMutex, RwLock};
-use tokio::time::{sleep, Duration, timeout};
+use tokio::time::{sleep, Duration, timeout, interval};
 use tokio::task::JoinError;
 use tokio::fs;
 use log::{info, debug, warn, error};
 use crate::config::{SledConfig, SledDaemon, SledDaemonPool, SledStorage, StorageConfig, StorageEngineType, 
                     DAEMON_REGISTRY_DB_PATH, DEFAULT_DATA_DIRECTORY, DEFAULT_STORAGE_PORT, ReplicationStrategy, 
-                    NodeHealth, LoadBalancer, };
+                    NodeHealth, LoadBalancer, HealthCheckConfig, };
 use crate::storage_engine::storage_utils::{create_edge_key, deserialize_edge, deserialize_vertex, serialize_edge, serialize_vertex};
 use models::{Edge, Identifier, Vertex};
 use models::errors::{GraphError, GraphResult};
@@ -35,148 +35,10 @@ use {
     tokio::io::{AsyncReadExt, AsyncWriteExt},
 };
 
-impl LoadBalancer {
-    /// Create a new LoadBalancer instance.
-    pub fn new(replication_factor: usize) -> Self {
-        Self {
-            nodes: Arc::new(RwLock::new(HashMap::new())),
-            current_index: Arc::new(TokioMutex::new(0)),
-            replication_factor,
-        }
-    }
-
-    /// Add or update node health status.
-    pub async fn update_node_health(&self, port: u16, is_healthy: bool, response_time_ms: u64) {
-        let mut nodes = self.nodes.write().await;
-        let node_health = nodes.entry(port).or_insert(NodeHealth {
-            port,
-            is_healthy: false,
-            last_check: SystemTime::now(),
-            response_time_ms: 0,
-            error_count: 0,
-        });
-        
-        node_health.is_healthy = is_healthy;
-        node_health.last_check = SystemTime::now();
-        node_health.response_time_ms = response_time_ms;
-        
-        if is_healthy {
-            node_health.error_count = 0;
-        } else {
-            node_health.error_count += 1;
-        }
-        
-        println!("===> LOAD BALANCER: Updated node {} health: healthy={}, response_time={}ms, errors={}", 
-                 port, is_healthy, response_time_ms, node_health.error_count);
-    }
-
-    /// Get healthy nodes for read operations (round-robin).
-    pub async fn get_read_node(&self) -> Option<u16> {
-        let nodes = self.nodes.read().await;
-        let healthy_nodes: Vec<u16> = nodes.values()
-            .filter(|node| node.is_healthy)
-            .map(|node| node.port)
-            .collect();
-        
-        if healthy_nodes.is_empty() {
-            return None;
-        }
-        
-        let mut index = self.current_index.lock().await;
-        let selected_port = healthy_nodes[*index % healthy_nodes.len()];
-        *index = (*index + 1) % healthy_nodes.len();
-        
-        println!("===> LOAD BALANCER: Selected read node {}", selected_port);
-        Some(selected_port)
-    }
-
-    /// Get nodes for write replication.
-    pub async fn get_write_nodes(&self, strategy: ReplicationStrategy) -> Vec<u16> {
-        let nodes = self.nodes.read().await;
-        let mut healthy_nodes: Vec<(u16, u64)> = nodes.values()
-            .filter(|node| node.is_healthy)
-            .map(|node| (node.port, node.response_time_ms))
-            .collect();
-        
-        // Sort by response time (fastest first)
-        healthy_nodes.sort_by_key(|(_, response_time)| *response_time);
-        
-        let selected_nodes = match strategy {
-            ReplicationStrategy::AllNodes => {
-                healthy_nodes.iter().map(|(port, _)| *port).collect()
-            },
-            ReplicationStrategy::NNodes(n) => {
-                healthy_nodes.iter()
-                    .take(n.min(healthy_nodes.len()))
-                    .map(|(port, _)| *port)
-                    .collect()
-            },
-            ReplicationStrategy::Raft => {
-                // For Raft, return all healthy nodes (Raft will handle consensus)
-                healthy_nodes.iter().map(|(port, _)| *port).collect()
-            }
-        };
-        
-        println!("===> LOAD BALANCER: Selected write nodes {:?} for strategy {:?}", 
-                 selected_nodes, strategy);
-        selected_nodes
-    }
-
-    /// Get all healthy nodes.
-    pub async fn get_healthy_nodes(&self) -> Vec<u16> {
-        let nodes = self.nodes.read().await;
-        nodes.values()
-            .filter(|node| node.is_healthy)
-            .map(|node| node.port)
-            .collect()
-    }
-    
-    /// Get the least loaded node for write operations.
-    /// This method selects the healthiest node with the lowest response time.
-    pub async fn get_least_loaded_node(&self) -> Option<u16> {
-        let nodes = self.nodes.read().await;
-        let mut healthy_nodes: Vec<&NodeHealth> = nodes.values()
-            .filter(|node| node.is_healthy)
-            .collect();
-
-        if healthy_nodes.is_empty() {
-            return None;
-        }
-
-        // Sort by response time (least loaded first)
-        healthy_nodes.sort_by_key(|node| node.response_time_ms);
-        let selected_port = healthy_nodes[0].port;
-
-        println!("===> LOAD BALANCER: Selected least loaded node {}", selected_port);
-        Some(selected_port)
-    }
-
-    /// Get all nodes, including unhealthy ones.
-    pub async fn get_all_nodes(&self) -> Vec<u16> {
-        let nodes = self.nodes.read().await;
-        nodes.keys().cloned().collect()
-    }
-
-    /// Remove a node from the load balancer.
-    pub async fn remove_node(&self, port: u16) {
-        let mut nodes = self.nodes.write().await;
-        if nodes.remove(&port).is_some() {
-            println!("===> LOAD BALANCER: Removed node {}", port);
-        } else {
-            println!("===> LOAD BALANCER: Node {} not found, nothing to remove", port);
-        }
-    }
-
-    /// Get a map of all node health statuses.
-    pub async fn get_all_node_health(&self) -> HashMap<u16, NodeHealth> {
-        let nodes = self.nodes.read().await;
-        nodes.clone()
-    }
-}
-
 impl SledDaemon {
 
     pub async fn new(config: SledConfig) -> GraphResult<Self> {
+        println!("SledDaemon =================> LET US SEE IF THIS WAS EVER CALLED");
         let port = config.port.ok_or_else(|| {
             GraphError::ConfigurationError("No port specified in SledConfig".to_string())
         })?;
@@ -464,7 +326,7 @@ impl SledDaemon {
         responder.set_maxmsgsize(MAX_MESSAGE_SIZE as i64)
             .map_err(|e| GraphError::StorageError(format!("Failed to set max message size for port {}: {}", self.port, e)))?;
 
-        let socket_path = format!("/opt/graphdb/pgraphdb-{}.ipc", self.port);
+        let socket_path = format!("/opt/graphdb/graphdb-{}.ipc", self.port);
         let socket_dir = Path::new("/opt/graphdb");
 
         if !socket_dir.exists() {
@@ -605,6 +467,14 @@ impl SledDaemon {
             };
 
             let response = match request.get("command").and_then(|c| c.as_str()) {
+                Some("status") => {
+                    println!("===> PROCESSING STATUS FOR PORT {}", self.port);
+                    json!({ "status": "success", "port": self.port })
+                }
+                Some("ping") => {
+                    println!("===> PROCESSING PING FOR PORT {}", self.port);
+                    json!({ "status": "success", "port": self.port })  // Return "success" not "ok"
+                }
                 Some("set_key") => {
                     let key = match request.get("key").and_then(|k| k.as_str()) {
                         Some(k) => k,
@@ -851,7 +721,7 @@ impl SledDaemon {
         socket.set_sndtimeo(10000)
             .map_err(|e| GraphError::StorageError(format!("Failed to set send timeout: {}", e)))?;
 
-        let endpoint = format!("ipc:///opt/graphdb/pgraphdb-{}.ipc", port);
+        let endpoint = format!("ipc:///opt/graphdb/graphdb-{}.ipc", port);
         println!("===> SLED STORAGE: CONNECTING TO ZMQ ENDPOINT {} FOR PORT {}", endpoint, port);
         
         socket.connect(&endpoint)
@@ -1486,7 +1356,7 @@ impl SledDaemon {
         let context = ZmqContext::new();
         let socket = context.socket(zmq::REQ)
             .map_err(|e| GraphError::StorageError(format!("Failed to create ZeroMQ socket: {}", e)))?;
-        let endpoint = format!("ipc:///opt/graphdb/pgraphdb-{}.ipc", self.port);
+        let endpoint = format!("ipc:///opt/graphdb/graphdb-{}.ipc", self.port);
         socket.connect(&endpoint)
             .map_err(|e| GraphError::StorageError(format!("Failed to connect to ZeroMQ socket {}: {}", endpoint, e)))?;
 
@@ -1515,7 +1385,7 @@ impl SledDaemon {
         let context = ZmqContext::new();
         let socket = context.socket(zmq::REQ)
             .map_err(|e| GraphError::StorageError(format!("Failed to create ZeroMQ socket: {}", e)))?;
-        let endpoint = format!("ipc:///opt/graphdb/pgraphdb-{}.ipc", self.port);
+        let endpoint = format!("ipc:///opt/graphdb/graphdb-{}.ipc", self.port);
         socket.connect(&endpoint)
             .map_err(|e| GraphError::StorageError(format!("Failed to connect to ZeroMQ socket {}: {}", endpoint, e)))?;
 
@@ -1546,7 +1416,7 @@ impl SledDaemon {
         let context = ZmqContext::new();
         let socket = context.socket(zmq::REQ)
             .map_err(|e| GraphError::StorageError(format!("Failed to create ZeroMQ socket: {}", e)))?;
-        let endpoint = format!("ipc:///opt/graphdb/pgraphdb-{}.ipc", self.port);
+        let endpoint = format!("ipc:///opt/graphdb/graphdb-{}.ipc", self.port);
         socket.connect(&endpoint)
             .map_err(|e| GraphError::StorageError(format!("Failed to connect to ZeroMQ socket {}: {}", endpoint, e)))?;
 
@@ -1577,7 +1447,7 @@ impl SledDaemon {
         let context = ZmqContext::new();
         let socket = context.socket(zmq::REQ)
             .map_err(|e| GraphError::StorageError(format!("Failed to create ZeroMQ socket: {}", e)))?;
-        let endpoint = format!("ipc:///opt/graphdb/pgraphdb-{}.ipc", self.port);
+        let endpoint = format!("ipc:///opt/graphdb/graphdb-{}.ipc", self.port);
         socket.connect(&endpoint)
             .map_err(|e| GraphError::StorageError(format!("Failed to connect to ZeroMQ socket {}: {}", endpoint, e)))?;
 
@@ -1605,12 +1475,13 @@ impl SledDaemonPool {
 
 
     pub fn new() -> Self {
+        println!("SledDaemonPool =================> LET US SEE IF THIS WAS EVER CALLED");
         Self {
             daemons: HashMap::new(),
             registry: Arc::new(RwLock::new(HashMap::new())),
             initialized: Arc::new(RwLock::new(false)),
             load_balancer: Arc::new(LoadBalancer::new(3)), // Default replication factor of 3
-            use_raft: false,
+            use_raft_for_scale: false,
         }
     }
 
@@ -1620,9 +1491,15 @@ impl SledDaemonPool {
         Ok(pool)
     }
 
+    /// Adds a new SledDaemon instance to the pool.
+    /// This method is essential for `SledStorage::new_with_client` to work.
+    pub fn add_daemon(&mut self, daemon: Arc<SledDaemon>) {
+        self.daemons.insert(daemon.port, daemon);
+    }
+
     /// Enhanced insert with replication across multiple nodes
-    pub async fn insert_replicated(&self, key: &[u8], value: &[u8], use_raft: bool) -> GraphResult<()> {
-        let strategy = if use_raft && self.use_raft {
+    pub async fn insert_replicated(&self, key: &[u8], value: &[u8], use_raft_for_scale: bool) -> GraphResult<()> {
+        let strategy = if use_raft_for_scale && self.use_raft_for_scale {
             ReplicationStrategy::Raft
         } else {
             ReplicationStrategy::NNodes(self.load_balancer.replication_factor)
@@ -1638,7 +1515,7 @@ impl SledDaemonPool {
         
         // For Raft, use leader-based replication
          #[cfg(feature = "with-openraft-sled")]
-        if matches!(strategy, ReplicationStrategy::Raft) && self.use_raft {
+        if matches!(strategy, ReplicationStrategy::Raft) && self.use_raft_for_scale {
             return self.insert_raft(key, value).await;
         }
         
@@ -1686,7 +1563,7 @@ impl SledDaemonPool {
         socket.set_sndtimeo(5000)
             .map_err(|e| GraphError::StorageError(format!("Failed to set send timeout: {}", e)))?;
 
-        let endpoint = format!("ipc:///opt/graphdb/pgraphdb-{}.ipc", port);
+        let endpoint = format!("ipc:///opt/graphdb/graphdb-{}.ipc", port);
         socket.connect(&endpoint)
             .map_err(|e| GraphError::StorageError(format!("Failed to connect to {}: {}", endpoint, e)))?;
 
@@ -1755,7 +1632,7 @@ impl SledDaemonPool {
         socket.set_sndtimeo(5000)
             .map_err(|e| GraphError::StorageError(format!("Failed to set send timeout: {}", e)))?;
 
-        let endpoint = format!("ipc:///opt/graphdb/pgraphdb-{}.ipc", port);
+        let endpoint = format!("ipc:///opt/graphdb/graphdb-{}.ipc", port);
         socket.connect(&endpoint)
             .map_err(|e| GraphError::StorageError(format!("Failed to connect to {}: {}", endpoint, e)))?;
 
@@ -1819,8 +1696,15 @@ impl SledDaemonPool {
         
         println!("===> HEALTH CHECK: Checking {} total nodes", all_ports.len());
         
+        let health_config = HealthCheckConfig {
+            interval: Duration::from_secs(10),
+            connect_timeout: Duration::from_secs(2),
+            response_buffer_size: 1024,
+        };
+
+
         for port in all_ports {
-            let is_healthy = self.health_check_node(port).await.unwrap_or(false);
+            let is_healthy = self.health_check_node(port, &health_config).await.unwrap_or(false);
             println!("===> HEALTH CHECK: Node {} is {}", port, if is_healthy { "healthy" } else { "unhealthy" });
         }
         
@@ -1832,16 +1716,18 @@ impl SledDaemonPool {
     }
 
     /// Health check for a single node
-    async fn health_check_node(&self, port: u16) -> GraphResult<bool> {
+    async fn health_check_node(&self, port: u16, config: &HealthCheckConfig) -> GraphResult<bool> {
         let address = format!("127.0.0.1:{}", port);
         let start_time = SystemTime::now();
-        let connect_timeout = Duration::from_secs(2);
 
-        match timeout(connect_timeout, TcpStream::connect(&address)).await {
+        match timeout(config.connect_timeout, TcpStream::connect(&address)).await {
             Ok(Ok(mut stream)) => {
                 let request = json!({"command": "status"});
                 let request_bytes = serde_json::to_vec(&request)
-                    .map_err(|e| GraphError::SerializationError(e.to_string()))?;
+                    .map_err(|e| {
+                        warn!("Failed to serialize status request for port {}: {}", port, e);
+                        GraphError::SerializationError(e.to_string())
+                    })?;
 
                 if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut stream, &request_bytes).await {
                     self.load_balancer.update_node_health(port, false, 0).await;
@@ -1849,8 +1735,8 @@ impl SledDaemonPool {
                     return Ok(false);
                 }
 
-                let mut response_buffer = vec![0; 4096];
-                let bytes_read = match timeout(connect_timeout, tokio::io::AsyncReadExt::read(&mut stream, &mut response_buffer)).await {
+                let mut response_buffer = vec![0; config.response_buffer_size];
+                let bytes_read = match timeout(config.connect_timeout, tokio::io::AsyncReadExt::read(&mut stream, &mut response_buffer)).await {
                     Ok(Ok(n)) => n,
                     Ok(Err(e)) => {
                         self.load_balancer.update_node_health(port, false, 0).await;
@@ -1864,13 +1750,12 @@ impl SledDaemonPool {
                     }
                 };
 
-                let response_time = start_time.elapsed().unwrap().as_millis() as u64;
+                let response_time = start_time.elapsed().unwrap_or(Duration::from_millis(0)).as_millis() as u64;
 
                 let response: Value = serde_json::from_slice(&response_buffer[..bytes_read])
                     .map_err(|e| GraphError::DeserializationError(e.to_string()))?;
 
                 let is_healthy = response["status"] == "ok";
-
                 self.load_balancer.update_node_health(port, is_healthy, response_time).await;
 
                 if is_healthy {
@@ -1895,48 +1780,34 @@ impl SledDaemonPool {
     }
 
     /// Start periodic health monitoring
-    pub async fn start_health_monitoring(&self) {
+    pub async fn start_health_monitoring(&self, config: HealthCheckConfig) {
         let load_balancer = self.load_balancer.clone();
         let daemons = self.daemons.clone();
+        let running = self.initialized.clone();
+        let health_config = config.clone(); // Clone to own the config
+        let pool = Arc::new(self.clone()); // Clone SledDaemonPool and wrap in Arc
 
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            let mut interval = interval(health_config.interval);
 
-            loop {
+            while *running.read().await {
                 interval.tick().await;
 
                 let ports: Vec<u16> = daemons.keys().copied().collect();
+                let health_checks = ports.into_iter().map(|port| {
+                    let pool = pool.clone();
+                    let health_config = health_config.clone();
+                    async move {
+                        let is_healthy = pool.health_check_node(port, &health_config).await.unwrap_or(false);
+                        (port, is_healthy)
+                    }
+                });
 
-                for port in ports {
-                    let address = format!("127.0.0.1:{}", port);
-                    let start_time = SystemTime::now();
-                    let connect_timeout = Duration::from_secs(2);
+                let start_time = SystemTime::now();
+                let results = join_all(health_checks).await;
 
-                    let is_healthy = match timeout(connect_timeout, TcpStream::connect(&address)).await {
-                        Ok(Ok(mut stream)) => {
-                            let request = json!({"command": "status"});
-                            let request_bytes = serde_json::to_vec(&request).unwrap_or_default();
-
-                            if tokio::io::AsyncWriteExt::write_all(&mut stream, &request_bytes).await.is_err() {
-                                false
-                            } else {
-                                let mut response_buffer = vec![0; 4096];
-                                match timeout(connect_timeout, tokio::io::AsyncReadExt::read(&mut stream, &mut response_buffer)).await {
-                                    Ok(Ok(n)) => {
-                                        if let Ok(response) = serde_json::from_slice::<Value>(&response_buffer[..n]) {
-                                            response["status"] == "ok"
-                                        } else {
-                                            false
-                                        }
-                                    },
-                                    _ => false,
-                                }
-                            }
-                        },
-                        _ => false,
-                    };
-
-                    let response_time = start_time.elapsed().unwrap().as_millis() as u64;
+                for (port, is_healthy) in results {
+                    let response_time = start_time.elapsed().unwrap_or(Duration::from_millis(0)).as_millis() as u64;
                     load_balancer.update_node_health(port, is_healthy, response_time).await;
 
                     if is_healthy {
@@ -1944,12 +1815,28 @@ impl SledDaemonPool {
                     } else {
                         warn!("Health check failed for node on port {}.", port);
                     }
+
+                    #[cfg(feature = "with-openraft-sled")]
+                    if is_healthy {
+                        if let Some(daemon) = daemons.get(&port) {
+                            if let Ok(is_leader) = daemon.is_leader().await {
+                                info!("Node {} Raft leader status: {}", port, is_leader);
+                            }
+                        }
+                    }
                 }
 
                 let healthy_nodes = load_balancer.get_healthy_nodes().await;
-                println!("===> HEALTH MONITOR: {}/{} nodes healthy: {:?}", 
-                         healthy_nodes.len(), daemons.len(), healthy_nodes);
+                info!("===> HEALTH MONITOR: {}/{} nodes healthy: {:?}", 
+                      healthy_nodes.len(), daemons.len(), healthy_nodes);
+
+                if healthy_nodes.len() <= daemons.len() / 2 {
+                    warn!("Cluster health degraded: only {}/{} nodes healthy", 
+                          healthy_nodes.len(), daemons.len());
+                }
             }
+
+            info!("Health monitoring stopped due to pool shutdown");
         });
     }
 
@@ -2088,7 +1975,7 @@ impl SledDaemonPool {
         }
 
         // Set Raft usage based on config
-        self.use_raft = storage_config.use_raft_for_scale;
+        self.use_raft_for_scale = storage_config.use_raft_for_scale;
         
         let port = cli_port.unwrap_or(config.port.unwrap_or(DEFAULT_STORAGE_PORT));
         let default_data_dir = PathBuf::from(DEFAULT_DATA_DIRECTORY);
@@ -2105,7 +1992,7 @@ impl SledDaemonPool {
         // Ensure directory exists
         if !db_path.exists() {
             fs::create_dir_all(&db_path).await
-                .map_err(|e| GraphError::Io(e))?;
+                .map_err(|e| GraphError::Io(e.to_string()))?;
         }
 
         // Initialize daemon
@@ -2138,8 +2025,15 @@ impl SledDaemonPool {
         self.daemons.insert(port, Arc::new(daemon));
         *initialized = true;
         
+        // Create HealthCheckConfig (use config values or defaults)
+        let health_config = HealthCheckConfig {
+            interval: Duration::from_secs(10),
+            connect_timeout: Duration::from_secs(2),
+            response_buffer_size: 1024,
+        };
+
         // Start health monitoring
-        self.start_health_monitoring().await;
+        self.start_health_monitoring(health_config).await;
         
         info!("SledDaemonPool initialized successfully with replication on port {}", port);
         println!("===> SLED DAEMON POOL INITIALIZED SUCCESSFULLY WITH REPLICATION ON PORT {}", port);
@@ -2177,8 +2071,8 @@ impl SledDaemonPool {
     }
 
     /// Public interface methods that use the enhanced replication
-    pub async fn insert(&self, key: &[u8], value: &[u8], use_raft: bool) -> GraphResult<()> {
-        self.insert_replicated(key, value, use_raft).await
+    pub async fn insert(&self, key: &[u8], value: &[u8], use_raft_for_scale: bool) -> GraphResult<()> {
+        self.insert_replicated(key, value, use_raft_for_scale).await
     }
 
     pub async fn retrieve(&self, key: &[u8]) -> GraphResult<Option<Vec<u8>>> {
@@ -2194,7 +2088,7 @@ impl SledDaemonPool {
             "healthy_nodes": healthy_nodes.len(),
             "healthy_node_ports": healthy_nodes,
             "replication_factor": self.load_balancer.replication_factor,
-            "use_raft": self.use_raft,
+            "use_raft_for_scale": false,
             "cluster_health": if healthy_nodes.len() > total_nodes / 2 { "healthy" } else { "degraded" }
         }))
     }
@@ -2326,7 +2220,7 @@ impl SledDaemonPool {
         Err(GraphError::StorageError("No leader daemon found".to_string()))
     }
 
-    pub async fn create_edge(&self, edge: Edge, _use_raft: bool) -> GraphResult<()> {
+    pub async fn create_edge(&self, edge: Edge, _use_raft_for_scale: bool) -> GraphResult<()> {
         let daemon = self.leader_daemon().await?;
         timeout(Duration::from_secs(5), daemon.create_edge(&edge)).await
             .map_err(|_| GraphError::StorageError("Timeout during create_edge".to_string()))?
@@ -2337,14 +2231,14 @@ impl SledDaemonPool {
         outbound_id: &Uuid,
         edge_type: &Identifier,
         inbound_id: &Uuid,
-        _use_raft: bool,
+        _use_raft_for_scale: bool,
     ) -> GraphResult<Option<Edge>> {
         let daemon = self.leader_daemon().await?;
         timeout(Duration::from_secs(5), daemon.get_edge(outbound_id, edge_type, inbound_id)).await
             .map_err(|_| GraphError::StorageError("Timeout during get_edge".to_string()))?
     }
 
-    pub async fn update_edge(&self, edge: Edge, _use_raft: bool) -> GraphResult<()> {
+    pub async fn update_edge(&self, edge: Edge, _use_raft_for_scale: bool) -> GraphResult<()> {
         let daemon = self.leader_daemon().await?;
         timeout(Duration::from_secs(5), daemon.update_edge(&edge)).await
             .map_err(|_| GraphError::StorageError("Timeout during update_edge".to_string()))?
@@ -2355,32 +2249,32 @@ impl SledDaemonPool {
         outbound_id: &Uuid,
         edge_type: &Identifier,
         inbound_id: &Uuid,
-        _use_raft: bool,
+        _use_raft_for_scale: bool,
     ) -> GraphResult<()> {
         let daemon = self.leader_daemon().await?;
         timeout(Duration::from_secs(5), daemon.delete_edge(outbound_id, edge_type, inbound_id)).await
             .map_err(|_| GraphError::StorageError("Timeout during delete_edge".to_string()))?
     }
 
-    pub async fn create_vertex(&self, vertex: Vertex, _use_raft: bool) -> GraphResult<()> {
+    pub async fn create_vertex(&self, vertex: Vertex, _use_raft_for_scale: bool) -> GraphResult<()> {
         let daemon = self.leader_daemon().await?;
         timeout(Duration::from_secs(5), daemon.create_vertex(&vertex)).await
             .map_err(|_| GraphError::StorageError("Timeout during create_vertex".to_string()))?
     }
 
-    pub async fn get_vertex(&self, id: &Uuid, _use_raft: bool) -> GraphResult<Option<Vertex>> {
+    pub async fn get_vertex(&self, id: &Uuid, _use_raft_for_scale: bool) -> GraphResult<Option<Vertex>> {
         let daemon = self.leader_daemon().await?;
         timeout(Duration::from_secs(5), daemon.get_vertex(id)).await
             .map_err(|_| GraphError::StorageError("Timeout during get_vertex".to_string()))?
     }
 
-    pub async fn update_vertex(&self, vertex: Vertex, _use_raft: bool) -> GraphResult<()> {
+    pub async fn update_vertex(&self, vertex: Vertex, _use_raft_for_scale: bool) -> GraphResult<()> {
         let daemon = self.leader_daemon().await?;
         timeout(Duration::from_secs(5), daemon.update_vertex(&vertex)).await
             .map_err(|_| GraphError::StorageError("Timeout during update_vertex".to_string()))?
     }
 
-    pub async fn delete_vertex(&self, id: &Uuid, _use_raft: bool) -> GraphResult<()> {
+    pub async fn delete_vertex(&self, id: &Uuid, _use_raft_for_scale: bool) -> GraphResult<()> {
         let daemon = self.leader_daemon().await?;
         timeout(Duration::from_secs(5), daemon.delete_vertex(id)).await
             .map_err(|_| GraphError::StorageError("Timeout during delete_vertex".to_string()))?
@@ -2456,7 +2350,7 @@ impl SledDaemonPool {
         let context = ZmqContext::new();
         let socket = context.socket(zmq::REQ)
             .map_err(|e| GraphError::StorageError(format!("Failed to create ZeroMQ socket: {}", e)))?;
-        let endpoint = format!("ipc:///opt/graphdb/pgraphdb-{}.ipc", port);
+        let endpoint = format!("ipc:///opt/graphdb/graphdb-{}.ipc", port);
         socket.connect(&endpoint)
             .map_err(|e| GraphError::StorageError(format!("Failed to connect to ZeroMQ socket {}: {}", endpoint, e)))?;
 
@@ -2487,7 +2381,7 @@ impl SledDaemonPool {
         let context = ZmqContext::new();
         let socket = context.socket(zmq::REQ)
             .map_err(|e| GraphError::StorageError(format!("Failed to create ZeroMQ socket: {}", e)))?;
-        let endpoint = format!("ipc:///opt/graphdb/pgraphdb-{}.ipc", port);
+        let endpoint = format!("ipc:///opt/graphdb/graphdb-{}.ipc", port);
         socket.connect(&endpoint)
             .map_err(|e| GraphError::StorageError(format!("Failed to connect to ZeroMQ socket {}: {}", endpoint, e)))?;
 
@@ -2520,7 +2414,7 @@ impl SledDaemonPool {
         let context = ZmqContext::new();
         let socket = context.socket(zmq::REQ)
             .map_err(|e| GraphError::StorageError(format!("Failed to create ZeroMQ socket: {}", e)))?;
-        let endpoint = format!("ipc:///opt/graphdb/pgraphdb-{}.ipc", port);
+        let endpoint = format!("ipc:///opt/graphdb/graphdb-{}.ipc", port);
         socket.connect(&endpoint)
             .map_err(|e| GraphError::StorageError(format!("Failed to connect to ZeroMQ socket {}: {}", endpoint, e)))?;
 
@@ -2553,7 +2447,7 @@ impl SledDaemonPool {
         let context = ZmqContext::new();
         let socket = context.socket(zmq::REQ)
             .map_err(|e| GraphError::StorageError(format!("Failed to create ZeroMQ socket: {}", e)))?;
-        let endpoint = format!("ipc:///opt/graphdb/pgraphdb-{}.ipc", port);
+        let endpoint = format!("ipc:///opt/graphdb/graphdb-{}.ipc", port);
         socket.connect(&endpoint)
             .map_err(|e| GraphError::StorageError(format!("Failed to connect to ZeroMQ socket {}: {}", endpoint, e)))?;
 
@@ -2842,21 +2736,3 @@ impl RaftNetwork<NodeId, BasicNode> for RaftTcpNetwork {
         }
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

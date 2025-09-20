@@ -18,7 +18,7 @@ pub use crate::config::{StorageEngineType,
                        StorageConfigInner};
 use crate::query_exec_engine::query_exec_engine::{QueryExecEngine};
 pub use crate::storage_engine::storage_engine::{StorageEngineManager, GLOBAL_STORAGE_ENGINE_MANAGER};
-pub use crate::config::{EngineTypeOnly, RocksdbConfig, SledConfig, TikvConfig, MySQLConfig, 
+pub use crate::config::{EngineTypeOnly, RocksDBConfig, SledConfig, TikvConfig, MySQLConfig, 
                        RedisConfig, PostgreSQLConfig};
 pub use models::errors::GraphError;
 pub use crate::config::config_structs::*;

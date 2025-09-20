@@ -13,9 +13,11 @@ use models::errors::GraphError;
 use models::{Edge, Identifier, Vertex};
 use serde_json::Value;
 use uuid::Uuid;
+use log::{info, debug, error, warn};
+
 use crate::storage_engine::{GraphStorageEngine, StorageEngine};
 use crate::storage_engine::inmemory_storage::InMemoryStorage;
-use crate::config::config::{StorageConfig, StorageEngineType};
+use crate::config::config::{StorageConfig, StorageEngineType, QueryResult, QueryPlan,};
 use tokio::sync::Mutex as TokioMutex;
 
 #[derive(Debug)]
@@ -117,6 +119,12 @@ impl GraphStorageEngine for HybridStorage {
 
     async fn query(&self, query_string: &str) -> Result<Value, GraphError> {
         self.persistent.query(query_string).await
+    }
+
+    async fn execute_query(&self, query_plan: QueryPlan) -> Result<QueryResult, GraphError> {
+        info!("Executing query on SledStorage (returning null as not implemented)");
+        println!("===> EXECUTING QUERY ON HYBRID STORAGE (NOT IMPLEMENTED)");
+        Ok(QueryResult::Null)
     }
 
     async fn create_vertex(&self, vertex: Vertex) -> Result<(), GraphError> {

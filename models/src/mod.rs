@@ -1,3 +1,4 @@
+pub mod errors;
 pub mod bulk_insert;
 pub mod edges;
 pub mod identifiers;
@@ -22,6 +23,7 @@ pub use self::properties::{
 pub use self::queries::*;
 pub use self::vertices::Vertex;
 pub use self::to_vertex::ToVertex;
+pub use self::errors::*;
 
 pub use self::medical::{
     Address,

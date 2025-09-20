@@ -1,13 +1,11 @@
-// models/src/errors.rs
-
 use std::io;
 use std::string::FromUtf8Error;
 pub use thiserror::Error;
-use uuid;
 use uuid::Error as UuidError;
 use bincode::error::{DecodeError, EncodeError};
 use anyhow::Error as AnyhowError;
 use serde_json::Error as SerdeJsonError;
+use serde::{Serialize, Deserialize};
 use rmp_serde::encode::Error as RmpEncodeError;
 use rmp_serde::decode::Error as RmpDecodeError;
 use zmq::Error as ZmqError;
@@ -15,8 +13,10 @@ use tokio::task::JoinError;
 
 use crate::{identifiers::Identifier, properties::PropertyMap, PropertyValue};
 
-#[derive(Debug, Error)]
+#[derive(Debug, Serialize, Deserialize, Error)]
 pub enum GraphError {
+    #[error("IO error: {0}")]
+    Io(String),
     #[error("Storage error: {0}")]
     StorageError(String), // General storage operation error
     #[error("Serialization error: {0}")]
@@ -43,24 +43,22 @@ pub enum GraphError {
     InternalError(String),
     #[error("entity with identifier {0} was not found")]
     NotFound(Identifier),
-    #[error(transparent)]
-    Io(#[from] io::Error),
-    #[error(transparent)]
-    Validation(#[from] ValidationError),
+    #[error("Validation error: {0}")]
+    Validation(ValidationError),
     #[cfg(feature = "rocksdb-errors")]
-    #[error(transparent)]
-    Rocksdb(#[from] rocksdb::Error),
+    #[error("RocksDB error: {0}")]
+    Rocksdb(String),
     #[cfg(feature = "sled-errors")]
-    #[error(transparent)]
-    Sled(#[from] sled::Error),
+    #[error("Sled error: {0}")]
+    Sled(String),
     #[cfg(feature = "bincode-errors")]
-    #[error(transparent)]
-    BincodeDecode(#[from] DecodeError),
+    #[error("Bincode decode error: {0}")]
+    BincodeDecode(String),
     #[cfg(feature = "bincode-errors")]
-    #[error(transparent)]
-    BincodeEncode(#[from] EncodeError),
+    #[error("Bincode encode error: {0}")]
+    BincodeEncode(String),
     #[error("UUID parsing or generation error: {0}")]
-    Uuid(#[from] UuidError),
+    Uuid(String),
     #[error("An unknown error occurred.")]
     Unknown,
     #[error("Authentication error: {0}")]
@@ -69,106 +67,143 @@ pub enum GraphError {
     InvalidStorageEngine(String),
     #[error("Network error: {0}")]
     NetworkError(String),
+    #[error("Serialization error: {0}")]
+    Serialization(String),
+    #[error("Storage error: {0}")]
+    Storage(String),
 }
 
-
-// Implement From for serde_json::Error to convert into GraphError variants.
-impl From<serde_json::Error> for GraphError {
-    fn from(err: serde_json::Error) -> Self {
-        GraphError::SerializationError(format!("JSON processing error: {}", err))
-    }
-}
-
-// Added: Implement From for rmp_serde::encode::Error
-impl From<rmp_serde::encode::Error> for GraphError {
-    fn from(err: rmp_serde::encode::Error) -> Self {
+// Implement From for rmp_serde::encode::Error
+impl From<RmpEncodeError> for GraphError {
+    fn from(err: RmpEncodeError) -> Self {
         GraphError::SerializationError(format!("MessagePack encode error: {}", err))
     }
 }
 
-// Added: Implement From for rmp_serde::decode::Error
-impl From<rmp_serde::decode::Error> for GraphError {
-    fn from(err: rmp_serde::decode::Error) -> Self {
+// Implement From for rmp_serde::decode::Error
+impl From<RmpDecodeError> for GraphError {
+    fn from(err: RmpDecodeError) -> Self {
         GraphError::DeserializationError(format!("MessagePack decode error: {}", err))
     }
 }
 
-// Added: Implement From for anyhow::Error
+// Implement From for serde_json::Error
+impl From<SerdeJsonError> for GraphError {
+    fn from(err: SerdeJsonError) -> Self {
+        GraphError::Serialization(format!("JSON serialization error: {}", err))
+    }
+}
+
+// Implement From for anyhow::Error
 impl From<AnyhowError> for GraphError {
     fn from(err: AnyhowError) -> Self {
         GraphError::StorageError(format!("Underlying storage operation failed: {}", err))
     }
 }
 
-// NEW: Implement From for zmq::Error
+// Implement From for zmq::Error
 impl From<ZmqError> for GraphError {
     fn from(err: ZmqError) -> Self {
         GraphError::NetworkError(format!("ZeroMQ error: {}", err))
     }
 }
 
-// THIS IS THE MISSING IMPLEMENTATION THAT THE COMPILER IS ASKING FOR.
+// Implement From for JoinError
 impl From<JoinError> for GraphError {
     fn from(err: JoinError) -> Self {
-        GraphError::InternalError(format!("Task failed to join: {:?}", err))
+        GraphError::InternalError(format!("Task failed to join: {}", err))
     }
 }
 
-/// A validation error.
-#[derive(Debug, Error, PartialEq)]
+// Implement From for io::Error
+impl From<io::Error> for GraphError {
+    fn from(err: io::Error) -> Self {
+        GraphError::Io(format!("IO error: {}", err))
+    }
+}
+
+// Implement From for UuidError
+impl From<UuidError> for GraphError {
+    fn from(err: UuidError) -> Self {
+        GraphError::Uuid(format!("UUID error: {}", err))
+    }
+}
+
+// Implement From for ValidationError
+impl From<ValidationError> for GraphError {
+    fn from(err: ValidationError) -> Self {
+        GraphError::Validation(err)
+    }
+}
+
+// Implement From for rocksdb::Error
+#[cfg(feature = "rocksdb-errors")]
+impl From<rocksdb::Error> for GraphError {
+    fn from(err: rocksdb::Error) -> Self {
+        GraphError::Rocksdb(format!("RocksDB error: {}", err))
+    }
+}
+
+// Implement From for sled::Error
+#[cfg(feature = "sled-errors")]
+impl From<sled::Error> for GraphError {
+    fn from(err: sled::Error) -> Self {
+        GraphError::Sled(format!("Sled error: {}", err))
+    }
+}
+
+// Implement From for bincode::error::DecodeError
+#[cfg(feature = "bincode-errors")]
+impl From<DecodeError> for GraphError {
+    fn from(err: DecodeError) -> Self {
+        GraphError::BincodeDecode(format!("Bincode decode error: {}", err))
+    }
+}
+
+// Implement From for bincode::error::EncodeError
+#[cfg(feature = "bincode-errors")]
+impl From<EncodeError> for GraphError {
+    fn from(err: EncodeError) -> Self {
+        GraphError::BincodeEncode(format!("Bincode encode error: {}", err))
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Error, PartialEq)]
 pub enum ValidationError {
-    /// An invalid value was provided where a specific value or format was expected.
     #[error("invalid value provided")]
     InvalidValue,
-    /// An inner query produced an invalid or unexpected output type.
     #[error("inner query produced an invalid output type")]
     InnerQuery,
-    /// An identifier is invalid (e.g., malformed string).
     #[error("identifier '{0}' is invalid")]
     InvalidIdentifier(String),
-    /// An identifier has an invalid length.
     #[error("identifier has invalid length")]
     InvalidIdentifierLength,
-    /// Cannot increment UUID because it is already at its maximum value.
     #[error("cannot increment UUID because it is already at its maximum value")]
     CannotIncrementUuid,
-    /// A property with the given name was not found.
     #[error("property with name {0} not found")]
     PropertyNotFound(Identifier),
-    /// The property has an unexpected type.
     #[error("property has unexpected type, expected {0}, found {1}")]
     PropertyTypeMismatch(String, String),
-    /// A required property was not found.
     #[error("required property with name {0} not found")]
     RequiredPropertyNotFound(Identifier),
-    /// A required property has an unexpected type.
     #[error("required property {0} has unexpected type, expected {1}, found {2}")]
     RequiredPropertyTypeMismatch(Identifier, String, String),
-    /// A vertex with the given label already exists.
     #[error("vertex with label {0} already exists")]
     VertexAlreadyExists(Identifier),
-    /// An edge with the given label already exists.
     #[error("edge with label {0} already exists")]
     EdgeAlreadyExists(Identifier),
-    /// A property value is missing for the given property name.
     #[error("missing property value for {0}")]
     MissingPropertyValue(Identifier),
-    /// An invalid value for a property was provided.
     #[error("invalid value for property {0}")]
     InvalidPropertyValue(Identifier),
-    /// A property is read-only and cannot be changed.
     #[error("property {0} is read-only and cannot be changed")]
     ReadOnlyProperty(Identifier),
-    /// Password hashing failed.
     #[error("password hashing failed")]
     PasswordHashingFailed,
-    /// Password verification failed.
     #[error("password verification failed")]
     PasswordVerificationFailed,
-    /// An unexpected property was found.
     #[error("unexpected property with name {0}")]
     UnexpectedProperty(Identifier),
-    /// An invalid date format was provided.
     #[error("invalid date format: {0}")]
     InvalidDateFormat(String),
 }

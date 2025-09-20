@@ -1,7 +1,7 @@
 use std::any::Any;
 use std::sync::Arc;
 use async_trait::async_trait;
-use crate::config::{ TypeConfig, MemStoreForTypeConfig}; // ensure this path matches where TypeConfig is defined
+use crate::config::{ TypeConfig, MemStoreForTypeConfig, QueryResult, QueryPlan }; // ensure this path matches where TypeConfig is defined
 use crate::storage_engine::{GraphStorageEngine, StorageConfig, StorageEngine};
 use models::{Edge, Identifier, Vertex};
 use models::errors::{GraphError, GraphResult};
@@ -166,6 +166,12 @@ impl GraphStorageEngine for RaftStorage {
             "result": "In-memory query execution placeholder"
         }))
     }
+
+    async fn execute_query(&self, query_plan: QueryPlan) -> Result<QueryResult, GraphError> {
+        info!("Executing query on RaftStorage (returning null as not implemented)");
+        println!("===> EXECUTING QUERY ON Raft STORAGE (NOT IMPLEMENTED)");
+        Ok(QueryResult::Null)
+    }       
 
     async fn create_vertex(&self, vertex: Vertex) -> Result<(), GraphError> {
         let mut vertices = self.vertices.lock().await;

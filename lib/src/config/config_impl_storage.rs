@@ -1,27 +1,41 @@
+use async_trait::async_trait;
+use std::fmt;
 use std::fs;
-use std::fs::File;
 use std::ffi::OsStr;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::task;
 use anyhow::{anyhow, Context, Result};
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use serde_yaml2 as serde_yaml;
 use serde_json::{Map, Value, from_value};
+use tokio::sync::Mutex as TokioMutex;
 use crate::config::config_impl_cli::*;
 use crate::config::config_defaults::*;
 use crate::config::config_structs::*;
 use crate::config::config_constants::*;
+use openraft::{Entry, RaftStorage, StorageError};
 use crate::config::config_helpers::{load_engine_specific_config, hashmap_to_engine_specific_config};
 use models::errors::GraphError;
 use crate::storage_engine::storage_engine::StorageEngineManager;
+use rocksdb::{
+    DB,
+    WriteBatch,
+    BoundColumnFamily,
+    ColumnFamilyDescriptor,
+    Options,
+    ColumnFamily,
+    IteratorMode,
+    WriteOptions,
+};
 
 // Helper function to normalize the engine path
 fn normalize_engine_path(mut path: PathBuf, engine_type_str: &str) -> PathBuf {
     let engine_low = engine_type_str.to_lowercase();
 
-    // If the last component is exactly the engine_low, remove it (handles duplicates like sled/sled)
     if let Some(last) = path.file_name() {
         if let Some(last_str) = last.to_str() {
             if last_str == engine_low {
@@ -30,18 +44,48 @@ fn normalize_engine_path(mut path: PathBuf, engine_type_str: &str) -> PathBuf {
         }
     }
 
-    // Check if the path now ends with the engine directory (case-insensitive)
     let path_str = path.to_str().unwrap_or("").to_lowercase();
     let ends_with_engine = path_str.ends_with(&format!("/{}", engine_low))
         || path_str.ends_with(&engine_low)
         || path.components().last().map(|c| c.as_os_str() == OsStr::new(&engine_low)).unwrap_or(false);
 
-    // If not, append the engine directory
     if !ends_with_engine {
         path.push(&engine_low);
     }
 
     path
+}
+
+pub struct Storage {
+    db: Arc<DB>,
+}
+
+impl Storage {
+    pub fn new(path: &str) -> anyhow::Result<Self> {
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        let db = DB::open(&opts, path)?;
+        Ok(Self { db: Arc::new(db) })
+    }
+
+    pub fn cleanup_cf(&self, cf: &ColumnFamily) -> anyhow::Result<()> {
+        let db = &*self.db;
+        let mut batch = WriteBatch::default();
+        let iter = db.iterator_cf(cf, IteratorMode::Start);
+
+        for item in iter {
+            let (key, _) = item.map_err(|e| anyhow!("Iterator error: {}", e))?;
+            batch.delete_cf(cf, &key);
+        }
+
+        let write_opts = WriteOptions::default();
+        db.write(batch)
+            .map_err(|e| anyhow!("rocksdb write error: {}", e))?;
+        db.flush()
+            .map_err(|e| anyhow!("rocksdb flush error: {}", e))?;
+
+        Ok(())
+    }
 }
 
 // Main wrapper struct for top-level `storage` key
@@ -60,8 +104,24 @@ impl Default for StorageConfigInner {
             password: None,
             database: None,
             pd_endpoints: None,
-            cache_capacity: Some(1024*1024*1024),
+            cache_capacity: Some(1024 * 1024 * 1024),
             use_compression: true,
+        }
+    }
+}
+
+impl Default for RocksDBConfig {
+    fn default() -> Self {
+        RocksDBConfig {
+            storage_engine_type: StorageEngineType::RocksDB,
+            path: PathBuf::from("/opt/graphdb/storage_data/rocksdb"),
+            host: Some(String::from("127.0.0.1")),
+            port: Some(8049),
+            cache_capacity: None,
+            temporary: false,
+            use_compression: true,
+            use_raft_for_scale: false,
+            max_background_jobs: Some(1000),
         }
     }
 }
@@ -130,7 +190,6 @@ impl std::fmt::Display for StorageConfig {
 
 impl StorageConfig {
     pub async fn load(path: &Path) -> Result<StorageConfig> {
-        // 1. Check if the configuration file exists. If not, create and save a default one.
         if !path.exists() {
             info!("Config file not found at {:?}", path);
             let default_config = StorageConfig::default();
@@ -138,14 +197,9 @@ impl StorageConfig {
             return Ok(default_config);
         }
 
-        // 2. Read the file content asynchronously.
         let config_content = tokio::fs::read_to_string(path)
             .await
             .context(format!("Failed to read storage config file: {}", path.display()))?;
-        //debug!("Raw YAML content from {:?}:\n{}", path, config_content);
-        // 3. Deserialize the raw configuration into StorageConfigWrapper.
-        // We are no longer pre-processing the YAML content, as serde_yaml
-        // handles quoted strings correctly and the pre-processing corrupted the YAML structure.
         let wrapper: StorageConfigWrapper = serde_yaml::from_str(&config_content)
             .context(format!("Failed to parse YAML as StorageConfigWrapper from {:?}", path.display()))
             .map_err(|e| {
@@ -154,7 +208,6 @@ impl StorageConfig {
             })?;
         let mut config = wrapper.storage;
 
-        // 4. Load engine-specific configuration and prioritize it.
         let engine_specific_config_path = match config.storage_engine_type.to_string().to_lowercase().as_str() {
             "sled" => PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_SLED),
             "rocksdb" => PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_ROCKSDB),
@@ -173,7 +226,6 @@ impl StorageConfig {
             match SelectedStorageConfig::load_from_yaml(&engine_specific_config_path) {
                 Ok(engine_config) => {
                     config.engine_specific_config = Some(engine_config);
-                    // Update default_port if engine-specific port is provided
                     if let Some(port) = config.engine_specific_config.as_ref().and_then(|c| c.storage.port) {
                         if port != config.default_port {
                             info!("Overriding default_port {} with engine-specific port {} from {:?}",
@@ -188,12 +240,10 @@ impl StorageConfig {
                 }
             }
         } else {
-            info!("Engine-specific config file not found at {:?}, using default for {:?}",
-                engine_specific_config_path, config.storage_engine_type);
+            info!("Engine-specific config file not found at {:?}, using default for {:?}", engine_specific_config_path, config.storage_engine_type);
             config.engine_specific_config = Some(create_default_selected_storage_config(&config.storage_engine_type));
         }
 
-        // 5. Synchronize storage_engine_type and normalize path.
         if let Some(engine_config) = config.engine_specific_config.clone() {
             if config.storage_engine_type != engine_config.storage_engine_type {
                 info!(
@@ -203,7 +253,6 @@ impl StorageConfig {
                 config.storage_engine_type = engine_config.storage_engine_type;
             }
 
-            // Normalize the path to ensure it matches data_directory/<engine_type>, but only if the engine type is not already the last path component.
             let engine_path_name = config.storage_engine_type.to_string().to_lowercase();
             let data_dir_path = config.data_directory.as_ref().map_or(
                 PathBuf::from(DEFAULT_DATA_DIRECTORY),
@@ -229,7 +278,6 @@ impl StorageConfig {
             config.engine_specific_config = Some(create_default_selected_storage_config(&config.storage_engine_type));
         }
 
-        // 6. Ensure required directories exist asynchronously.
         let data_dir = config.data_directory.as_ref().ok_or_else(|| anyhow!("Data directory is not specified in configuration"))?;
         tokio::fs::create_dir_all(data_dir)
             .await
@@ -242,7 +290,6 @@ impl StorageConfig {
             .context(format!("Failed to create log directory {:?}", log_dir))?;
         info!("Ensured log directory exists: {:?}", log_dir);
 
-        // 7. Final validation.
         let validated_config = config.validate().context("Failed to validate storage configuration")?;
         info!("Successfully loaded and validated storage configuration from {:?}", path);
         debug!(
@@ -316,6 +363,9 @@ impl StorageConfig {
       username: "{}"
       password: "{}"
       pd_endpoints: "{}"
+      max_background_jobs: {}
+      temporary: {}
+      use_compression: {}
     max_open_files: {}
   "#,
             self.config_root_directory.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
@@ -334,17 +384,20 @@ impl StorageConfig {
             engine_username,
             engine_password,
             engine_pd_endpoints,
+            self.engine_specific_config.as_ref().and_then(|es| es.storage.cache_capacity).unwrap_or(0),
+            self.engine_specific_config.as_ref().map_or(false, |es| es.storage.use_compression),
+            self.engine_specific_config.as_ref().map_or(false, |es| es.storage.use_compression),
             self.max_open_files
         );
 
         tokio::fs::create_dir_all(config_path.parent().unwrap())
             .await
             .context(format!("Failed to create parent directories for {}", config_path.display()))?;
-        
+
         tokio::fs::write(&config_path, yaml_string.as_bytes())
             .await
             .context(format!("Failed to write StorageConfig to file: {}", config_path.display()))?;
-        
+
         info!("Saved storage configuration to {:?}", config_path);
 
         let written_content = tokio::fs::read_to_string(&config_path)
@@ -359,13 +412,11 @@ impl StorageConfig {
         Ok(())
     }
 
-
     pub fn validate(self) -> Result<Self, GraphError> {
         let available_engines = StorageEngineManager::available_engines();
         if !available_engines.contains(&self.storage_engine_type) {
             return Err(GraphError::InvalidStorageEngine(format!(
-                "Storage engine {:?} is not enabled. Available engines: {:?}",
-                self.storage_engine_type, available_engines
+                "Storage engine {:?} is not enabled. Available engines: {:?}", self.storage_engine_type, available_engines
             )));
         }
         if let Some(engine_config) = &self.engine_specific_config {
@@ -468,7 +519,6 @@ impl SelectedStorageConfig {
             .with_context(|| format!("Failed to read config file {:?}", path))?;
         debug!("Raw YAML content from {:?}:\n{}", path, content);
 
-        // Preprocess YAML to remove commented lines
         let cleaned_content = content
             .lines()
             .filter(|line| {
@@ -478,12 +528,11 @@ impl SelectedStorageConfig {
             .collect::<Vec<&str>>()
             .join("\n");
 
-        // First try to parse as StorageConfigWrapper (main config file)
         match serde_yaml::from_str::<StorageConfigWrapper>(&cleaned_content) {
             Ok(wrapper) => {
                 if let Some(engine_config) = wrapper.storage.engine_specific_config {
                     info!("Successfully extracted engine-specific config from main config file {:?}", path);
-                    debug!("Extracted engine config: {:?}", engine_config);
+                    debug!("Parsed config: {:?}", engine_config);
                     return Ok(engine_config);
                 } else {
                     debug!("No engine_specific_config found in main config file, trying as standalone engine config");
@@ -494,12 +543,11 @@ impl SelectedStorageConfig {
             }
         }
 
-        // Try deserializing as engine-specific config file (which has 'storage:' wrapper)
         #[derive(Deserialize)]
         struct EngineSpecificWrapper {
             storage: SelectedStorageConfig,
         }
-        
+
         match serde_yaml::from_str::<EngineSpecificWrapper>(&cleaned_content) {
             Ok(wrapper) => {
                 info!("Successfully parsed engine-specific config with storage wrapper from {:?}", path);
@@ -511,7 +559,6 @@ impl SelectedStorageConfig {
             }
         }
 
-        // Try deserializing as standalone engine config (SelectedStorageConfigWrapper)
         match serde_yaml::from_str::<SelectedStorageConfigWrapper>(&cleaned_content) {
             Ok(wrapper) => {
                 info!("Successfully parsed standalone engine-specific config from {:?}", path);
@@ -523,17 +570,16 @@ impl SelectedStorageConfig {
             }
         }
 
-        // Fallback: manual parsing to handle malformed YAML
         let mut in_storage_block = false;
         let mut in_engine_config_block = false;
         let mut storage_lines: Vec<String> = Vec::new();
-        
+
         for raw_line in cleaned_content.lines() {
             let line = raw_line.trim();
             if line.is_empty() {
                 continue;
             }
-            
+
             if !in_storage_block {
                 if line.starts_with("storage:") {
                     in_storage_block = true;
@@ -544,11 +590,8 @@ impl SelectedStorageConfig {
                     in_engine_config_block = true;
                     continue;
                 }
-                // Skip other top-level storage fields
                 continue;
             } else {
-                // We're in the engine_specific_config block
-                // Stop at unindented lines (end of block) or other top-level keys
                 if (!raw_line.starts_with(' ') && !raw_line.starts_with('\t')) ||
                    (line.ends_with(':') && !line.contains(' ')) {
                     break;
@@ -556,8 +599,7 @@ impl SelectedStorageConfig {
                 storage_lines.push(line.to_string());
             }
         }
-        
-        // If we didn't find engine_specific_config block, treat whole content as engine config
+
         if storage_lines.is_empty() {
             for raw_line in cleaned_content.lines() {
                 let line = raw_line.trim();
@@ -570,7 +612,6 @@ impl SelectedStorageConfig {
                         continue;
                     }
                 } else {
-                    // Stop at unindented lines (end of storage block)
                     if !raw_line.starts_with(' ') && !raw_line.starts_with('\t') {
                         break;
                     }
@@ -578,7 +619,7 @@ impl SelectedStorageConfig {
                 }
             }
         }
-        
+
         let storage_block = storage_lines.join("\n");
 
         let extract_simple = |key: &str| -> Option<String> {
@@ -639,9 +680,8 @@ impl SelectedStorageConfig {
                 password: extract_simple("password"),
                 database: extract_simple("database"),
                 pd_endpoints: extract_simple("pd_endpoints"),
-                cache_capacity: Some(1024*1024*1024),
+                cache_capacity: Some(1024 * 1024 * 1024),
                 use_compression: true,
-
             },
         };
 
@@ -676,5 +716,109 @@ fn create_default_selected_storage_config(engine_type: &StorageEngineType) -> Se
             cache_capacity: None,
             use_compression: true,
         },
+    }
+}
+
+impl RocksDBRaftStorage {
+    /// Creates a new instance of RocksDBRaftStorage.
+    pub fn new(
+        db: Arc<DB>,
+        log_cf: Arc<BoundColumnFamily<'static>>,
+        state_cf: Arc<BoundColumnFamily<'static>>,
+        snapshot_cf: Arc<BoundColumnFamily<'static>>,
+        snapshot_meta_cf: Arc<BoundColumnFamily<'static>>,
+        client: Arc<RocksDBClient>,
+        config: StorageConfig,
+    ) -> Self {
+        Self {
+            db,
+            state_cf_name: "state".to_string(),
+            log_cf_name: "log".to_string(),
+            state_cf,
+            log_cf,
+            snapshot_cf,
+            snapshot_cf_name: "snapshot".to_string(),
+            snapshot_meta_cf_name: "snapshot_meta".to_string(),
+            snapshot_meta_cf,
+            config,
+            client: Some(client),
+        }
+    }
+
+    /// Retrieves a value for a given key from the log column family.
+    pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, GraphError> {
+        let db = self.db.clone();
+        let log_cf = self.log_cf.clone();
+        let key = key.to_vec(); // Clone to owned Vec<u8> for 'static lifetime
+
+        task::spawn_blocking(move || {
+            debug!("Getting key {:?}", key);
+            db.get_cf(&log_cf, &key)
+                .map_err(|e| GraphError::StorageError(e.to_string()))
+        })
+        .await
+        .map_err(|e| GraphError::StorageError(format!("Failed to spawn blocking task: {}", e)))?
+    }
+
+    /// Sets a value for a given key in the log column family.
+    pub async fn set(&self, key: &[u8], value: &[u8]) -> Result<(), GraphError> {
+        let db = self.db.clone();
+        let log_cf = self.log_cf.clone();
+        let key = key.to_vec(); // Clone to owned Vec<u8> for 'static lifetime
+        let value = value.to_vec(); // Clone to owned Vec<u8> for 'static lifetime
+
+        task::spawn_blocking(move || {
+            let mut write_opts = WriteOptions::default();
+            write_opts.set_sync(true);
+            debug!("Setting key {:?} with value {:?}", key, value);
+            db.put_cf_opt(&log_cf, &key, &value, &write_opts)
+                .map_err(|e| GraphError::StorageError(e.to_string()))
+        })
+        .await
+        .map_err(|e| GraphError::StorageError(format!("Failed to spawn blocking task: {}", e)))?
+    }
+
+    /// Deletes a key-value pair from the log column family.
+    pub async fn delete(&self, key: &[u8]) -> Result<(), GraphError> {
+        let db = self.db.clone();
+        let log_cf = self.log_cf.clone();
+        let key = key.to_vec(); // Clone to owned Vec<u8> for 'static lifetime
+
+        task::spawn_blocking(move || {
+            let mut write_opts = WriteOptions::default();
+            write_opts.set_sync(true);
+            debug!("Deleting key {:?}", key);
+            db.delete_cf_opt(&log_cf, &key, &write_opts)
+                .map_err(|e| GraphError::StorageError(e.to_string()))
+        })
+        .await
+        .map_err(|e| GraphError::StorageError(format!("Failed to spawn blocking task: {}", e)))?
+    }
+
+    /// Flushes all pending writes to disk.
+    pub async fn flush(&self) -> Result<(), GraphError> {
+        let db = self.db.clone();
+
+        task::spawn_blocking(move || {
+            debug!("Flushing WAL");
+            db.flush_wal(true)
+                .map_err(|e| GraphError::StorageError(e.to_string()))
+        })
+        .await
+        .map_err(|e| GraphError::StorageError(format!("Failed to spawn blocking task: {}", e)))?
+    }
+
+    /// Closes the underlying RocksDB client.
+    pub async fn close(&mut self) -> Result<(), GraphError> {
+        if let Some(client_arc) = self.client.take() {
+            debug!("Closing RocksDB client");
+            // The unwrap is safe here because `take()` guarantees we have a value.
+            let mut client = Arc::try_unwrap(client_arc)
+                .map_err(|_| GraphError::Storage("Could not unwrap Arc to close client".to_string()))?;
+            client.close().await
+        } else {
+            debug!("No RocksDB client to close");
+            Ok(())
+        }
     }
 }

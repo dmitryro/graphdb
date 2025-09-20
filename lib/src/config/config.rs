@@ -66,6 +66,7 @@ pub use super::config_impl_cli::*;
 pub use super::config_impl_storage::*;
 pub use super::config_serializers::*;
 pub use super::config_constants::*;
+pub use super::config_traits::*;
 
 use crate::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
 
