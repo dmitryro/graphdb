@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::sync::{Mutex as TokioMutex, RwLock};
-use crate::config::{ReplicationStrategy, NodeHealth};
+use crate::config::{ReplicationStrategy, NodeHealth, HealthCheckConfig};
 use models::errors::{GraphResult, GraphError};
 use log::{info, debug, warn, error, trace};
-pub use crate::config::config_structs::{ LoadBalancer };
-
+use std::collections::VecDeque;
+pub use crate::config::config_structs::{LoadBalancer};
 
 impl LoadBalancer {
     /// Create a new LoadBalancer instance.
@@ -15,6 +15,8 @@ impl LoadBalancer {
             nodes: Arc::new(RwLock::new(HashMap::new())),
             current_index: Arc::new(TokioMutex::new(0)),
             replication_factor,
+            health_check_config: HealthCheckConfig::default(),
+            healthy_nodes: Arc::new(RwLock::new(VecDeque::new())),
         }
     }
 

@@ -1,8 +1,10 @@
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
-use anyhow::{Result, Context, anyhow};
+use derivative::Derivative;
 use tokio::sync::{Mutex as TokioMutex, RwLock};
 use tokio::time::Duration;
 use clap::{Args, Parser, Subcommand};
+use uuid::Uuid;
 use log::{debug, error, info, warn, trace};
 use std::path::{Path, PathBuf};
 use std::collections::{HashMap};
@@ -16,49 +18,92 @@ use crate::config::config_constants::*;
 use crate::config::config_serializers::*;
 use crate::query_exec_engine::query_exec_engine::{QueryExecEngine};
 use crate::commands::{Commands, CommandType, StatusArgs, RestartArgs, ReloadArgs, RestartAction,
-                    ReloadAction, RestCliCommand, StatusAction, StorageAction, ShowAction, ShowArgs,
-                    StartAction, StopAction, StopArgs, DaemonCliCommand, UseAction, SaveAction};
+                      ReloadAction, RestCliCommand, StatusAction, StorageAction, ShowAction, ShowArgs,
+                      StartAction, StopAction, StopArgs, DaemonCliCommand, UseAction, SaveAction};
 use crate::daemon_utils::{is_port_in_cluster_range, is_valid_cluster_range, parse_cluster_range};
 pub use crate::storage_engine::storage_engine::{StorageEngineManager, GLOBAL_STORAGE_ENGINE_MANAGER};
-pub use models::errors::GraphError;
+use models::{Vertex, Edge, Identifier, identifiers::SerializableUuid};
+use models::errors::{GraphError, GraphResult};
 use openraft_memstore::MemStore;
+use openraft::{
+    self, BasicNode, Entry, LogId, RaftLogReader, RaftSnapshotBuilder, RaftStorage, Snapshot,
+    SnapshotMeta, RaftTypeConfig, StoredMembership, Vote,
+};
+use rocksdb::{BoundColumnFamily, ColumnFamily, ColumnFamilyDescriptor, DB, Options, WriteOptions};
+
 #[cfg(feature = "with-openraft-sled")]
 use openraft_sled::SledRaftStorage;
 use sled::{Config, Db, Tree};
 use crate::daemon_registry::DaemonMetadata;
 
+// Raft type configuration
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Ord, PartialOrd, Eq, PartialEq, Copy)]
+pub struct TypeConfig;
+
+/// The type for a Raft node's unique ID.
+pub type NodeIdType = u64;
+/*
+impl openraft::RaftTypeConfig for TypeConfig {
+    type D = Vec<u8>;
+    type R = RaftResponse;
+    type NodeId = u64;
+    type Node = BasicNode;
+    type Entry = Entry<Self>;
+    type SnapshotData = std::io::Cursor<Vec<u8>>;
+}
+*/
+
+
+// The NodeId must be `u64` as per the `openraft` crate's definition.
+
+// Define Raft application's request and response types.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AppResponse {
+    SetResponse(String),
+    DeleteResponse,
+}
+
+impl RaftTypeConfig for TypeConfig {
+    type D = AppRequest;
+    type R = AppResponse;
+    type NodeId = NodeIdType;
+    type Node = NodeIdType; // Simplified to use NodeIdType directly
+    type Entry = openraft::Entry<Self>;
+    type SnapshotData = std::io::Cursor<Vec<u8>>;
+    type AsyncRuntime = openraft::TokioRuntime;
+    type Responder = openraft::raft::responder::OneshotResponder<Self>;
+}
+
+/*
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AppResponse {
+    pub message: String,
+}*/
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RaftResponse {
+    SetResponse(String),
+    DeleteResponse,
+}
 
 /// Represents a plan for a graph query.
-/// In this context, it's a simple container for the query string itself,
-/// which would be interpreted by the remote storage engine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueryPlan {
-    /// The string representation of the query to be executed.
     pub query: String,
 }
 
 /// Represents the result of an executed graph query.
-/// It contains the raw data returned by the storage engine,
-/// typically as a string that can be deserialized into a more
-/// complex data structure later.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QueryResult {
-    /// A successful query result containing a string of data.
     Success(String),
-    /// Represents a null or empty result.
     Null,
 }
 
-
 /// Replication strategy for data operations
-/// Represents the strategy for replicating data writes.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum ReplicationStrategy {
-    /// Replicate to all available nodes
     AllNodes,
-    /// Replicate to N nodes (including primary)
     NNodes(usize),
-    /// Use Raft consensus
     Raft,
 }
 
@@ -71,17 +116,29 @@ pub struct NodeHealth {
     pub response_time_ms: u64,
     pub error_count: u32,
 }
-
 /// Load balancer for routing requests across healthy nodes
-/// The configuration for the load balancer in a distributed setup.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Derivative, Clone, Serialize, Deserialize)]
+#[derivative(Debug, Default)]
 pub struct LoadBalancer {
     #[serde(skip)]
+    #[derivative(Debug = "ignore")]
     pub nodes: Arc<RwLock<HashMap<u16, NodeHealth>>>,
+
     #[serde(skip)]
+    #[derivative(Debug = "ignore")]
     pub current_index: Arc<TokioMutex<usize>>,
+
     pub replication_factor: usize,
+
+    #[serde(skip)]
+    #[derivative(Debug = "ignore")]
+    pub healthy_nodes: Arc<RwLock<VecDeque<NodeHealth>>>,
+
+    #[serde(skip)]
+    #[derivative(Debug = "ignore")]
+    pub health_check_config: HealthCheckConfig,
 }
+
 
 #[derive(Clone)]
 pub struct HealthCheckConfig {
@@ -100,7 +157,7 @@ impl Default for HealthCheckConfig {
     }
 }
 
-// StorageEngineType
+/// Storage engine types
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum StorageEngineType {
@@ -114,27 +171,24 @@ pub enum StorageEngineType {
     MySQL,
 }
 
-#[derive(Clone, Debug, Copy, Default, Eq, PartialEq, Ord, PartialOrd)]
-pub struct TypeConfig;
-
 pub struct MemStoreForTypeConfig {
     pub inner: Arc<MemStore>,
 }
 
-// Define a struct to mirror the YAML configuration
+/// Engine configuration from YAML
 #[derive(Debug, Deserialize)]
 pub struct EngineConfig {
     pub storage: HashMap<String, Value>,
 }
 
-// Struct to hold sled::Db and its path
+/// Struct to hold sled::Db and its path
 #[derive(Debug)]
 pub struct SledDbWithPath {
     pub db: Arc<sled::Db>,
     pub path: PathBuf,
 }
 
-// --- Struct Definitions ---
+/// Sled daemon configuration
 #[derive(Debug, Clone)]
 pub struct SledDaemon {
     pub port: u16,
@@ -145,30 +199,122 @@ pub struct SledDaemon {
     pub kv_pairs: Tree,
     pub running: Arc<TokioMutex<bool>>,
     #[cfg(feature = "with-openraft-sled")]
-    pub raft_storage: Arc<openraft_sled::SledRaftStorage>,
+    pub raft_storage: Arc<openraft_sled::SledRaftStorage<TypeConfig>>,
     #[cfg(feature = "with-openraft-sled")]
     pub node_id: u64,
 }
 
+/// Sled daemon pool
 #[derive(Debug, Default, Clone)]
 pub struct SledDaemonPool {
     pub daemons: HashMap<u16, Arc<SledDaemon>>,
     pub registry: Arc<RwLock<HashMap<u16, DaemonMetadata>>>,
     pub initialized: Arc<RwLock<bool>>,
     pub load_balancer: Arc<LoadBalancer>,
-    pub use_raft: bool,
+    pub use_raft_for_scale: bool, // Changed from use_raft
 }
 
+/// Sled storage configuration
 #[derive(Debug, Clone)]
 pub struct SledStorage {
     pub pool: Arc<TokioMutex<SledDaemonPool>>,
 }
 
+/// Struct to hold rocksdb::DB and its path
+#[derive(Debug)]
+pub struct RocksDbWithPath {
+    pub db: Arc<DB>,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RaftCommand {
+    SetKey { key: Vec<u8>, value: Vec<u8> },
+    DeleteKey { key: Vec<u8> },
+    CreateVertex(Vertex),
+    UpdateVertex(Vertex),
+    DeleteVertex(Uuid),
+    CreateEdge(Edge),
+    UpdateEdge(Edge),
+    Set { key: String, value: String, cf: String },
+    Insert { key: String, value: String, cf: String },
+    Remove { key: String, cf: String },
+    Delete { key: String, cf: String },
+    DeleteEdge { outbound_id: Uuid, edge_type: Identifier, inbound_id: Uuid },
+}
+
+
+// The AppRequest enum wraps your RaftCommand. OpenRaft is generic over this
+// type, allowing it to handle your specific application commands.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum AppRequest {
+    // The Command variant holds the actual application logic to be executed.
+    Command(RaftCommand),
+}
+
+/// RocksDB Client
+#[derive(Debug, Clone)]
+pub struct RocksDBClient {
+    pub inner: Arc<TokioMutex<Arc<DB>>>,
+    pub db_path: PathBuf,
+    pub is_running: bool,
+}
+
+/// RocksDB Raft storage
+#[derive(Clone)]
+pub struct RocksDBRaftStorage {
+    pub db: Arc<DB>,
+    pub state_cf_name: String,
+    pub log_cf_name: String,
+    pub snapshot_cf_name: String,
+    pub snapshot_meta_cf_name: String,
+    pub state_cf: Arc<BoundColumnFamily<'static>>,
+    pub log_cf: Arc<BoundColumnFamily<'static>>,
+    pub snapshot_cf: Arc<BoundColumnFamily<'static>>,
+    pub snapshot_meta_cf: Arc<BoundColumnFamily<'static>>,
+    pub config: StorageConfig,
+    pub client: Option<Arc<RocksDBClient>>,
+}
+
+/// RocksDB daemon configuration
+#[derive(Debug, Clone)]
+pub struct RocksDBDaemon {
+    pub port: u16,
+    pub db_path: PathBuf,
+    pub db: Arc<DB>,
+    pub running: Arc<TokioMutex<bool>>,
+    #[cfg(feature = "with-openraft-rocksdb")]
+    pub raft_storage: Arc<RocksDBRaftStorage>,
+    #[cfg(feature = "with-openraft-rocksdb")]
+    pub node_id: u64,
+}
+
+/// RocksDB daemon pool
+#[derive(Debug, Default, Clone)]
+pub struct RocksDBDaemonPool {
+    pub daemons: HashMap<u16, Arc<RocksDBDaemon>>,
+    pub registry: Arc<RwLock<HashMap<u16, DaemonMetadata>>>,
+    pub initialized: Arc<RwLock<bool>>,
+    pub load_balancer: Arc<LoadBalancer>,
+    pub use_raft_for_scale: bool, // Changed from use_raft
+}
+
+/// RocksDB storage configuration
+#[derive(Debug, Clone)]
+pub struct RocksDBStorage {
+    pub use_raft_for_scale: bool,
+    pub pool: Arc<TokioMutex<RocksDBDaemonPool>>,
+    #[cfg(feature = "with-openraft-rocksdb")]
+    pub raft: Option<openraft::Raft<TypeConfig>>,
+}
+
+/// Engine type configuration
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct EngineTypeOnly {
     pub storage_engine_type: StorageEngineType,
 }
 
+/// Hybrid storage configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HybridConfig {
     pub storage_engine_type: StorageEngineType,
@@ -177,14 +323,21 @@ pub struct HybridConfig {
     pub port: Option<u16>,
 }
 
+/// RocksDB configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RocksdbConfig {
+pub struct RocksDBConfig {
     pub storage_engine_type: StorageEngineType,
     pub path: PathBuf,
     pub host: Option<String>,
     pub port: Option<u16>,
+    pub temporary: bool,
+    pub use_compression: bool,
+    pub use_raft_for_scale: bool,
+    pub cache_capacity: Option<u64>,
+    pub max_background_jobs: Option<u16>,
 }
 
+/// Sled configuration
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct SledConfig {
@@ -211,6 +364,7 @@ impl Default for SledConfig {
     }
 }
 
+/// TiKV configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TikvConfig {
     pub storage_engine_type: StorageEngineType,
@@ -222,6 +376,7 @@ pub struct TikvConfig {
     pub password: Option<String>,
 }
 
+/// Redis configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedisConfig {
     pub storage_engine_type: StorageEngineType,
@@ -230,6 +385,7 @@ pub struct RedisConfig {
     pub port: Option<u16>,
 }
 
+/// MySQL configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MySQLConfig {
     pub storage_engine_type: StorageEngineType,
@@ -238,6 +394,7 @@ pub struct MySQLConfig {
     pub port: Option<u16>,
 }
 
+/// PostgreSQL configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostgreSQLConfig {
     pub storage_engine_type: StorageEngineType,
@@ -246,7 +403,7 @@ pub struct PostgreSQLConfig {
     pub port: Option<u16>,
 }
 
-// A temporary struct to deserialize the raw YAML content, which is flexible.
+/// Raw storage configuration from YAML
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "kebab-case")]
 pub struct RawStorageConfig {
@@ -263,6 +420,7 @@ pub struct RawStorageConfig {
     pub max_open_files: Option<u64>,
 }
 
+/// Inner storage configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StorageConfigInner {
     #[serde(with = "option_path_buf_serde", default)]
@@ -285,6 +443,7 @@ pub struct StorageConfigInner {
     pub cache_capacity: Option<u64>,
 }
 
+/// Selected storage configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SelectedStorageConfig {
     #[serde(with = "storage_engine_type_serde")]
@@ -293,12 +452,13 @@ pub struct SelectedStorageConfig {
     pub storage: StorageConfigInner,
 }
 
-// THIS IS THE MISSING STRUCT DEFINITION
+/// Wrapper for selected storage configuration
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct SelectedStorageConfigWrapper {
     pub storage: SelectedStorageConfig,
 }
 
+/// Main daemon configuration
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct MainDaemonConfig {
     pub data_directory: String,
@@ -307,11 +467,13 @@ pub struct MainDaemonConfig {
     pub cluster_range: String,
 }
 
+/// Wrapper for main daemon configuration
 #[derive(Debug, Deserialize)]
 pub struct MainConfigWrapper {
     pub main_daemon: MainDaemonConfig,
 }
 
+/// REST API configuration
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct RestApiConfig {
     pub data_directory: String,
@@ -320,12 +482,14 @@ pub struct RestApiConfig {
     pub cluster_range: String,
 }
 
+/// Wrapper for REST API configuration
 #[derive(Debug, Deserialize, Serialize)]
 pub struct RestApiConfigWrapper {
-   pub config_root_directory: String,
-   pub rest_api: RestApiConfig,
+    pub config_root_directory: String,
+    pub rest_api: RestApiConfig,
 }
 
+/// Daemon YAML configuration
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct DaemonYamlConfig {
     pub config_root_directory: String,
@@ -339,6 +503,7 @@ pub struct DaemonYamlConfig {
     pub log_level: String,
 }
 
+/// Storage configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct StorageConfig {
@@ -371,7 +536,7 @@ pub struct StorageConfigWrapper {
     pub storage: StorageConfig,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineSpecificConfig {
     pub storage_engine_type: StorageEngineType,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -541,11 +706,11 @@ pub struct PathsConfig {}
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct SecurityConfig {}
 
-#[derive(Debug, Serialize, Deserialize, Clone)] // Fixed: Added Serialize and Deserialize derives
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ServerConfig {
     pub port: Option<u16>,
     pub host: Option<String>,
-    pub max_connections: u32, // Fixed: Corrected syntax from `<u32>` to `u32`
+    pub max_connections: u32,
 }
 
 impl Default for ServerConfig {
@@ -554,7 +719,7 @@ impl Default for ServerConfig {
         ServerConfig {
             port: Some(DEFAULT_STORAGE_PORT),
             host: Some("127.0.0.1".to_string()),
-            max_connections: 100, // Added: Provide a default value for max_connections
+            max_connections: 100,
         }
     }
 }
@@ -596,11 +761,11 @@ impl Default for DaemonConfig {
         trace!("Creating default DaemonConfig");
         DaemonConfig {
             port: None,
-            process_name: "graphdb".to_string(), // Fixed: Use String directly
-            user: "graphdb".to_string(),          // Fixed: Use String directly
-            group: "graphdb".to_string(),         // Fixed: Use String directly
+            process_name: "graphdb".to_string(),
+            user: "graphdb".to_string(),
+            group: "graphdb".to_string(),
             default_port: 8049,
-            cluster_range: "8000-9000".to_string(), // Fixed: Use String directly
+            cluster_range: "8000-9000".to_string(),
             max_connections: 300,
             max_open_files: 100,
             use_raft_for_scale: false,
@@ -610,7 +775,7 @@ impl Default for DaemonConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 #[serde(rename_all = "snake_case")]
 pub struct CliTomlStorageConfig {
     #[serde(default)]

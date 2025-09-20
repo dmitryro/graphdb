@@ -66,10 +66,10 @@ use daemon_api::start_daemon;
 pub use models::errors::GraphError;
 use lib::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
 use lib::config::{StorageEngineType, StorageConfig as EngineStorageConfig, TikvConfig,
-                                  RedisConfig, MySQLConfig, PostgreSQLConfig, RocksdbConfig, SledConfig,
+                                  RedisConfig, MySQLConfig, PostgreSQLConfig, RocksDBConfig, SledConfig,
                                   };
 use lib::storage_engine::{AsyncStorageEngineManager, StorageEngineManager, GLOBAL_STORAGE_ENGINE_MANAGER, 
-                          emergency_cleanup_storage_engine_manager,  SledStorage, RocksdbStorage, TikvStorage, 
+                          emergency_cleanup_storage_engine_manager,  SledStorage, RocksDBStorage, TikvStorage, 
                           log_lock_file_diagnostics, SurrealdbGraphStorage};
 
 use lib::daemon::daemon_management::{

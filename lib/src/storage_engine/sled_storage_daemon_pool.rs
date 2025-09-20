@@ -1481,7 +1481,7 @@ impl SledDaemonPool {
             registry: Arc::new(RwLock::new(HashMap::new())),
             initialized: Arc::new(RwLock::new(false)),
             load_balancer: Arc::new(LoadBalancer::new(3)), // Default replication factor of 3
-            use_raft: false,
+            use_raft_for_scale: false,
         }
     }
 
@@ -1498,8 +1498,8 @@ impl SledDaemonPool {
     }
 
     /// Enhanced insert with replication across multiple nodes
-    pub async fn insert_replicated(&self, key: &[u8], value: &[u8], use_raft: bool) -> GraphResult<()> {
-        let strategy = if use_raft && self.use_raft {
+    pub async fn insert_replicated(&self, key: &[u8], value: &[u8], use_raft_for_scale: bool) -> GraphResult<()> {
+        let strategy = if use_raft_for_scale && self.use_raft_for_scale {
             ReplicationStrategy::Raft
         } else {
             ReplicationStrategy::NNodes(self.load_balancer.replication_factor)
@@ -1515,7 +1515,7 @@ impl SledDaemonPool {
         
         // For Raft, use leader-based replication
          #[cfg(feature = "with-openraft-sled")]
-        if matches!(strategy, ReplicationStrategy::Raft) && self.use_raft {
+        if matches!(strategy, ReplicationStrategy::Raft) && self.use_raft_for_scale {
             return self.insert_raft(key, value).await;
         }
         
@@ -1975,7 +1975,7 @@ impl SledDaemonPool {
         }
 
         // Set Raft usage based on config
-        self.use_raft = storage_config.use_raft_for_scale;
+        self.use_raft_for_scale = storage_config.use_raft_for_scale;
         
         let port = cli_port.unwrap_or(config.port.unwrap_or(DEFAULT_STORAGE_PORT));
         let default_data_dir = PathBuf::from(DEFAULT_DATA_DIRECTORY);
@@ -1992,7 +1992,7 @@ impl SledDaemonPool {
         // Ensure directory exists
         if !db_path.exists() {
             fs::create_dir_all(&db_path).await
-                .map_err(|e| GraphError::Io(e))?;
+                .map_err(|e| GraphError::Io(e.to_string()))?;
         }
 
         // Initialize daemon
@@ -2071,8 +2071,8 @@ impl SledDaemonPool {
     }
 
     /// Public interface methods that use the enhanced replication
-    pub async fn insert(&self, key: &[u8], value: &[u8], use_raft: bool) -> GraphResult<()> {
-        self.insert_replicated(key, value, use_raft).await
+    pub async fn insert(&self, key: &[u8], value: &[u8], use_raft_for_scale: bool) -> GraphResult<()> {
+        self.insert_replicated(key, value, use_raft_for_scale).await
     }
 
     pub async fn retrieve(&self, key: &[u8]) -> GraphResult<Option<Vec<u8>>> {
@@ -2088,7 +2088,7 @@ impl SledDaemonPool {
             "healthy_nodes": healthy_nodes.len(),
             "healthy_node_ports": healthy_nodes,
             "replication_factor": self.load_balancer.replication_factor,
-            "use_raft": self.use_raft,
+            "use_raft_for_scale": false,
             "cluster_health": if healthy_nodes.len() > total_nodes / 2 { "healthy" } else { "degraded" }
         }))
     }
@@ -2220,7 +2220,7 @@ impl SledDaemonPool {
         Err(GraphError::StorageError("No leader daemon found".to_string()))
     }
 
-    pub async fn create_edge(&self, edge: Edge, _use_raft: bool) -> GraphResult<()> {
+    pub async fn create_edge(&self, edge: Edge, _use_raft_for_scale: bool) -> GraphResult<()> {
         let daemon = self.leader_daemon().await?;
         timeout(Duration::from_secs(5), daemon.create_edge(&edge)).await
             .map_err(|_| GraphError::StorageError("Timeout during create_edge".to_string()))?
@@ -2231,14 +2231,14 @@ impl SledDaemonPool {
         outbound_id: &Uuid,
         edge_type: &Identifier,
         inbound_id: &Uuid,
-        _use_raft: bool,
+        _use_raft_for_scale: bool,
     ) -> GraphResult<Option<Edge>> {
         let daemon = self.leader_daemon().await?;
         timeout(Duration::from_secs(5), daemon.get_edge(outbound_id, edge_type, inbound_id)).await
             .map_err(|_| GraphError::StorageError("Timeout during get_edge".to_string()))?
     }
 
-    pub async fn update_edge(&self, edge: Edge, _use_raft: bool) -> GraphResult<()> {
+    pub async fn update_edge(&self, edge: Edge, _use_raft_for_scale: bool) -> GraphResult<()> {
         let daemon = self.leader_daemon().await?;
         timeout(Duration::from_secs(5), daemon.update_edge(&edge)).await
             .map_err(|_| GraphError::StorageError("Timeout during update_edge".to_string()))?
@@ -2249,32 +2249,32 @@ impl SledDaemonPool {
         outbound_id: &Uuid,
         edge_type: &Identifier,
         inbound_id: &Uuid,
-        _use_raft: bool,
+        _use_raft_for_scale: bool,
     ) -> GraphResult<()> {
         let daemon = self.leader_daemon().await?;
         timeout(Duration::from_secs(5), daemon.delete_edge(outbound_id, edge_type, inbound_id)).await
             .map_err(|_| GraphError::StorageError("Timeout during delete_edge".to_string()))?
     }
 
-    pub async fn create_vertex(&self, vertex: Vertex, _use_raft: bool) -> GraphResult<()> {
+    pub async fn create_vertex(&self, vertex: Vertex, _use_raft_for_scale: bool) -> GraphResult<()> {
         let daemon = self.leader_daemon().await?;
         timeout(Duration::from_secs(5), daemon.create_vertex(&vertex)).await
             .map_err(|_| GraphError::StorageError("Timeout during create_vertex".to_string()))?
     }
 
-    pub async fn get_vertex(&self, id: &Uuid, _use_raft: bool) -> GraphResult<Option<Vertex>> {
+    pub async fn get_vertex(&self, id: &Uuid, _use_raft_for_scale: bool) -> GraphResult<Option<Vertex>> {
         let daemon = self.leader_daemon().await?;
         timeout(Duration::from_secs(5), daemon.get_vertex(id)).await
             .map_err(|_| GraphError::StorageError("Timeout during get_vertex".to_string()))?
     }
 
-    pub async fn update_vertex(&self, vertex: Vertex, _use_raft: bool) -> GraphResult<()> {
+    pub async fn update_vertex(&self, vertex: Vertex, _use_raft_for_scale: bool) -> GraphResult<()> {
         let daemon = self.leader_daemon().await?;
         timeout(Duration::from_secs(5), daemon.update_vertex(&vertex)).await
             .map_err(|_| GraphError::StorageError("Timeout during update_vertex".to_string()))?
     }
 
-    pub async fn delete_vertex(&self, id: &Uuid, _use_raft: bool) -> GraphResult<()> {
+    pub async fn delete_vertex(&self, id: &Uuid, _use_raft_for_scale: bool) -> GraphResult<()> {
         let daemon = self.leader_daemon().await?;
         timeout(Duration::from_secs(5), daemon.delete_vertex(id)).await
             .map_err(|_| GraphError::StorageError("Timeout during delete_vertex".to_string()))?
@@ -2736,21 +2736,3 @@ impl RaftNetwork<NodeId, BasicNode> for RaftTcpNetwork {
         }
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

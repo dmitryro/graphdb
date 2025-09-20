@@ -19,4 +19,3 @@ pub trait AsyncStorageEngine: Send + Sync + Debug {
     /// Closes the storage engine, flushing all data.
     async fn close(&self) -> Result<(), GraphError>;
 }
-

@@ -566,7 +566,7 @@ async fn create_default_yaml_config(yaml_path: &PathBuf, engine_type: StorageEng
     config.save().await
         .map_err(|e| {
             error!("Failed to save default YAML config to {:?}: {}", yaml_path, e);
-            GraphError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+            GraphError::ConfigurationError(format!("Failed to save default YAML config to {:?}: {}", yaml_path, e))
         })?;
     info!("Default YAML config created at {:?}", yaml_path);
     Ok(())
@@ -582,7 +582,7 @@ pub async fn init_storage_engine_manager(config_path_yaml: PathBuf) -> Result<()
     if let Some(parent) = config_path_yaml.parent() {
         fs::create_dir_all(parent)
             .await
-            .map_err(|e| GraphError::Io(e))
+            .map_err(|e| GraphError::Io(e.to_string()))
             .with_context(|| format!("Failed to create directory for YAML config: {:?}", parent))?;
     }
     
