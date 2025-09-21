@@ -19,6 +19,7 @@ use crate::storage_engine::{
     HybridStorage,
     InMemoryStorage,
 };
+use crate::daemon::daemon_management::is_storage_daemon_running;
 #[cfg(feature = "redis-datastore")]
 use crate::storage_engine::redis_storage::RedisStorage;
 #[cfg(feature = "postgres-datastore")]
@@ -47,16 +48,26 @@ impl Database {
                         serde_json::from_value(config_value)
                             .map_err(|e| GraphError::ConfigurationError(format!("Failed to parse SledConfig: {}", e)))?
                     } else {
+                        let port = config.default_port;
+                        let path = config.data_directory.clone()
+                            .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
+                            .join("sled")
+                            .join(port.to_string());
                         SledConfig {
                             storage_engine_type: config.storage_engine_type.clone(),
-                            path: config.data_directory.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY)),
-                            host: None,
-                            port: None,
+                            path,
+                            host: Some("127.0.0.1".to_string()),
+                            port: Some(port),
                             cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
                             temporary: false,
                             use_compression: true,
                         }
                     };
+                    // Check for existing daemon
+                    let port = sled_config.port.unwrap_or(config.default_port);
+                    if is_storage_daemon_running(port).await {
+                        info!("Reusing existing Sled daemon on port {}", port);
+                    }
                     Arc::new(SledStorage::new(&sled_config, &config).await?)
                 }
                 #[cfg(not(feature = "with-sled"))]
@@ -71,11 +82,16 @@ impl Database {
                         serde_json::from_value(config_value)
                             .map_err(|e| GraphError::ConfigurationError(format!("Failed to parse RocksDBConfig: {}", e)))?
                     } else {
+                        let port = config.default_port;
+                        let path = config.data_directory.clone()
+                            .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
+                            .join("rocksdb")
+                            .join(port.to_string());
                         RocksDBConfig {
                             storage_engine_type: config.storage_engine_type.clone(),
-                            path: config.data_directory.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY)),
-                            host: None,
-                            port: None,
+                            path,
+                            host: Some("127.0.0.1".to_string()),
+                            port: Some(port),
                             cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
                             temporary: false,
                             use_compression: true,
@@ -83,6 +99,11 @@ impl Database {
                             max_background_jobs: Some(1000),
                         }
                     };
+                    // Check for existing daemon
+                    let port = rocksdb_config.port.unwrap_or(config.default_port);
+                    if is_storage_daemon_running(port).await {
+                        info!("Reusing existing RocksDB daemon on port {}", port);
+                    }
                     Arc::new(RocksDBStorage::new(&rocksdb_config, &config).await?)
                 }
                 #[cfg(not(feature = "with-rocksdb"))]
@@ -155,15 +176,24 @@ impl Database {
                         Some(StorageEngineType::Sled) => {
                             #[cfg(feature = "with-sled")]
                             {
+                                let port = config.default_port;
+                                let path = config.data_directory.clone()
+                                    .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
+                                    .join("sled")
+                                    .join(port.to_string());
                                 let sled_config = SledConfig {
                                     storage_engine_type: StorageEngineType::Sled,
-                                    path: config.data_directory.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY)),
-                                    host: None,
-                                    port: None,
+                                    path,
+                                    host: Some("127.0.0.1".to_string()),
+                                    port: Some(port),
                                     cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
                                     temporary: false,
                                     use_compression: true,
                                 };
+                                // Check for existing daemon
+                                if is_storage_daemon_running(port).await {
+                                    info!("Reusing existing Sled daemon on port {}", port);
+                                }
                                 Arc::new(SledStorage::new(&sled_config, &config).await?)
                                     as Arc<dyn GraphStorageEngine + Send + Sync>
                             }
@@ -173,17 +203,26 @@ impl Database {
                         Some(StorageEngineType::RocksDB) => {
                             #[cfg(feature = "with-rocksdb")]
                             {
+                                let port = config.default_port;
+                                let path = config.data_directory.clone()
+                                    .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
+                                    .join("rocksdb")
+                                    .join(port.to_string());
                                 let rocksdb_config = RocksDBConfig {
                                     storage_engine_type: StorageEngineType::RocksDB,
-                                    path: config.data_directory.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY)),
-                                    host: None,
-                                    port: None,
-                                    cache_capacity: None,
+                                    path,
+                                    host: Some("127.0.0.1".to_string()),
+                                    port: Some(port),
+                                    cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
                                     temporary: false,
                                     use_compression: true,
                                     use_raft_for_scale: false,
                                     max_background_jobs: Some(1000),
                                 };
+                                // Check for existing daemon
+                                if is_storage_daemon_running(port).await {
+                                    info!("Reusing existing RocksDB daemon on port {}", port);
+                                }
                                 Arc::new(RocksDBStorage::new(&rocksdb_config, &config).await?)
                                     as Arc<dyn GraphStorageEngine + Send + Sync>
                             }
@@ -229,15 +268,24 @@ impl Database {
             StorageEngineType::Sled => {
                 #[cfg(feature = "with-sled")]
                 {
+                    let port = config_wrapper.storage.default_port;
+                    let path = config_wrapper.storage.data_directory.clone()
+                        .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
+                        .join("sled")
+                        .join(port.to_string());
                     let sled_config = SledConfig {
                         storage_engine_type: StorageEngineType::Sled,
-                        path: config_wrapper.storage.data_directory.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY)),
-                        host: None,
-                        port: None,
+                        path,
+                        host: Some("127.0.0.1".to_string()),
+                        port: Some(port),
                         cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
                         temporary: false,
                         use_compression: true,
                     };
+                    // Check for existing daemon
+                    if is_storage_daemon_running(port).await {
+                        info!("Reusing existing Sled daemon on port {}", port);
+                    }
                     Arc::new(SledStorage::new(&sled_config, &config_wrapper.storage).await?)
                         as Arc<dyn GraphStorageEngine + Send + Sync>
                 }
@@ -247,17 +295,26 @@ impl Database {
             StorageEngineType::RocksDB => {
                 #[cfg(feature = "with-rocksdb")]
                 {
+                    let port = config_wrapper.storage.default_port;
+                    let path = config_wrapper.storage.data_directory.clone()
+                        .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
+                        .join("rocksdb")
+                        .join(port.to_string());
                     let rocksdb_config = RocksDBConfig {
                         storage_engine_type: StorageEngineType::RocksDB,
-                        path: config_wrapper.storage.data_directory.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY)),
-                        host: None,
-                        port: None,
-                        cache_capacity: None,
+                        path,
+                        host: Some("127.0.0.1".to_string()),
+                        port: Some(port),
+                        cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
                         temporary: false,
                         use_compression: true,
                         use_raft_for_scale: false,
                         max_background_jobs: Some(1000),
                     };
+                    // Check for existing daemon
+                    if is_storage_daemon_running(port).await {
+                        info!("Reusing existing RocksDB daemon on port {}", port);
+                    }
                     Arc::new(RocksDBStorage::new(&rocksdb_config, &config_wrapper.storage).await?)
                         as Arc<dyn GraphStorageEngine + Send + Sync>
                 }
@@ -328,15 +385,24 @@ impl Database {
                         Some(StorageEngineType::Sled) => {
                             #[cfg(feature = "with-sled")]
                             {
+                                let port = config_wrapper.storage.default_port;
+                                let path = config_wrapper.storage.data_directory.clone()
+                                    .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
+                                    .join("sled")
+                                    .join(port.to_string());
                                 let sled_config = SledConfig {
                                     storage_engine_type: StorageEngineType::Sled,
-                                    path: config_wrapper.storage.data_directory.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY)),
-                                    host: None,
-                                    port: None,
+                                    path,
+                                    host: Some("127.0.0.1".to_string()),
+                                    port: Some(port),
                                     cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
                                     temporary: false,
                                     use_compression: true,
                                 };
+                                // Check for existing daemon
+                                if is_storage_daemon_running(port).await {
+                                    info!("Reusing existing Sled daemon on port {}", port);
+                                }
                                 Arc::new(SledStorage::new(&sled_config, &config_wrapper.storage).await?)
                                     as Arc<dyn GraphStorageEngine + Send + Sync>
                             }
@@ -346,17 +412,26 @@ impl Database {
                         Some(StorageEngineType::RocksDB) => {
                             #[cfg(feature = "with-rocksdb")]
                             {
+                                let port = config_wrapper.storage.default_port;
+                                let path = config_wrapper.storage.data_directory.clone()
+                                    .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY))
+                                    .join("rocksdb")
+                                    .join(port.to_string());
                                 let rocksdb_config = RocksDBConfig {
                                     storage_engine_type: StorageEngineType::RocksDB,
-                                    path: config_wrapper.storage.data_directory.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY)),
-                                    host: None,
-                                    port: None,
-                                    cache_capacity: None,
+                                    path,
+                                    host: Some("127.0.0.1".to_string()),
+                                    port: Some(port),
+                                    cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
                                     temporary: false,
                                     use_compression: true,
                                     use_raft_for_scale: false,
                                     max_background_jobs: Some(1000),
                                 };
+                                // Check for existing daemon
+                                if is_storage_daemon_running(port).await {
+                                    info!("Reusing existing RocksDB daemon on port {}", port);
+                                }
                                 Arc::new(RocksDBStorage::new(&rocksdb_config, &config_wrapper.storage).await?)
                                     as Arc<dyn GraphStorageEngine + Send + Sync>
                             }
