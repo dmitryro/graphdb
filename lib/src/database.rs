@@ -76,7 +76,7 @@ impl Database {
                             path: config.data_directory.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY)),
                             host: None,
                             port: None,
-                            cache_capacity: None,
+                            cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
                             temporary: false,
                             use_compression: true,
                             use_raft_for_scale: false,

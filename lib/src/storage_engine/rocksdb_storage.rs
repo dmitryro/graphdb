@@ -1,3 +1,4 @@
+use std::collections::{HashSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -11,7 +12,6 @@ use futures::future::join_all;
 use uuid::Uuid;
 use async_trait::async_trait;
 use std::any::Any;
-use std::collections::HashMap;
 
 use crate::config::{
     RocksDBConfig, RocksDBStorage, RocksDBDaemonPool, StorageConfig, StorageEngineType,
@@ -21,9 +21,9 @@ use crate::storage_engine::{StorageEngine, GraphStorageEngine};
 use crate::storage_engine::storage_utils::{
     serialize_vertex, deserialize_vertex, serialize_edge, deserialize_edge, create_edge_key
 };
-use crate::daemon::daemon_management::{find_pid_by_port, stop_process_by_pid};
+use crate::daemon::daemon_management::{find_pid_by_port, stop_process_by_pid, is_storage_daemon_running};
 use crate::daemon::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
-use crate::daemon::daemon_utils::{is_storage_daemon_running, parse_cluster_range};
+use crate::daemon::daemon_utils::{parse_cluster_range};
 use models::{Vertex, Edge, Identifier};
 use models::errors::{GraphResult, GraphError};
 use models::identifiers::SerializableUuid;
@@ -38,7 +38,30 @@ use {
 pub static ROCKSDB_DB: LazyLock<OnceCell<TokioMutex<RocksDbWithPath>>> = LazyLock::new(|| OnceCell::new());
 pub static ROCKSDB_POOL_MAP: LazyLock<OnceCell<TokioMutex<HashMap<u16, Arc<TokioMutex<RocksDBDaemonPool>>>>>> = LazyLock::new(|| OnceCell::new());
 
+// Singleton protection for RocksDB database instances
+static ACTIVE_DATABASES: LazyLock<RwLock<HashSet<PathBuf>>> = LazyLock::new(|| RwLock::new(HashSet::new()));
+
 impl RocksDBStorage {
+    // Add singleton protection to prevent multiple instances accessing same database
+    pub async fn ensure_single_instance(path: &Path) -> GraphResult<()> {
+        let mut active_dbs = ACTIVE_DATABASES.write().await;
+        if active_dbs.contains(path) {
+            return Err(GraphError::StorageError(
+                format!("Database at {:?} is already in use by another instance", path)
+            ));
+        }
+        active_dbs.insert(path.to_path_buf());
+        info!("Registered database instance at {:?}", path);
+        Ok(())
+    }
+
+    pub async fn release_instance(path: &Path) {
+        let mut active_dbs = ACTIVE_DATABASES.write().await;
+        if active_dbs.remove(path) {
+            info!("Released database instance at {:?}", path);
+        }
+    }
+
     pub async fn new(config: &RocksDBConfig, _storage_config: &StorageConfig) -> GraphResult<Self> {
         let start_time = Instant::now();
         info!("Initializing RocksDBStorage with config: {:?}", config);
@@ -51,6 +74,106 @@ impl RocksDBStorage {
         info!("Using RocksDB path {}", db_path.display());
         println!("===> USING ROCKSDB PATH {}", db_path.display());
 
+        // Check for single instance access BEFORE trying to open database
+        Self::ensure_single_instance(&db_path).await.map_err(|e| {
+            error!("Cannot initialize RocksDB at {}: {}", db_path.display(), e);
+            println!("===> ERROR: CANNOT INITIALIZE ROCKSDB AT {}: {}", db_path.display(), e);
+            e
+        })?;
+
+        // If initialization fails anywhere below, release the instance lock
+        let initialization_result = Self::initialize_database(config, _storage_config, &db_path, port).await;
+        
+        if initialization_result.is_err() {
+            Self::release_instance(&db_path).await;
+        }
+        
+        initialization_result
+    }
+
+    pub async fn new_with_client(config: &RocksDBConfig, storage_config: &StorageConfig, client: RocksDBClient) -> GraphResult<Self> {
+        let start_time = Instant::now();
+        info!("Initializing RocksDBStorage with client for port {:?}", config.port);
+        println!("===> INITIALIZING RocksDBStorage WITH CLIENT FOR PORT {:?}", config.port);
+
+        let port = config.port.unwrap_or(DEFAULT_STORAGE_PORT);
+        let db_path = config.path.clone();
+        
+        // Check if port is in use and clean up if necessary
+        match find_pid_by_port(port).await {
+            Some(pid) => {
+                warn!(
+                    "Port {} is in use by PID {}, attempting to terminate",
+                    port, pid
+                );
+                println!(
+                    "===> WARNING: PORT {} IS IN USE BY PID {}, ATTEMPTING TO TERMINATE",
+                    port, pid
+                );
+
+                if let Err(e) = stop_process_by_pid("RocksDB", pid).await {
+                    warn!("Failed to terminate daemon with PID {}: {}", pid, e);
+                    println!("===> WARNING: FAILED TO TERMINATE DAEMON WITH PID {}: {}", pid, e);
+                }
+
+                GLOBAL_DAEMON_REGISTRY
+                    .get()
+                    .await
+                    .remove_daemon_by_type("rocksdb", port)
+                    .await?;
+
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            None => {
+                debug!("No process found using port {}", port);
+                println!("===> NO PROCESS FOUND USING PORT {}", port);
+            }
+        }
+
+        let pool = {
+            let pool_map = ROCKSDB_POOL_MAP.get_or_init(|| async {
+                TokioMutex::new(HashMap::new())
+            }).await;
+            let mut pool_map_guard = pool_map.lock().await;
+            let new_pool = Arc::new(TokioMutex::new(RocksDBDaemonPool::new_with_client(client, &db_path, port).await?));
+            pool_map_guard.insert(port, new_pool.clone());
+            new_pool
+        };
+
+        let daemon_metadata = DaemonMetadata {
+            service_type: "storage".to_string(),
+            ip_address: config.host.clone().unwrap_or("127.0.0.1".to_string()),
+            data_dir: Some(db_path.clone()),
+            config_path: Some(PathBuf::from(storage_config.config_root_directory.clone().unwrap_or_default())),
+            engine_type: Some("rocksdb".to_string()),
+            last_seen_nanos: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64,
+            pid: std::process::id() as u32,
+            port,
+        };
+        GLOBAL_DAEMON_REGISTRY.get().await.register_daemon(daemon_metadata).await
+            .map_err(|e| GraphError::StorageError(format!("Failed to register daemon for port {}: {}", port, e)))?;
+        info!("Registered daemon for port {}", port);
+        println!("===> REGISTERED DAEMON FOR PORT {}", port);
+
+        let storage = Self {
+            pool,
+            use_raft_for_scale: config.use_raft_for_scale,
+            #[cfg(feature = "with-openraft-rocksdb")]
+            raft: None,
+        };
+
+        info!("Successfully initialized RocksDBStorage with client in {}ms", start_time.elapsed().as_millis());
+        println!("===> SUCCESSFULLY INITIALIZED RocksDBStorage WITH CLIENT IN {}ms", start_time.elapsed().as_millis());
+        Ok(storage)
+    }
+
+    async fn initialize_database(
+        config: &RocksDBConfig, 
+        _storage_config: &StorageConfig, 
+        db_path: &Path, 
+        port: u16
+    ) -> GraphResult<Self> {
+        let start_time = Instant::now();
         // Ensure parent directory exists
         let parent_dir = db_path.parent().ok_or_else(|| {
             error!("Invalid database path: no parent directory for {}", db_path.display());
@@ -112,7 +235,7 @@ impl RocksDBStorage {
 
                 info!("Successfully opened RocksDB database at {}", db_path.display());
                 println!("===> SUCCESSFULLY OPENED ROCKSDB DATABASE AT {}", db_path.display());
-                Ok::<_, GraphError>(TokioMutex::new(RocksDbWithPath { db: Arc::new(db), path: db_path.clone() }))
+                Ok::<_, GraphError>(TokioMutex::new(RocksDbWithPath { db: Arc::new(db), path: db_path.to_path_buf() }))
             }).await {
                 Ok(Ok(db)) => break db,
                 Ok(Err(e)) => {
@@ -136,7 +259,7 @@ impl RocksDBStorage {
             .map_err(|_| GraphError::StorageError("Failed to set ROCKSDB_DB singleton".to_string()))?;
 
         let pool = {
-            let daemon_metadata_opt = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await.ok().flatten();
+            let daemon_metadata_opt = GLOBAL_DAEMON_REGISTRY.get().await.get_daemon_metadata(port).await.ok().flatten();
             if let Some(daemon_metadata) = daemon_metadata_opt {
                 info!("Found existing daemon on port {}, attempting to reuse pool", port);
                 println!("===> FOUND EXISTING DAEMON ON PORT {}, ATTEMPTING TO REUSE POOL", port);
@@ -169,7 +292,7 @@ impl RocksDBStorage {
                         }
                         tokio::time::sleep(Duration::from_millis(500)).await;
                     }
-                    GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("rocksdb", port).await?;
+                    GLOBAL_DAEMON_REGISTRY.get().await.remove_daemon_by_type("rocksdb", port).await?;
                     Self::force_unlock(&db_path).await?;
                     tokio::time::sleep(Duration::from_millis(500)).await;
                     let new_pool = Arc::new(TokioMutex::new(RocksDBDaemonPool::new()));
@@ -241,6 +364,31 @@ impl RocksDBStorage {
         let db_path = config.path.clone();
         let port = config.port.unwrap_or(DEFAULT_STORAGE_PORT);
 
+        // Check for single instance access BEFORE using existing database
+        Self::ensure_single_instance(&db_path).await.map_err(|e| {
+            error!("Cannot initialize RocksDB at {}: {}", db_path.display(), e);
+            println!("===> ERROR: CANNOT INITIALIZE ROCKSDB AT {}: {}", db_path.display(), e);
+            e
+        })?;
+
+        // If initialization fails anywhere below, release the instance lock
+        let initialization_result = Self::initialize_with_existing_db(config, _storage_config, existing_db, &db_path, port).await;
+        
+        if initialization_result.is_err() {
+            Self::release_instance(&db_path).await;
+        }
+        
+        initialization_result
+    }
+
+    async fn initialize_with_existing_db(
+        config: &RocksDBConfig,
+        _storage_config: &StorageConfig,
+        existing_db: Arc<DB>,
+        db_path: &Path,
+        port: u16,
+    ) -> GraphResult<Self> {
+        let start_time = Instant::now();
         // Verify column families in existing database
         let cf_names = vec!["vertices", "edges", "kv_pairs"];
         for cf_name in &cf_names {
@@ -263,11 +411,11 @@ impl RocksDBStorage {
         // Force unlock before setting database
         Self::force_unlock(&db_path).await?;
 
-        ROCKSDB_DB.set(TokioMutex::new(RocksDbWithPath { db: existing_db.clone(), path: db_path.clone() }))
+        ROCKSDB_DB.set(TokioMutex::new(RocksDbWithPath { db: existing_db.clone(), path: db_path.to_path_buf() }))
             .map_err(|_| GraphError::StorageError("Failed to set ROCKSDB_DB singleton".to_string()))?;
 
         let pool = {
-            let metadata = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await?;
+            let metadata = GLOBAL_DAEMON_REGISTRY.get().await.get_daemon_metadata(port).await?;
             if let Some(metadata) = metadata {
                 info!("Found existing daemon on port {}. Checking pool state...", port);
                 println!("===> FOUND EXISTING DAEMON ON PORT {}", port);
@@ -302,7 +450,7 @@ impl RocksDBStorage {
                     }
                     Self::force_unlock(&db_path).await?;
                     tokio::time::sleep(Duration::from_millis(500)).await;
-                    GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("rocksdb", port).await?;
+                    GLOBAL_DAEMON_REGISTRY.get().await.remove_daemon_by_type("rocksdb", port).await?;
                 }
 
                 let new_pool = Arc::new(TokioMutex::new(RocksDBDaemonPool::new()));
@@ -382,7 +530,7 @@ impl RocksDBStorage {
                 })?
                 .map_err(|e| {
                     error!("Failed to remove lock file at {}: {}", lock_file.display(), e);
-                    println!("===> ERROR: FAILED TO REMOVE LOCK FILE AT {}", lock_file.display());
+                    println!("===> ERROR: FAILED TO REMOVE LOCK FILE AT {}: {}", lock_file.display(), e);
                     GraphError::StorageError(format!("Failed to remove lock file at {}: {}", lock_file.display(), e))
                 })?;
             info!("Successfully removed lock file at {}", lock_file.display());
@@ -401,6 +549,10 @@ impl RocksDBStorage {
         println!("===> FORCE RESET: DESTROYING DATABASE AT {:?}", config.path);
 
         let db_path = config.path.clone();
+        
+        // Release the instance if it's being tracked
+        Self::release_instance(&db_path).await;
+        
         Self::force_unlock(&db_path).await?;
 
         if db_path.exists() {
@@ -447,12 +599,22 @@ impl RocksDBStorage {
             })
     }
 
+    // Rest of the methods remain the same...
     pub fn new_pinned(config: &RocksDBConfig, storage_config: &StorageConfig) -> Box<dyn futures::Future<Output = GraphResult<Self>> + Send + 'static> {
         let config = config.clone();
         let storage_config = storage_config.clone();
         Box::new(async move {
             RocksDBStorage::new(&config, &storage_config).await
         })
+    }
+
+    // Helper method to get database path from pool
+    async fn get_database_path(&self) -> Option<PathBuf> {
+        if let Ok(pool_guard) = timeout(Duration::from_secs(1), self.pool.lock()).await {
+            pool_guard.daemons.values().next().map(|daemon| daemon.db_path.clone())
+        } else {
+            None
+        }
     }
 
     pub async fn set_key(&self, key: &str, value: &str) -> GraphResult<()> {
@@ -875,8 +1037,17 @@ impl RocksDBStorage {
     }
 }
 
+// Implement Drop trait to release singleton instance when RocksDBStorage is dropped
 impl Drop for RocksDBStorage {
     fn drop(&mut self) {
+        // Try to get the database path for cleanup
+        let db_path_opt = if let Ok(pool) = self.pool.try_lock() {
+            pool.daemons.values().next().map(|daemon| daemon.db_path.clone())
+        } else {
+            None
+        };
+
+        // Flush all databases before dropping
         if let Ok(pool) = self.pool.try_lock() {
             for daemon in pool.daemons.values() {
                 if let Err(e) = daemon.db.flush() {
@@ -885,6 +1056,36 @@ impl Drop for RocksDBStorage {
             }
         } else {
             eprintln!("Failed to acquire lock on RocksDBDaemonPool during drop");
+        }
+
+        // Release the singleton instance
+        if let Some(db_path) = db_path_opt {
+            // Use tokio::spawn to handle the async release in a blocking context
+            let rt = match tokio::runtime::Handle::try_current() {
+                Ok(handle) => Some(handle),
+                Err(_) => {
+                    // If we're not in a tokio runtime, try to create a minimal one
+                    match tokio::runtime::Runtime::new() {
+                        Ok(rt) => {
+                            let path = db_path.clone();
+                            rt.block_on(async move {
+                                RocksDBStorage::release_instance(&path).await;
+                            });
+                            return;
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to create runtime for cleanup: {}", e);
+                            None
+                        }
+                    }
+                }
+            };
+
+            if let Some(handle) = rt {
+                handle.spawn(async move {
+                    RocksDBStorage::release_instance(&db_path).await;
+                });
+            }
         }
     }
 }
@@ -1062,7 +1263,7 @@ impl GraphStorageEngine for RocksDBStorage {
     }
 
     async fn update_vertex(&self, vertex: Vertex) -> Result<(), GraphError> {
-        self.add_vertex(vertex).await // For simplicity, reuse add_vertex; update logic may need expansion
+        self.add_vertex(vertex).await
     }
 
     async fn delete_vertex(&self, id: &Uuid) -> Result<(), GraphError> {
@@ -1078,7 +1279,7 @@ impl GraphStorageEngine for RocksDBStorage {
     }
 
     async fn update_edge(&self, edge: Edge) -> Result<(), GraphError> {
-        self.add_edge(edge).await // For simplicity, reuse add_edge; update logic may need expansion
+        self.add_edge(edge).await
     }
 
     async fn delete_edge(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> Result<(), GraphError> {
@@ -1102,12 +1303,37 @@ impl GraphStorageEngine for RocksDBStorage {
     }
 
     async fn close(&self) -> Result<(), GraphError> {
+        // Release the singleton instance before closing
+        if let Some(db_path) = self.get_database_path().await {
+            Self::release_instance(&db_path).await;
+        }
+        
         info!("Closing RocksDBStorage");
         println!("===> CLOSING ROCKSDB STORAGE");
         Ok(())
     }
 
     async fn clear_data(&self) -> Result<(), GraphError> {
-        self.clear_data().await
+        let cf_names = vec!["vertices", "edges", "kv_pairs"];
+        let pool_guard = timeout(Duration::from_secs(5), self.pool.lock())
+            .await
+            .map_err(|_| GraphError::StorageError("Timeout acquiring RocksDB pool lock".to_string()))?;
+        
+        for daemon in pool_guard.daemons.values() {
+            let db = &daemon.db;
+            for cf_name in &cf_names {
+                let cf = db.cf_handle(cf_name)
+                    .ok_or_else(|| GraphError::StorageError(format!("{} column family not found", cf_name)))?;
+                let iter = db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+                for result in iter {
+                    let (key, _) = result.map_err(|e| GraphError::StorageError(e.to_string()))?;
+                    db.delete_cf(&cf, &key)
+                        .map_err(|e| GraphError::StorageError(e.to_string()))?;
+                }
+            }
+        }
+        info!("Successfully cleared all data");
+        println!("===> SUCCESSFULLY CLEARED ALL DATA");
+        Ok(())
     }
 }

@@ -669,6 +669,8 @@ pub async fn start_storage_interactive(
                     pd_endpoints: None,
                     use_compression: false,
                     cache_capacity: None,
+                    temporary: false,
+                    use_raft_for_scale: false,
                 },
             });
 
@@ -790,6 +792,8 @@ pub async fn start_storage_interactive(
                     pd_endpoints: None,
                     use_compression: false,
                     cache_capacity: None,
+                    temporary: false,
+                    use_raft_for_scale: false,
                 },
             });
 
@@ -2026,6 +2030,8 @@ pub async fn handle_use_storage_command(
                             database: wrapper.storage.database,
                             use_compression: true,
                             cache_capacity: Some(1024*1024*1024),
+                            temporary: false,
+                            use_raft_for_scale: false,
                         },
                     };
                     info!("Successfully parsed TiKV config: {:?}", tikv_config);
@@ -2128,6 +2134,8 @@ pub async fn handle_use_storage_command(
             pd_endpoints: if engine == StorageEngineType::TiKV { Some(pd_endpoints) } else { None },
             cache_capacity: Some(1024*1024*1024),
             use_compression: true,
+            temporary: false,
+            use_raft_for_scale: false,
         },
     };
 

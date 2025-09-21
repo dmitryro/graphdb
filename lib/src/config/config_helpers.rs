@@ -41,6 +41,8 @@ where
             pd_endpoints: None,
             cache_capacity: Some(1024*1024*1024),
             use_compression: true,
+            temporary: false,
+            use_raft_for_scale: false,
         };
 
         if let Some(path_val) = raw_map.get("path") {
@@ -186,6 +188,8 @@ pub fn create_default_selected_storage_config(engine_type: &StorageEngineType) -
         },
         cache_capacity: Some(1024*1024*1024),
         use_compression: true,
+        temporary: false, 
+        use_raft_for_scale: false,
     };
 
     SelectedStorageConfig {
@@ -282,6 +286,16 @@ pub fn hashmap_to_engine_specific_config(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    let temporary = map
+        .get("temporary")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let use_raft_for_scale = map
+        .get("use_raft_for_scale")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     Ok(SelectedStorageConfig {
         storage_engine_type: engine_type,
         storage: StorageConfigInner {
@@ -294,6 +308,8 @@ pub fn hashmap_to_engine_specific_config(
             pd_endpoints,
             cache_capacity,
             use_compression,
+            temporary,
+            use_raft_for_scale,
         },
     })
 }
@@ -473,6 +489,8 @@ pub fn create_default_engine_specific_config(engine_type: &StorageEngineType) ->
                 pd_endpoints: None,
                 cache_capacity: Some(1024*1024*1024),
                 use_compression: true,
+                temporary: false,
+                use_raft_for_scale: false,
             }
         }),
         StorageEngineType::RocksDB => Some(SelectedStorageConfig {
@@ -487,6 +505,8 @@ pub fn create_default_engine_specific_config(engine_type: &StorageEngineType) ->
                 pd_endpoints: None,
                 cache_capacity: Some(1024*1024*1024),
                 use_compression: true,
+                temporary: false,
+                use_raft_for_scale: false,
             }
         }),
         StorageEngineType::Sled => Some(SelectedStorageConfig {
@@ -501,6 +521,8 @@ pub fn create_default_engine_specific_config(engine_type: &StorageEngineType) ->
                 pd_endpoints: None,
                 cache_capacity: Some(1024*1024*1024),
                 use_compression: true,
+                temporary: false,
+                use_raft_for_scale: false,
             }
         }),
         StorageEngineType::TiKV => Some(SelectedStorageConfig {
@@ -515,6 +537,8 @@ pub fn create_default_engine_specific_config(engine_type: &StorageEngineType) ->
                 pd_endpoints: None,
                 cache_capacity: Some(1024*1024*1024),
                 use_compression: true,
+                temporary: false,
+                use_raft_for_scale: false,
             }
         }),
         StorageEngineType::PostgreSQL => Some(SelectedStorageConfig {
@@ -529,6 +553,8 @@ pub fn create_default_engine_specific_config(engine_type: &StorageEngineType) ->
                 pd_endpoints: None,
                 cache_capacity: Some(1024*1024*1024),
                 use_compression: true,
+                temporary: false,
+                use_raft_for_scale: false,
             }
         }),
         StorageEngineType::MySQL => Some(SelectedStorageConfig {
@@ -543,6 +569,8 @@ pub fn create_default_engine_specific_config(engine_type: &StorageEngineType) ->
                 pd_endpoints: None,
                 cache_capacity: Some(1024*1024*1024),
                 use_compression: true,
+                temporary: false,
+                use_raft_for_scale: false,
             }
         }),
         StorageEngineType::Redis => Some(SelectedStorageConfig {
@@ -557,6 +585,8 @@ pub fn create_default_engine_specific_config(engine_type: &StorageEngineType) ->
                 pd_endpoints: None,
                 cache_capacity: Some(1024*1024*1024),
                 use_compression: true,
+                temporary: false,
+                use_raft_for_scale: false,
             }
         }),
         StorageEngineType::InMemory => Some(SelectedStorageConfig {
@@ -571,6 +601,8 @@ pub fn create_default_engine_specific_config(engine_type: &StorageEngineType) ->
                 pd_endpoints: None,
                 cache_capacity: Some(1024*1024*1024),
                 use_compression: true,
+                temporary: false,
+                use_raft_for_scale: false,
             }
         }),
     }
@@ -927,6 +959,8 @@ pub fn create_default_yaml_config(yaml_path: &PathBuf, engine_type: StorageEngin
             pd_endpoints: None,
             cache_capacity: Some(1024*1024*1024),
             use_compression: true,
+            temporary: false,
+            use_raft_for_scale: false,
         }
     });
     
@@ -998,6 +1032,8 @@ pub async fn create_default_storage_yaml_config(yaml_path: &PathBuf, engine_type
                 pd_endpoints: None,
                 cache_capacity: Some(1024 * 1024 * 1024),
                 use_compression: false,
+                temporary: false,
+                use_raft_for_scale: false,
             },
         }),
     };

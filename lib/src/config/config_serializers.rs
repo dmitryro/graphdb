@@ -144,13 +144,24 @@ pub mod selected_storage_config_serde {
         password: Option<String>,
         #[serde(default)]
         pd_endpoints: Option<String>,
+        #[serde(default = "default_temporary")]
+        temporary: bool,
+        #[serde(default = "default_use_raft_for_scale")]
+        use_raft_for_scale: bool,
+    }
+
+    fn default_temporary() -> bool {
+        false
+    }
+
+    fn default_use_raft_for_scale() -> bool {
+        true
     }
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<SelectedStorageConfig>, D::Error>
     where
         D: Deserializer<'de>,
     {
-        // Handle the case where the field might be null or missing
         let opt_value: Option<TempStorageConfig> = Option::deserialize(deserializer)?;
         
         match opt_value {
@@ -165,8 +176,10 @@ pub mod selected_storage_config_serde {
                         password: temp_config.password,
                         database: None,
                         pd_endpoints: temp_config.pd_endpoints,
-                        cache_capacity: Some(1024*1024*1024),
+                        cache_capacity: Some(1024 * 1024 * 1024),
                         use_compression: true,
+                        temporary: temp_config.temporary,
+                        use_raft_for_scale: temp_config.use_raft_for_scale,
                     },
                 }))
             }
@@ -181,7 +194,7 @@ pub mod selected_storage_config_serde {
         match config {
             Some(config) => {
                 use serde::ser::SerializeMap;
-                let mut map = serializer.serialize_map(Some(7))?;
+                let mut map = serializer.serialize_map(Some(9))?;
                 map.serialize_entry("storage_engine_type", &config.storage_engine_type.to_string().to_lowercase())?;
                 if let Some(path) = &config.storage.path {
                     map.serialize_entry("path", path)?;
@@ -201,6 +214,8 @@ pub mod selected_storage_config_serde {
                 if let Some(pd_endpoints) = &config.storage.pd_endpoints {
                     map.serialize_entry("pd_endpoints", pd_endpoints)?;
                 }
+                map.serialize_entry("temporary", &config.storage.temporary)?;
+                map.serialize_entry("use_raft_for_scale", &config.storage.use_raft_for_scale)?;
                 map.end()
             }
             None => serializer.serialize_none(),

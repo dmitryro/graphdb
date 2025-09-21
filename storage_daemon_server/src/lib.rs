@@ -559,6 +559,8 @@ async fn create_default_yaml_config(yaml_path: &PathBuf, engine_type: StorageEng
                 pd_endpoints: None,
                 cache_capacity: Some(1024*1024*1024),
                 use_compression: true,
+                temporary: false,
+                use_raft_for_scale: false,
             },
         }),
     };
@@ -727,6 +729,12 @@ pub async fn start_storage_daemon_server_real(
                 use_compression: settings.engine_specific_config.get("use_compression")
                     .and_then(|p| p.as_bool())
                     .unwrap_or(false),
+                temporary: settings.engine_specific_config.get("temporary")
+                    .and_then(|p| p.as_bool())
+                    .unwrap_or(false), 
+                use_raft_for_scale: settings.engine_specific_config.get("use_raft_for_scale")
+                    .and_then(|p| p.as_bool())
+                    .unwrap_or(false),             
             },
         }),
         max_open_files: settings.max_open_files,

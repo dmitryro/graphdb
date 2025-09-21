@@ -106,6 +106,8 @@ impl Default for StorageConfigInner {
             pd_endpoints: None,
             cache_capacity: Some(1024 * 1024 * 1024),
             use_compression: true,
+            temporary: false,
+            use_raft_for_scale: false,
         }
     }
 }
@@ -224,7 +226,9 @@ impl StorageConfig {
         if engine_specific_config_path.exists() {
             info!("Loading engine-specific config from {:?}", engine_specific_config_path);
             match SelectedStorageConfig::load_from_yaml(&engine_specific_config_path) {
-                Ok(engine_config) => {
+                Ok(mut engine_config) => {
+                    // Propagate top-level use_raft_for_scale to engine-specific config
+                    engine_config.storage.use_raft_for_scale = config.use_raft_for_scale;
                     config.engine_specific_config = Some(engine_config);
                     if let Some(port) = config.engine_specific_config.as_ref().and_then(|c| c.storage.port) {
                         if port != config.default_port {
@@ -236,12 +240,16 @@ impl StorageConfig {
                 }
                 Err(e) => {
                     warn!("Failed to load engine-specific config from {:?}: {}. Using default.", engine_specific_config_path, e);
-                    config.engine_specific_config = Some(create_default_selected_storage_config(&config.storage_engine_type));
+                    let mut engine_config = create_default_selected_storage_config(&config.storage_engine_type);
+                    engine_config.storage.use_raft_for_scale = config.use_raft_for_scale;
+                    config.engine_specific_config = Some(engine_config);
                 }
             }
         } else {
             info!("Engine-specific config file not found at {:?}, using default for {:?}", engine_specific_config_path, config.storage_engine_type);
-            config.engine_specific_config = Some(create_default_selected_storage_config(&config.storage_engine_type));
+            let mut engine_config = create_default_selected_storage_config(&config.storage_engine_type);
+            engine_config.storage.use_raft_for_scale = config.use_raft_for_scale;
+            config.engine_specific_config = Some(engine_config);
         }
 
         if let Some(engine_config) = config.engine_specific_config.clone() {
@@ -275,7 +283,9 @@ impl StorageConfig {
             }
         } else {
             info!("'engine_specific_config' was missing, setting to default for engine: {:?}", config.storage_engine_type);
-            config.engine_specific_config = Some(create_default_selected_storage_config(&config.storage_engine_type));
+            let mut engine_config = create_default_selected_storage_config(&config.storage_engine_type);
+            engine_config.storage.use_raft_for_scale = config.use_raft_for_scale;
+            config.engine_specific_config = Some(engine_config);
         }
 
         let data_dir = config.data_directory.as_ref().ok_or_else(|| anyhow!("Data directory is not specified in configuration"))?;
@@ -451,6 +461,8 @@ impl From<RawStorageConfig> for StorageConfig {
                 pd_endpoints: None,
                 cache_capacity: None,
                 use_compression: true,
+                temporary: false,
+                use_raft_for_scale: false,
             };
 
             if let Some(path) = config_map.get("path").and_then(|v| v.as_str()) {
@@ -682,6 +694,8 @@ impl SelectedStorageConfig {
                 pd_endpoints: extract_simple("pd_endpoints"),
                 cache_capacity: Some(1024 * 1024 * 1024),
                 use_compression: true,
+                temporary: false,
+                use_raft_for_scale: false,
             },
         };
 
@@ -715,6 +729,8 @@ fn create_default_selected_storage_config(engine_type: &StorageEngineType) -> Se
             pd_endpoints: None,
             cache_capacity: None,
             use_compression: true,
+            temporary: false,
+            use_raft_for_scale: false,
         },
     }
 }
