@@ -51,79 +51,20 @@ impl RocksDBStorage {
         info!("Using RocksDB path {}", db_path.display());
         println!("===> USING ROCKSDB PATH {}", db_path.display());
 
-        // Validate path for redundant port
-        if db_path.file_name().and_then(|p| p.to_str()) == Some(&port.to_string()) {
-            if let Some(parent) = db_path.parent() {
-                if parent.file_name().and_then(|p| p.to_str()) == Some(&port.to_string()) {
-                    warn!("Path {} contains redundant port {}, consider correcting configuration", db_path.display(), port);
-                    println!("===> WARNING: PATH {} CONTAINS REDUNDANT PORT {}, CONSIDER CORRECTING CONFIGURATION", db_path.display(), port);
-                }
-            }
-        }
+        // Ensure parent directory exists
+        let parent_dir = db_path.parent().ok_or_else(|| {
+            error!("Invalid database path: no parent directory for {}", db_path.display());
+            GraphError::StorageError(format!("Invalid database path: no parent directory for {}", db_path.display()))
+        })?;
+        fs::create_dir_all(&parent_dir)
+            .await
+            .map_err(|e| {
+                error!("Failed to create parent directory at {}: {}", parent_dir.display(), e);
+                println!("===> ERROR: FAILED TO CREATE PARENT DIRECTORY AT {}", parent_dir.display());
+                GraphError::StorageError(format!("Failed to create parent directory at {}: {}", parent_dir.display(), e))
+            })?;
 
-        // Clean up existing database state with retries
-        const MAX_CLEANUP_RETRIES: u32 = 3;
-        let mut cleanup_attempt = 0;
-        while cleanup_attempt < MAX_CLEANUP_RETRIES {
-            info!("Cleanup attempt {}/{} for RocksDB at {}", cleanup_attempt + 1, MAX_CLEANUP_RETRIES, db_path.display());
-            println!("===> CLEANUP ATTEMPT {}/{} FOR ROCKSDB AT {}", cleanup_attempt + 1, MAX_CLEANUP_RETRIES, db_path.display());
-
-            if db_path.exists() {
-                info!("Destroying existing RocksDB database at {}", db_path.display());
-                println!("===> DESTROYING EXISTING ROCKSDB DATABASE AT {}", db_path.display());
-                let mut opts = Options::default();
-                opts.set_paranoid_checks(false);
-                match DB::destroy(&opts, &db_path) {
-                    Ok(_) => {
-                        info!("Successfully destroyed database at {}", db_path.display());
-                        println!("===> SUCCESSFULLY DESTROYED DATABASE AT {}", db_path.display());
-                    }
-                    Err(e) => {
-                        warn!("Failed to destroy database at {}: {}", db_path.display(), e);
-                        println!("===> WARNING: FAILED TO DESTROY DATABASE AT {}", db_path.display());
-                    }
-                }
-
-                match timeout(Duration::from_secs(10), fs::remove_dir_all(&db_path)).await {
-                    Ok(Ok(_)) => {
-                        info!("Successfully removed database directory at {}", db_path.display());
-                        println!("===> SUCCESSFULLY REMOVED DATABASE DIRECTORY AT {}", db_path.display());
-                        break;
-                    }
-                    Ok(Err(e)) => {
-                        warn!("Failed to remove directory at {} on attempt {}: {}", db_path.display(), cleanup_attempt + 1, e);
-                        println!("===> WARNING: FAILED TO REMOVE DIRECTORY AT {} ON ATTEMPT {}", db_path.display(), cleanup_attempt + 1);
-                        cleanup_attempt += 1;
-                        if cleanup_attempt < MAX_CLEANUP_RETRIES {
-                            tokio::time::sleep(Duration::from_millis(2000 * (cleanup_attempt as u64 + 1))).await;
-                        }
-                    }
-                    Err(_) => {
-                        warn!("Timeout removing directory at {} on attempt {}", db_path.display(), cleanup_attempt + 1);
-                        println!("===> WARNING: TIMEOUT REMOVING DIRECTORY AT {} ON ATTEMPT {}", db_path.display(), cleanup_attempt + 1);
-                        cleanup_attempt += 1;
-                        if cleanup_attempt < MAX_CLEANUP_RETRIES {
-                            tokio::time::sleep(Duration::from_millis(2000 * (cleanup_attempt as u64 + 1))).await;
-                        }
-                    }
-                }
-            } else {
-                info!("No existing database directory found at {}", db_path.display());
-                println!("===> NO EXISTING DATABASE DIRECTORY FOUND AT {}", db_path.display());
-                break;
-            }
-        }
-
-        if cleanup_attempt >= MAX_CLEANUP_RETRIES {
-            error!("Failed to remove directory {} after {} attempts", db_path.display(), MAX_CLEANUP_RETRIES);
-            println!("===> ERROR: FAILED TO REMOVE DIRECTORY {} AFTER {} ATTEMPTS", db_path.display(), MAX_CLEANUP_RETRIES);
-            return Err(GraphError::StorageError(format!("Failed to remove directory {} after {} attempts", db_path.display(), MAX_CLEANUP_RETRIES)));
-        }
-
-        // Extended delay to ensure filesystem consistency
-        tokio::time::sleep(Duration::from_secs(10)).await;
-
-        // Create directory
+        // Create database directory
         fs::create_dir_all(&db_path)
             .await
             .map_err(|e| {
@@ -132,50 +73,8 @@ impl RocksDBStorage {
                 GraphError::StorageError(format!("Failed to create database directory at {}: {}", db_path.display(), e))
             })?;
 
-        // Verify directory is empty
-        let mut dir = fs::read_dir(&db_path).await
-            .map_err(|e| {
-                error!("Failed to read directory {}: {}", db_path.display(), e);
-                println!("===> ERROR: FAILED TO READ DIRECTORY {}", db_path.display());
-                GraphError::StorageError(format!("Failed to read directory {}: {}", db_path.display(), e))
-            })?;
-        while let Some(entry) = dir.next_entry().await
-            .map_err(|e| {
-                error!("Failed to read directory entry in {}: {}", db_path.display(), e);
-                println!("===> ERROR: FAILED TO READ DIRECTORY ENTRY IN {}", db_path.display());
-                GraphError::StorageError(format!("Failed to read directory entry in {}: {}", db_path.display(), e))
-            })? {
-            let file_name = entry.file_name().to_string_lossy().into_owned();
-            error!("Unexpected file {} found in {} after cleanup, database should be empty", file_name, db_path.display());
-            println!("===> ERROR: UNEXPECTED FILE {} FOUND IN {} AFTER CLEANUP, DATABASE SHOULD BE EMPTY", file_name, db_path.display());
-            return Err(GraphError::StorageError(format!("Unexpected file {} found in {} after cleanup", file_name, db_path.display())));
-        }
-
-        // Check parent directory for unexpected files
-        if let Some(parent) = db_path.parent() {
-            let mut parent_dir = fs::read_dir(parent).await
-                .map_err(|e| {
-                    error!("Failed to read parent directory {}: {}", parent.display(), e);
-                    println!("===> ERROR: FAILED TO READ PARENT DIRECTORY {}", parent.display());
-                    GraphError::StorageError(format!("Failed to read parent directory {}: {}", parent.display(), e))
-                })?;
-            while let Some(entry) = parent_dir.next_entry().await
-                .map_err(|e| {
-                    error!("Failed to read parent directory entry in {}: {}", parent.display(), e);
-                    println!("===> ERROR: FAILED TO READ PARENT DIRECTORY ENTRY IN {}", parent.display());
-                    GraphError::StorageError(format!("Failed to read parent directory entry in {}: {}", parent.display(), e))
-                })? {
-                let file_name = entry.file_name().to_string_lossy().into_owned();
-                if file_name != db_path.file_name().and_then(|f| f.to_str()).unwrap_or("") {
-                    warn!("Unexpected file/dir {} found in parent directory {}", file_name, parent.display());
-                    println!("===> UNEXPECTED FILE/DIR {} FOUND IN PARENT DIRECTORY {}", file_name, parent.display());
-                }
-            }
-        }
-
         // Force unlock before opening database
         Self::force_unlock(&db_path).await?;
-        tokio::time::sleep(Duration::from_secs(2)).await;
 
         let mut opts = Options::default();
         opts.create_if_missing(true);
@@ -185,72 +84,50 @@ impl RocksDBStorage {
         opts.set_error_if_exists(false);
 
         let cf_names = vec!["vertices", "edges", "kv_pairs"];
-
-        // Retry opening the database
-        const MAX_OPEN_RETRIES: u32 = 3;
-        let mut open_attempt = 0;
         let rocks_db_instance = loop {
-            info!("Attempt {}/{} to open RocksDB at {}", open_attempt + 1, MAX_OPEN_RETRIES, db_path.display());
-            println!("===> ATTEMPT {}/{} TO OPEN ROCKSDB AT {}", open_attempt + 1, MAX_OPEN_RETRIES, db_path.display());
+            info!("Attempt to open RocksDB at {}", db_path.display());
+            println!("===> ATTEMPT TO OPEN ROCKSDB AT {}", db_path.display());
 
-            // Recreate cfs for each attempt to avoid cloning
             let cfs: Vec<ColumnFamilyDescriptor> = cf_names
                 .iter()
                 .map(|name| ColumnFamilyDescriptor::new(*name, Options::default()))
                 .collect();
 
-            match timeout(Duration::from_secs(10), async {
+            match timeout(Duration::from_secs(5), async {
                 let db = DB::open_cf_descriptors(&opts, &db_path, cfs)
                     .map_err(|e| {
                         error!("Failed to open RocksDB at {}: {}", db_path.display(), e);
                         println!("===> ERROR: FAILED TO OPEN ROCKSDB AT {}: {}", db_path.display(), e);
                         GraphError::StorageError(format!("Failed to open RocksDB database at {}: {}", db_path.display(), e))
                     })?;
+                
+                // Verify column families are accessible
+                for cf_name in &cf_names {
+                    if db.cf_handle(cf_name).is_none() {
+                        error!("Column family {} not opened in database at {}", cf_name, db_path.display());
+                        println!("===> ERROR: COLUMN FAMILY {} NOT OPENED IN DATABASE AT {}", cf_name, db_path.display());
+                        return Err(GraphError::StorageError(format!("Column family {} not opened in database at {}", cf_name, db_path.display())));
+                    }
+                }
+
                 info!("Successfully opened RocksDB database at {}", db_path.display());
                 println!("===> SUCCESSFULLY OPENED ROCKSDB DATABASE AT {}", db_path.display());
                 Ok::<_, GraphError>(TokioMutex::new(RocksDbWithPath { db: Arc::new(db), path: db_path.clone() }))
             }).await {
                 Ok(Ok(db)) => break db,
                 Ok(Err(e)) => {
-                    open_attempt += 1;
-                    if open_attempt >= MAX_OPEN_RETRIES {
-                        error!("Failed to open RocksDB at {} after {} attempts: {}", db_path.display(), MAX_OPEN_RETRIES, e);
-                        println!("===> ERROR: FAILED TO OPEN ROCKSDB AT {} AFTER {} ATTEMPTS", db_path.display(), MAX_OPEN_RETRIES);
-                        return Err(e);
-                    }
-                    warn!("Failed to open RocksDB on attempt {}/{}: {}", open_attempt, MAX_OPEN_RETRIES, e);
-                    println!("===> WARNING: FAILED TO OPEN ROCKSDB ON ATTEMPT {}/{}", open_attempt, MAX_OPEN_RETRIES);
-                    // Attempt cleanup again before retry
-                    if db_path.exists() {
-                        let mut cleanup_opts = Options::default();
-                        cleanup_opts.set_paranoid_checks(false);
-                        if let Err(e) = DB::destroy(&cleanup_opts, &db_path) {
-                            warn!("Failed to destroy database during retry at {}: {}", db_path.display(), e);
-                            println!("===> WARNING: FAILED TO DESTROY DATABASE DURING RETRY AT {}", db_path.display());
-                        }
-                        if let Err(e) = fs::remove_dir_all(&db_path).await {
-                            warn!("Failed to remove directory during retry at {}: {}", db_path.display(), e);
-                            println!("===> WARNING: FAILED TO REMOVE DIRECTORY DURING RETRY AT {}", db_path.display());
-                        }
-                        fs::create_dir_all(&db_path).await
-                            .map_err(|e| {
-                                error!("Failed to recreate directory at {}: {}", db_path.display(), e);
-                                println!("===> ERROR: FAILED TO RECREATE DIRECTORY AT {}", db_path.display());
-                                GraphError::StorageError(format!("Failed to recreate directory at {}: {}", db_path.display(), e))
-                            })?;
-                    }
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    error!("Failed to open RocksDB at {}: {}", db_path.display(), e);
+                    println!("===> ERROR: FAILED TO OPEN ROCKSDB AT {}", db_path.display());
+                    Self::force_unlock(&db_path).await?;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    return Err(e);
                 }
                 Err(_) => {
-                    open_attempt += 1;
-                    if open_attempt >= MAX_OPEN_RETRIES {
-                        error!("Timeout opening RocksDB at {} after {} attempts", db_path.display(), MAX_OPEN_RETRIES);
-                        println!("===> ERROR: TIMEOUT OPENING ROCKSDB AT {} AFTER {} ATTEMPTS", db_path.display(), MAX_OPEN_RETRIES);
-                        return Err(GraphError::StorageError(format!("Timeout opening RocksDB at {} after {} attempts", db_path.display(), MAX_OPEN_RETRIES)));
-                    }
-                    warn!("Timeout opening RocksDB on attempt {}/{}", open_attempt, MAX_OPEN_RETRIES);
-                    println!("===> WARNING: TIMEOUT OPENING ROCKSDB ON ATTEMPT {}/{}", open_attempt, MAX_OPEN_RETRIES);
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    error!("Timeout opening RocksDB at {}", db_path.display());
+                    println!("===> ERROR: TIMEOUT OPENING ROCKSDB AT {}", db_path.display());
+                    Self::force_unlock(&db_path).await?;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    return Err(GraphError::StorageError(format!("Timeout opening RocksDB at {}", db_path.display())));
                 }
             }
         };
@@ -280,7 +157,7 @@ impl RocksDBStorage {
                         raft: None,
                     });
                 } else {
-                    info!("Stale daemon registry entry found, creating new pool");
+                    info!("Stale daemon registry entry found, creating new pool",);
                     println!("===> STALE DAEMON REGISTRY ENTRY FOUND, CREATING NEW POOL");
                     let pid = daemon_metadata.pid;
                     if is_storage_daemon_running(port).await {
@@ -289,15 +166,12 @@ impl RocksDBStorage {
                         if let Err(e) = stop_process_by_pid("RocksDB", pid).await {
                             warn!("Failed to terminate daemon with PID {}: {}", pid, e);
                             println!("===> WARNING: FAILED TO TERMINATE DAEMON WITH PID {}: {}", pid, e);
-                        } else {
-                            info!("Successfully terminated daemon with PID {}", pid);
-                            println!("===> SUCCESSFULLY TERMINATED DAEMON WITH PID {}", pid);
                         }
                         tokio::time::sleep(Duration::from_millis(500)).await;
                     }
                     GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("rocksdb", port).await?;
                     Self::force_unlock(&db_path).await?;
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
                     let new_pool = Arc::new(TokioMutex::new(RocksDBDaemonPool::new()));
                     pool_map_guard.insert(port, new_pool.clone());
                     new_pool
@@ -306,7 +180,7 @@ impl RocksDBStorage {
                 info!("No existing daemon found, creating a new RocksDBDaemonPool");
                 println!("===> NO EXISTING DAEMON FOUND, CREATING A NEW ROCKSDB DAEMON POOL");
                 Self::force_unlock(&db_path).await?;
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
                 let pool_map = ROCKSDB_POOL_MAP.get_or_init(|| async {
                     TokioMutex::new(HashMap::new())
                 }).await;
@@ -318,13 +192,13 @@ impl RocksDBStorage {
         };
 
         {
-            let mut pool_guard = timeout(Duration::from_secs(10), pool.lock())
+            let mut pool_guard = timeout(Duration::from_secs(5), pool.lock())
                 .await
                 .map_err(|_| GraphError::StorageError("Failed to acquire pool lock for initialization".to_string()))?;
-            info!("Initializing cluster with use_raft: {}", pool_guard.use_raft_for_scale);
-            println!("===> INITIALIZING CLUSTER WITH USE_RAFT: {}", pool_guard.use_raft_for_scale);
+            info!("Initializing cluster with use_raft: {}", config.use_raft_for_scale);
+            println!("===> INITIALIZING CLUSTER WITH USE_RAFT: {}", config.use_raft_for_scale);
             let rocks_db_guard = ROCKSDB_DB.get().unwrap().lock().await;
-            timeout(Duration::from_secs(10), pool_guard.initialize_with_db(config, rocks_db_guard.db.clone()))
+            timeout(Duration::from_secs(5), pool_guard.initialize_with_db(config, rocks_db_guard.db.clone()))
                 .await
                 .map_err(|_| GraphError::StorageError("Timeout initializing RocksDBDaemonPool".to_string()))??;
             info!("Initialized cluster on port {} with existing DB", port);
@@ -358,89 +232,26 @@ impl RocksDBStorage {
         println!("===> SUCCESSFULLY INITIALIZED RocksDBStorage in {}ms", start_time.elapsed().as_millis());
         Ok(storage)
     }
-
+    
     pub async fn new_with_db(config: &RocksDBConfig, _storage_config: &StorageConfig, existing_db: Arc<DB>) -> GraphResult<Self> {
         let start_time = Instant::now();
         info!("Initializing RocksDBStorage with existing database at {}", config.path.display());
         println!("===> INITIALIZING ROCKSDB STORAGE WITH EXISTING DB AT {}", config.path.display());
 
         let db_path = config.path.clone();
-        info!("Using database path {}", db_path.display());
-        println!("===> USING ROCKSDB PATH {}", db_path.display());
-
         let port = config.port.unwrap_or(DEFAULT_STORAGE_PORT);
-        if db_path.file_name().and_then(|p| p.to_str()) == Some(&port.to_string()) {
-            if let Some(parent) = db_path.parent() {
-                if parent.file_name().and_then(|p| p.to_str()) == Some(&port.to_string()) {
-                    warn!("Path {} contains redundant port {}, consider correcting configuration", db_path.display(), port);
-                    println!("===> WARNING: PATH {} CONTAINS REDUNDANT PORT {}, CONSIDER CORRECTING CONFIGURATION", db_path.display(), port);
-                }
+
+        // Verify column families in existing database
+        let cf_names = vec!["vertices", "edges", "kv_pairs"];
+        for cf_name in &cf_names {
+            if existing_db.cf_handle(cf_name).is_none() {
+                error!("Column family {} not found in existing database at {}", cf_name, db_path.display());
+                println!("===> ERROR: COLUMN FAMILY {} NOT FOUND IN EXISTING DATABASE AT {}", cf_name, db_path.display());
+                return Err(GraphError::StorageError(format!("Column family {} not found in existing database at {}", cf_name, db_path.display())));
             }
         }
 
-        // Clean up existing database state with retries
-        const MAX_CLEANUP_RETRIES: u32 = 3;
-        let mut cleanup_attempt = 0;
-        while cleanup_attempt < MAX_CLEANUP_RETRIES {
-            info!("Cleanup attempt {}/{} for RocksDB at {}", cleanup_attempt + 1, MAX_CLEANUP_RETRIES, db_path.display());
-            println!("===> CLEANUP ATTEMPT {}/{} FOR ROCKSDB AT {}", cleanup_attempt + 1, MAX_CLEANUP_RETRIES, db_path.display());
-
-            if db_path.exists() {
-                info!("Destroying existing RocksDB database at {}", db_path.display());
-                println!("===> DESTROYING EXISTING ROCKSDB DATABASE AT {}", db_path.display());
-                let mut opts = Options::default();
-                opts.set_paranoid_checks(false);
-                match DB::destroy(&opts, &db_path) {
-                    Ok(_) => {
-                        info!("Successfully destroyed database at {}", db_path.display());
-                        println!("===> SUCCESSFULLY DESTROYED DATABASE AT {}", db_path.display());
-                    }
-                    Err(e) => {
-                        warn!("Failed to destroy database at {}: {}", db_path.display(), e);
-                        println!("===> WARNING: FAILED TO DESTROY DATABASE AT {}", db_path.display());
-                    }
-                }
-
-                match timeout(Duration::from_secs(10), fs::remove_dir_all(&db_path)).await {
-                    Ok(Ok(_)) => {
-                        info!("Successfully removed database directory at {}", db_path.display());
-                        println!("===> SUCCESSFULLY REMOVED DATABASE DIRECTORY AT {}", db_path.display());
-                        break;
-                    }
-                    Ok(Err(e)) => {
-                        warn!("Failed to remove directory at {} on attempt {}: {}", db_path.display(), cleanup_attempt + 1, e);
-                        println!("===> WARNING: FAILED TO REMOVE DIRECTORY AT {} ON ATTEMPT {}", db_path.display(), cleanup_attempt + 1);
-                        cleanup_attempt += 1;
-                        if cleanup_attempt < MAX_CLEANUP_RETRIES {
-                            tokio::time::sleep(Duration::from_millis(2000 * (cleanup_attempt as u64 + 1))).await;
-                        }
-                    }
-                    Err(_) => {
-                        warn!("Timeout removing directory at {} on attempt {}", db_path.display(), cleanup_attempt + 1);
-                        println!("===> WARNING: TIMEOUT REMOVING DIRECTORY AT {} ON ATTEMPT {}", db_path.display(), cleanup_attempt + 1);
-                        cleanup_attempt += 1;
-                        if cleanup_attempt < MAX_CLEANUP_RETRIES {
-                            tokio::time::sleep(Duration::from_millis(2000 * (cleanup_attempt as u64 + 1))).await;
-                        }
-                    }
-                }
-            } else {
-                info!("No existing database directory found at {}", db_path.display());
-                println!("===> NO EXISTING DATABASE DIRECTORY FOUND AT {}", db_path.display());
-                break;
-            }
-        }
-
-        if cleanup_attempt >= MAX_CLEANUP_RETRIES {
-            error!("Failed to remove directory {} after {} attempts", db_path.display(), MAX_CLEANUP_RETRIES);
-            println!("===> ERROR: FAILED TO REMOVE DIRECTORY {} AFTER {} ATTEMPTS", db_path.display(), MAX_CLEANUP_RETRIES);
-            return Err(GraphError::StorageError(format!("Failed to remove directory {} after {} attempts", db_path.display(), MAX_CLEANUP_RETRIES)));
-        }
-
-        // Extended delay to ensure filesystem consistency
-        tokio::time::sleep(Duration::from_secs(10)).await;
-
-        // Create directory
+        // Create directory if it doesn't exist
         fs::create_dir_all(&db_path)
             .await
             .map_err(|e| {
@@ -449,27 +260,8 @@ impl RocksDBStorage {
                 GraphError::StorageError(format!("Failed to create database directory at {}: {}", db_path.display(), e))
             })?;
 
-        // Verify directory is empty
-        let mut dir = fs::read_dir(&db_path).await
-            .map_err(|e| {
-                error!("Failed to read directory {}: {}", db_path.display(), e);
-                println!("===> ERROR: FAILED TO READ DIRECTORY {}", db_path.display());
-                GraphError::StorageError(format!("Failed to read directory {}: {}", db_path.display(), e))
-            })?;
-        while let Some(entry) = dir.next_entry().await
-            .map_err(|e| {
-                error!("Failed to read directory entry in {}: {}", db_path.display(), e);
-                println!("===> ERROR: FAILED TO READ DIRECTORY ENTRY IN {}", db_path.display());
-                GraphError::StorageError(format!("Failed to read directory entry in {}: {}", db_path.display(), e))
-            })? {
-            let file_name = entry.file_name().to_string_lossy().into_owned();
-            error!("Unexpected file {} found in {} after cleanup, database should be empty", file_name, db_path.display());
-            println!("===> ERROR: UNEXPECTED FILE {} FOUND IN {} AFTER CLEANUP, DATABASE SHOULD BE EMPTY", file_name, db_path.display());
-            return Err(GraphError::StorageError(format!("Unexpected file {} found in {} after cleanup", file_name, db_path.display())));
-        }
-
+        // Force unlock before setting database
         Self::force_unlock(&db_path).await?;
-        tokio::time::sleep(Duration::from_secs(2)).await;
 
         ROCKSDB_DB.set(TokioMutex::new(RocksDbWithPath { db: existing_db.clone(), path: db_path.clone() }))
             .map_err(|_| GraphError::StorageError("Failed to set ROCKSDB_DB singleton".to_string()))?;
@@ -477,24 +269,17 @@ impl RocksDBStorage {
         let pool = {
             let metadata = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await?;
             if let Some(metadata) = metadata {
-                if let Some(registered_path) = &metadata.data_dir {
-                    if registered_path != &db_path {
-                        warn!("Path mismatch: daemon registry shows {}, but config specifies {}", registered_path.display(), db_path.display());
-                        println!("===> PATH MISMATCH: DAEMON REGISTRY SHOWS {}, BUT CONFIG SPECIFIES {}", registered_path.display(), db_path.display());
-                    }
-                }
+                info!("Found existing daemon on port {}. Checking pool state...", port);
+                println!("===> FOUND EXISTING DAEMON ON PORT {}", port);
 
                 let pool_map = ROCKSDB_POOL_MAP.get_or_init(|| async {
-                    TokioMutex::new(HashMap::<u16, Arc<TokioMutex<RocksDBDaemonPool>>>::new())
+                    TokioMutex::new(HashMap::new())
                 }).await;
                 let mut pool_map_guard = timeout(Duration::from_secs(5), pool_map.lock())
                     .await
                     .map_err(|_| GraphError::StorageError("Failed to acquire pool map lock".to_string()))?;
 
                 if let Some(existing_pool) = pool_map_guard.get(&port) {
-                    info!("Found existing daemon on port {}. Checking pool state...", port);
-                    println!("===> FOUND EXISTING DAEMON ON PORT {}", port);
-
                     let pool_guard = timeout(Duration::from_secs(5), existing_pool.lock())
                         .await
                         .map_err(|_| GraphError::StorageError("Failed to acquire existing pool lock".to_string()))?;
@@ -516,7 +301,7 @@ impl RocksDBStorage {
                         println!("===> WARNING: FAILED TO KILL DAEMON WITH PID {}: {}", pid, e);
                     }
                     Self::force_unlock(&db_path).await?;
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
                     GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("rocksdb", port).await?;
                 }
 
@@ -524,8 +309,10 @@ impl RocksDBStorage {
                 pool_map_guard.insert(port, new_pool.clone());
                 new_pool
             } else {
+                info!("No existing daemon found, creating a new RocksDBDaemonPool");
+                println!("===> NO EXISTING DAEMON FOUND, CREATING A NEW ROCKSDB DAEMON POOL");
                 let pool_map = ROCKSDB_POOL_MAP.get_or_init(|| async {
-                    TokioMutex::new(HashMap::<u16, Arc<TokioMutex<RocksDBDaemonPool>>>::new())
+                    TokioMutex::new(HashMap::new())
                 }).await;
                 let mut pool_map_guard = timeout(Duration::from_secs(5), pool_map.lock())
                     .await
@@ -537,13 +324,13 @@ impl RocksDBStorage {
         };
 
         {
-            let mut pool_guard = timeout(Duration::from_secs(10), pool.lock())
+            let mut pool_guard = timeout(Duration::from_secs(5), pool.lock())
                 .await
                 .map_err(|_| GraphError::StorageError("Failed to acquire pool lock for initialization".to_string()))?;
-            info!("Initializing cluster with use_raft: {}", pool_guard.use_raft_for_scale);
-            println!("===> INITIALIZING CLUSTER WITH USE_RAFT: {}", pool_guard.use_raft_for_scale);
+            info!("Initializing cluster with use_raft: {}", config.use_raft_for_scale);
+            println!("===> INITIALIZING CLUSTER WITH USE_RAFT: {}", config.use_raft_for_scale);
             let rocks_db_guard = ROCKSDB_DB.get().unwrap().lock().await;
-            timeout(Duration::from_secs(10), pool_guard.initialize_with_db(config, rocks_db_guard.db.clone()))
+            timeout(Duration::from_secs(5), pool_guard.initialize_with_db(config, rocks_db_guard.db.clone()))
                 .await
                 .map_err(|_| GraphError::StorageError("Timeout initializing RocksDBDaemonPool".to_string()))??;
             info!("Initialized cluster on port {} with existing DB", port);
@@ -580,77 +367,30 @@ impl RocksDBStorage {
 
     pub async fn force_unlock(path: &Path) -> GraphResult<()> {
         let lock_file = path.join("LOCK");
-        info!("Attempting to force unlock RocksDB database at {}", path.display());
-        println!("===> ATTEMPTING TO FORCE UNLOCK ROCKSDB DATABASE AT {}", path.display());
+        info!("Checking for lock file at {}", lock_file.display());
         println!("===> CHECKING FOR LOCK FILE AT {}", lock_file.display());
 
         if lock_file.exists() {
-            info!("Found lock file at {}", lock_file.display());
-            println!("===> FOUND LOCK FILE AT {}", lock_file.display());
-
-            const MAX_RETRIES: u32 = 3;
-            const BASE_DELAY_MS: u64 = 1000;
-            let mut attempt = 0;
-
-            while attempt < MAX_RETRIES {
-                match timeout(Duration::from_secs(2), fs::remove_file(&lock_file)).await {
-                    Ok(Ok(_)) => {
-                        info!("Successfully removed lock file at {}", lock_file.display());
-                        println!("===> SUCCESSFULLY REMOVED LOCK FILE AT {}", lock_file.display());
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                        break;
-                    }
-                    Ok(Err(e)) => {
-                        warn!("Failed to remove lock file at {} on attempt {}: {}", lock_file.display(), attempt + 1, e);
-                        println!("===> WARNING: FAILED TO REMOVE LOCK FILE AT {} ON ATTEMPT {}", lock_file.display(), attempt + 1);
-                        attempt += 1;
-                        if attempt < MAX_RETRIES {
-                            tokio::time::sleep(Duration::from_millis(BASE_DELAY_MS * (attempt as u64 + 1))).await;
-                        }
-                    }
-                    Err(_) => {
-                        warn!("Timeout removing lock file at {} on attempt {}", lock_file.display(), attempt + 1);
-                        println!("===> WARNING: TIMEOUT REMOVING LOCK FILE AT {} ON ATTEMPT {}", lock_file.display(), attempt + 1);
-                        attempt += 1;
-                        if attempt < MAX_RETRIES {
-                            tokio::time::sleep(Duration::from_millis(BASE_DELAY_MS * (attempt as u64 + 1))).await;
-                        }
-                    }
-                }
-            }
-
-            if attempt >= MAX_RETRIES {
-                error!("Failed to unlock {} after {} attempts", lock_file.display(), MAX_RETRIES);
-                println!("===> ERROR: FAILED TO UNLOCK ROCKSDB DATABASE AT {} AFTER {} ATTEMPTS", lock_file.display(), MAX_RETRIES);
-                return Err(GraphError::StorageError(format!("Failed to unlock {} after {} attempts", lock_file.display(), MAX_RETRIES)));
-            }
+            info!("Found lock file at {}, removing", lock_file.display());
+            println!("===> FOUND LOCK FILE AT {}, REMOVING", lock_file.display());
+            timeout(Duration::from_secs(2), fs::remove_file(&lock_file))
+                .await
+                .map_err(|_| {
+                    error!("Timeout removing lock file at {}", lock_file.display());
+                    println!("===> ERROR: TIMEOUT REMOVING LOCK FILE AT {}", lock_file.display());
+                    GraphError::StorageError(format!("Timeout removing lock file at {}", lock_file.display()))
+                })?
+                .map_err(|e| {
+                    error!("Failed to remove lock file at {}: {}", lock_file.display(), e);
+                    println!("===> ERROR: FAILED TO REMOVE LOCK FILE AT {}", lock_file.display());
+                    GraphError::StorageError(format!("Failed to remove lock file at {}: {}", lock_file.display(), e))
+                })?;
+            info!("Successfully removed lock file at {}", lock_file.display());
+            println!("===> SUCCESSFULLY REMOVED LOCK FILE AT {}", lock_file.display());
+            tokio::time::sleep(Duration::from_millis(500)).await;
         } else {
             info!("No lock file found at {}", lock_file.display());
             println!("===> NO LOCK FILE FOUND AT {}", lock_file.display());
-        }
-
-        // Verify no other RocksDB files remain
-        let mut dir = fs::read_dir(path).await
-            .map_err(|e| {
-                error!("Failed to read directory {}: {}", path.display(), e);
-                println!("===> ERROR: FAILED TO READ DIRECTORY {}", path.display());
-                GraphError::StorageError(format!("Failed to read directory {}: {}", path.display(), e))
-            })?;
-        while let Some(entry) = dir.next_entry().await
-            .map_err(|e| {
-                error!("Failed to read directory entry in {}: {}", path.display(), e);
-                println!("===> ERROR: FAILED TO READ DIRECTORY ENTRY IN {}", path.display());
-                GraphError::StorageError(format!("Failed to read directory entry in {}: {}", path.display(), e))
-            })? {
-            let file_name = entry.file_name().to_string_lossy().into_owned();
-            warn!("Unexpected file {} found in {} after unlock, attempting to remove", file_name, path.display());
-            println!("===> WARNING: UNEXPECTED FILE {} FOUND IN {} AFTER UNLOCK, ATTEMPTING TO REMOVE", file_name, path.display());
-            let file_path = path.join(file_name);
-            if let Err(e) = fs::remove_file(&file_path).await {
-                error!("Failed to remove unexpected file {}: {}", file_path.display(), e);
-                println!("===> ERROR: FAILED TO REMOVE UNEXPECTED FILE {}", file_path.display());
-                return Err(GraphError::StorageError(format!("Failed to remove unexpected file {}: {}", file_path.display(), e)));
-            }
         }
 
         Ok(())
@@ -662,95 +402,41 @@ impl RocksDBStorage {
 
         let db_path = config.path.clone();
         Self::force_unlock(&db_path).await?;
-        tokio::time::sleep(Duration::from_secs(2)).await;
 
-        // Clean up with retries
-        const MAX_CLEANUP_RETRIES: u32 = 3;
-        let mut cleanup_attempt = 0;
-        while cleanup_attempt < MAX_CLEANUP_RETRIES {
-            info!("Cleanup attempt {}/{} for RocksDB at {}", cleanup_attempt + 1, MAX_CLEANUP_RETRIES, db_path.display());
-            println!("===> CLEANUP ATTEMPT {}/{} FOR ROCKSDB AT {}", cleanup_attempt + 1, MAX_CLEANUP_RETRIES, db_path.display());
-
-            if db_path.exists() {
-                info!("Destroying existing RocksDB database at {}", db_path.display());
-                println!("===> DESTROYING EXISTING ROCKSDB DATABASE AT {}", db_path.display());
-                let mut opts = Options::default();
-                opts.set_paranoid_checks(false);
-                match DB::destroy(&opts, &db_path) {
-                    Ok(_) => {
-                        info!("Successfully destroyed database at {}", db_path.display());
-                        println!("===> SUCCESSFULLY DESTROYED DATABASE AT {}", db_path.display());
-                    }
-                    Err(e) => {
-                        warn!("Failed to destroy database at {}: {}", db_path.display(), e);
-                        println!("===> WARNING: FAILED TO DESTROY DATABASE AT {}", db_path.display());
-                    }
+        if db_path.exists() {
+            info!("Destroying existing RocksDB database at {}", db_path.display());
+            println!("===> DESTROYING EXISTING ROCKSDB DATABASE AT {}", db_path.display());
+            let mut opts = Options::default();
+            opts.set_paranoid_checks(false);
+            if let Err(e) = DB::destroy(&opts, &db_path) {
+                warn!("Failed to destroy database at {}: {}", db_path.display(), e);
+                println!("===> WARNING: FAILED TO DESTROY DATABASE AT {}", db_path.display());
+            }
+            match timeout(Duration::from_secs(5), fs::remove_dir_all(&db_path)).await {
+                Ok(Ok(_)) => {
+                    info!("Successfully removed database directory at {}", db_path.display());
+                    println!("===> SUCCESSFULLY REMOVED DATABASE DIRECTORY AT {}", db_path.display());
                 }
-
-                match timeout(Duration::from_secs(10), fs::remove_dir_all(&db_path)).await {
-                    Ok(Ok(_)) => {
-                        info!("Successfully removed database directory at {}", db_path.display());
-                        println!("===> SUCCESSFULLY REMOVED DATABASE DIRECTORY AT {}", db_path.display());
-                        break;
-                    }
-                    Ok(Err(e)) => {
-                        warn!("Failed to remove directory at {} on attempt {}: {}", db_path.display(), cleanup_attempt + 1, e);
-                        println!("===> WARNING: FAILED TO REMOVE DIRECTORY AT {} ON ATTEMPT {}", db_path.display(), cleanup_attempt + 1);
-                        cleanup_attempt += 1;
-                        if cleanup_attempt < MAX_CLEANUP_RETRIES {
-                            tokio::time::sleep(Duration::from_millis(2000 * (cleanup_attempt as u64 + 1))).await;
-                        }
-                    }
-                    Err(_) => {
-                        warn!("Timeout removing directory at {} on attempt {}", db_path.display(), cleanup_attempt + 1);
-                        println!("===> WARNING: TIMEOUT REMOVING DIRECTORY AT {} ON ATTEMPT {}", db_path.display(), cleanup_attempt + 1);
-                        cleanup_attempt += 1;
-                        if cleanup_attempt < MAX_CLEANUP_RETRIES {
-                            tokio::time::sleep(Duration::from_millis(2000 * (cleanup_attempt as u64 + 1))).await;
-                        }
-                    }
+                Ok(Err(e)) => {
+                    error!("Failed to remove directory at {}: {}", db_path.display(), e);
+                    println!("===> ERROR: FAILED TO REMOVE DIRECTORY AT {}", db_path.display());
+                    return Err(GraphError::StorageError(format!("Failed to remove directory at {}: {}", db_path.display(), e)));
                 }
-            } else {
-                info!("No existing database directory found at {}", db_path.display());
-                println!("===> NO EXISTING DATABASE DIRECTORY FOUND AT {}", db_path.display());
-                break;
+                Err(_) => {
+                    error!("Timeout removing directory at {}", db_path.display());
+                    println!("===> ERROR: TIMEOUT REMOVING DIRECTORY AT {}", db_path.display());
+                    return Err(GraphError::StorageError(format!("Timeout removing directory at {}", db_path.display())));
+                }
             }
         }
 
-        if cleanup_attempt >= MAX_CLEANUP_RETRIES {
-            error!("Failed to remove directory {} after {} attempts", db_path.display(), MAX_CLEANUP_RETRIES);
-            println!("===> ERROR: FAILED TO REMOVE DIRECTORY {} AFTER {} ATTEMPTS", db_path.display(), MAX_CLEANUP_RETRIES);
-            return Err(GraphError::StorageError(format!("Failed to remove directory {} after {} attempts", db_path.display(), MAX_CLEANUP_RETRIES)));
-        }
-
-        // Extended delay to ensure filesystem consistency
-        tokio::time::sleep(Duration::from_secs(10)).await;
-
-        // Verify directory is empty
-        fs::create_dir_all(&db_path).await
+        fs::create_dir_all(&db_path)
+            .await
             .map_err(|e| {
                 error!("Failed to recreate database directory at {}: {}", db_path.display(), e);
                 println!("===> ERROR: FAILED TO RECREATE DATABASE DIRECTORY AT {}", db_path.display());
                 GraphError::StorageError(format!("Failed to recreate database directory at {}: {}", db_path.display(), e))
             })?;
-
-        let mut dir = fs::read_dir(&db_path).await
-            .map_err(|e| {
-                error!("Failed to read directory {}: {}", db_path.display(), e);
-                println!("===> ERROR: FAILED TO READ DIRECTORY {}", db_path.display());
-                GraphError::StorageError(format!("Failed to read directory {}: {}", db_path.display(), e))
-            })?;
-        while let Some(entry) = dir.next_entry().await
-            .map_err(|e| {
-                error!("Failed to read directory entry in {}: {}", db_path.display(), e);
-                println!("===> ERROR: FAILED TO READ DIRECTORY ENTRY IN {}", db_path.display());
-                GraphError::StorageError(format!("Failed to read directory entry in {}: {}", db_path.display(), e))
-            })? {
-            let file_name = entry.file_name().to_string_lossy().into_owned();
-            error!("Unexpected file {} found in {} after reset, database should be empty", file_name, db_path.display());
-            println!("===> ERROR: UNEXPECTED FILE {} FOUND IN {} AFTER RESET, DATABASE SHOULD BE EMPTY", file_name, db_path.display());
-            return Err(GraphError::StorageError(format!("Unexpected file {} found in {} after reset", file_name, db_path.display())));
-        }
 
         Self::new(config, &StorageConfig::default())
             .await
