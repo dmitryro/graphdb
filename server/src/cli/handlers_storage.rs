@@ -1269,14 +1269,16 @@ pub async fn stop_storage_interactive(
 }
 
 /// Displays status of storage daemons only.
-/// Displays status of storage daemons only.
 pub async fn display_storage_daemon_status(
     port_arg: Option<u16>,
     storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
 ) {
     // Load CLI storage config
     let cli_storage_config = match load_storage_config_from_yaml(None).await {
-        Ok(config) => Some(config),
+        Ok(config) => {
+            info!("Loaded storage config: {:?}", config);
+            Some(config)
+        }
         Err(e) => {
             warn!("Failed to load CLI storage config from YAML: {}", e);
             None
@@ -1313,19 +1315,13 @@ pub async fn display_storage_daemon_status(
         for port in &running_ports {
             if !storage_daemons.iter().any(|d| d.port == *port) {
                 warn!("Storage daemon running on port {} but not in registry. Updating metadata...", port);
-                let engine_type = if let Some(manager) = GLOBAL_STORAGE_ENGINE_MANAGER.get() {
-                    manager.current_engine_type().await
-                } else {
-                    config.storage_engine_type.clone()
-                };
-
+                let engine_type = config.storage_engine_type.clone();
                 let instance_path = config
                     .data_directory
                     .as_ref()
                     .unwrap_or(&PathBuf::from(DEFAULT_DATA_DIRECTORY))
                     .join(daemon_api_storage_engine_type_to_string(&engine_type).to_lowercase())
                     .join(port.to_string());
-
                 let pid = find_pid_by_port(*port).await.unwrap_or(0);
 
                 let update_metadata = DaemonMetadata {
@@ -1390,17 +1386,35 @@ pub async fn display_storage_daemon_status(
 
             let metadata = storage_daemons.iter().find(|d| d.port == port);
 
-            let (engine_type_str, data_path_display) = if let Some(manager) = GLOBAL_STORAGE_ENGINE_MANAGER.get() {
+            // Prioritize configuration for engine type and data path
+            let (engine_type_str, data_path_display) = if let Some(config) = &cli_storage_config {
+                let engine = config.storage_engine_type.clone();
+                let data_path = config
+                    .data_directory
+                    .as_ref()
+                    .unwrap_or(&PathBuf::from(DEFAULT_DATA_DIRECTORY))
+                    .join(daemon_api_storage_engine_type_to_string(&engine).to_lowercase())
+                    .join(port.to_string());
+                (
+                    daemon_api_storage_engine_type_to_string(&engine),
+                    data_path.display().to_string(),
+                )
+            } else if let Some(manager) = GLOBAL_STORAGE_ENGINE_MANAGER.get() {
                 let engine = manager.current_engine_type().await;
                 let data_path = manager.get_current_engine_data_path().await;
-                let data_path_str = data_path
-                    .map_or("N/A".to_string(), |p| p.display().to_string());
-                (daemon_api_storage_engine_type_to_string(&engine), data_path_str)
+                let data_path_str = data_path.map_or("N/A".to_string(), |p| p.display().to_string());
+                (
+                    daemon_api_storage_engine_type_to_string(&engine),
+                    data_path_str,
+                )
             } else {
-                warn!("StorageEngineManager not initialized; falling back to daemon metadata.");
-                let engine = metadata.as_ref().and_then(|meta| meta.engine_type.clone())
+                warn!("Falling back to daemon metadata for port {}", port);
+                let engine = metadata
+                    .as_ref()
+                    .and_then(|meta| meta.engine_type.clone())
                     .unwrap_or_else(|| "unknown".to_string());
-                let data_path_str = metadata.as_ref()
+                let data_path_str = metadata
+                    .as_ref()
                     .and_then(|meta| meta.data_dir.clone())
                     .map_or("N/A".to_string(), |p| p.display().to_string());
                 (engine, data_path_str)
@@ -1420,7 +1434,8 @@ pub async fn display_storage_daemon_status(
                 println!("{:<15} {:<10} {:<50}", "", "", format!("Min Disk Space: {} GB", storage_config.min_disk_space_gb));
                 println!("{:<15} {:<10} {:<50}", "", "", format!("Use Raft: {}", storage_config.use_raft_for_scale));
             } else {
-                println!("{:<15} {:<10} {:<50}", storage_daemon_status, port, "Configuration not loaded due to error");
+                println!("{:<15} {:<10} {:<50}", storage_daemon_status, port, format!("{} | Engine: {} (Configuration not loaded)", pid_info, engine_type_str));
+                println!("{:<15} {:<10} {:<50}", "", "", format!("Data Path: {}", data_path_display));
             }
 
             // Print separator between multiple ports
