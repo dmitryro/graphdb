@@ -14,7 +14,7 @@ use lib::daemon::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
 use lib::query_exec_engine::query_exec_engine::QueryExecEngine;
 use lib::query_parser::{parse_query_from_string, QueryType};
 use lib::config::{StorageEngineType, SledConfig, RocksDBConfig, DEFAULT_STORAGE_CONFIG_PATH_RELATIVE, 
-                  default_data_directory, default_log_directory, daemon_api_storage_engine_type_to_string};
+                  default_data_directory, default_log_directory, daemon_api_storage_engine_type_to_string, load_cli_config};
 use lib::storage_engine::storage_engine::{StorageEngine, GraphStorageEngine, AsyncStorageEngineManager, StorageEngineManager, GLOBAL_STORAGE_ENGINE_MANAGER};
 use lib::commands::parse_kv_operation;
 use lib::config::{StorageConfig, MAX_SHUTDOWN_RETRIES, SHUTDOWN_RETRY_DELAY_MS, load_storage_config_from_yaml, QueryPlan, QueryResult};
@@ -308,7 +308,6 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
     Err(last_error.unwrap_or_else(|| anyhow!("Failed to complete ZMQ operation after {} attempts", MAX_RETRIES)))
 }
 
-#[cfg(feature = "with-rocksdb")]
 async fn handle_kv_rocksdb_zmq(key: String, value: Option<String>, operation: &str) -> Result<()> {
     const CONNECT_TIMEOUT_SECS: u64 = 3;
     const REQUEST_TIMEOUT_SECS: u64 = 10;
@@ -442,72 +441,77 @@ async fn handle_kv_rocksdb_zmq(key: String, value: Option<String>, operation: &s
     Err(last_error.unwrap_or_else(|| anyhow!("Failed to complete ZMQ operation after {} attempts", MAX_RETRIES)))
 }
 
+
 pub async fn handle_kv_command(engine: Arc<QueryExecEngine>, operation: String, key: String, value: Option<String>) -> Result<()> {
     debug!("In handle_kv_command: operation={}, key={}", operation, key);
     let validated_op = parse_kv_operation(&operation)
         .map_err(|e| anyhow!("Invalid KV operation: {}", e))?;
 
-    let config = lib::config::load_cli_config().await?;
+    let config = load_cli_config().await
+        .map_err(|e| anyhow!("Failed to load CLI config: {}", e))?;
     debug!("Loaded config: {:?}", config);
-    if config.storage.storage_engine_type == Some(StorageEngineType::Sled) {
-        info!("Using Sled-specific ZeroMQ handler for KV operation: {}", validated_op);
-        handle_kv_sled_zmq(key.clone(), value, &validated_op).await?;
-        Ok(())
-    } else if config.storage.storage_engine_type == Some(StorageEngineType::RocksDB) {
-        #[cfg(feature = "with-rocksdb")]
-        {
-            info!("Using RocksDB-specific ZeroMQ handler for KV operation: {}", validated_op);
-            handle_kv_rocksdb_zmq(key.clone(), value, &validated_op).await?;
+
+    // Handle Sled and RocksDB via ZeroMQ, others via engine directly
+    match config.storage.storage_engine_type {
+        Some(StorageEngineType::Sled) => {
+            info!("Using Sled-specific ZeroMQ handler for KV operation: {}", validated_op);
+            handle_kv_sled_zmq(key.clone(), value, &validated_op).await
+                .map_err(|e| anyhow!("Sled ZeroMQ operation failed: {}", e))?;
             Ok(())
         }
-        #[cfg(not(feature = "with-rocksdb"))]
-        Err(anyhow!("RocksDB support is not enabled in this build"))
-    } else {
-        match validated_op.as_str() {
-            "get" => {
-                info!("Executing Key-Value GET for key: {}", key);
-                let result = engine
-                    .kv_get(&key)
-                    .await
-                    .map_err(|e| anyhow!("Failed to get key '{}': {}", key, e))?;
-                match result {
-                    Some(val) => {
-                        println!("Value for key '{}': {}", key, val);
-                        Ok(())
+        Some(StorageEngineType::RocksDB) => {
+            info!("Using RocksDB-specific ZeroMQ handler for KV operation: {}", validated_op);
+            handle_kv_rocksdb_zmq(key.clone(), value, &validated_op).await
+                .map_err(|e| anyhow!("RocksDB ZeroMQ operation failed: {}", e))?;
+            Ok(())
+        }
+        _ => {
+            match validated_op.as_str() {
+                "get" => {
+                    info!("Executing Key-Value GET for key: {}", key);
+                    let result = engine
+                        .kv_get(&key)
+                        .await
+                        .map_err(|e| anyhow!("Failed to get key '{}': {}", key, e))?;
+                    match result {
+                        Some(val) => {
+                            println!("Value for key '{}': {}", key, val);
+                            Ok(())
+                        }
+                        None => {
+                            println!("Key '{}' not found", key);
+                            Ok(())
+                        }
                     }
-                    None => {
+                }
+                "set" => {
+                    let value = value.ok_or_else(|| {
+                        anyhow!("Missing value for 'kv set' command. Usage: kv set <key> <value> or kv set --key <key> --value <value>")
+                    })?;
+                    info!("Executing Key-Value SET for key: {}, value: {}", key, value);
+                    let stored_value = engine
+                        .kv_set(&key, &value)
+                        .await
+                        .map_err(|e| anyhow!("Failed to set key '{}': {}", key, e))?;
+                    println!("Successfully set and verified key '{:?}' to '{:?}'", key, stored_value);
+                    Ok(())
+                }
+                "delete" => {
+                    info!("Executing Key-Value DELETE for key: {}", key);
+                    let existed = engine
+                        .kv_delete(&key)
+                        .await
+                        .map_err(|e| anyhow!("Failed to delete key '{}': {}", key, e))?;
+                    if existed {
+                        println!("Successfully deleted key '{}'", key);
+                    } else {
                         println!("Key '{}' not found", key);
-                        Ok(())
                     }
+                    Ok(())
                 }
-            }
-            "set" => {
-                let value = value.ok_or_else(|| {
-                    anyhow!("Missing value for 'kv set' command. Usage: kv set <key> <value> or kv set --key <key> --value <value>")
-                })?;
-                info!("Executing Key-Value SET for key: {}, value: {}", key, value);
-                let stored_value = engine
-                    .kv_set(&key, &value)
-                    .await
-                    .map_err(|e| anyhow!("Failed to set key '{}': {}", key, e))?;
-                println!("Successfully set and verified key '{:?}' to '{:?}'", key, stored_value);
-                Ok(())
-            }
-            "delete" => {
-                info!("Executing Key-Value DELETE for key: {}", key);
-                let existed = engine
-                    .kv_delete(&key)
-                    .await
-                    .map_err(|e| anyhow!("Failed to delete key '{}': {}", key, e))?;
-                if existed {
-                    println!("Successfully deleted key '{}'", key);
-                } else {
-                    println!("Key '{}' not found", key);
+                _ => {
+                    Err(anyhow!("Unsupported KV operation: '{}'. Supported operations: get, set, delete", operation))
                 }
-                Ok(())
-            }
-            _ => {
-                Err(anyhow!("Unsupported KV operation: '{}'. Supported operations: get, set, delete", operation))
             }
         }
     }

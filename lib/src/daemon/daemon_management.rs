@@ -7,7 +7,7 @@ use std::sync::{Arc, LazyLock};
 use std::collections::{HashSet, HashMap};
 use std::fmt;
 use regex::Regex;
-use sysinfo::{System, Pid, Process, ProcessStatus, ProcessesToUpdate};
+use sysinfo::{System, Pid, Process, ProcessStatus, ProcessesToUpdate, RefreshKind, ProcessRefreshKind};
 use tokio::task::JoinHandle;
 use tokio::sync::{oneshot, Mutex as TokioMutex};
 use tokio::net::TcpStream;
@@ -23,7 +23,9 @@ use std::process::Stdio;
 use tokio::process::Command;
 use std::os::unix::process::ExitStatusExt;
 use std::fs;
-
+use zmq::{ self, REQ, Context as ZmqContext, Message };
+use serde_json::{json, Value};
+use models::errors::{GraphError, GraphResult};
 use crate::config::{
     get_default_rest_port_from_config,
     load_storage_config_str as load_storage_config,
@@ -39,9 +41,9 @@ use crate::config::{
     DAEMON_REGISTRY_DB_PATH,
     load_main_daemon_config,
     load_rest_config,
+    StorageEngineType,
 };
 use crate::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
-use crate::config::StorageEngineType;
 
 /// Helper to run an external command with a timeout.
 pub async fn run_command_with_timeout(
@@ -917,9 +919,192 @@ pub async fn is_rest_api_running(port: u16) -> bool {
     all_daemons.get(&port).map_or(false, |(_pid, service_type)| service_type == "rest")
 }
 
+
+pub async fn get_running_storage_daemons() -> GraphResult<Vec<u16>> {
+    let all_daemons = get_all_daemon_processes_with_ports()
+        .await
+        .map_err(|e| GraphError::StorageError(format!("Failed to get daemon processes: {}", e)))?;
+
+    let mut active_ports = Vec::new();
+
+    for (port, (pid, service_type)) in all_daemons {
+        if service_type != "storage" {
+            debug!("Skipping non-storage daemon on port {} with service_type {}", port, service_type);
+            continue;
+        }
+
+        // Verify process existence
+        let mut system = System::new_with_specifics(
+            RefreshKind::nothing().with_processes(ProcessRefreshKind::everything())
+        );
+        if system.process(Pid::from(pid as usize)).is_none() {
+            warn!("Daemon on port {} with PID {} is registered but not running", port, pid);
+            if let Err(e) = GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("storage", port).await {
+                warn!("Failed to remove stale daemon entry for port {}: {}", port, e);
+            }
+            continue;
+        }
+
+        // Check daemon responsiveness
+        match timeout(TokioDuration::from_millis(1000), ping_daemon(port)).await {
+            Ok(Ok(response)) if response["status"] == "success" => {
+                info!("Storage daemon on port {} (PID {}) is running and responsive", port, pid);
+                active_ports.push(port);
+                if let Ok(Some(mut metadata)) = GLOBAL_DAEMON_REGISTRY.find_daemon_by_port(port).await {
+                    metadata.last_seen_nanos = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos() as i64;
+                    if let Err(e) = GLOBAL_DAEMON_REGISTRY.register_daemon(metadata).await {
+                        warn!("Failed to update registry for port {}: {}", port, e);
+                    }
+                }
+            }
+            Ok(Ok(response)) => {
+                warn!("Storage daemon on port {} (PID {}) responded with invalid status: {:?}", port, pid, response);
+                if let Err(e) = GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("storage", port).await {
+                    warn!("Failed to remove stale daemon entry for port {}: {}", port, e);
+                }
+            }
+            Ok(Err(e)) => {
+                warn!("Failed to ping storage daemon on port {} (PID {}): {}", port, pid, e);
+                if let Err(e) = GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("storage", port).await {
+                    warn!("Failed to remove stale daemon entry for port {}: {}", port, e);
+                }
+            }
+            Err(_) => {
+                warn!("Timeout pinging storage daemon on port {} (PID {})", port, pid);
+                if let Err(e) = GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("storage", port).await {
+                    warn!("Failed to remove stale daemon entry for port {}: {}", port, e);
+                }
+            }
+        }
+    }
+
+    Ok(active_ports)
+}
+
+async fn ping_daemon(port: u16) -> GraphResult<Value> {
+    let context = ZmqContext::new();
+    let socket = context.socket(zmq::REQ)
+        .map_err(|e| GraphError::StorageError(format!("Failed to create ZeroMQ socket: {}", e)))?;
+
+    socket.set_rcvtimeo(1000)
+        .map_err(|e| GraphError::StorageError(format!("Failed to set receive timeout: {}", e)))?;
+    socket.set_sndtimeo(1000)
+        .map_err(|e| GraphError::StorageError(format!("Failed to set send timeout: {}", e)))?;
+    socket.set_connect_timeout(1000)
+        .map_err(|e| GraphError::StorageError(format!("Failed to set connect timeout: {}", e)))?;
+
+    let endpoint = format!("ipc:///opt/graphdb/graphdb-{}.ipc", port);
+    debug!("Attempting to connect to ZeroMQ endpoint {} for port {}", endpoint, port);
+    socket.connect(&endpoint)
+        .map_err(|e| GraphError::StorageError(format!("Failed to connect to {}: {}", endpoint, e)))?;
+
+    let request = json!({ "command": "ping" });
+    socket.send(serde_json::to_vec(&request)?, 0)
+        .map_err(|e| GraphError::StorageError(format!("Failed to send ping request to port {}: {}", port, e)))?;
+
+    let reply = socket.recv_bytes(0)
+        .map_err(|e| GraphError::StorageError(format!("Failed to receive ping response from port {}: {}", port, e)))?;
+
+    serde_json::from_slice(&reply)
+        .map_err(|e| GraphError::StorageError(format!("Failed to parse ping response from port {}: {}", port, e)))
+}
+
 pub async fn is_storage_daemon_running(port: u16) -> bool {
-    let all_daemons = get_all_daemon_processes_with_ports().await.unwrap_or_default();
-    all_daemons.get(&port).map_or(false, |(_pid, service_type)| service_type == "storage")
+    // Check registry
+    let daemon_metadata = match GLOBAL_DAEMON_REGISTRY.find_daemon_by_port(port).await {
+        Ok(Some(metadata)) if metadata.service_type == "storage" => {
+            debug!("Found daemon in registry for port {}: {:?}", port, metadata);
+            Some(metadata)
+        }
+        Ok(Some(metadata)) => {
+            debug!("Found daemon on port {}, but service_type is {} (not storage)", port, metadata.service_type);
+            None
+        }
+        Ok(None) => {
+            debug!("No daemon found in registry for port {}", port);
+            None
+        }
+        Err(e) => {
+            warn!("Failed to query registry for port {}: {}", port, e);
+            None
+        }
+    };
+
+    let pid = match &daemon_metadata {
+        Some(metadata) => {
+            let mut system = System::new_with_specifics(
+                RefreshKind::nothing().with_processes(ProcessRefreshKind::everything())
+            );
+            if system.process(Pid::from(metadata.pid as usize)).is_none() {
+                warn!("Daemon on port {} with PID {} is registered but not running", port, metadata.pid);
+                if let Err(e) = GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("storage", port).await {
+                    warn!("Failed to remove stale daemon entry for port {}: {}", port, e);
+                }
+                None
+            } else {
+                Some(metadata.pid)
+            }
+        }
+        None => find_pid_by_port(port).await,
+    };
+
+    let Some(pid) = pid else {
+        debug!("No daemon found for port {} in registry or port scan", port);
+        return false;
+    };
+
+    // Verify process existence
+    let mut system = System::new_with_specifics(
+        RefreshKind::nothing().with_processes(ProcessRefreshKind::everything())
+    );
+    if system.process(Pid::from(pid as usize)).is_none() {
+        warn!("Daemon on port {} with PID {} is not running", port, pid);
+        if let Err(e) = GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("storage", port).await {
+            warn!("Failed to remove stale daemon entry for port {}: {}", port, e);
+        }
+        return false;
+    }
+
+    // Perform ZeroMQ ping
+    match timeout(TokioDuration::from_millis(1000), ping_daemon(port)).await {
+        Ok(Ok(response)) if response["status"] == "success" => {
+            info!("Daemon on port {} (PID {}) is running and responsive", port, pid);
+            if let Some(mut metadata) = daemon_metadata {
+                metadata.last_seen_nanos = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos() as i64;
+                if let Err(e) = GLOBAL_DAEMON_REGISTRY.register_daemon(metadata).await {
+                    warn!("Failed to update registry for port {}: {}", port, e);
+                }
+            }
+            true
+        }
+        Ok(Ok(response)) => {
+            warn!("Daemon on port {} (PID {}) responded with invalid status: {:?}", port, pid, response);
+            if let Err(e) = GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("storage", port).await {
+                warn!("Failed to remove stale daemon entry for port {}: {}", port, e);
+            }
+            false
+        }
+        Ok(Err(e)) => {
+            warn!("Daemon on port {} (PID {}) is unresponsive: {}", port, pid, e);
+            if let Err(e) = GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("storage", port).await {
+                warn!("Failed to remove stale daemon entry for port {}: {}", port, e);
+            }
+            false
+        }
+        Err(_) => {
+            warn!("Timeout pinging daemon on port {} (PID {})", port, pid);
+            if let Err(e) = GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("storage", port).await {
+                warn!("Failed to remove stale daemon entry for port {}: {}", port, e);
+            }
+            false
+        }
+    }
 }
 
 pub async fn stop_specific_main_daemon(port: u16, should_reclaim: bool) -> Result<(), anyhow::Error> {

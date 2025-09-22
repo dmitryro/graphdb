@@ -31,8 +31,8 @@ use serde_json::{Map, Value, from_value};
 use serde::{Deserialize, Serialize, Deserializer};
 use log::{info, debug, warn, error, trace};
 #[cfg(unix)]
-use nix::unistd::{Pid, getpid, getuid};
-use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, RefreshKind};
+use nix::unistd::{Pid as NixPid, getpid, getuid};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, RefreshKind};
 use nix::sys::signal::{self, kill, Signal};
 #[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt, MetadataExt};
@@ -1087,20 +1087,24 @@ impl StorageEngineManager {
         let engine_path = base_engine_path.join(port.to_string());
         println!("===> in new in storage_engine.rs - STEP 2 ");
 
-        // Clean up existing database directory for RocksDB
-        if storage_engine_type == StorageEngineType::RocksDB && engine_path.exists() {
-            info!("Removing existing database directory at {:?}", engine_path);
-            println!("===> REMOVING EXISTING DATABASE DIRECTORY AT {:?}", engine_path);
-            if let Err(e) = timeout(TokioDuration::from_secs(5), fs::remove_dir_all(&engine_path)).await {
-                error!("Timeout removing directory at {:?}", engine_path);
-                println!("===> ERROR: TIMEOUT REMOVING DIRECTORY AT {:?}", engine_path);
-                return Err(GraphError::StorageError(format!("Timeout removing directory at {:?}", engine_path)));
+        // Check if a daemon is already running
+        if is_storage_daemon_running(port).await {
+            info!("===> Reusing existing daemon on port {}", port);
+            println!("===> REUSING EXISTING DAEMON ON PORT {}", port);
+            // Update config path if necessary
+            if let Some(ref mut engine_config) = config.engine_specific_config {
+                engine_config.storage.path = Some(engine_path.clone());
+                engine_config.storage.port = Some(port);
             }
-            if let Err(e) = fs::create_dir_all(&engine_path).await {
-                error!("Failed to recreate directory at {:?}", engine_path);
-                println!("===> ERROR: FAILED TO RECREATE DIRECTORY AT {:?}", engine_path);
-                return Err(GraphError::StorageError(format!("Failed to recreate directory at {:?}", engine_path)));
-            }
+            let engine = Self::initialize_storage_engine(storage_engine_type, &config).await?;
+            return Self::create_manager(
+                storage_engine_type,
+                config,
+                config_path,
+                engine,
+                !use_temp,
+                Arc::new(TokioMutex::new(HashMap::new())),
+            ).await;
         }
 
         // Check and release any existing locks
@@ -1127,7 +1131,7 @@ impl StorageEngineManager {
             #[cfg(feature = "with-rocksdb")]
             StorageEngineType::RocksDB => {
                 println!("===> new new in storage_engine.rs - LET ME SEE IF IT EVER ATTEMPTED TO DO ANYTHING IN ROCKSDB");
-                // Only remove LOCK file, do not open database
+                // Only remove LOCK file, do not delete database directory
                 let lock_file = engine_path.join("LOCK");
                 if lock_file.exists() {
                     info!("Found lock file at {:?}", lock_file);
@@ -1144,18 +1148,41 @@ impl StorageEngineManager {
                     }
                     info!("Successfully removed lock file at {:?}", lock_file);
                     println!("===> SUCCESSFULLY REMOVED LOCK FILE AT {:?}", lock_file);
-                    sleep(TokioDuration::from_millis(500)).await;
+                    tokio::time::sleep(TokioDuration::from_millis(500)).await;
                 } else {
                     info!("No lock file found at {:?}", lock_file);
                     println!("===> NO LOCK FILE FOUND AT {:?}", lock_file);
+                }
+                // Ensure the database directory exists
+                if !engine_path.exists() {
+                    info!("Creating new database directory at {:?}", engine_path);
+                    println!("===> CREATING NEW DATABASE DIRECTORY AT {:?}", engine_path);
+                    if let Err(e) = fs::create_dir_all(&engine_path).await {
+                        error!("Failed to create directory at {:?}", engine_path);
+                        println!("===> ERROR: FAILED TO CREATE DIRECTORY AT {:?}", engine_path);
+                        return Err(GraphError::StorageError(format!("Failed to create directory at {:?}: {}", engine_path, e)));
+                    }
+                } else {
+                    info!("Reusing existing database directory at {:?}", engine_path);
+                    println!("===> REUSING EXISTING DATABASE DIRECTORY AT {:?}", engine_path);
                 }
             }
             _ => {}
         }
 
-        if let Some(ref mut engine_config) = config.engine_specific_config {
-            engine_config.storage.path = Some(engine_path.clone());
-            engine_config.storage.port = Some(port);
+        // Clean up stale registry entry
+        if let Ok(Some(metadata)) = GLOBAL_DAEMON_REGISTRY.find_daemon_by_port(port).await {
+            let system = System::new_with_specifics(
+                RefreshKind::nothing().with_processes(ProcessRefreshKind::everything())
+            );
+            if system.process(Pid::from(metadata.pid as usize)).is_none() {
+                warn!("Removing stale registry entry for port {} with PID {}", port, metadata.pid);
+                println!("===> REMOVING STALE REGISTRY ENTRY FOR PORT {} WITH PID {}", port, metadata.pid);
+                if let Err(e) = GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("storage", port).await {
+                    warn!("Failed to remove stale daemon entry for port {}: {}", port, e);
+                    println!("===> WARNING: FAILED TO REMOVE STALE DAEMON ENTRY FOR PORT {}: {}", port, e);
+                }
+            }
         }
 
         // Get or create metadata
@@ -1188,6 +1215,11 @@ impl StorageEngineManager {
                 new_metadata
             }
         };
+
+        if let Some(ref mut engine_config) = config.engine_specific_config {
+            engine_config.storage.path = Some(engine_path.clone());
+            engine_config.storage.port = Some(port);
+        }
 
         if !use_temp {
             config.save().await.map_err(|e| GraphError::ConfigurationError(format!("Failed to save config: {}", e)))?;
