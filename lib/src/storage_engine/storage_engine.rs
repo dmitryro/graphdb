@@ -9,7 +9,7 @@ use tokio::sync::{OnceCell, RwLock, Mutex as TokioMutex};
 use std::fmt::Debug;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -31,8 +31,8 @@ use serde_json::{Map, Value, from_value};
 use serde::{Deserialize, Serialize, Deserializer};
 use log::{info, debug, warn, error, trace};
 #[cfg(unix)]
-use nix::unistd::{Pid, getpid, getuid};
-use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, RefreshKind};
+use nix::unistd::{Pid as NixPid, getpid, getuid};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, RefreshKind};
 use nix::sys::signal::{self, kill, Signal};
 #[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt, MetadataExt};
@@ -102,6 +102,9 @@ static REDIS_SINGLETON: OnceCell<Arc<RedisStorage>> = OnceCell::const_new();
 static POSTGRES_SINGLETON: OnceCell<Arc<PostgresStorage>> = OnceCell::const_new();
 #[cfg(feature = "mysql-datastore")]
 static MYSQL_SINGLETON: OnceCell<Arc<MySQLStorage>> = OnceCell::const_new();
+
+// Global lock to prevent concurrent RocksDB initialization
+static ROCKSDB_INIT_LOCK: LazyLock<TokioMutex<()>> = LazyLock::new(|| TokioMutex::new(()));
 
 
 const MAX_RETRIES: u32 = 5;
@@ -218,21 +221,35 @@ pub struct SurrealdbGraphStorage {
 
 #[cfg(feature = "with-rocksdb")]
 impl SurrealdbGraphStorage {
-    pub async fn force_unlock(path: &PathBuf) -> Result<(), GraphError> {
+    pub async fn force_unlock(path: &Path) -> Result<(), GraphError> {
         let lock_file = path.join("LOCK");
+        info!("Checking for lock file at {:?}", lock_file);
+        println!("===> CHECKING FOR LOCK FILE AT {:?}", lock_file);
+
         if lock_file.exists() {
-            info!("Removing RocksDB lock file at {:?}", lock_file);
-            tokio::fs::remove_file(&lock_file).await
-                .map_err(|e| GraphError::StorageError(format!("Failed to remove RocksDB lock file at {:?}: {}", lock_file, e)))?;
+            info!("Found lock file at {:?}", lock_file);
+            println!("===> FOUND LOCK FILE AT {:?}", lock_file);
+            timeout(TokioDuration::from_secs(2), fs::remove_file(&lock_file))
+                .await
+                .map_err(|_| {
+                    error!("Timeout removing lock file at {:?}", lock_file);
+                    println!("===> ERROR: TIMEOUT REMOVING LOCK FILE AT {:?}", lock_file);
+                    GraphError::StorageError(format!("Timeout removing lock file at {:?}", lock_file))
+                })?
+                .map_err(|e| {
+                    error!("Failed to remove lock file at {:?}: {}", lock_file, e);
+                    println!("===> ERROR: FAILED TO REMOVE LOCK FILE AT {:?}", lock_file);
+                    GraphError::StorageError(format!("Failed to remove lock file at {:?}: {}", lock_file, e))
+                })?;
+            info!("Successfully removed lock file at {:?}", lock_file);
+            println!("===> SUCCESSFULLY REMOVED LOCK FILE AT {:?}", lock_file);
+            sleep(TokioDuration::from_millis(500)).await;
+        } else {
+            info!("No lock file found at {:?}", lock_file);
+            println!("===> NO LOCK FILE FOUND AT {:?}", lock_file);
         }
-        // Verify the database can be opened to ensure no other locks
-        match Surreal::new::<RocksDb>(path.clone()).await {
-            Ok(_) => {
-                info!("RocksDB database at {:?} is accessible after lock removal", path);
-                Ok(())
-            }
-            Err(e) => Err(GraphError::StorageError(format!("RocksDB database at {:?} still locked or inaccessible: {}", path, e)))
-        }
+
+        Ok(())
     }
 }
 
@@ -807,7 +824,7 @@ async fn recover_rocksdb(data_dir: &PathBuf) -> Result<(), GraphError> {
                             }
                             
                             // Wait to ensure resources are released
-                            tokio::time::sleep(tokio::time::Duration::from_millis(3000)).await;
+                            tokio::time::sleep(TokioDuration::from_millis(3000)).await;
                             
                             // Check if lock is held by current process
                             let current_pid = process::id();
@@ -893,7 +910,7 @@ async fn recover_rocksdb(data_dir: &PathBuf) -> Result<(), GraphError> {
                 }
                 
                 // Wait to ensure resources are released
-                tokio::time::sleep(tokio::time::Duration::from_millis(3000)).await;
+                tokio::time::sleep(TokioDuration::from_millis(3000)).await;
                 
                 warn!("Removing RocksDB lock file (non-Unix system, retry {}): {:?}", retries, lock_file);
                 fs::remove_file(&lock_file)
@@ -911,7 +928,7 @@ async fn recover_rocksdb(data_dir: &PathBuf) -> Result<(), GraphError> {
         retries += 1;
         if retries < MAX_RETRIES {
             trace!("Retrying lock file cleanup after 3s delay (attempt {}/{})", retries + 1, MAX_RETRIES);
-            tokio::time::sleep(tokio::time::Duration::from_millis(3000)).await;
+            tokio::time::sleep(TokioDuration::from_millis(3000)).await;
         }
     }
 
@@ -1068,14 +1085,36 @@ impl StorageEngineManager {
             .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY));
         let base_engine_path = base_data_dir.join(&engine_path_name);
         let engine_path = base_engine_path.join(port.to_string());
+        println!("===> in new in storage_engine.rs - STEP 2 ");
 
-        // Check and release any existing locks before proceeding
+        // Check if a daemon is already running
+        if is_storage_daemon_running(port).await {
+            info!("===> Reusing existing daemon on port {}", port);
+            println!("===> REUSING EXISTING DAEMON ON PORT {}", port);
+            // Update config path if necessary
+            if let Some(ref mut engine_config) = config.engine_specific_config {
+                engine_config.storage.path = Some(engine_path.clone());
+                engine_config.storage.port = Some(port);
+            }
+            let engine = Self::initialize_storage_engine(storage_engine_type, &config).await?;
+            return Self::create_manager(
+                storage_engine_type,
+                config,
+                config_path,
+                engine,
+                !use_temp,
+                Arc::new(TokioMutex::new(HashMap::new())),
+            ).await;
+        }
+
+        // Check and release any existing locks
         match storage_engine_type {
             #[cfg(feature = "with-sled")]
             StorageEngineType::Sled => {
                 if engine_path.exists() {
                     if let Err(e) = SledStorage::force_unlock(&engine_path).await {
                         warn!("Failed to unlock Sled database at {:?}: {}", engine_path, e);
+                        println!("===> WARNING: FAILED TO UNLOCK SLED DATABASE AT {:?}", engine_path);
                         return Err(GraphError::StorageError(format!("Failed to unlock Sled database at {:?}: {}", engine_path, e)));
                     } else {
                         info!("Successfully unlocked Sled database at {:?}", engine_path);
@@ -1091,28 +1130,59 @@ impl StorageEngineManager {
             }
             #[cfg(feature = "with-rocksdb")]
             StorageEngineType::RocksDB => {
-                if engine_path.exists() {
-                    if let Err(e) = SurrealdbGraphStorage::force_unlock(&engine_path).await {
-                        warn!("Failed to unlock RocksDB database at {:?}: {}", engine_path, e);
-                        return Err(GraphError::StorageError(format!("Failed to unlock RocksDB database at {:?}: {}", engine_path, e)));
-                    } else {
-                        info!("Successfully unlocked RocksDB database at {:?}", engine_path);
-                        println!("===> SUCCESSFULLY UNLOCKED ROCKSDB DATABASE AT {:?}", engine_path);
+                println!("===> new new in storage_engine.rs - LET ME SEE IF IT EVER ATTEMPTED TO DO ANYTHING IN ROCKSDB");
+                // Only remove LOCK file, do not delete database directory
+                let lock_file = engine_path.join("LOCK");
+                if lock_file.exists() {
+                    info!("Found lock file at {:?}", lock_file);
+                    println!("===> FOUND LOCK FILE AT {:?}", lock_file);
+                    if let Err(e) = timeout(TokioDuration::from_secs(2), fs::remove_file(&lock_file)).await {
+                        error!("Timeout removing lock file at {:?}", lock_file);
+                        println!("===> ERROR: TIMEOUT REMOVING LOCK FILE AT {:?}", lock_file);
+                        return Err(GraphError::StorageError(format!("Timeout removing lock file at {:?}", lock_file)));
                     }
-                    // Verify no lock file exists
-                    let lock_file = engine_path.join("LOCK");
-                    if lock_file.exists() {
-                        return Err(GraphError::StorageError(format!("Lock file still exists at {:?} after unlock attempt", lock_file)));
+                    if let Err(e) = fs::remove_file(&lock_file).await {
+                        error!("Failed to remove lock file at {:?}: {}", lock_file, e);
+                        println!("===> ERROR: FAILED TO REMOVE LOCK FILE AT {:?}", lock_file);
+                        return Err(GraphError::StorageError(format!("Failed to remove lock file at {:?}: {}", lock_file, e)));
                     }
+                    info!("Successfully removed lock file at {:?}", lock_file);
+                    println!("===> SUCCESSFULLY REMOVED LOCK FILE AT {:?}", lock_file);
+                    tokio::time::sleep(TokioDuration::from_millis(500)).await;
+                } else {
+                    info!("No lock file found at {:?}", lock_file);
                     println!("===> NO LOCK FILE FOUND AT {:?}", lock_file);
+                }
+                // Ensure the database directory exists
+                if !engine_path.exists() {
+                    info!("Creating new database directory at {:?}", engine_path);
+                    println!("===> CREATING NEW DATABASE DIRECTORY AT {:?}", engine_path);
+                    if let Err(e) = fs::create_dir_all(&engine_path).await {
+                        error!("Failed to create directory at {:?}", engine_path);
+                        println!("===> ERROR: FAILED TO CREATE DIRECTORY AT {:?}", engine_path);
+                        return Err(GraphError::StorageError(format!("Failed to create directory at {:?}: {}", engine_path, e)));
+                    }
+                } else {
+                    info!("Reusing existing database directory at {:?}", engine_path);
+                    println!("===> REUSING EXISTING DATABASE DIRECTORY AT {:?}", engine_path);
                 }
             }
             _ => {}
         }
 
-        if let Some(ref mut engine_config) = config.engine_specific_config {
-            engine_config.storage.path = Some(engine_path.clone());
-            engine_config.storage.port = Some(port);
+        // Clean up stale registry entry
+        if let Ok(Some(metadata)) = GLOBAL_DAEMON_REGISTRY.find_daemon_by_port(port).await {
+            let system = System::new_with_specifics(
+                RefreshKind::nothing().with_processes(ProcessRefreshKind::everything())
+            );
+            if system.process(Pid::from(metadata.pid as usize)).is_none() {
+                warn!("Removing stale registry entry for port {} with PID {}", port, metadata.pid);
+                println!("===> REMOVING STALE REGISTRY ENTRY FOR PORT {} WITH PID {}", port, metadata.pid);
+                if let Err(e) = GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("storage", port).await {
+                    warn!("Failed to remove stale daemon entry for port {}: {}", port, e);
+                    println!("===> WARNING: FAILED TO REMOVE STALE DAEMON ENTRY FOR PORT {}: {}", port, e);
+                }
+            }
         }
 
         // Get or create metadata
@@ -1146,10 +1216,15 @@ impl StorageEngineManager {
             }
         };
 
+        if let Some(ref mut engine_config) = config.engine_specific_config {
+            engine_config.storage.path = Some(engine_path.clone());
+            engine_config.storage.port = Some(port);
+        }
+
         if !use_temp {
             config.save().await.map_err(|e| GraphError::ConfigurationError(format!("Failed to save config: {}", e)))?;
         }
-
+        println!("====> IN new in storage_engine.rs - before it even goes to init_rocksdb");
         let engine = Self::initialize_storage_engine(storage_engine_type, &config).await?;
 
         Self::create_manager(
@@ -1418,7 +1493,7 @@ impl StorageEngineManager {
                     Err(e) => {
                         warn!("Failed to shut down existing manager (retry {}): {:?}", retry, e);
                         if retry < MAX_RETRIES - 1 {
-                            tokio::time::sleep(tokio::time::Duration::from_millis(3000)).await;
+                            tokio::time::sleep(TokioDuration::from_millis(3000)).await;
                         }
                     }
                 }
@@ -1969,93 +2044,88 @@ impl StorageEngineManager {
     #[cfg(feature = "with-rocksdb")]
     async fn init_rocksdb(config: &StorageConfig) -> GraphResult<Arc<dyn GraphStorageEngine + Send + Sync>> {
         info!("Initializing RocksDB engine: {:?}", config);
-        println!("===> INITIALIZING ROCKSDB ENGINE: {:?}", config);
+        println!("===> in init_rocksdb - INITIALIZING ROCKSDB ENGINE: {:?}", config);
 
         let engine_specific = config.engine_specific_config.as_ref()
             .ok_or_else(|| GraphError::ConfigurationError("Missing engine_specific_config for RocksDB".to_string()))?;
 
-        let rocksdb_path = engine_specific.storage.path.clone()
-            .ok_or_else(|| GraphError::ConfigurationError("Missing path for RocksDB".to_string()))?;
+        // Use storage_config.data_directory as the base path if no specific path is provided
+        let rocksdb_path = if let Some(path) = &engine_specific.storage.path {
+            path.clone()
+        } else {
+            let default_data_dir = PathBuf::from(DEFAULT_DATA_DIRECTORY);
+            let base_data_dir = config.data_directory.as_ref().unwrap_or(&default_data_dir);
+            base_data_dir.join("rocksdb")
+        };
 
         let port = engine_specific.storage.port.unwrap_or(DEFAULT_STORAGE_PORT);
+        println!("===> USING ENGINE-SPECIFIC PORT {} FROM CONFIG", port);
+
+        // Ensure directory exists and is writable
+        if !rocksdb_path.exists() {
+            info!("Creating RocksDB directory: {}", rocksdb_path.display());
+            println!("===> CREATING ROCKSDB DIRECTORY: {}", rocksdb_path.display());
+            fs::create_dir_all(&rocksdb_path)
+                .await
+                .map_err(|e| {
+                    error!("Failed to create RocksDB directory at {}: {}", rocksdb_path.display(), e);
+                    println!("===> ERROR: FAILED TO CREATE ROCKSDB DIRECTORY AT {}", rocksdb_path.display());
+                    GraphError::StorageError(format!("Failed to create RocksDB directory at {}: {}", rocksdb_path.display(), e))
+                })?;
+        }
+
+        if !rocksdb_path.is_dir() {
+            error!("Path {} exists but is not a directory", rocksdb_path.display());
+            println!("===> ERROR: PATH {} EXISTS BUT IS NOT A DIRECTORY", rocksdb_path.display());
+            return Err(GraphError::StorageError(format!("Path {} is not a directory", rocksdb_path.display())));
+        }
+
+        let metadata = fs::metadata(&rocksdb_path)
+            .await
+            .map_err(|e| {
+                error!("Failed to access directory metadata at {}: {}", rocksdb_path.display(), e);
+                println!("===> ERROR: FAILED TO ACCESS DIRECTORY METADATA AT {}", rocksdb_path.display());
+                GraphError::StorageError(format!("Failed to access directory metadata at {}: {}", rocksdb_path.display(), e))
+            })?;
+
+        if metadata.permissions().readonly() {
+            error!("Directory at {} is not writable", rocksdb_path.display());
+            println!("===> ERROR: DIRECTORY AT {} IS NOT WRITABLE", rocksdb_path.display());
+            return Err(GraphError::StorageError(format!("Directory at {} is not writable", rocksdb_path.display())));
+        }
 
         // Check and release any existing locks
         if rocksdb_path.exists() {
+            if let Err(e) = RocksDBStorage::force_unlock(&rocksdb_path).await {
+                error!("Failed to unlock RocksDB database at {}: {}", rocksdb_path.display(), e);
+                println!("===> ERROR: FAILED TO UNLOCK ROCKSDB DATABASE AT {}", rocksdb_path.display());
+                return Err(GraphError::StorageError(format!("Failed to unlock RocksDB database at {}: {}", rocksdb_path.display(), e)));
+            }
+            info!("Successfully unlocked RocksDB database at {}", rocksdb_path.display());
+            println!("===> SUCCESSFULLY UNLOCKED ROCKSDB DATABASE AT {}", rocksdb_path.display());
+
+            // Verify no lock file exists
             let lock_file = rocksdb_path.join("LOCK");
             if lock_file.exists() {
-                let daemon_metadata_opt = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await.ok().flatten();
-                if let Some(daemon_metadata) = daemon_metadata_opt {
-                    if let pid = daemon_metadata.pid {
-                        if is_storage_daemon_running(pid as u16).await {
-                            info!("Daemon on port {} (PID {}) is running, checking pool state", port, pid);
-                            println!("===> DAEMON ON PORT {} (PID {}) IS RUNNING, CHECKING POOL STATE", port, pid);
-
-                            let pool_map = ROCKSDB_POOL_MAP.get_or_init(|| async {
-                                TokioMutex::new(HashMap::new())
-                            }).await;
-                            let pool_map_guard = time::timeout(TokioDuration::from_secs(5), pool_map.lock())
-                                .await
-                                .map_err(|_| GraphError::StorageError("Timeout acquiring pool map lock".to_string()))?;
-
-                            if let Some(existing_pool) = pool_map_guard.get(&port) {
-                                let pool_guard = time::timeout(TokioDuration::from_secs(5), existing_pool.lock())
-                                    .await
-                                    .map_err(|_| GraphError::StorageError("Timeout acquiring existing pool lock".to_string()))?;
-                                if !pool_guard.daemons.is_empty() {
-                                    info!("Reusing existing RocksdbDaemonPool for port {}", port);
-                                    println!("===> REUSING EXISTING ROCKSDB DAEMON POOL FOR PORT {}", port);
-                                    return Ok(Arc::new(RocksDBStorage { pool: existing_pool.clone(), use_raft_for_scale: config.use_raft_for_scale }));
-                                }
-                            }
-                            warn!("Daemon on port {} (PID {}) is running but pool is empty or inaccessible", port, pid);
-                            println!("===> DAEMON ON PORT {} (PID {}) IS RUNNING BUT POOL IS EMPTY OR INACCESSIBLE", port, pid);
-                        } else {
-                            warn!("Daemon on port {} (PID {}) is not responsive, attempting to unlock", port, pid);
-                            println!("===> DAEMON ON PORT {} (PID {}) IS NOT RESPONSIVE, ATTEMPTING TO UNLOCK", port, pid);
-                            if let Err(e) = RocksDBStorage::force_unlock(&rocksdb_path).await {
-                                error!("Failed to unlock RocksDB database at {:?}: {}", rocksdb_path, e);
-                                println!("===> ERROR: FAILED TO UNLOCK ROCKSDB DATABASE AT {:?}", rocksdb_path);
-                                return Err(GraphError::StorageError(format!("Failed to unlock RocksDB database at {:?}: {}", rocksdb_path, e)));
-                            }
-                            info!("Successfully unlocked RocksDB database at {:?}", rocksdb_path);
-                            println!("===> SUCCESSFULLY UNLOCKED ROCKSDB DATABASE AT {:?}", rocksdb_path);
-                            GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("rocksdb", port).await?;
-                        }
-                    }
-                } else {
-                    warn!("No daemon metadata found for port {}, attempting to unlock", port);
-                    println!("===> NO DAEMON METADATA FOUND FOR PORT {}, ATTEMPTING TO UNLOCK", port);
-                    if let Err(e) = RocksDBStorage::force_unlock(&rocksdb_path).await {
-                        error!("Failed to unlock RocksDB database at {:?}: {}", rocksdb_path, e);
-                        println!("===> ERROR: FAILED TO UNLOCK ROCKSDB DATABASE AT {:?}", rocksdb_path);
-                        return Err(GraphError::StorageError(format!("Failed to unlock RocksDB database at {:?}: {}", rocksdb_path, e)));
-                    }
-                    info!("Successfully unlocked RocksDB database at {:?}", rocksdb_path);
-                    println!("===> SUCCESSFULLY UNLOCKED ROCKSDB DATABASE AT {:?}", rocksdb_path);
-                }
-
-                if lock_file.exists() {
-                    error!("Lock file still exists at {:?} after unlock attempt", lock_file);
-                    println!("===> ERROR: LOCK FILE STILL EXISTS AT {:?}", lock_file);
-                    return Err(GraphError::StorageError(format!("Lock file still exists at {:?} after unlock attempt", lock_file)));
-                }
-                println!("===> NO LOCK FILE FOUND AT {:?}", lock_file);
+                error!("Lock file still exists at {} after unlock attempt", lock_file.display());
+                println!("===> ERROR: LOCK FILE STILL EXISTS AT {}", lock_file.display());
+                return Err(GraphError::StorageError(format!("Lock file still exists at {} after unlock attempt", lock_file.display())));
             }
+            println!("===> NO LOCK FILE FOUND AT {}", lock_file.display());
         }
-
         // Attempt to get existing metadata
-        let metadata = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await?;
+        let daemon_metadata = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await?;
 
-        if let Some(mut existing_metadata) = metadata {
+        if let Some(mut existing_metadata) = daemon_metadata {
             if existing_metadata.data_dir != Some(rocksdb_path.clone()) {
-                warn!("Path mismatch for RocksDB: registry shows {:?}, but config specifies {:?}", existing_metadata.data_dir, rocksdb_path);
-                println!("===> PATH MISMATCH FOR ROCKSDB: REGISTRY SHOWS {:?}, BUT CONFIG SPECIFIES {:?}", existing_metadata.data_dir, rocksdb_path);
+                warn!("Path mismatch for RocksDB: registry shows {:?}, but config specifies {}", existing_metadata.data_dir, rocksdb_path.display());
+                println!("===> PATH MISMATCH FOR ROCKSDB: REGISTRY SHOWS {:?}, BUT CONFIG SPECIFIES {}", existing_metadata.data_dir, rocksdb_path.display());
                 
                 // Update registry with correct path
                 existing_metadata.data_dir = Some(rocksdb_path.clone());
                 GLOBAL_DAEMON_REGISTRY.update_daemon_metadata(existing_metadata).await?;
-                info!("Updated daemon registry data_dir to {:?}", rocksdb_path);
-                println!("===> UPDATED DAEMON REGISTRY DATA_DIR TO {:?}", rocksdb_path);
+                info!("Updated daemon registry data_dir to {}", rocksdb_path.display());
+                println!("===> UPDATED DAEMON REGISTRY DATA_DIR TO {}", rocksdb_path.display());
             }
         } else {
             // Create new metadata if not exists
@@ -2065,7 +2135,7 @@ impl StorageEngineManager {
                 pid: std::process::id(),
                 ip_address: "127.0.0.1".to_string(),
                 data_dir: Some(rocksdb_path.clone()),
-                config_path: None,
+                config_path: config.config_root_directory.clone(),
                 engine_type: Some("RocksDB".to_string()),
                 last_seen_nanos: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -2073,31 +2143,26 @@ impl StorageEngineManager {
                     .unwrap_or(0),
             };
             GLOBAL_DAEMON_REGISTRY.register_daemon(new_metadata).await?;
-            info!("Created new daemon registry entry for port {} with path {:?}", port, rocksdb_path);
-            println!("===> CREATED NEW DAEMON REGISTRY ENTRY FOR PORT {} WITH PATH {:?}", port, rocksdb_path);
+            info!("Created new daemon registry entry for port {} with path {}", port, rocksdb_path.display());
+            println!("===> CREATED NEW DAEMON REGISTRY ENTRY FOR PORT {} WITH PATH {}", port, rocksdb_path.display());
         }
-
+        
         let rocksdb_config = RocksDBConfig {
+            storage_engine_type: StorageEngineType::RocksDB,
             path: rocksdb_path,
             host: engine_specific.storage.host.clone(),
-            port: engine_specific.storage.port,
-            cache_capacity: None,
-            max_background_jobs: Some(5),
-            storage_engine_type: StorageEngineType::RocksDB,
-            temporary: false,       // Default to non-temporary storage
-            use_compression: true, // Enable compression by default
-            use_raft_for_scale: false, // Default to false, adjust based on your needs
+            port: Some(port),
+            cache_capacity: engine_specific.storage.cache_capacity,
+            max_background_jobs: Some(1000),
+            temporary: false,
+            use_compression: engine_specific.storage.use_compression,
+            use_raft_for_scale: false,
         };
-
+        
         // Attempt to open RocksDB database
-        RocksDBStorage::new(&rocksdb_config, config)
-            .await
+        RocksDBStorage::new(&rocksdb_config, config).await
             .map(|s| Arc::new(s) as Arc<dyn GraphStorageEngine + Send + Sync>)
-            .map_err(|e| {
-                error!("Failed to initialize RocksDB: {}", e);
-                println!("===> ERROR: FAILED TO INITIALIZE ROCKSDB: {}", e);
-                GraphError::StorageError(format!("Failed to initialize RocksDB: {}", e))
-            })
+            .map_err(|e| GraphError::StorageError(format!("Failed to initialize RocksDB: {}", e)))
     }
 
     #[cfg(not(feature = "redis-datastore"))]
@@ -3299,10 +3364,12 @@ impl StorageEngineManager {
                             StorageEngineType::RocksDB => {
                                 #[cfg(feature = "with-rocksdb")]
                                 {
-                                    let rocksdb_path = config.engine_specific_config
+                                    let engine_specific = config.engine_specific_config
                                         .as_ref()
-                                        .and_then(|map| map.storage.path.clone())
-                                        .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data/rocksdb"));
+                                        .ok_or_else(|| GraphError::ConfigurationError("RocksDB configuration missing from `engine_specific_config`".to_string()))?;
+                                    let rocksdb_path = engine_specific.storage.path.clone()
+                                        .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data/rocksdb"))
+                                        .join(engine_specific.storage.port.unwrap_or(config.default_port).to_string());
                                     if lock_file_exists(rocksdb_path.join("LOCK")).await? {
                                         warn!("Lock file exists for RocksDB: {:?}", rocksdb_path.join("LOCK"));
                                         recover_rocksdb(&rocksdb_path).await?;
@@ -3310,18 +3377,14 @@ impl StorageEngineManager {
                                     let rocksdb_config = RocksDBConfig {
                                         storage_engine_type: StorageEngineType::RocksDB,
                                         path: rocksdb_path,
-                                        host: Some(config.engine_specific_config
-                                            .as_ref()
-                                            .and_then(|map| map.storage.host.clone())
+                                        host: Some(engine_specific.storage.host.clone()
                                             .unwrap_or("127.0.0.1".to_string())),
-                                        port: config.engine_specific_config
-                                            .as_ref()
-                                            .and_then(|map| map.storage.port),
-                                        cache_capacity: None,
+                                        port: engine_specific.storage.port,
+                                        cache_capacity: engine_specific.storage.cache_capacity,
                                         max_background_jobs: Some(1000),
                                         temporary: false,
-                                        use_compression: true,
-                                        use_raft_for_scale: false,
+                                        use_compression: engine_specific.storage.use_compression,
+                                        use_raft_for_scale: engine_specific.storage.use_compression,
                                     };
                                     info!("Initializing RocksDB engine with path: {:?}", rocksdb_config.path);
                                     let mut rocksdb_singleton = ROCKSDB_SINGLETON.lock().await;

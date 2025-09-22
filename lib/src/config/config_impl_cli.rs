@@ -117,6 +117,8 @@ impl CliConfig {
                         },
                         cache_capacity: Some(1024 * 1024 * 1024),
                         use_compression: true,
+                        temporary: false,
+                        use_raft_for_scale: false,
                     },
                 });
 

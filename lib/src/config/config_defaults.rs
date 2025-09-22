@@ -33,6 +33,8 @@ pub fn default_engine_specific_config() -> Option<SelectedStorageConfig> {
             pd_endpoints: None,
             cache_capacity: Some(1024*1024*1024),
             use_compression: true,
+            temporary: false,
+            use_raft_for_scale: false,
         },
     })
 }
