@@ -42,17 +42,6 @@ pub struct TypeConfig;
 
 /// The type for a Raft node's unique ID.
 pub type NodeIdType = u64;
-/*
-impl openraft::RaftTypeConfig for TypeConfig {
-    type D = Vec<u8>;
-    type R = RaftResponse;
-    type NodeId = u64;
-    type Node = BasicNode;
-    type Entry = Entry<Self>;
-    type SnapshotData = std::io::Cursor<Vec<u8>>;
-}
-*/
-
 
 // The NodeId must be `u64` as per the `openraft` crate's definition.
 
@@ -252,13 +241,37 @@ pub enum AppRequest {
     Command(RaftCommand),
 }
 
+// Add an enum to track the client mode
+#[derive(Debug, Clone)]
+pub enum RocksDBClientMode {
+    Direct,    // Direct database access (original behavior)
+    ZMQ(u16),  // ZMQ communication with daemon on specified port
+}
+
+#[derive(Debug, Clone)]
+pub enum SledClientMode {
+    Direct,
+    ZMQ(u16),
+}
+
 /// RocksDB Client
 #[derive(Debug, Clone)]
 pub struct RocksDBClient {
     pub inner: Arc<TokioMutex<Arc<DB>>>,
     pub db_path: PathBuf,
     pub is_running: bool,
+    pub mode: Option<RocksDBClientMode>,
 }
+
+
+#[derive(Clone, Debug)]
+pub struct SledClient {
+    pub inner: Arc<TokioMutex<Arc<Db>>>,
+    pub db_path: PathBuf,
+    pub is_running: Arc<TokioMutex<bool>>,  // Changed from bool
+    pub mode: Option<SledClientMode>,
+}
+
 
 /// RocksDB Raft storage
 #[derive(Clone)]
@@ -441,6 +454,18 @@ pub struct StorageConfigInner {
     pub use_compression: bool,
     #[serde(default)]
     pub cache_capacity: Option<u64>,
+    #[serde(default = "default_temporary")]
+    pub temporary: bool,
+    #[serde(default = "default_use_raft_for_scale")]
+    pub use_raft_for_scale: bool,
+}
+
+fn default_use_raft_for_scale() -> bool {
+    false // Matches StorageConfig default
+}
+
+fn default_temporary() -> bool {
+    false
 }
 
 /// Selected storage configuration
