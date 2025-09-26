@@ -22,6 +22,7 @@ use crate::commands::{Commands, CommandType, StatusArgs, RestartArgs, ReloadArgs
                       StartAction, StopAction, StopArgs, DaemonCliCommand, UseAction, SaveAction};
 use crate::daemon_utils::{is_port_in_cluster_range, is_valid_cluster_range, parse_cluster_range};
 pub use crate::storage_engine::storage_engine::{StorageEngineManager, GLOBAL_STORAGE_ENGINE_MANAGER};
+pub use crate::storage_engine::sled_client::{ZmqSocketWrapper};
 use models::{Vertex, Edge, Identifier, identifiers::SerializableUuid};
 use models::errors::{GraphError, GraphResult};
 use openraft_memstore::MemStore;
@@ -35,6 +36,7 @@ use rocksdb::{BoundColumnFamily, ColumnFamily, ColumnFamilyDescriptor, DB, Optio
 use openraft_sled::SledRaftStorage;
 use sled::{Config, Db, Tree};
 use crate::daemon_registry::DaemonMetadata;
+use zmq::Socket;
 
 // Raft type configuration
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Ord, PartialOrd, Eq, PartialEq, Copy)]
@@ -175,6 +177,7 @@ pub struct EngineConfig {
 pub struct SledDbWithPath {
     pub db: Arc<sled::Db>,
     pub path: PathBuf,
+    pub client: Option<(SledClient, Arc<TokioMutex<ZmqSocketWrapper>>)>,
 }
 
 /// Sled daemon configuration
@@ -242,13 +245,13 @@ pub enum AppRequest {
 }
 
 // Add an enum to track the client mode
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RocksDBClientMode {
     Direct,    // Direct database access (original behavior)
     ZMQ(u16),  // ZMQ communication with daemon on specified port
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SledClientMode {
     Direct,
     ZMQ(u16),

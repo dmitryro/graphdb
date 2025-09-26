@@ -8,6 +8,8 @@ use tokio::sync::{Mutex as TokioMutex, RwLock};
 use tokio::time::{sleep, Duration as TokioDuration, timeout, interval};
 use tokio::fs;
 use log::{info, debug, warn, error};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::mpsc;
 pub use crate::config::{
     RocksDBConfig, RocksDBDaemon, RocksDBDaemonPool, StorageConfig, StorageEngineType,
     DAEMON_REGISTRY_DB_PATH, DEFAULT_DATA_DIRECTORY, DEFAULT_STORAGE_PORT,
@@ -39,7 +41,7 @@ use {
 impl RocksDBDaemon {
     pub async fn new(config: RocksDBConfig) -> GraphResult<Self> {
         info!("===> Initializing RocksDBDaemon with config: {:?}", config);
-        println!("===> RocksDBDaemon =================> LET US SEE IF THIS WAS EVER CALLED");
+        println!("===> Initializing RocksDBDaemon with full config: {:?}", config);
 
         let port = config.port.ok_or_else(|| {
             GraphError::ConfigurationError("No port specified in RocksDBConfig".to_string())
@@ -63,6 +65,8 @@ impl RocksDBDaemon {
                     fs::remove_file(&lock_path).await.map_err(|e| {
                         GraphError::StorageError(format!("Failed to remove stale lock file at {:?}: {}", lock_path, e))
                     })?;
+                } else {
+                    info!("===> Lock file exists, but process with PID {} is still running on port {}", metadata.pid, port);
                 }
             }
         }
@@ -70,15 +74,17 @@ impl RocksDBDaemon {
         // Check if daemon is already running
         if is_storage_daemon_running(port).await {
             info!("===> Reusing existing daemon on port {}", port);
-            match Self::open_existing_db(&db_path) {
-                Ok(db) => {
-                    info!("===> Successfully opened existing RocksDB at {:?}", db_path);
-                    return Self::new_with_db(config, Arc::new(db)).await;
-                }
-                Err(e) => {
-                    warn!("Failed to open existing database at {:?}: {}. Proceeding with new initialization.", db_path, e);
-                }
-            }
+            let mut opts = Options::default();
+            opts.create_if_missing(false);
+            let cfs = rocksdb::DB::list_cf(&opts, &db_path).unwrap_or_default();
+            let db = if cfs.contains(&"kv_pairs".to_string()) {
+                info!("===> Reusing existing kv_pairs column family at {:?}", db_path);
+                DB::open_cf(&opts, &db_path, &["kv_pairs"])
+            } else {
+                DB::open(&opts, &db_path)
+            }.map_err(|e| GraphError::StorageError(format!("Failed to open existing RocksDB at {}: {}", db_path.display(), e)))?;
+            info!("===> Successfully opened existing RocksDB at {:?}", db_path);
+            return Self::new_with_db(config, Arc::new(db)).await;
         }
 
         // Clean up stale registry entry
@@ -90,6 +96,7 @@ impl RocksDBDaemon {
                 warn!("===> Removing stale registry entry for port {} with PID {}", port, metadata.pid);
                 if let Err(e) = GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("storage", port).await {
                     warn!("Failed to remove stale daemon entry for port {}: {}", port, e);
+                    println!("===> WARNING: Failed to remove stale daemon entry for port {}: {}", port, e);
                 }
             }
         }
@@ -189,46 +196,88 @@ impl RocksDBDaemon {
             data_dir: Some(db_path),
             engine_type: Some(StorageEngineType::RocksDB.to_string()),
             pid: std::process::id() as u32,
-            last_seen_nanos: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64,
+            last_seen_nanos: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| GraphError::StorageError(format!("Failed to get system time: {}", e)))?
+                .as_nanos() as i64,
         };
         GLOBAL_DAEMON_REGISTRY.register_daemon(metadata).await
             .map_err(|e| {
                 error!("Failed to register daemon for port {}: {}", port, e);
+                println!("===> ERROR: Failed to register daemon for port {}: {}", port, e);
                 GraphError::StorageError(format!("Failed to register daemon for port {}: {}", port, e))
             })?;
+        info!("===> Successfully registered daemon for port {} with PID {}", port, std::process::id());
 
-        // Start ZeroMQ server in an async task
+        // Create shutdown channel
+        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
+
+        // Start ZeroMQ server in a blocking task to avoid Send/Sync issues
         let daemon_for_zmq = daemon.clone();
-        tokio::spawn(async move {
+        let zmq_task = tokio::task::spawn_blocking(move || {
             info!("===> Starting ZeroMQ server for port {}", daemon_for_zmq.port);
-            if let Err(e) = daemon_for_zmq.run_zmq_server().await {
-                error!("===> ZeroMQ server failed for port {}: {}", daemon_for_zmq.port, e);
-                println!("===> ERROR: ZeroMQ server failed for port {}: {}", daemon_for_zmq.port, e);
-            }
+            let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime for ZMQ");
+            rt.block_on(async move {
+                match daemon_for_zmq.run_zmq_server(shutdown_rx).await {
+                    Ok(_) => {
+                        info!("===> ZeroMQ server running successfully for port {}", daemon_for_zmq.port);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        error!("===> ZeroMQ server failed for port {}: {}", daemon_for_zmq.port, e);
+                        println!("===> ERROR: ZeroMQ server failed for port {}: {}", daemon_for_zmq.port, e);
+                        Err(GraphError::StorageError(format!("ZeroMQ server failed for port {}: {}", daemon_for_zmq.port, e)))
+                    }
+                }
+            })
         });
 
-        // Handle SIGTERM
+        // Delay SIGTERM handler to ensure initialization completes
         #[cfg(unix)]
         {
             let daemon_for_signal = daemon.clone();
+            let shutdown_tx = shutdown_tx.clone();
             tokio::spawn(async move {
+                tokio::time::sleep(TokioDuration::from_millis(1000)).await;
                 let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                     .expect("Failed to register SIGTERM handler");
                 sigterm.recv().await;
                 info!("===> Received SIGTERM in RocksDB daemon on port {}", port);
-                if let Err(e) = daemon_for_signal.shutdown().await {
-                    error!("===> Failed to shutdown RocksDB daemon on port {}: {}", port, e);
+                let mut running = daemon_for_signal.running.lock().await;
+                if *running {
+                    *running = false; // Set running to false to signal shutdown
+                    let _ = shutdown_tx.send(()).await; // Signal ZMQ server to shut down
+                    if let Err(e) = daemon_for_signal.shutdown().await {
+                        error!("===> Failed to shutdown RocksDB daemon on port {}: {}", port, e);
+                        println!("===> ERROR: Failed to shutdown RocksDB daemon on port {}: {}", port, e);
+                    } else {
+                        info!("===> RocksDB daemon shutdown complete on port {}", port);
+                    }
                 } else {
-                    info!("===> RocksDB daemon shutdown complete on port {}", port);
+                    info!("===> Ignoring SIGTERM as daemon on port {} is not fully initialized", port);
                 }
             });
         }
 
+        // Verify ZeroMQ task didn't fail immediately
+        tokio::time::sleep(TokioDuration::from_millis(500)).await;
+        if zmq_task.is_finished() {
+            if let Ok(Err(e)) = zmq_task.await {
+                error!("===> ZeroMQ task failed early for port {}: {}", port, e);
+                println!("===> ERROR: ZeroMQ task failed early for port {}: {}", port, e);
+                return Err(e);
+            }
+        }
+
         info!("===> RocksDB daemon initialization complete for port {}", port);
+        println!("===> RocksDB daemon initialization complete for port {} with PID {}", port, std::process::id());
         Ok(daemon)
     }
 
     pub async fn new_with_db(config: RocksDBConfig, existing_db: Arc<DB>) -> GraphResult<Self> {
+        info!("===> Initializing RocksDB daemon with existing DB at {:?}", config.path);
+        println!("===> Initializing RocksDBDaemon with existing DB and config: {:?}", config);
+
         let port = config.port.ok_or_else(|| {
             GraphError::ConfigurationError("No port specified in RocksDBConfig".to_string())
         })?;
@@ -239,7 +288,21 @@ impl RocksDBDaemon {
             config.path.join(port.to_string())
         };
 
-        info!("===> Initializing RocksDB daemon with existing DB at {:?}", db_path);
+        // Check for stale lock file
+        let lock_path = db_path.join("LOCK");
+        if lock_path.exists() {
+            let system = System::new_with_specifics(
+                RefreshKind::nothing().with_processes(ProcessRefreshKind::everything())
+            );
+            if let Ok(Some(metadata)) = GLOBAL_DAEMON_REGISTRY.find_daemon_by_port(port).await {
+                if system.process(Pid::from(metadata.pid as usize)).is_none() {
+                    info!("===> Removing stale lock file at {:?}", lock_path);
+                    fs::remove_file(&lock_path).await.map_err(|e| {
+                        GraphError::StorageError(format!("Failed to remove stale lock file at {:?}: {}", lock_path, e))
+                    })?;
+                }
+            }
+        }
 
         #[cfg(feature = "with-openraft-rocksdb")]
         let (raft, raft_storage) = {
@@ -291,58 +354,85 @@ impl RocksDBDaemon {
             data_dir: Some(db_path),
             engine_type: Some(StorageEngineType::RocksDB.to_string()),
             pid: std::process::id() as u32,
-            last_seen_nanos: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64,
+            last_seen_nanos: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| GraphError::StorageError(format!("Failed to get system time: {}", e)))?
+                .as_nanos() as i64,
         };
         GLOBAL_DAEMON_REGISTRY.register_daemon(metadata).await
             .map_err(|e| {
                 error!("Failed to register daemon for port {}: {}", port, e);
+                println!("===> ERROR: Failed to register daemon for port {}: {}", port, e);
                 GraphError::StorageError(format!("Failed to register daemon for port {}: {}", port, e))
             })?;
+        info!("===> Successfully registered daemon for port {} with PID {}", port, std::process::id());
 
-        // Start ZeroMQ server in an async task
+        // Create shutdown channel
+        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
+
+        // Start ZeroMQ server in a blocking task to avoid Send/Sync issues
         let daemon_for_zmq = daemon.clone();
-        tokio::spawn(async move {
+        let zmq_task = tokio::task::spawn_blocking(move || {
             info!("===> Starting ZeroMQ server for port {}", daemon_for_zmq.port);
-            if let Err(e) = daemon_for_zmq.run_zmq_server().await {
-                error!("===> ZeroMQ server failed for port {}: {}", daemon_for_zmq.port, e);
-                println!("===> ERROR: ZeroMQ server failed for port {}: {}", daemon_for_zmq.port, e);
-            }
+            let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime for ZMQ");
+            rt.block_on(async move {
+                match daemon_for_zmq.run_zmq_server(shutdown_rx).await {
+                    Ok(_) => {
+                        info!("===> ZeroMQ server running successfully for port {}", daemon_for_zmq.port);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        error!("===> ZeroMQ server failed for port {}: {}", daemon_for_zmq.port, e);
+                        println!("===> ERROR: ZeroMQ server failed for port {}: {}", daemon_for_zmq.port, e);
+                        Err(GraphError::StorageError(format!("ZeroMQ server failed for port {}: {}", daemon_for_zmq.port, e)))
+                    }
+                }
+            })
         });
 
-        // Handle SIGTERM
+        // Delay SIGTERM handler to ensure initialization completes
         #[cfg(unix)]
         {
             let daemon_for_signal = daemon.clone();
+            let shutdown_tx = shutdown_tx.clone();
             tokio::spawn(async move {
+                tokio::time::sleep(TokioDuration::from_millis(1000)).await;
                 let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                     .expect("Failed to register SIGTERM handler");
                 sigterm.recv().await;
                 info!("===> Received SIGTERM in RocksDB daemon on port {}", port);
-                if let Err(e) = daemon_for_signal.shutdown().await {
-                    error!("===> Failed to shutdown RocksDB daemon on port {}: {}", port, e);
+                let mut running = daemon_for_signal.running.lock().await;
+                if *running {
+                    *running = false; // Set running to false to signal shutdown
+                    let _ = shutdown_tx.send(()).await; // Signal ZMQ server to shut down
+                    if let Err(e) = daemon_for_signal.shutdown().await {
+                        error!("===> Failed to shutdown RocksDB daemon on port {}: {}", port, e);
+                        println!("===> ERROR: Failed to shutdown RocksDB daemon on port {}: {}", port, e);
+                    } else {
+                        info!("===> RocksDB daemon shutdown complete on port {}", port);
+                    }
                 } else {
-                    info!("===> RocksDB daemon shutdown complete on port {}", port);
+                    info!("===> Ignoring SIGTERM as daemon on port {} is not fully initialized", port);
                 }
             });
         }
 
+        // Verify ZeroMQ task didn't fail immediately
+        tokio::time::sleep(TokioDuration::from_millis(500)).await;
+        if zmq_task.is_finished() {
+            if let Ok(Err(e)) = zmq_task.await {
+                error!("===> ZeroMQ task failed early for port {}: {}", port, e);
+                println!("===> ERROR: ZeroMQ task failed early for port {}: {}", port, e);
+                return Err(e);
+            }
+        }
+
         info!("===> RocksDB daemon initialization complete for port {}", port);
+        println!("===> RocksDB daemon initialization complete for port {} with PID {}", port, std::process::id());
         Ok(daemon)
     }
 
-    fn open_existing_db(db_path: &Path) -> GraphResult<DB> {
-        let mut opts = Options::default();
-        opts.create_if_missing(false);
-        let cfs = rocksdb::DB::list_cf(&opts, db_path).unwrap_or_default();
-        if cfs.contains(&"kv_pairs".to_string()) {
-            DB::open_cf(&opts, db_path, &["kv_pairs"])
-        } else {
-            DB::open(&opts, db_path)
-        }
-        .map_err(|e| GraphError::StorageError(format!("Failed to open existing RocksDB at {}: {}", db_path.display(), e)))
-    }
-
-    async fn run_zmq_server(&self) -> GraphResult<()> {
+    async fn run_zmq_server(&self, mut shutdown_rx: mpsc::Receiver<()>) -> GraphResult<()> {
         const SOCKET_TIMEOUT_MS: i32 = 1000;
         const MAX_MESSAGE_SIZE: i32 = 1024 * 1024;
 
@@ -402,270 +492,297 @@ impl RocksDBDaemon {
         let mut consecutive_errors = 0;
         const MAX_CONSECUTIVE_ERRORS: u32 = 10;
 
-        while *self.running.lock().await {
-            let msg = match responder.recv_bytes(zmq::DONTWAIT) {
-                Ok(msg) => {
-                    consecutive_errors = 0;
-                    debug!("Received ZeroMQ message for port {}: {:?}", self.port, String::from_utf8_lossy(&msg));
-                    println!("===> RECEIVED ZEROMQ MESSAGE FOR PORT {}: {:?}", self.port, String::from_utf8_lossy(&msg));
-                    msg
+        loop {
+            tokio::select! {
+                // Handle shutdown signal
+                _ = shutdown_rx.recv() => {
+                    info!("Received shutdown signal for ZeroMQ server on port {}", self.port);
+                    break;
                 }
-                Err(zmq::Error::EAGAIN) => {
-                    tokio::time::sleep(TokioDuration::from_millis(100)).await;
-                    continue;
-                }
-                Err(e) => {
-                    consecutive_errors += 1;
-                    warn!("Failed to receive ZeroMQ message for port {} (attempt {}): {}", self.port, consecutive_errors, e);
-                    println!("===> WARNING: FAILED TO RECEIVE ZEROMQ MESSAGE FOR PORT {} (ATTEMPT {}): {}", self.port, consecutive_errors, e);
-                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                        error!("Too many consecutive ZeroMQ errors for port {}, shutting down server", self.port);
-                        println!("===> ERROR: TOO MANY CONSECUTIVE ZEROMQ ERRORS FOR PORT {}, SHUTTING DOWN SERVER", self.port);
-                        break;
-                    }
-                    tokio::time::sleep(TokioDuration::from_millis(100)).await;
-                    continue;
-                }
-            };
-
-            let request: Value = match serde_json::from_slice(&msg) {
-                Ok(req) => {
-                    debug!("Parsed request for port {}: {:?}", self.port, req);
-                    println!("===> PARSED ZEROMQ REQUEST FOR PORT {}: {:?}", self.port, req);
-                    req
-                }
-                Err(e) => {
-                    error!("Failed to parse ZeroMQ request for port {}: {}", self.port, e);
-                    println!("===> ERROR: FAILED TO PARSE ZEROMQ REQUEST FOR PORT {}: {}", self.port, e);
-                    let response = json!({
-                        "status": "error",
-                        "message": format!("Failed to parse request: {}", e)
-                    });
-                    if let Ok(response_bytes) = serde_json::to_vec(&response) {
-                        if let Err(e) = responder.send(&response_bytes, 0) {
-                            error!("Failed to send ZeroMQ error response for port {}: {}", self.port, e);
-                            println!("===> ERROR: FAILED TO SEND ZEROMQ ERROR RESPONSE FOR PORT {}: {}", self.port, e);
+                // Process incoming messages
+                _ = async {
+                    let msg = match responder.recv_bytes(zmq::DONTWAIT) {
+                        Ok(msg) => {
+                            consecutive_errors = 0;
+                            debug!("Received ZeroMQ message for port {}: {:?}", self.port, String::from_utf8_lossy(&msg));
+                            println!("===> RECEIVED ZEROMQ MESSAGE FOR PORT {}: {:?}", self.port, String::from_utf8_lossy(&msg));
+                            msg
                         }
-                    }
-                    continue;
-                }
-            };
-
-            let response = match request.get("command").and_then(|c| c.as_str()) {
-                Some("status") => {
-                    println!("===> PROCESSING STATUS FOR PORT {}", self.port);
-                    json!({ "status": "success", "port": self.port })
-                }
-                Some("ping") => {
-                    println!("===> PROCESSING PING FOR PORT {}", self.port);
-                    json!({ "status": "success", "port": self.port })
-                }
-                Some("set_key") => {
-                    let key = match request.get("key").and_then(|k| k.as_str()) {
-                        Some(k) => k,
-                        None => {
-                            let response = json!({ "status": "error", "message": "Missing key in set_key request" });
-                            if let Ok(response_bytes) = serde_json::to_vec(&response) {
-                                let _ = responder.send(&response_bytes, 0);
-                            }
-                            continue;
-                        }
-                    };
-                    let value = match request.get("value").and_then(|v| v.as_str()) {
-                        Some(v) => v,
-                        None => {
-                            let response = json!({ "status": "error", "message": "Missing value in set_key request" });
-                            if let Ok(response_bytes) = serde_json::to_vec(&response) {
-                                let _ = responder.send(&response_bytes, 0);
-                            }
-                            continue;
-                        }
-                    };
-
-                    println!("===> PROCESSING SET_KEY FOR PORT {}: key={}, value={}", self.port, key, value);
-                    let cf_handle = match self.db.cf_handle("kv_pairs") {
-                        Some(cf) => cf,
-                        None => {
-                            let response = json!({ "status": "error", "message": "Column family kv_pairs not found" });
-                            if let Ok(response_bytes) = serde_json::to_vec(&response) {
-                                let _ = responder.send(&response_bytes, 0);
-                            }
-                            continue;
-                        }
-                    };
-                    match self.db.put_cf(&cf_handle, key.as_bytes(), value.as_bytes()) {
-                        Ok(_) => {
-                            println!("===> SET_KEY SUCCESS FOR PORT {}: key={}", self.port, key);
-                            json!({ "status": "success" })
+                        Err(zmq::Error::EAGAIN) => {
+                            tokio::time::sleep(TokioDuration::from_millis(100)).await;
+                            return;
                         }
                         Err(e) => {
-                            println!("===> SET_KEY ERROR FOR PORT {}: key={}, error={}", self.port, key, e);
-                            json!({ "status": "error", "message": e.to_string() })
-                        }
-                    }
-                }
-                Some("get_key") => {
-                    let key = match request.get("key").and_then(|k| k.as_str()) {
-                        Some(k) => k,
-                        None => {
-                            let response = json!({ "status": "error", "message": "Missing key in get_key request" });
-                            if let Ok(response_bytes) = serde_json::to_vec(&response) {
-                                let _ = responder.send(&response_bytes, 0);
+                            consecutive_errors += 1;
+                            warn!("Failed to receive ZeroMQ message for port {} (attempt {}): {}", self.port, consecutive_errors, e);
+                            println!("===> WARNING: FAILED TO RECEIVE ZEROMQ MESSAGE FOR PORT {} (ATTEMPT {}): {}", self.port, consecutive_errors, e);
+                            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                                error!("Too many consecutive ZeroMQ errors for port {}, shutting down server", self.port);
+                                println!("===> ERROR: TOO MANY CONSECUTIVE ZEROMQ ERRORS FOR PORT {}, SHUTTING DOWN SERVER", self.port);
+                                return;
                             }
-                            continue;
+                            tokio::time::sleep(TokioDuration::from_millis(100)).await;
+                            return;
                         }
                     };
 
-                    println!("===> PROCESSING GET_KEY: key={}", key);
-                    let cf_handle = match self.db.cf_handle("kv_pairs") {
-                        Some(cf) => cf,
-                        None => {
-                            let response = json!({ "status": "error", "message": "Column family kv_pairs not found" });
-                            if let Ok(response_bytes) = serde_json::to_vec(&response) {
-                                let _ = responder.send(&response_bytes, 0);
-                            }
-                            continue;
-                        }
-                    };
-                    match self.db.get_cf(&cf_handle, key.as_bytes()) {
-                        Ok(Some(val)) => {
-                            let value_str = String::from_utf8_lossy(&val).to_string();
-                            println!("===> GET_KEY SUCCESS: key={}, value={}", key, value_str);
-                            json!({ "status": "success", "value": value_str })
-                        }
-                        Ok(None) => {
-                            println!("===> GET_KEY SUCCESS: key={} not found", key);
-                            json!({ "status": "success", "value": null })
+                    let request: Value = match serde_json::from_slice(&msg) {
+                        Ok(req) => {
+                            debug!("Parsed request for port {}: {:?}", self.port, req);
+                            println!("===> PARSED ZEROMQ REQUEST FOR PORT {}: {:?}", self.port, req);
+                            req
                         }
                         Err(e) => {
-                            println!("===> GET_KEY ERROR: key={}, error={}", key, e);
-                            json!({ "status": "error", "message": e.to_string() })
-                        }
-                    }
-                }
-                Some("delete_key") => {
-                    let key = match request.get("key").and_then(|k| k.as_str()) {
-                        Some(k) => k,
-                        None => {
-                            let response = json!({ "status": "error", "message": "Missing key in delete_key request" });
+                            error!("Failed to parse ZeroMQ request for port {}: {}", self.port, e);
+                            println!("===> ERROR: FAILED TO PARSE ZEROMQ REQUEST FOR PORT {}: {}", self.port, e);
+                            let response = json!({
+                                "status": "error",
+                                "message": format!("Failed to parse request: {}", e)
+                            });
                             if let Ok(response_bytes) = serde_json::to_vec(&response) {
-                                let _ = responder.send(&response_bytes, 0);
-                            }
-                            continue;
-                        }
-                    };
-
-                    println!("===> PROCESSING DELETE_KEY: key={}", key);
-                    let cf_handle = match self.db.cf_handle("kv_pairs") {
-                        Some(cf) => cf,
-                        None => {
-                            let response = json!({ "status": "error", "message": "Column family kv_pairs not found" });
-                            if let Ok(response_bytes) = serde_json::to_vec(&response) {
-                                let _ = responder.send(&response_bytes, 0);
-                            }
-                            continue;
-                        }
-                    };
-                    match self.db.delete_cf(&cf_handle, key.as_bytes()) {
-                        Ok(_) => {
-                            println!("===> DELETE_KEY SUCCESS: key={}", key);
-                            json!({ "status": "success" })
-                        }
-                        Err(e) => {
-                            println!("===> DELETE_KEY ERROR: key={}, error={}", key, e);
-                            json!({ "status": "error", "message": e.to_string() })
-                        }
-                    }
-                }
-                Some("flush") => {
-                    println!("===> PROCESSING FLUSH");
-                    match self.db.flush() {
-                        Ok(_) => {
-                            println!("===> FLUSH SUCCESS");
-                            json!({ "status": "success", "bytes_flushed": 0 })
-                        }
-                        Err(e) => {
-                            error!("Failed to flush database at {:?}: {}", self.db_path, e);
-                            println!("===> FLUSH ERROR: {}", e);
-                            json!({ "status": "error", "message": e.to_string() })
-                        }
-                    }
-                }
-                Some("clear_data") => {
-                    println!("===> PROCESSING CLEAR_DATA");
-                    let cf_handle = match self.db.cf_handle("kv_pairs") {
-                        Some(cf) => cf,
-                        None => {
-                            let response = json!({ "status": "error", "message": "Column family kv_pairs not found" });
-                            if let Ok(response_bytes) = serde_json::to_vec(&response) {
-                                let _ = responder.send(&response_bytes, 0);
-                            }
-                            continue;
-                        }
-                    };
-                    let iterator = self.db.iterator_cf(&cf_handle, rocksdb::IteratorMode::Start);
-                    let mut batch = rocksdb::WriteBatch::default();
-                    for item in iterator {
-                        match item {
-                            Ok((key, _)) => batch.delete_cf(&cf_handle, &key),
-                            Err(e) => {
-                                let response = json!({ "status": "error", "message": format!("Iterator error: {}", e) });
-                                if let Ok(response_bytes) = serde_json::to_vec(&response) {
-                                    let _ = responder.send(&response_bytes, 0);
+                                if let Err(e) = responder.send(&response_bytes, 0) {
+                                    error!("Failed to send ZeroMQ error response for port {}: {}", self.port, e);
+                                    println!("===> ERROR: FAILED TO SEND ZEROMQ ERROR RESPONSE FOR PORT {}: {}", self.port, e);
                                 }
-                                continue;
                             }
+                            return;
                         }
-                    }
-                    match self.db.write(batch) {
-                        Ok(_) => {
-                            match self.db.flush() {
+                    };
+
+                    let response = match request.get("command").and_then(|c| c.as_str()) {
+                        Some("status") => {
+                            println!("===> PROCESSING STATUS FOR PORT {}", self.port);
+                            json!({ "status": "success", "port": self.port })
+                        }
+                        Some("ping") => {
+                            println!("===> PROCESSING PING FOR PORT {}", self.port);
+                            json!({ "status": "success", "port": self.port })
+                        }
+                        Some("set_key") => {
+                            let key = match request.get("key").and_then(|k| k.as_str()) {
+                                Some(k) => k,
+                                None => {
+                                    let response = json!({ "status": "error", "message": "Missing key in set_key request" });
+                                    if let Ok(response_bytes) = serde_json::to_vec(&response) {
+                                        let _ = responder.send(&response_bytes, 0);
+                                    }
+                                    return;
+                                }
+                            };
+                            let value = match request.get("value").and_then(|v| v.as_str()) {
+                                Some(v) => v,
+                                None => {
+                                    let response = json!({ "status": "error", "message": "Missing value in set_key request" });
+                                    if let Ok(response_bytes) = serde_json::to_vec(&response) {
+                                        let _ = responder.send(&response_bytes, 0);
+                                    }
+                                    return;
+                                }
+                            };
+
+                            println!("===> PROCESSING SET_KEY FOR PORT {}: key={}, value={}", self.port, key, value);
+                            let cf_handle = match self.db.cf_handle("kv_pairs") {
+                                Some(cf) => cf,
+                                None => {
+                                    let response = json!({ "status": "error", "message": "Column family kv_pairs not found" });
+                                    if let Ok(response_bytes) = serde_json::to_vec(&response) {
+                                        let _ = responder.send(&response_bytes, 0);
+                                    }
+                                    return;
+                                }
+                            };
+                            match self.db.put_cf(&cf_handle, key.as_bytes(), value.as_bytes()) {
                                 Ok(_) => {
-                                    info!("Cleared kv_pairs at {:?}", self.db_path);
-                                    println!("===> CLEAR_DATA SUCCESS");
-                                    json!({ "status": "success", "bytes_flushed": 0 })
+                                    println!("===> SET_KEY SUCCESS FOR PORT {}: key={}", self.port, key);
+                                    json!({ "status": "success" })
                                 }
                                 Err(e) => {
-                                    error!("Failed to flush after clearing kv_pairs at {:?}: {}", self.db_path, e);
-                                    println!("===> CLEAR_DATA ERROR: Failed to flush: {}", e);
+                                    println!("===> SET_KEY ERROR FOR PORT {}: key={}, error={}", self.port, key, e);
                                     json!({ "status": "error", "message": e.to_string() })
                                 }
                             }
                         }
-                        Err(e) => {
-                            error!("Failed to clear kv_pairs at {:?}: {}", self.db_path, e);
-                            println!("===> CLEAR_DATA ERROR: {}", e);
-                            json!({ "status": "error", "message": e.to_string() })
+                        Some("get_key") => {
+                            let key = match request.get("key").and_then(|k| k.as_str()) {
+                                Some(k) => k,
+                                None => {
+                                    let response = json!({ "status": "error", "message": "Missing key in get_key request" });
+                                    if let Ok(response_bytes) = serde_json::to_vec(&response) {
+                                        let _ = responder.send(&response_bytes, 0);
+                                    }
+                                    return;
+                                }
+                            };
+
+                            println!("===> PROCESSING GET_KEY: key={}", key);
+                            let cf_handle = match self.db.cf_handle("kv_pairs") {
+                                Some(cf) => cf,
+                                None => {
+                                    let response = json!({ "status": "error", "message": "Column family kv_pairs not found" });
+                                    if let Ok(response_bytes) = serde_json::to_vec(&response) {
+                                        let _ = responder.send(&response_bytes, 0);
+                                    }
+                                    return;
+                                }
+                            };
+                            match self.db.get_cf(&cf_handle, key.as_bytes()) {
+                                Ok(Some(val)) => {
+                                    let value_str = String::from_utf8_lossy(&val).to_string();
+                                    println!("===> GET_KEY SUCCESS: key={}, value={}", key, value_str);
+                                    json!({ "status": "success", "value": value_str })
+                                }
+                                Ok(None) => {
+                                    println!("===> GET_KEY SUCCESS: key={} not found", key);
+                                    json!({ "status": "success", "value": null })
+                                }
+                                Err(e) => {
+                                    println!("===> GET_KEY ERROR: key={}, error={}", key, e);
+                                    json!({ "status": "error", "message": e.to_string() })
+                                }
+                            }
+                        }
+                        Some("delete_key") => {
+                            let key = match request.get("key").and_then(|k| k.as_str()) {
+                                Some(k) => k,
+                                None => {
+                                    let response = json!({ "status": "error", "message": "Missing key in delete_key request" });
+                                    if let Ok(response_bytes) = serde_json::to_vec(&response) {
+                                        let _ = responder.send(&response_bytes, 0);
+                                    }
+                                    return;
+                                }
+                            };
+
+                            println!("===> PROCESSING DELETE_KEY: key={}", key);
+                            let cf_handle = match self.db.cf_handle("kv_pairs") {
+                                Some(cf) => cf,
+                                None => {
+                                    let response = json!({ "status": "error", "message": "Column family kv_pairs not found" });
+                                    if let Ok(response_bytes) = serde_json::to_vec(&response) {
+                                        let _ = responder.send(&response_bytes, 0);
+                                    }
+                                    return;
+                                }
+                            };
+                            match self.db.delete_cf(&cf_handle, key.as_bytes()) {
+                                Ok(_) => {
+                                    println!("===> DELETE_KEY SUCCESS: key={}", key);
+                                    json!({ "status": "success" })
+                                }
+                                Err(e) => {
+                                    println!("===> DELETE_KEY ERROR: key={}, error={}", key, e);
+                                    json!({ "status": "error", "message": e.to_string() })
+                                }
+                            }
+                        }
+                        Some("flush") => {
+                            println!("===> PROCESSING FLUSH");
+                            match self.db.flush() {
+                                Ok(_) => {
+                                    println!("===> FLUSH SUCCESS");
+                                    json!({ "status": "success", "bytes_flushed": 0 })
+                                }
+                                Err(e) => {
+                                    error!("Failed to flush database at {:?}: {}", self.db_path, e);
+                                    println!("===> FLUSH ERROR: {}", e);
+                                    json!({ "status": "error", "message": e.to_string() })
+                                }
+                            }
+                        }
+                        Some("clear_data") => {
+                            println!("===> PROCESSING CLEAR_DATA");
+                            let cf_handle = match self.db.cf_handle("kv_pairs") {
+                                Some(cf) => cf,
+                                None => {
+                                    let response = json!({ "status": "error", "message": "Column family kv_pairs not found" });
+                                    if let Ok(response_bytes) = serde_json::to_vec(&response) {
+                                        let _ = responder.send(&response_bytes, 0);
+                                    }
+                                    return;
+                                }
+                            };
+                            let iterator = self.db.iterator_cf(&cf_handle, rocksdb::IteratorMode::Start);
+                            let mut batch = rocksdb::WriteBatch::default();
+                            for item in iterator {
+                                match item {
+                                    Ok((key, _)) => batch.delete_cf(&cf_handle, &key),
+                                    Err(e) => {
+                                        let response = json!({ "status": "error", "message": format!("Iterator error: {}", e) });
+                                        if let Ok(response_bytes) = serde_json::to_vec(&response) {
+                                            let _ = responder.send(&response_bytes, 0);
+                                        }
+                                        return;
+                                    }
+                                }
+                            }
+                            match self.db.write(batch) {
+                                Ok(_) => {
+                                    match self.db.flush() {
+                                        Ok(_) => {
+                                            info!("Cleared kv_pairs at {:?}", self.db_path);
+                                            println!("===> CLEAR_DATA SUCCESS");
+                                            json!({ "status": "success", "bytes_flushed": 0 })
+                                        }
+                                        Err(e) => {
+                                            error!("Failed to flush after clearing kv_pairs at {:?}: {}", self.db_path, e);
+                                            println!("===> CLEAR_DATA ERROR: Failed to flush: {}", e);
+                                            json!({ "status": "error", "message": e.to_string() })
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Failed to clear kv_pairs at {:?}: {}", self.db_path, e);
+                                    println!("===> CLEAR_DATA ERROR: {}", e);
+                                    json!({ "status": "error", "message": e.to_string() })
+                                }
+                            }
+                        }
+                        Some(cmd) => {
+                            error!("Unsupported command for port {}: {}", self.port, cmd);
+                            println!("===> ERROR: UNSUPPORTED ZEROMQ COMMAND FOR PORT {}: {}", self.port, cmd);
+                            json!({ "status": "error", "message": format!("Unsupported command: {}", cmd) })
+                        }
+                        None => {
+                            error!("No command specified in request for port {}: {:?}", self.port, request);
+                            println!("===> ERROR: NO COMMAND SPECIFIED IN ZEROMQ REQUEST FOR PORT {}: {:?}", self.port, request);
+                            json!({ "status": "error", "message": "No command specified" })
+                        }
+                    };
+
+                    if let Ok(response_bytes) = serde_json::to_vec(&response) {
+                        if let Err(e) = responder.send(&response_bytes, 0) {
+                            error!("Failed to send ZeroMQ response for port {}: {}", self.port, e);
+                            println!("===> ERROR: FAILED TO SEND ZEROMQ RESPONSE FOR PORT {}: {}", self.port, e);
+                        } else {
+                            debug!("Sent ZeroMQ response for port {}: {:?}", self.port, response);
+                            println!("===> SENT ZEROMQ RESPONSE FOR PORT {}: {:?}", self.port, response);
+                        }
+                    } else {
+                        error!("Failed to serialize ZeroMQ response for port {}", self.port);
+                        println!("===> ERROR: FAILED TO SERIALIZE ZEROMQ RESPONSE FOR PORT {}", self.port);
+                        let error_response = json!({ "status": "error", "message": "Failed to serialize response" });
+                        if let Ok(error_bytes) = serde_json::to_vec(&error_response) {
+                            let _ = responder.send(&error_bytes, 0);
                         }
                     }
-                }
-                Some(cmd) => {
-                    error!("Unsupported command for port {}: {}", self.port, cmd);
-                    println!("===> ERROR: UNSUPPORTED ZEROMQ COMMAND FOR PORT {}: {}", self.port, cmd);
-                    json!({ "status": "error", "message": format!("Unsupported command: {}", cmd) })
-                }
-                None => {
-                    error!("No command specified in request for port {}: {:?}", self.port, request);
-                    println!("===> ERROR: NO COMMAND SPECIFIED IN ZEROMQ REQUEST FOR PORT {}: {:?}", self.port, request);
-                    json!({ "status": "error", "message": "No command specified" })
-                }
-            };
+                } => {}
+            }
 
-            if let Ok(response_bytes) = serde_json::to_vec(&response) {
-                if let Err(e) = responder.send(&response_bytes, 0) {
-                    error!("Failed to send ZeroMQ response for port {}: {}", self.port, e);
-                    println!("===> ERROR: FAILED TO SEND ZEROMQ RESPONSE FOR PORT {}: {}", self.port, e);
-                } else {
-                    debug!("Sent ZeroMQ response for port {}: {:?}", self.port, response);
-                    println!("===> SENT ZEROMQ RESPONSE FOR PORT {}: {:?}", self.port, response);
-                }
-            } else {
-                error!("Failed to serialize ZeroMQ response for port {}", self.port);
-                println!("===> ERROR: FAILED TO SERIALIZE ZEROMQ RESPONSE FOR PORT {}", self.port);
-                let error_response = json!({ "status": "error", "message": "Failed to serialize response" });
-                if let Ok(error_bytes) = serde_json::to_vec(&error_response) {
-                    let _ = responder.send(&error_bytes, 0);
-                }
+            // Check if shutdown is requested
+            if !*self.running.lock().await {
+                info!("Shutdown signal detected for ZeroMQ server on port {}", self.port);
+                break;
+            }
+        }
+
+        // Cleanup
+        info!("Cleaning up ZeroMQ server for port {}", self.port);
+        if let Err(e) = responder.disconnect(&endpoint) {
+            warn!("Failed to disconnect ZeroMQ socket for port {}: {}", self.port, e);
+        }
+        if fs::metadata(&socket_path).await.is_ok() {
+            if let Err(e) = fs::remove_file(&socket_path).await {
+                warn!("Failed to remove IPC socket file {} for port {}: {}", socket_path, self.port, e);
             }
         }
 
@@ -745,58 +862,34 @@ impl RocksDBDaemon {
     }
 
     pub async fn shutdown(&self) -> GraphResult<()> {
-        info!("Shutting down RocksDBDaemon at path {:?}", self.db_path);
-        println!("===> SHUTTING DOWN ROCKSDB DAEMON AT PATH {:?}", self.db_path);
+        info!("===> Starting graceful shutdown for daemon on port {}", self.port);
+        println!("===> STARTING GRACEFUL SHUTDOWN FOR DAEMON ON PORT {}", self.port);
 
-        // Mark daemon as not running
-        let mut running_guard = self.running.lock().await;
-        *running_guard = false;
-        drop(running_guard);
+        // Signal shutdown by setting running to false
+        {
+            let mut running = self.running.lock().await;
+            *running = false;
+        }
+
+        // Give ZMQ server time to shut down gracefully
+        tokio::time::sleep(TokioDuration::from_millis(500)).await;
 
         // Flush database
         if let Err(e) = self.db.flush() {
-            warn!("Failed to flush RocksDB: {}", e);
-            println!("===> WARNING: FAILED TO FLUSH ROCKSDB: {}", e);
-        } else {
-            info!("Flushed RocksDBDaemon at {:?}", self.db_path);
-            println!("===> FLUSHED ROCKSDB DAEMON AT {:?}", self.db_path);
+            warn!("Failed to flush database during shutdown: {}", e);
         }
 
-        // Check if process is still running
-        if let Some(pid) = find_pid_by_port(self.port).await {
-            if is_storage_daemon_running(self.port).await {
-                info!(
-                    "Terminating daemon process with PID {} on port {}",
-                    pid, self.port
-                );
-                println!(
-                    "===> TERMINATING DAEMON PROCESS WITH PID {} ON PORT {}",
-                    pid, self.port
-                );
-                if let Err(e) = stop_process_by_pid("RocksDB", pid).await {
-                    warn!("Failed to terminate daemon with PID {}: {}", pid, e);
-                    println!(
-                        "===> WARNING: FAILED TO TERMINATE DAEMON WITH PID {}: {}",
-                        pid, e
-                    );
-                }
-            }
+        // Clean up socket file
+        let socket_path = format!("/opt/graphdb/graphdb-{}.ipc", self.port);
+        let _ = fs::remove_file(&socket_path).await;
+
+        // Remove from registry
+        if let Err(e) = GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("storage", self.port).await {
+            warn!("Failed to remove daemon from registry: {}", e);
         }
 
-        // Remove daemon from registry
-        if let Err(e) = GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("rocksdb", self.port).await {
-            warn!("Failed to remove daemon from registry for port {}: {}", self.port, e);
-            println!("===> WARNING: FAILED TO REMOVE DAEMON FROM REGISTRY FOR PORT {}: {}", self.port, e);
-        }
-
-        // Remove lock file
-        if let Err(e) = Self::force_unlock_path(&self.db_path).await {
-            warn!("Failed to remove lock file at {}: {}", self.db_path.display(), e);
-            println!("===> WARNING: FAILED TO REMOVE LOCK FILE AT {}: {}", self.db_path.display(), e);
-        }
-
-        info!("Successfully shut down RocksDBDaemon on port {}", self.port);
-        println!("===> SUCCESSFULLY SHUT DOWN ROCKSDB DAEMON ON PORT {}", self.port);
+        info!("===> Graceful shutdown complete for daemon on port {}", self.port);
+        println!("===> GRACEFUL SHUTDOWN COMPLETE FOR DAEMON ON PORT {}", self.port);
         Ok(())
     }
 
@@ -1331,7 +1424,51 @@ impl RocksDBDaemonPool {
 
     pub async fn new_with_db(config: &RocksDBConfig, existing_db: Arc<rocksdb::DB>) -> GraphResult<Self> {
         let mut pool = Self::new();
-        pool.initialize_with_db(config, existing_db).await?;
+        let port = config.port.unwrap_or(DEFAULT_STORAGE_PORT);
+        
+        // Initialize daemon with existing database
+        let daemon = RocksDBDaemon::new_with_db(config.clone(), existing_db).await?;
+        let daemon_arc = Arc::new(daemon);
+        pool.daemons.insert(port, daemon_arc.clone());
+
+        // Register daemon metadata
+        let data_dir = config.path.clone();
+        let db_path = data_dir.join(port.to_string());
+        let metadata = DaemonMetadata {
+            port,
+            service_type: "RocksDB".to_string(),
+            ip_address: "127.0.0.1".to_string(),
+            config_path: Some(db_path.clone()),
+            data_dir: Some(data_dir),
+            engine_type: Some(StorageEngineType::RocksDB.to_string()),
+            pid: std::process::id() as u32,
+            last_seen_nanos: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| GraphError::StorageError(format!("Failed to get system time: {}", e)))?
+                .as_nanos() as i64,
+        };
+
+        {
+            let mut registry = pool.registry.write().await;
+            registry.insert(port, metadata);
+        }
+
+        {
+            let mut nodes = pool.load_balancer.nodes.write().await;
+            nodes.insert(
+                port,
+                NodeHealth {
+                    is_healthy: true,
+                    last_check: SystemTime::now(),
+                    response_time_ms: 0,
+                    error_count: 0,
+                    port,
+                },
+            );
+        }
+
+        *pool.initialized.write().await = true;
+        info!("Successfully initialized RocksDBDaemonPool with existing DB for port {}", port);
         Ok(pool)
     }
 
@@ -1353,7 +1490,10 @@ impl RocksDBDaemonPool {
             data_dir: Some(db_path.to_path_buf()),
             engine_type: Some(StorageEngineType::RocksDB.to_string()),
             pid: std::process::id() as u32,
-            last_seen_nanos: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64,
+            last_seen_nanos: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| GraphError::StorageError(format!("Failed to get system time: {}", e)))?
+                .as_nanos() as i64,
         };
 
         {
@@ -1768,7 +1908,10 @@ impl RocksDBDaemonPool {
             data_dir: Some(data_dir.clone()),
             engine_type: Some(StorageEngineType::RocksDB.to_string()),
             pid: std::process::id() as u32,
-            last_seen_nanos: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64,
+            last_seen_nanos: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| GraphError::StorageError(format!("Failed to get system time: {}", e)))?
+                .as_nanos() as i64,
         };
 
         {
@@ -1811,7 +1954,10 @@ impl RocksDBDaemonPool {
             data_dir: Some(data_dir.clone()),
             engine_type: Some(StorageEngineType::RocksDB.to_string()),
             pid: std::process::id() as u32,
-            last_seen_nanos: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64,
+            last_seen_nanos: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| GraphError::StorageError(format!("Failed to get system time: {}", e)))?
+                .as_nanos() as i64,
         };
 
         {

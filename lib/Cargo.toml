@@ -12,6 +12,12 @@ tikv-client = { version = "0.3.0", optional = true }
 #surrealdb-tikv-client = "0.3.0-surreal.3"
 
 # Rest of your dependencies remain the same...
+prctl = "1.0.0"
+proctitle = "0.1.1"
+users = "0.11.0"
+bytemuck = "1.21.0"
+lazy_static = "1.5.0" # Aligned with lib
+config = "0.15.8" # Consistent
 libc = "0.2.175"
 fs2 = "0.4.3"
 keyv = { version = "0.2.1", optional = true}
@@ -81,6 +87,7 @@ toml = "0.8.20"
 postgres = "0.19.10"
 redis = { version = "0.32.4", features = ["aio", "tokio-comp"], optional = true}
 log = "0.4.27"
+simplelog = "0.12.2"
 password-hash = { version = "0.5", features = ["rand_core"] }
 moka = { version = "0.12.10", features = ["sync", "future"] }
 thiserror = "2.0.12"
