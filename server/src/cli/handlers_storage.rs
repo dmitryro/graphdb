@@ -743,6 +743,7 @@ pub async fn start_storage_interactive(
         info!("Attempt {}/{} to initialize StorageEngineManager on port {}", attempt, max_init_attempts, selected_port);
         println!("===> ATTEMPT {}/{} TO INITIALIZE STORAGEENGINEMANAGER ON PORT {}", attempt, max_init_attempts, selected_port);
 
+        // Check if manager is already initialized
         if let Some(async_manager) = GLOBAL_STORAGE_ENGINE_MANAGER.get() {
             info!("Existing StorageEngineManager found, updating with new config");
             async_manager
@@ -1782,6 +1783,7 @@ async fn ensure_process_terminated(pid: u32) -> Result<()> {
     Err(anyhow!("Failed to terminate process {} after {} attempts", pid, max_attempts))
 }
 
+
 /// Handles the 'use storage' command for managing the storage daemon.
 pub async fn handle_use_storage_command(
     engine: StorageEngineType,
@@ -1876,7 +1878,6 @@ pub async fn handle_use_storage_command(
         }
     };
 
-    // Clean up stale directories for other engines
     let engine_types = vec![StorageEngineType::RocksDB, StorageEngineType::Sled, StorageEngineType::TiKV];
     for other_engine in engine_types.iter().filter(|&e| e != &engine) {
         let stale_path = PathBuf::from(format!("/opt/graphdb/storage_data/{}/{}", other_engine.to_string().to_lowercase(), current_config.default_port));
@@ -2069,8 +2070,8 @@ pub async fn handle_use_storage_command(
     }
     println!("Reloaded storage config for daemon management: {:?}", new_config);
 
-    // Stop existing storage daemons if engine type mismatches
-    println!("===> USE STORAGE HANDLER - STEP 5: Attempting to stop existing daemon...");
+    // Stop all running storage daemons
+    println!("===> USE STORAGE HANDLER - STEP 5: Attempting to stop all existing storage daemons...");
     let mut successfully_stopped_ports: Vec<u16> = Vec::new();
     let mut failed_to_stop_ports: Vec<u16> = Vec::new();
 
@@ -2143,14 +2144,14 @@ pub async fn handle_use_storage_command(
                 println!("Storage Daemon on port {} stopped.", daemon.port);
                 is_daemon_stopped = true;
                 if pid_file_path.exists() {
-                    std::fs::remove_file(&pid_file_path).ok();
+                    tokio_fs::remove_file(&pid_file_path).await.ok();
                     println!("Storage daemon on port {} stopped.", daemon.port);
                 }
                 break;
             }
 
             info!("Storage daemon still running on port {}, retrying stop in {}ms...", daemon.port, SHUTDOWN_RETRY_DELAY_MS);
-            tokio::time::sleep(Duration::from_millis(SHUTDOWN_RETRY_DELAY_MS)).await;
+            tokio::time::sleep(TokioDuration::from_millis(SHUTDOWN_RETRY_DELAY_MS)).await;
         }
 
         if is_daemon_stopped {
