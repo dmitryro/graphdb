@@ -7,4 +7,5 @@ storage:
   path: /opt/graphdb/storage_data/rocksdb
   host: "127.0.0.1"
   port: "8051"
+  use_compression: false
   # Optional remote connection fields (uncomment and configure if using a remote RocksDB server).

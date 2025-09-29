@@ -106,7 +106,7 @@ impl SledClient {
         info!("Creating SledClient for ZMQ connection on port {}", port);
 
         // Create socket directory
-        let socket_dir = PathBuf::from("/opt/graphdb");
+        let socket_dir = PathBuf::from("/tmp");
         if let Err(e) = tokio::fs::create_dir_all(&socket_dir).await {
             error!("Failed to create socket directory {}: {}", socket_dir.display(), e);
             return Err(GraphError::StorageError(format!("Failed to create socket directory {}: {}", socket_dir.display(), e)));
@@ -132,7 +132,7 @@ impl SledClient {
         }
 
         // Create ZMQ socket
-        let socket_path = format!("/opt/graphdb/graphdb-{}.ipc", port);
+        let socket_path = format!("/tmp/graphdb-{}.ipc", port);
         let addr = format!("ipc://{}", socket_path);
         let context = zmq::Context::new();
         let socket = context.socket(zmq::REQ)
@@ -151,7 +151,7 @@ impl SledClient {
 
         let client = Self {
             inner: Arc::new(TokioMutex::new(Arc::new(db))),
-            db_path: PathBuf::from(format!("/opt/graphdb/storage_data/sled/{}", port)),
+            db_path: PathBuf::from(format!("/tmp/storage_data/sled/{}", port)),
             is_running: Arc::new(TokioMutex::new(true)),
             mode: Some(SledClientMode::ZMQ(port)),
         };
@@ -378,7 +378,7 @@ impl SledClient {
     }
 
     async fn send_zmq_request(&self, port: u16, request: Value) -> GraphResult<Value> {
-        let socket_path = format!("/opt/graphdb/graphdb-{}.ipc", port);
+        let socket_path = format!("/tmp/graphdb-{}.ipc", port);
         let addr = format!("ipc://{}", socket_path);
 
         let request_data = serde_json::to_vec(&request)

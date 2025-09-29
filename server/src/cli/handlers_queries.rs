@@ -209,7 +209,7 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
     let daemon = daemons.iter().max_by_key(|m| m.port).unwrap_or(daemons.first().unwrap());
     info!("Selected daemon on port: {}", daemon.port);
 
-    let socket_path = format!("/opt/graphdb/graphdb-{}.ipc", daemon.port);
+    let socket_path = format!("/tmp/graphdb-{}.ipc", daemon.port);
     let addr = format!("ipc://{}", socket_path);
 
     if !tokio::fs::metadata(&socket_path).await.is_ok() {
@@ -334,7 +334,7 @@ async fn handle_kv_rocksdb_zmq(key: String, value: Option<String>, operation: &s
     let daemon = daemons.iter().max_by_key(|m| m.port).unwrap_or(daemons.first().unwrap());
     info!("Selected RocksDB daemon on port: {}", daemon.port);
 
-    let socket_path = format!("/opt/graphdb/graphdb-{}.ipc", daemon.port);
+    let socket_path = format!("/tmp/graphdb-{}.ipc", daemon.port);
     let addr = format!("ipc://{}", socket_path);
 
     if !tokio::fs::metadata(&socket_path).await.is_ok() {

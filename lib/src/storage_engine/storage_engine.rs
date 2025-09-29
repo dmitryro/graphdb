@@ -66,7 +66,7 @@ use crate::config::{DEFAULT_DATA_DIRECTORY, DEFAULT_LOG_DIRECTORY, LOCK_FILE_PAT
                                  SledDbWithPath, RocksDbWithPath, load_storage_config_from_yaml,
                                  create_default_storage_yaml_config,
                                  load_engine_specific_config};
-use crate::daemon::daemon_management::{ is_storage_daemon_running };
+use crate::daemon::daemon_management::{ is_storage_daemon_running, is_socket_used_by_cli };
 use crate::daemon::daemon_utils::{find_pid_by_port, stop_process, parse_cluster_range};
 use crate::daemon::daemon_registry::{GLOBAL_DAEMON_REGISTRY,  NonBlockingDaemonRegistry, DaemonMetadata};
 use crate::storage_engine::inmemory_storage::{InMemoryStorage};
@@ -3025,6 +3025,7 @@ impl StorageEngineManager {
         engines.push(StorageEngineType::MySQL);
         engines
     }
+
     pub async fn use_storage(&mut self, new_config: StorageConfig, permanent: bool) -> Result<(), GraphError> {
         info!("=== Starting use_storage for engine: {:?}, permanent: {} ===", new_config.storage_engine_type, permanent);
         trace!("use_storage called with engine_type: {:?}", new_config.storage_engine_type);
@@ -3067,17 +3068,26 @@ impl StorageEngineManager {
             .unwrap_or(new_config.default_port);
 
         // Clean up stale ZeroMQ socket file
-        let socket_path = format!("/opt/graphdb/graphdb-{}.ipc", port);
-        if PathBuf::from(&socket_path).exists() {
-            info!("Removing stale ZeroMQ socket file: {}", socket_path);
-            fs::remove_file(&socket_path)
-                .await
-                .map_err(|e| GraphError::StorageError(format!("Failed to remove stale ZeroMQ socket file {}: {}", socket_path, e)))?;
+        let socket_path = format!("/tmp/graphdb-{}.ipc", port);
+        if fs::metadata(&socket_path).await.is_ok() {
+            if !is_socket_used_by_cli(&socket_path).await? {
+                info!("Removing stale ZeroMQ socket file: {}", socket_path);
+                fs::remove_file(&socket_path).await
+                    .map_err(|e| GraphError::StorageError(format!("Failed to remove stale ZeroMQ socket file {}: {}", socket_path, e)))?;
+            }
         }
 
         // Check for running daemon on the port
         let daemon_running = match find_pid_by_port(port).await {
-            Ok(Some(pid)) => NonBlockingDaemonRegistry::is_pid_running(pid).await.unwrap_or(false),
+            Ok(Some(pid)) => {
+                let status = std::process::Command::new("ps")
+                    .arg("-p")
+                    .arg(pid.to_string())
+                    .output()
+                    .map(|output| output.status.success())
+                    .unwrap_or(false);
+                status
+            }
             _ => false,
         };
 
@@ -3184,34 +3194,46 @@ impl StorageEngineManager {
                 StorageEngineType::Redis => {
                     #[cfg(feature = "redis-datastore")]
                     {
-                        let redis_instance = REDIS_SINGLETON.get().await;
-                        if let Ok(redis_instance) = redis_instance {
+                        if let Some(redis_instance) = REDIS_SINGLETON.get() {
                             info!("Closing existing Redis instance before switching");
                             redis_instance.close().await
                                 .map_err(|e| GraphError::StorageError(format!("Failed to close Redis: {}", e)))?;
+                            // Note: OnceCell cannot be unset, so we rely on close() to release resources
                         }
+                    }
+                    #[cfg(not(feature = "redis-datastore"))]
+                    {
+                        warn!("Redis cleanup skipped: feature not enabled");
                     }
                 }
                 StorageEngineType::PostgreSQL => {
                     #[cfg(feature = "postgres-datastore")]
                     {
-                        let postgres_instance = POSTGRES_SINGLETON.get().await;
-                        if let Ok(postgres_instance) = postgres_instance {
+                        if let Some(postgres_instance) = POSTGRES_SINGLETON.get() {
                             info!("Closing existing PostgreSQL instance before switching");
                             postgres_instance.close().await
                                 .map_err(|e| GraphError::StorageError(format!("Failed to close PostgreSQL: {}", e)))?;
+                            // Note: OnceCell cannot be unset
                         }
+                    }
+                    #[cfg(not(feature = "postgres-datastore"))]
+                    {
+                        warn!("PostgreSQL cleanup skipped: feature not enabled");
                     }
                 }
                 StorageEngineType::MySQL => {
                     #[cfg(feature = "mysql-datastore")]
                     {
-                        let mysql_instance = MYSQL_SINGLETON.get().await;
-                        if let Ok(mysql_instance) = mysql_instance {
+                        if let Some(mysql_instance) = MYSQL_SINGLETON.get() {
                             info!("Closing existing MySQL instance before switching");
                             mysql_instance.close().await
                                 .map_err(|e| GraphError::StorageError(format!("Failed to close MySQL: {}", e)))?;
+                            // Note: OnceCell cannot be unset
                         }
+                    }
+                    #[cfg(not(feature = "mysql-datastore"))]
+                    {
+                        warn!("MySQL cleanup skipped: feature not enabled");
                     }
                 }
                 _ => {}
@@ -3267,7 +3289,7 @@ impl StorageEngineManager {
             loaded_config.save().await
                 .map_err(|e| {
                     error!("Failed to save new config to {:?}: {}", config_path, e);
-                    e
+                    GraphError::ConfigurationError(format!("Failed to save config: {}", e))
                 })?;
             self.session_engine_type = None;
         } else {
@@ -3287,7 +3309,13 @@ impl StorageEngineManager {
                 match find_pid_by_port(port).await {
                     Ok(Some(found_pid)) => {
                         debug!("Found PID {} for port {} on attempt {}", found_pid, port, attempt);
-                        if NonBlockingDaemonRegistry::is_pid_running(found_pid).await.unwrap_or(false) {
+                        let status = std::process::Command::new("ps")
+                            .arg("-p")
+                            .arg(found_pid.to_string())
+                            .output()
+                            .map(|output| output.status.success())
+                            .unwrap_or(false);
+                        if status {
                             info!("Active daemon found on port {}, stopping and updating registry.", port);
                             stop_process(found_pid).await
                                 .map_err(|e| GraphError::StorageError(format!("Failed to stop daemon on PID {}: {}", found_pid, e)))?;
@@ -3387,9 +3415,13 @@ impl StorageEngineManager {
                                                     port: config.engine_specific_config
                                                         .as_ref()
                                                         .and_then(|map| map.storage.port),
-                                                    cache_capacity: None,
                                                     temporary: false,
-                                                    use_compression: true,
+                                                    use_compression: config.engine_specific_config
+                                                        .as_ref()
+                                                        .map_or(true, |c| c.storage.use_compression),
+                                                    cache_capacity: config.engine_specific_config
+                                                        .as_ref()
+                                                        .and_then(|map| map.storage.cache_capacity.map(|c| c)),
                                                 };
                                                 match SledStorage::new(&sled_config, &config).await {
                                                     Ok(storage) => Arc::new(storage),
@@ -3417,11 +3449,17 @@ impl StorageEngineManager {
                                                     port: config.engine_specific_config
                                                         .as_ref()
                                                         .and_then(|map| map.storage.port),
-                                                    cache_capacity: None,
+                                                    cache_capacity: config.engine_specific_config
+                                                        .as_ref()
+                                                        .and_then(|map| map.storage.cache_capacity.map(|c| c)),
                                                     max_background_jobs: Some(5),
                                                     temporary: false,
-                                                    use_compression: true,
-                                                    use_raft_for_scale: false,
+                                                    use_compression: config.engine_specific_config
+                                                        .as_ref()
+                                                        .map_or(true, |c| c.storage.use_compression),
+                                                    use_raft_for_scale: config.engine_specific_config
+                                                        .as_ref()
+                                                        .map_or(false, |c| c.storage.use_raft_for_scale),
                                                 };
                                                 match RocksDBStorage::new(&rocksdb_config, &config).await {
                                                     Ok(storage) => Arc::new(storage),
@@ -3497,9 +3535,9 @@ impl StorageEngineManager {
                                             .unwrap_or_else(|| PathBuf::from(format!("/opt/graphdb/storage_data/sled/{}", config.default_port))),
                                         host: engine_specific.storage.host.clone(),
                                         port: engine_specific.storage.port,
-                                        temporary: false,
+                                        temporary: engine_specific.storage.temporary,
                                         use_compression: engine_specific.storage.use_compression,
-                                        cache_capacity: engine_specific.storage.cache_capacity,
+                                        cache_capacity: engine_specific.storage.cache_capacity.map(|c| c),
                                     };
                                     
                                     info!("Initializing Sled engine with path: {:?}", sled_config.path);
@@ -3540,14 +3578,13 @@ impl StorageEngineManager {
                                     let rocksdb_config = RocksDBConfig {
                                         storage_engine_type: StorageEngineType::RocksDB,
                                         path: rocksdb_path,
-                                        host: Some(engine_specific.storage.host.clone()
-                                            .unwrap_or("127.0.0.1".to_string())),
+                                        host: engine_specific.storage.host.clone(),
                                         port: engine_specific.storage.port,
-                                        cache_capacity: engine_specific.storage.cache_capacity,
-                                        max_background_jobs: Some(1000),
-                                        temporary: false,
+                                        cache_capacity: engine_specific.storage.cache_capacity.map(|c| c),
+                                        max_background_jobs: Some(5),
+                                        temporary: engine_specific.storage.temporary,
                                         use_compression: engine_specific.storage.use_compression,
-                                        use_raft_for_scale: engine_specific.storage.use_compression,
+                                        use_raft_for_scale: engine_specific.storage.use_raft_for_scale,
                                     };
                                     info!("Initializing RocksDB engine with path: {:?}", rocksdb_config.path);
                                     let mut rocksdb_singleton = ROCKSDB_SINGLETON.lock().await;
@@ -3581,10 +3618,9 @@ impl StorageEngineManager {
                                             .as_ref()
                                             .and_then(|map| map.storage.path.clone())
                                             .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data/tikv")),
-                                        host: Some(config.engine_specific_config
+                                        host: config.engine_specific_config
                                             .as_ref()
-                                            .and_then(|map| map.storage.host.clone())
-                                            .unwrap_or("127.0.0.1".to_string())),
+                                            .and_then(|map| map.storage.host.clone()),
                                         port: config.engine_specific_config
                                             .as_ref()
                                             .and_then(|map| map.storage.port),
@@ -3622,25 +3658,31 @@ impl StorageEngineManager {
                                 {
                                     let redis_config = RedisConfig {
                                         storage_engine_type: StorageEngineType::Redis,
-                                        path: config.engine_specific_config
-                                            .as_ref()
-                                            .and_then(|map| map.storage.path.clone())
-                                            .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data/redis")),
-                                        host: Some(config.engine_specific_config
+                                        host: config.engine_specific_config
                                             .as_ref()
                                             .and_then(|map| map.storage.host.clone())
-                                            .unwrap_or("127.0.0.1".to_string())),
+                                            .unwrap_or_else(|| "localhost".to_string()),
                                         port: config.engine_specific_config
                                             .as_ref()
                                             .and_then(|map| map.storage.port)
                                             .unwrap_or(6379),
+                                        username: config.engine_specific_config
+                                            .as_ref()
+                                            .and_then(|map| map.storage.username.clone()),
+                                        password: config.engine_specific_config
+                                            .as_ref()
+                                            .and_then(|map| map.storage.password.clone()),
+                                        database: config.engine_specific_config
+                                            .as_ref()
+                                            .and_then(|map| map.storage.database),
                                     };
-                                    let redis_instance = REDIS_SINGLETON.get_or_init(|| async {
-                                        trace!("Creating new RedisStorage singleton");
-                                        let storage = RedisStorage::new(&redis_config).await?;
-                                        Ok(Arc::new(storage))
-                                    }).await?;
-                                    Ok(redis_instance.clone() as Arc<dyn GraphStorageEngine + Send + Sync>)
+                                    let redis_instance = REDIS_SINGLETON
+                                        .get_or_init(|| async {
+                                            Arc::new(RedisStorage::new(&redis_config).await.expect("Failed to initialize Redis"))
+                                        })
+                                        .await;
+                                    info!("Initialized Redis engine with host: {}, port: {}", redis_config.host, redis_config.port);
+                                    Ok(Arc::clone(&redis_instance) as Arc<dyn GraphStorageEngine + Send + Sync>)
                                 }
                                 #[cfg(not(feature = "redis-datastore"))]
                                 {
@@ -3653,25 +3695,33 @@ impl StorageEngineManager {
                                 {
                                     let postgres_config = PostgreSQLConfig {
                                         storage_engine_type: StorageEngineType::PostgreSQL,
-                                        path: config.engine_specific_config
-                                            .as_ref()
-                                            .and_then(|map| map.storage.path.clone())
-                                            .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data/postgresql")),
-                                        host: Some(config.engine_specific_config
+                                        host: config.engine_specific_config
                                             .as_ref()
                                             .and_then(|map| map.storage.host.clone())
-                                            .unwrap_or("127.0.0.1".to_string())),
+                                            .unwrap_or_else(|| "localhost".to_string()),
                                         port: config.engine_specific_config
                                             .as_ref()
                                             .and_then(|map| map.storage.port)
                                             .unwrap_or(5432),
+                                        username: config.engine_specific_config
+                                            .as_ref()
+                                            .and_then(|map| map.storage.username.clone())
+                                            .unwrap_or_else(|| "postgres".to_string()),
+                                        password: config.engine_specific_config
+                                            .as_ref()
+                                            .and_then(|map| map.storage.password.clone()),
+                                        database: config.engine_specific_config
+                                            .as_ref()
+                                            .and_then(|map| map.storage.database)
+                                            .unwrap_or(0),
                                     };
-                                    let postgres_instance = POSTGRES_SINGLETON.get_or_init(|| async {
-                                        trace!("Creating new PostgresStorage singleton");
-                                        let storage = PostgresStorage::new(&postgres_config).await?;
-                                        Ok(Arc::new(storage))
-                                    }).await?;
-                                    Ok(postgres_instance.clone() as Arc<dyn GraphStorageEngine + Send + Sync>)
+                                    let postgres_instance = POSTGRES_SINGLETON
+                                        .get_or_init(|| async {
+                                            Arc::new(PostgresStorage::new(&postgres_config).await.expect("Failed to initialize PostgreSQL"))
+                                        })
+                                        .await;
+                                    info!("Initialized PostgreSQL engine with host: {}, port: {}", postgres_config.host, postgres_config.port);
+                                    Ok(Arc::clone(&postgres_instance) as Arc<dyn GraphStorageEngine + Send + Sync>)
                                 }
                                 #[cfg(not(feature = "postgres-datastore"))]
                                 {
@@ -3684,25 +3734,33 @@ impl StorageEngineManager {
                                 {
                                     let mysql_config = MySQLConfig {
                                         storage_engine_type: StorageEngineType::MySQL,
-                                        path: config.engine_specific_config
-                                            .as_ref()
-                                            .and_then(|map| map.storage.path.clone())
-                                            .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data/mysql")),
-                                        host: Some(config.engine_specific_config
+                                        host: config.engine_specific_config
                                             .as_ref()
                                             .and_then(|map| map.storage.host.clone())
-                                            .unwrap_or("127.0.0.1".to_string())),
+                                            .unwrap_or_else(|| "localhost".to_string()),
                                         port: config.engine_specific_config
                                             .as_ref()
                                             .and_then(|map| map.storage.port)
                                             .unwrap_or(3306),
+                                        username: config.engine_specific_config
+                                            .as_ref()
+                                            .and_then(|map| map.storage.username.clone())
+                                            .unwrap_or_else(|| "root".to_string()),
+                                        password: config.engine_specific_config
+                                            .as_ref()
+                                            .and_then(|map| map.storage.password.clone()),
+                                        database: config.engine_specific_config
+                                            .as_ref()
+                                            .and_then(|map| map.storage.database)
+                                            .unwrap_or(0),
                                     };
-                                    let mysql_instance = MYSQL_SINGLETON.get_or_init(|| async {
-                                        trace!("Creating new MySQLStorage singleton");
-                                        let storage = MySQLStorage::new(&mysql_config).await?;
-                                        Ok(Arc::new(storage))
-                                    }).await?;
-                                    Ok(mysql_instance.clone() as Arc<dyn GraphStorageEngine + Send + Sync>)
+                                    let mysql_instance = MYSQL_SINGLETON
+                                        .get_or_init(|| async {
+                                            Arc::new(MySQLStorage::new(&mysql_config).await.expect("Failed to initialize MySQL"))
+                                        })
+                                        .await;
+                                    info!("Initialized MySQL engine with host: {}, port: {}", mysql_config.host, mysql_config.port);
+                                    Ok(Arc::clone(&mysql_instance) as Arc<dyn GraphStorageEngine + Send + Sync>)
                                 }
                                 #[cfg(not(feature = "mysql-datastore"))]
                                 {

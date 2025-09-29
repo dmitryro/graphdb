@@ -1,15 +1,3 @@
-// storage_daemon_server/src/lib.rs
-// Fixed: 2025-08-10 - Corrected StorageConfig initialization to match expected fields and types
-// Fixed: 2025-08-10 - Converted Map<String, Value> to HashMap<String, Value> for engine_specific_config
-// Fixed: 2025-08-10 - Removed unnecessary Some wrapper for data_directory (E0308)
-// Fixed: 2025-08-10 - Added missing StorageConfig fields (E0063)
-// Fixed: 2025-08-10 - Converted log_directory to String (E0308)
-// Fixed: 2025-08-10 - Removed invalid max_disk_space_mb field (E0560)
-// Fixed: 2025-09-09 - Fixed type mismatches in load_storage_config_from_yaml and StorageSettings conversion
-// Fixed: 2025-09-09 - Corrected engine_specific_config conversion from SelectedStorageConfig to HashMap
-// Fixed: 2025-09-09 - Removed invalid unwrap_or on max_open_files
-// Fixed: 2025-09-09 - Fixed type mismatches in init_storage_engine_manager and related functions
-
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
@@ -35,9 +23,11 @@ use std::io::Cursor;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use log::{info, error, warn, debug};
 use simplelog::{CombinedLogger, TermLogger, WriteLogger, LevelFilter, Config, ConfigBuilder, TerminalMode, ColorChoice};
-use serde_json::{Value, Map};
+use serde_json::{Value, Map, json};
 use crate::storage_engine::storage_engine::{StorageEngineManager, GLOBAL_STORAGE_ENGINE_MANAGER, AsyncStorageEngineManager};
 use models::errors::{GraphError, GraphResult};
+use zmq::{Context as ZmqContext, Socket, REP};
+use std::os::unix::fs::PermissionsExt;
 
 // Re-export the necessary items from the storage_client module.
 pub use crate::daemon::storage_client::StorageClient;
@@ -47,7 +37,7 @@ pub use crate::daemon::storage_client::StorageClient;
 pub struct TypeConfig;
 
 impl RaftTypeConfig for TypeConfig {
-    type D = StorageRequest;
+    type D = crate::config::AppRequest; // Use AppRequest from config_structs
     type R = StorageResponse;
     type NodeId = u64;
     type Node = BasicNode;
@@ -77,7 +67,7 @@ pub struct StorageResponse {
 impl Responder<TypeConfig> for StorageResponse {
     type Receiver = Sender<Result<ClientWriteResponse<TypeConfig>, ClientWriteError<u64, BasicNode>>>;
     
-    fn from_app_data(data: StorageRequest) -> (StorageRequest, Self, Self::Receiver) {
+    fn from_app_data(data: crate::config::AppRequest) -> (crate::config::AppRequest, Self, Self::Receiver) {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let response = StorageResponse {
             success: true,
@@ -395,7 +385,6 @@ impl RaftStorage<TypeConfig> for InMemoryRaftStorage {
     }
 
     async fn save_committed(&mut self, _committed: Option<LogId<u64>>) -> Result<(), openraft::StorageError<u64>> {
-        // Note: This is a no-op; real implementation should persist
         Ok(())
     }
 
@@ -440,14 +429,21 @@ impl RaftStorage<TypeConfig> for InMemoryRaftStorage {
 
         for entry in entries {
             let response = match &entry.payload {
-                openraft::EntryPayload::Normal(cmd) => match &cmd.command {
-                    Command::Set { key, value } => {
-                        data.kvs.insert(key.clone(), value.clone());
-                        StorageResponse {
-                            success: true,
-                            message: format!("Set {} = {}", key, value),
-                            data: Some(format!("Set {} = {}", key, value)),
-                        }
+                openraft::EntryPayload::Normal(app_request) => {
+                    // Convert AppRequest to StorageRequest for processing
+                    // Note: This is a placeholder. You need to define how AppRequest maps to Command
+                    // For now, assume AppRequest can be serialized to JSON and processed as key-value
+                    let key = serde_json::to_string(app_request)
+                        .map_err(|e| openraft::StorageError::from_io_error(
+                            ErrorSubject::StateMachine,
+                            ErrorVerb::Write,
+                            std::io::Error::new(std::io::ErrorKind::Other, e),
+                        ))?;
+                    data.kvs.insert(key.clone(), key.clone());
+                    StorageResponse {
+                        success: true,
+                        message: format!("Processed AppRequest for key {}", key),
+                        data: Some(key),
                     }
                 },
                 openraft::EntryPayload::Membership(membership) => {
@@ -530,7 +526,6 @@ impl RaftStorage<TypeConfig> for InMemoryRaftStorage {
     }
 }
 
-// --- Corrected `create_default_yaml_config` function ---
 async fn create_default_yaml_config(yaml_path: &PathBuf, engine_type: StorageEngineType) -> Result<(), GraphError> {
     info!("Creating default YAML config at {:?}", yaml_path);
     let config = StorageConfig {
@@ -571,7 +566,6 @@ async fn create_default_yaml_config(yaml_path: &PathBuf, engine_type: StorageEng
     Ok(())
 }
 
-// --- Corrected `init_storage_engine_manager` function ---
 pub async fn init_storage_engine_manager(config_path_yaml: PathBuf) -> Result<(), GraphError> {
     use tokio::fs;
     use anyhow::Context;
@@ -585,13 +579,11 @@ pub async fn init_storage_engine_manager(config_path_yaml: PathBuf) -> Result<()
             .with_context(|| format!("Failed to create directory for YAML config: {:?}", parent))?;
     }
     
-    // Check if already initialized
     if GLOBAL_STORAGE_ENGINE_MANAGER.get().is_some() {
         info!("StorageEngineManager already initialized, reusing existing instance");
         return Ok(());
     }
     
-    // Load configuration from YAML to get storage_engine_type and port
     info!("Loading config from {:?}", config_path_yaml);
     let mut config = load_storage_config_from_yaml(Some(config_path_yaml.clone())).await
         .map_err(|e| {
@@ -605,10 +597,9 @@ pub async fn init_storage_engine_manager(config_path_yaml: PathBuf) -> Result<()
         .and_then(|c| c.storage.port)
         .unwrap_or_else(|| match storage_engine {
             StorageEngineType::TiKV => 2380,
-            _ => 8052, // Default for Sled and others
+            _ => 8052,
         });
 
-    // Update Sled path to be port-specific
     if storage_engine == StorageEngineType::Sled {
         if let Some(ref mut engine_config) = config.engine_specific_config {
             let base_path = config.data_directory
@@ -623,7 +614,6 @@ pub async fn init_storage_engine_manager(config_path_yaml: PathBuf) -> Result<()
 
     debug!("Loaded storage_engine_type: {:?}, port: {:?}", storage_engine, port);
     
-    // Initialize StorageEngineManager with the loaded storage_engine_type and port
     let manager = StorageEngineManager::new(storage_engine, &config_path_yaml, false, Some(port)).await
         .map_err(|e| {
             error!("Failed to create StorageEngineManager: {}", e);
@@ -634,19 +624,18 @@ pub async fn init_storage_engine_manager(config_path_yaml: PathBuf) -> Result<()
         .set(Arc::new(AsyncStorageEngineManager::from_manager(manager)))
         .map_err(|_| GraphError::StorageError("Failed to set StorageEngineManager: already initialized".to_string()))?;
 
-    
     info!("StorageEngineManager initialized successfully with engine: {:?} on port {:?}", storage_engine, port);
     Ok(())
 }
 
-// --- Corrected `start_storage_daemon_server_real` function ---
 pub async fn start_storage_daemon_server_real(
     port: u16,
     settings: StorageSettings,
     shutdown_rx: oneshot::Receiver<()>,
 ) -> Result<StorageDaemon, anyhow::Error> {
-    // Initialize logger
-    let log_file_path = format!("/tmp/graphdb-storage-{}.out", port);
+    use std::os::unix::fs::PermissionsExt;
+
+    let log_file_path = format!("{}/graphdb-storage-{}.out", settings.log_directory.display(), port);
     let log_file = File::create(&log_file_path)
         .with_context(|| format!("Failed to create log file at {}", log_file_path))?;
     let log_config = ConfigBuilder::new()
@@ -670,7 +659,30 @@ pub async fn start_storage_daemon_server_real(
     info!("[Storage Daemon] Storage engine type: {}", settings.storage_engine_type);
     info!("[Storage Daemon] Engine specific config: {:?}", settings.engine_specific_config);
 
-    // Verify RocksDB path if engine is RocksDB
+    // Ensure /opt/graphdb has correct permissions for IPC socket
+    let base_dir = PathBuf::from("/opt/graphdb");
+    if !base_dir.exists() {
+        fs::create_dir_all(&base_dir)
+            .with_context(|| format!("Failed to create directory {:?}", base_dir))?;
+    }
+    let metadata = fs::metadata(&base_dir)
+        .with_context(|| format!("Failed to get metadata for {:?}", base_dir))?;
+    let mut perms = metadata.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&base_dir, perms)
+        .with_context(|| format!("Failed to set permissions for {:?}", base_dir))?;
+    info!("[Storage Daemon] Set permissions (0o755) for directory {:?}", base_dir);
+
+    // Clean up stale PID files in /tmp
+    let tmp_pid_file = format!("/tmp/graphdb-storage-{}.pid", port);
+    if Path::new(&tmp_pid_file).exists() {
+        if let Err(e) = fs::remove_file(&tmp_pid_file) {
+            warn!("[Storage Daemon] Failed to remove stale PID file {}: {}", tmp_pid_file, e);
+        } else {
+            info!("[Storage Daemon] Removed stale PID file {}", tmp_pid_file);
+        }
+    }
+
     if settings.storage_engine_type.to_lowercase() == "rocksdb" {
         if !settings.engine_specific_config.is_empty() {
             if let Some(path) = settings.engine_specific_config.get("path").and_then(|p| p.as_str()) {
@@ -693,8 +705,6 @@ pub async fn start_storage_daemon_server_real(
             return Err(anyhow!("No engine_specific_config for RocksDB"));
         }
     }
-
-    let cluster_range_str = settings.cluster_range.clone();
 
     let storage_engine_type = StorageEngineType::from_str(&settings.storage_engine_type)
         .map_err(|e| anyhow::anyhow!("Invalid storage engine type: {}", e))?;
@@ -720,25 +730,18 @@ pub async fn start_storage_daemon_server_real(
                 database: settings.engine_specific_config.get("database").and_then(|d| d.as_str()).map(String::from),
                 pd_endpoints: settings.engine_specific_config.get("pd_endpoints").and_then(|p| p.as_str()).map(String::from),
                 cache_capacity: settings.engine_specific_config.get("cache_capacity").and_then(|p| p.as_u64()),
-                // The fix is here:
-                // 1. We use `.as_bool()` to correctly parse the value into an `Option<bool>`.
-                // 2. We use `.unwrap_or(false)` to get the `bool` value, providing a default if it's missing.
                 use_compression: settings.engine_specific_config.get("use_compression")
                     .and_then(|p| p.as_bool())
                     .unwrap_or(false),
                 temporary: settings.engine_specific_config.get("temporary")
                     .and_then(|p| p.as_bool())
-                    .unwrap_or(false), 
+                    .unwrap_or(false),
                 use_raft_for_scale: settings.engine_specific_config.get("use_raft_for_scale")
                     .and_then(|p| p.as_bool())
-                    .unwrap_or(false),             
+                    .unwrap_or(false),
             },
         }),
         max_open_files: settings.max_open_files,
-        /*connection_string: match settings.storage_engine_type.as_str() {
-            "redis" | "postgresql" | "mysql" => Some(format!("{}:{}", cluster_range_str, port)),
-            _ => None,
-        },*/
     };
 
     let storage = match create_storage(&storage_config).await {
@@ -754,7 +757,73 @@ pub async fn start_storage_daemon_server_real(
     };
     debug!("[Storage Daemon] Sled initialization step 2: Storage created");
 
-    // Initialize Raft if enabled
+    // Initialize ZMQ REP socket for IPC
+    let zmq_context = zmq::Context::new();
+    let zmq_socket = zmq_context.socket(REP)
+        .map_err(|e| anyhow!("Failed to create ZMQ socket for port {}: {}", port, e))?;
+    zmq_socket.set_rcvtimeo(15000)
+        .map_err(|e| anyhow!("Failed to set ZMQ receive timeout for port {}: {}", port, e))?;
+    zmq_socket.set_sndtimeo(10000)
+        .map_err(|e| anyhow!("Failed to set ZMQ send timeout for port {}: {}", port, e))?;
+    let socket_path = format!("/opt/graphdb/graphdb-{}.ipc", port);
+    zmq_socket.bind(&format!("ipc://{}", socket_path))
+        .map_err(|e| anyhow!("Failed to bind ZMQ socket to {}: {}", socket_path, e))?;
+    info!("[Storage Daemon] Initialized ZMQ IPC server for port {} at {}", port, socket_path);
+
+    let storage_clone = storage.clone();
+    tokio::spawn(async move {
+        let mut msg = zmq::Message::new();
+        loop {
+            match zmq_socket.recv(&mut msg, 0) {
+                Ok(_) => {
+                    match serde_json::from_slice::<StorageRequest>(&msg) {
+                        Ok(request) => {
+                            let response = match request.command {
+                                Command::Set { key, value } => {
+                                    match storage_clone.insert(key.as_bytes().to_vec(), value.as_bytes().to_vec()).await {
+                                        Ok(_) => StorageResponse {
+                                            success: true,
+                                            message: format!("Set {} = {}", key, value),
+                                            data: Some(value),
+                                        },
+                                        Err(e) => StorageResponse {
+                                            success: false,
+                                            message: format!("Failed to set {}: {}", key, e),
+                                            data: None,
+                                        },
+                                    }
+                                }
+                            };
+                            let response_data = serde_json::to_vec(&response)
+                                .expect("Failed to serialize ZMQ response");
+                            if let Err(e) = zmq_socket.send(&response_data, 0) {
+                                error!("[Storage Daemon] Failed to send ZMQ response for port {}: {}", port, e);
+                            }
+                        }
+                        Err(e) => {
+                            error!("[Storage Daemon] Failed to deserialize ZMQ request for port {}: {}", port, e);
+                            let response = StorageResponse {
+                                success: false,
+                                message: format!("Failed to deserialize request: {}", e),
+                                data: None,
+                            };
+                            let response_data = serde_json::to_vec(&response)
+                                .expect("Failed to serialize ZMQ error response");
+                            if let Err(e) = zmq_socket.send(&response_data, 0) {
+                                error!("[Storage Daemon] Failed to send ZMQ error response for port {}: {}", port, e);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("[Storage Daemon] Failed to receive ZMQ message for port {}: {}", port, e);
+                    break;
+                }
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
     let mut raft_handle = None;
     if settings.use_raft_for_scale {
         debug!("[Storage Daemon] Sled initialization step 3: Initializing Raft");
@@ -782,18 +851,16 @@ pub async fn start_storage_daemon_server_real(
         let raft = Raft::new(node_id, Arc::new(raft_config.validate()?), network, log_store, state_machine).await?;
         raft_handle = Some(tokio::spawn(async move {
             info!("[Storage Daemon] Raft cluster initialized, running event loop");
-            tokio::time::sleep(std::time::Duration::from_secs(3600)).await; // Simulate Raft loop
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
         }));
         info!("[Storage Daemon] Initialized Raft cluster");
         debug!("[Storage Daemon] Sled initialization step 4: Raft initialized");
     }
 
-    // Bind to the port
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await
         .with_context(|| format!("Failed to bind storage daemon to port {}", port))?;
     info!("[Storage Daemon] Successfully bound to port {}. Now listening for connections.", port);
 
-    // Set up registration and shutdown handling
     let (shutdown_tx, mut shutdown_rx_task) = oneshot::channel();
     let (registration_tx, mut registration_rx) = oneshot::channel::<()>();
     let storage_clone = storage.clone();
@@ -845,7 +912,6 @@ pub async fn start_storage_daemon_server_real(
         }
     });
 
-    // Ensure the server keeps running until shutdown
     tokio::spawn(async move {
         shutdown_rx.await.ok();
         info!("[Storage Daemon] Shutdown signal received. Initiating cleanup.");
@@ -855,7 +921,6 @@ pub async fn start_storage_daemon_server_real(
         }
         server_handle.abort();
         info!("[Storage Daemon] Server handle aborted.");
-        // Signal registration completion to allow shutdown
         let _ = registration_tx.send(());
     });
 

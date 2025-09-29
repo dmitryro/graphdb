@@ -1,5 +1,5 @@
 use serde::{Serialize, Deserialize};
-use std::fs::{self, File};
+use std::fs::{self, File, create_dir_all};
 use std::collections::{HashMap};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{PathBuf, Path};
@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use chrono::Utc;
 extern crate config as ext_config;
-// Now you can refer to its types like this:
 use ext_config::{ Config, ConfigError, File as ConfigFile };
 use crate::daemon::{DaemonizeBuilder, DaemonizeError};
 use log::{error, info, warn, debug, trace};
@@ -20,8 +19,8 @@ use tokio::process::Command;
 use tokio::time::{sleep, Duration};
 use serde_json;
 use std::collections::HashSet;
-use crate::storage_engine::config::{daemon_api_storage_engine_type_to_string, load_storage_config_from_yaml,
-                                  EngineStorageConfig, StorageEngineType, DEFAULT_STORAGE_CONFIG_PATH};
+use crate::config::{daemon_api_storage_engine_type_to_string, load_storage_config_from_yaml,
+                    EngineStorageConfig, StorageEngineType, DEFAULT_STORAGE_CONFIG_PATH, PID_FILE_DIR};
 use crate::config::{self, SelectedStorageConfig, StorageConfigInner};
 use crate::daemon::storage_daemon_server::{StorageSettings, start_storage_daemon_server_real};
 use simplelog::{
@@ -70,7 +69,6 @@ lazy_static! {
     pub static ref SHUTDOWN_FLAG: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
 }
 
-// Conversion function: EngineStorageConfig to StorageSettings
 pub fn engine_storage_config_to_storage_settings(config: EngineStorageConfig) -> StorageSettings {
     let mut engine_specific_config = HashMap::new();
     if let Some(esc) = config.engine_specific_config {
@@ -119,7 +117,7 @@ pub async fn is_process_running(pid: u32) -> bool {
 }
 
 pub async fn find_pid_by_port(port: u16) -> Option<u32> {
-    for attempt in 0..5 {
+    for attempt in 0..15 {
         let output = Command::new("lsof")
             .arg("-i")
             .arg(format!(":{}", port))
@@ -134,26 +132,38 @@ pub async fn find_pid_by_port(port: u16) -> Option<u32> {
             if !pid_str.is_empty() {
                 if let Ok(pid) = pid_str.parse::<u32>() {
                     if is_process_running(pid).await {
-                        info!("Found PID {} for port {} on attempt {}", pid, port, attempt);
+                        info!("Found PID {} for port {} on attempt {} via lsof", pid, port, attempt);
                         return Some(pid);
                     }
                 }
             }
         }
-        sleep(Duration::from_millis(200)).await;
-    }
-    info!("No valid PID found for port {} after 5 attempts", port);
-    None
-}
 
-fn remove_pid_file(pid_file_path: &str) {
-    if Path::new(pid_file_path).exists() {
-        if let Err(e) = fs::remove_file(pid_file_path) {
-            error!("Failed to remove PID file {}: {}", pid_file_path, e);
-        } else {
-            info!("Removed PID file {}", pid_file_path);
+        let pgrep_arg = format!("graphdb-.* --internal-port {}", port);
+        let pgrep_result = Command::new("pgrep")
+            .arg("-f")
+            .arg(&pgrep_arg)
+            .output()
+            .await
+            .ok()?;
+
+        if pgrep_result.status.success() {
+            let pid_str = String::from_utf8_lossy(&pgrep_result.stdout).trim().to_string();
+            if !pid_str.is_empty() {
+                if let Ok(pid) = pid_str.parse::<u32>() {
+                    if is_process_running(pid).await {
+                        info!("Found PID {} for port {} on attempt {} via pgrep", pid, port, attempt);
+                        return Some(pid);
+                    }
+                }
+            }
         }
+
+        info!("No PID found for port {} on attempt {}", port, attempt + 1);
+        sleep(Duration::from_millis(1000)).await;
     }
+    warn!("No valid PID found for port {} after 15 attempts", port);
+    None
 }
 
 fn cleanup_existing_daemons(base_process_name: &str) {
@@ -205,6 +215,8 @@ pub async fn start_daemon(
     daemon_type: &str,
     storage_config: Option<EngineStorageConfig>,
 ) -> Result<(), DaemonError> {
+    ensure_pid_directory()?;
+
     let config_path = "server/src/cli/config.toml";
     let main_config_yaml = "server/main_app_config.yaml";
     let rest_config_yaml = "rest_api/rest_api_config.yaml";
@@ -222,27 +234,6 @@ pub async fn start_daemon(
             )))
         }
     };
-
-    // Correctly handle the Option<EngineStorageConfig> to access its fields
-    match &storage_config {
-        Some(config) => {
-            debug!(
-                "[DEBUG] => Passed over config: default_port={}, cluster_range={}, data_directory={:?}, storage_engine_type={:?}, engine_specific_config={:?}, log_directory={:?}, max_disk_space_gb={}, min_disk_space_gb={}, use_raft_for_scale={}",
-                config.default_port,
-                config.cluster_range,
-                config.data_directory,
-                config.storage_engine_type,
-                config.engine_specific_config,
-                config.log_directory,
-                config.max_disk_space_gb,
-                config.min_disk_space_gb,
-                config.use_raft_for_scale,
-            );
-        }
-        None => {
-            debug!("[DEBUG] => No storage config passed over.");
-        }
-    }
 
     let mut base_process_name = format!("graphdb-{}", daemon_type);
 
@@ -285,14 +276,14 @@ pub async fn start_daemon(
             Some(config)
         } else {
             info!("Loading storage configuration from file: {}", storage_config_yaml);
-            let config_result = load_storage_config_from_yaml(Some(PathBuf::from(storage_config_yaml))).await
+            let config_result = load_storage_config_from_yaml(Some(PathBuf::from(storage_config_yaml)))
+                .await
                 .map_err(|e| anyhow::Error::new(e).context(format!("Failed to load storage config from {}", storage_config_yaml)))?;
             Some(config_result)
         }
     } else {
         None
     };
-    debug!("Using settings for {} daemon: {:?}", daemon_type, settings);
 
     let mut ports_to_start: Vec<u16> = Vec::new();
     if let Some(range_str) = cluster_range {
@@ -318,25 +309,25 @@ pub async fn start_daemon(
                 )));
             }
             ports_to_start.extend(start_port..=end_port);
-        } else if daemon_type == "rest" || daemon_type == "storage" {
-            ports_to_start.push(port.unwrap_or(default_port));
         } else {
-            return Err(DaemonError::GeneralError(
-                "Invalid daemon type for cluster range".to_string(),
-            ));
+            ports_to_start.push(port.unwrap_or(default_port));
         }
     } else {
         ports_to_start.push(port.unwrap_or(default_port));
     }
 
-    let max_port_check_attempts = 10; // Increased from 5
-    let port_check_interval_ms = 500; // Increased from 200
+    let max_port_check_attempts = if daemon_type == "storage" { 30 } else { 15 };
+    let port_check_interval_ms = 1000;
     let mut any_started = false;
 
     for current_port in ports_to_start {
         if skip_ports.contains(&current_port) {
             info!("Skipping reserved port {} for {}", current_port, daemon_type);
             continue;
+        }
+
+        if let Err(e) = stop_port_daemon(current_port, daemon_type).await {
+            warn!("Failed to clean up stale daemon on port {}: {}", current_port, e);
         }
 
         let socket_addr = format!("{}:{}", host_to_use, current_port)
@@ -349,40 +340,47 @@ pub async fn start_daemon(
 
         if TcpStream::connect(&socket_addr).is_ok() {
             info!(
-                "Port {} is already in use for {}. Skipping start.",
+                "Port {} is already in use for {}. Attempting to stop existing process.",
                 current_port, daemon_type
             );
-            any_started = true;
-            continue;
+            if let Err(e) = stop_port_daemon(current_port, daemon_type).await {
+                warn!("Failed to stop existing process on port {}: {}", current_port, e);
+                continue;
+            }
         }
 
-        let pid_file_path = format!("/tmp/graphdb-{}-{}.pid", daemon_type, current_port);
-        if Path::new(&pid_file_path).exists() {
-            info!(
-                "Removing stale PID file for {} on port {}: {}",
-                daemon_type, current_port, pid_file_path
-            );
-            remove_pid_file(&pid_file_path);
-        }
+        let pid_file_path = format!(
+            "{}/graphdb-{}-{}.pid",
+            PID_FILE_DIR, daemon_type, current_port
+        );
+        let stdout_file_path = format!(
+            "{}/graphdb-{}-{}.out",
+            PID_FILE_DIR, daemon_type, current_port
+        );
+        let stderr_file_path = format!(
+            "{}/graphdb-{}-{}.err",
+            PID_FILE_DIR, daemon_type, current_port
+        );
 
-        let specific_process_name = format!("graphdb-{}-{}", daemon_type, current_port);
-        let specific_stdout_file_path =
-            format!("/tmp/graphdb-{}-{}.out", daemon_type, current_port);
-        let specific_stderr_file_path =
-            format!("/tmp/graphdb-{}-{}.err", daemon_type, current_port);
+        // Clean up stale PID files in /tmp
+        let stale_pid_file_path = format!("/tmp/graphdb-{}-{}.pid", daemon_type, current_port);
+        remove_pid_file(&stale_pid_file_path);
 
-        let stdout = File::create(&specific_stdout_file_path)?;
-        let stderr = File::create(&specific_stderr_file_path)?;
+        remove_pid_file(&pid_file_path);
+
+        let stdout = File::create(&stdout_file_path)?;
+        let stderr = File::create(&stderr_file_path)?;
 
         let mut daemonize = DaemonizeBuilder::new()
-            .working_directory("/tmp")
+            .working_directory(PID_FILE_DIR)
             .umask(0o022)
             .stdout(stdout)
             .stderr(stderr)
-            .process_name(&specific_process_name)
+            .process_name(&format!("graphdb-{}-{}", daemon_type, current_port))
             .host(&host_to_use)
             .port(current_port)
             .skip_ports(skip_ports.clone())
+            .pid_file_path(&pid_file_path)
             .build()?;
 
         match daemonize.start() {
@@ -390,19 +388,19 @@ pub async fn start_daemon(
                 if child_pid == 0 {
                     // Child process
                     if daemon_type == "storage" {
-                        let rt = tokio::runtime::Runtime::new().unwrap();
+                        let rt = tokio::runtime::Runtime::new().map_err(|e| {
+                            error!("Failed to create Tokio runtime: {}", e);
+                            DaemonError::GeneralError(format!("Failed to create Tokio runtime: {}", e))
+                        })?;
                         let result = rt.block_on(async {
                             match settings.clone() {
                                 Some(config) => {
                                     let settings = engine_storage_config_to_storage_settings(config);
-                                    let (shutdown_tx, shutdown_rx) =
-                                        tokio::sync::oneshot::channel();
-                                    
-                                    // Spawn signal handler for graceful shutdown
+                                    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+
                                     let signal_handle = {
                                         let mut term_signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                                             .map_err(|e| DaemonError::SignalError(e.to_string()))?;
-                                        
                                         tokio::spawn(async move {
                                             tokio::select! {
                                                 _ = tokio::signal::ctrl_c() => {
@@ -425,12 +423,7 @@ pub async fn start_daemon(
                                     )
                                     .await
                                     {
-                                        Ok(daemon) => {
-                                            // Keep the runtime alive by waiting for the signal handler
-                                            if let Err(e) = signal_handle.await {
-                                                error!("[Storage Daemon] Signal handler failed: {:?}", e);
-                                                return Err(DaemonError::Anyhow(anyhow::anyhow!("Signal handler failed: {:?}", e)));
-                                            }
+                                        Ok(_) => {
                                             info!("[Storage Daemon] Storage daemon running on port {}", current_port);
                                             Ok(())
                                         }
@@ -453,8 +446,7 @@ pub async fn start_daemon(
                             error!("[Storage Daemon] Async block failed: {:?}", e);
                             std::process::exit(1);
                         }
-                        // Do not exit immediately; let the runtime handle shutdown
-                        std::thread::park(); // Keep the process alive until signaled
+                        std::thread::park();
                     } else {
                         let config = DaemonStartConfig {
                             daemon_type: daemon_type.to_string(),
@@ -509,8 +501,8 @@ pub async fn start_daemon(
                             daemon_type, child_pid, current_port, max_port_check_attempts, last_error
                         );
                         return Err(DaemonError::GeneralError(format!(
-                            "{} daemon (PID {}) failed to bind to port {} after {} attempts",
-                            daemon_type, child_pid, current_port, max_port_check_attempts
+                            "No valid PID found for port {} after {} attempts",
+                            current_port, max_port_check_attempts
                         )));
                     }
                 }
@@ -521,12 +513,17 @@ pub async fn start_daemon(
                         daemon_type, current_port, max_port_check_attempts
                     );
                     return Err(DaemonError::GeneralError(format!(
-                        "Failed to find PID for daemon on port {} after it started.",
-                        current_port
+                        "No valid PID found for port {} after {} attempts",
+                        current_port, max_port_check_attempts
                     )));
                 }
 
-                fs::write(&pid_file_path, confirmed_pid.to_string())?;
+                // Write PID file in parent as a fallback
+                if let Err(e) = fs::write(&pid_file_path, confirmed_pid.to_string()) {
+                    error!("Parent failed to write PID file {}: {}", pid_file_path, e);
+                } else {
+                    info!("Parent wrote PID file {} with PID {}", pid_file_path, confirmed_pid);
+                }
 
                 let metadata = DaemonMetadata {
                     service_type: daemon_type.to_string(),
@@ -561,7 +558,10 @@ pub async fn start_daemon(
                     "Failed to start {} daemon on port {}: {}",
                     daemon_type, current_port, e
                 );
-                continue;
+                return Err(DaemonError::GeneralError(format!(
+                    "Failed to start {} daemon on port {}: {}",
+                    daemon_type, current_port, e
+                )));
             }
         }
     }
@@ -575,14 +575,14 @@ pub async fn start_daemon(
 pub async fn stop_port_daemon(port: u16, daemon_type: &str) -> Result<(), DaemonError> {
     info!("Attempting to stop {} daemon on port {}...", daemon_type, port);
 
-    let pid_file_path = format!("/tmp/graphdb-{}-{}.pid", daemon_type, port);
-    let legacy_pid_file_path = format!("/tmp/graphdb-daemon-{}.pid", port);
+    let pid_file_path = format!("{}/graphdb-{}-{}.pid", PID_FILE_DIR, daemon_type, port);
+    let legacy_pid_file_path = format!("{}/graphdb-daemon-{}.pid", PID_FILE_DIR, port);
+    let tmp_pid_file_path = format!("/tmp/graphdb-{}-{}.pid", daemon_type, port);
 
-    // Remove both possible PID files
     remove_pid_file(&pid_file_path);
     remove_pid_file(&legacy_pid_file_path);
+    remove_pid_file(&tmp_pid_file_path);
 
-    // Check daemon registry first
     let metadata = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await?;
     if let Some(metadata) = metadata {
         if metadata.service_type == daemon_type {
@@ -591,10 +591,10 @@ pub async fn stop_port_daemon(port: u16, daemon_type: &str) -> Result<(), Daemon
                 if let Err(e) = kill(NixPid::from_raw(metadata.pid as i32), Signal::SIGTERM) {
                     error!("Failed to send SIGTERM to PID {}: {}", metadata.pid, e);
                 } else {
-                    sleep(Duration::from_millis(500)).await;
+                    sleep(Duration::from_millis(1000)).await;
                     let addr = format!("127.0.0.1:{}", port);
                     if let Some(socket_addr) = addr.to_socket_addrs()?.next() {
-                        if std::net::TcpStream::connect_timeout(&socket_addr, std::time::Duration::from_millis(500)).is_err() {
+                        if std::net::TcpStream::connect_timeout(&socket_addr, std::time::Duration::from_millis(1000)).is_err() {
                             info!("Port {} is now free.", port);
                             if let Err(e) = GLOBAL_DAEMON_REGISTRY.unregister_daemon(port).await {
                                 error!("Failed to unregister daemon on port {}: {}", port, e);
@@ -615,17 +615,16 @@ pub async fn stop_port_daemon(port: u16, daemon_type: &str) -> Result<(), Daemon
         }
     }
 
-    // Fallback to lsof
     let pid = find_pid_by_port(port).await;
     if let Some(pid) = pid {
         info!("Found PID {} for port {} via lsof. Attempting to kill...", pid, port);
         if let Err(e) = kill(NixPid::from_raw(pid as i32), Signal::SIGTERM) {
             error!("Failed to send SIGTERM to PID {}: {}. It might already be gone.", pid, e);
         } else {
-            sleep(Duration::from_millis(500)).await;
+            sleep(Duration::from_millis(1000)).await;
             let addr = format!("127.0.0.1:{}", port);
             if let Some(socket_addr) = addr.to_socket_addrs()?.next() {
-                if std::net::TcpStream::connect_timeout(&socket_addr, std::time::Duration::from_millis(500)).is_err() {
+                if std::net::TcpStream::connect_timeout(&socket_addr, std::time::Duration::from_millis(1000)).is_err() {
                     info!("Port {} is now free.", port);
                     if let Err(e) = GLOBAL_DAEMON_REGISTRY.unregister_daemon(port).await {
                         error!("Failed to unregister daemon on port {}: {}", port, e);
@@ -640,51 +639,58 @@ pub async fn stop_port_daemon(port: u16, daemon_type: &str) -> Result<(), Daemon
         }
     }
 
-    // Fallback to pgrep
     let pgrep_arg = format!("graphdb-{} --internal-port {}", daemon_type, port);
-    let pgrep_result = std::process::Command::new("pgrep")
+
+    let pgrep_result = Command::new("pgrep")
         .arg("-f")
         .arg(&pgrep_arg)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .and_then(|child| child.wait_with_output());
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
 
     match pgrep_result {
-        Ok(output) => {
-            let pids_str = String::from_utf8_lossy(&output.stdout);
-            let pids: Vec<u32> = pids_str.lines()
-                .filter_map(|line| line.trim().parse::<u32>().ok())
-                .collect();
+        Ok(mut child) => {
+            match child.wait_with_output().await {
+                Ok(output) => {
+                    let pids_str = String::from_utf8_lossy(&output.stdout);
+                    let pids: Vec<u32> = pids_str
+                        .lines()
+                        .filter_map(|line| line.trim().parse::<u32>().ok())
+                        .collect();
 
-            if pids.is_empty() {
-                info!("No {} daemon found running with command line matching '{}'.", daemon_type, pgrep_arg);
-                if let Err(e) = GLOBAL_DAEMON_REGISTRY.unregister_daemon(port).await {
-                    error!("Failed to unregister daemon on port {}: {}", port, e);
-                }
-                return Ok(());
-            }
+                    if pids.is_empty() {
+                        info!("No {} daemon found running with command line matching '{}'.", daemon_type, pgrep_arg);
+                        if let Err(e) = GLOBAL_DAEMON_REGISTRY.unregister_daemon(port).await {
+                            error!("Failed to unregister daemon on port {}: {}", port, e);
+                        }
+                        return Ok(());
+                    }
 
-            for pid in pids {
-                info!("Found PID {} matching '{}'. Attempting to kill...", pid, pgrep_arg);
-                if let Err(e) = kill(NixPid::from_raw(pid as i32), Signal::SIGTERM) {
-                    error!("Failed to send SIGTERM to PID {}: {}. It might already be gone.", pid, e);
-                } else {
-                    sleep(Duration::from_millis(500)).await;
-                    let addr = format!("127.0.0.1:{}", port);
-                    if let Some(socket_addr) = addr.to_socket_addrs()?.next() {
-                        if std::net::TcpStream::connect_timeout(&socket_addr, std::time::Duration::from_millis(500)).is_err() {
-                            info!("Port {} is now free.", port);
-                            if let Err(e) = GLOBAL_DAEMON_REGISTRY.unregister_daemon(port).await {
-                                error!("Failed to unregister daemon on port {}: {}", port, e);
-                            }
-                            return Ok(());
+                    for pid in pids {
+                        info!("Found PID {} matching '{}'. Attempting to kill...", pid, pgrep_arg);
+                        if let Err(e) = kill(NixPid::from_raw(pid as i32), Signal::SIGTERM) {
+                            error!("Failed to send SIGTERM to PID {}: {}. It might already be gone.", pid, e);
                         } else {
-                            return Err(DaemonError::ProcessError(format!(
-                                "Process with PID {} stopped, but port {} is still in use.", pid, port
-                            )));
+                            sleep(Duration::from_millis(1000)).await;
+                            let addr = format!("127.0.0.1:{}", port);
+                            if let Some(socket_addr) = addr.to_socket_addrs()?.next() {
+                                if std::net::TcpStream::connect_timeout(&socket_addr, std::time::Duration::from_millis(1000)).is_err() {
+                                    info!("Port {} is now free.", port);
+                                    if let Err(e) = GLOBAL_DAEMON_REGISTRY.unregister_daemon(port).await {
+                                        error!("Failed to unregister daemon on port {}: {}", port, e);
+                                    }
+                                    return Ok(());
+                                } else {
+                                    return Err(DaemonError::ProcessError(format!(
+                                        "Process with PID {} stopped, but port {} is still in use.", pid, port
+                                    )));
+                                }
+                            }
                         }
                     }
+                }
+                Err(e) => {
+                    error!("Failed to wait for `pgrep` command output for port {}: {}.", port, e);
                 }
             }
         }
@@ -785,8 +791,10 @@ pub async fn stop_daemon() -> Result<(), DaemonError> {
     }
     
     for &port in &known_ports {
-        let legacy_pid_file = format!("/tmp/graphdb-daemon-{}.pid", port);
+        let legacy_pid_file = format!("/opt/graphdb/pids/graphdb-daemon-{}.pid", port);
+        let tmp_pid_file = format!("/tmp/graphdb-storage-{}.pid", port);
         remove_pid_file(&legacy_pid_file);
+        remove_pid_file(&tmp_pid_file);
     }
     
     if let Err(e) = GLOBAL_DAEMON_REGISTRY.clear_all_daemons().await {
@@ -866,4 +874,26 @@ pub async fn find_running_storage_daemon_port() -> Option<u16> {
 
 pub async fn stop_daemon_api_call() -> Result<(), anyhow::Error> {
     stop_daemon().await.map_err(|e| anyhow::anyhow!("Daemon stop failed: {}", e))
+}
+
+pub fn ensure_pid_directory() -> Result<(), DaemonError> {
+    let pid_dir = Path::new(PID_FILE_DIR);
+    if !pid_dir.exists() {
+        create_dir_all(pid_dir).map_err(|e| {
+            error!("Failed to create PID directory {}: {}", PID_FILE_DIR, e);
+            DaemonError::Io(e)
+        })?;
+        info!("Created PID directory {}", PID_FILE_DIR);
+    }
+    Ok(())
+}
+
+pub fn remove_pid_file(pid_file_path: &str) {
+    if Path::new(pid_file_path).exists() {
+        if let Err(e) = fs::remove_file(pid_file_path) {
+            warn!("Failed to remove stale PID file {}: {}", pid_file_path, e);
+        } else {
+            info!("Removed stale PID file {}", pid_file_path);
+        }
+    }
 }

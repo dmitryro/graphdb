@@ -16,7 +16,7 @@ use fs2::FileExt;
 use chrono::Utc;
 use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::time::{self, timeout, Duration as TokioDuration};
+use tokio::time::{self, sleep, timeout, Duration as TokioDuration};
 use log::{info, debug, warn, error, trace};
 use futures::stream::StreamExt;
 use serde_json::{Value, Map};
@@ -24,7 +24,7 @@ use serde_yaml2 as serde_yaml;
 use rocksdb::{DB, Options};
 use reqwest::Client;
 use nix::sys::signal::{kill, Signal};
-use sysinfo::{System, Process, Pid as NixPid};
+use sysinfo::{System, Process, Pid as NixPid, ProcessesToUpdate, RefreshKind, ProcessRefreshKind};
 use nix::unistd::Pid;
 use std::time::Instant;
 use lib::commands::{CommandType, Commands, StartAction, StorageAction, UseAction};
@@ -890,83 +890,227 @@ pub async fn start_storage_interactive(
     Ok(())
 }
 
+
+#[allow(clippy::too_many_arguments)]
 pub async fn stop_storage_interactive(
     port: Option<u16>,
     shutdown_tx: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
     daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
     daemon_port: Arc<TokioMutex<Option<u16>>>,
-) -> Result<()> {
+) -> Result<(), anyhow::Error> {
     let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
 
-    let port = match port {
-        Some(p) => p,
+    // If no port is specified, stop all storage daemons
+    let target_ports = match port {
+        Some(p) => vec![p],
         None => {
-            return Err(anyhow::anyhow!("No port specified for stopping storage daemon"));
+            let daemons = daemon_registry
+                .get_all_daemon_metadata()
+                .await
+                .context("Failed to access daemon registry")?;
+            daemons
+                .into_iter()
+                .filter(|d| d.service_type == "storage")
+                .map(|d| d.port)
+                .collect::<Vec<u16>>()
         }
     };
 
-    // Find the daemon for the specified port
-    let daemon = daemon_registry
-        .get_all_daemon_metadata()
-        .await
-        .context("Failed to access daemon registry")?
-        .into_iter()
-        .find(|d| d.service_type == "storage" && d.port == port);
+    if target_ports.is_empty() && port.is_none() {
+        info!("No storage daemons found in registry to stop.");
+        println!("===> NO STORAGE DAEMONS FOUND IN REGISTRY TO STOP");
+        return Ok(());
+    }
 
-    match daemon {
-        Some(d) if d.pid != 0 && check_pid_validity(d.pid).await => {
-            info!("Attempting to stop Storage Daemon on port {} (PID {})...", port, d.pid);
-            // Send SIGTERM to the daemon's PID
-            kill(Pid::from_raw(d.pid as i32), Signal::SIGTERM)
-                .context(format!("Failed to send SIGTERM to PID {} for port {}", d.pid, port))?;
-            info!("Sent SIGTERM to PID {} for Storage Daemon on port {}.", d.pid, port);
+    let mut failed_ports = Vec::new();
 
-            // Wait briefly to ensure the process exits
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            if is_port_free(port).await {
-                info!("Port {} is now free.", port);
-            } else {
-                warn!("Port {} is still in use after SIGTERM.", port);
+    for port in target_ports {
+        // Find the daemon for the specified port
+        let daemon = daemon_registry
+            .get_all_daemon_metadata()
+            .await
+            .context("Failed to access daemon registry")?
+            .into_iter()
+            .find(|d| d.service_type == "storage" && d.port == port);
+
+        // Get the database path and socket path for cleanup
+        let db_path = PathBuf::from(DEFAULT_DATA_DIRECTORY)
+            .join("rocksdb")
+            .join(port.to_string());
+        let lock_path = db_path.join("LOCK");
+        let socket_path = format!("/tmp/graphdb-{}.ipc", port);
+
+        match daemon {
+            Some(d) if d.pid != 0 => {
+                // Validate PID before attempting to terminate
+                if check_pid_validity(d.pid).await {
+                    info!("Attempting to stop Storage Daemon on port {} (PID {})...", port, d.pid);
+                    println!("===> ATTEMPTING TO STOP STORAGE DAEMON ON PORT {} (PID {})", port, d.pid);
+
+                    // Try SIGTERM first with a longer timeout for graceful shutdown
+                    if let Err(e) = kill(Pid::from_raw(d.pid as i32), Signal::SIGTERM) {
+                        warn!("Failed to send SIGTERM to PID {} for port {}: {}", d.pid, port, e);
+                        println!("===> WARNING: FAILED TO SEND SIGTERM TO PID {} FOR PORT {}", d.pid, port);
+                    } else {
+                        info!("Sent SIGTERM to PID {} for Storage Daemon on port {}.", d.pid, port);
+                        println!("===> SENT SIGTERM TO PID {} FOR STORAGE DAEMON ON PORT {}", d.pid, port);
+                    }
+
+                    // Wait for process to exit (up to 5 seconds with retries)
+                    let max_attempts = 10;
+                    let mut attempts = 0;
+                    while check_pid_validity(d.pid).await && attempts < max_attempts {
+                        sleep(TokioDuration::from_millis(500)).await;
+                        attempts += 1;
+                    }
+
+                    // If process is still running, escalate to SIGKILL
+                    if check_pid_validity(d.pid).await {
+                        warn!("Process (PID {}) on port {} did not exit after SIGTERM. Sending SIGKILL...", d.pid, port);
+                        println!("===> WARNING: PROCESS (PID {}) ON PORT {} DID NOT EXIT AFTER SIGTERM. SENDING SIGKILL...", d.pid, port);
+                        if let Err(e) = kill(Pid::from_raw(d.pid as i32), Signal::SIGKILL) {
+                            warn!("Failed to send SIGKILL to PID {} for port {}: {}", d.pid, port, e);
+                            println!("===> WARNING: FAILED TO SEND SIGKILL TO PID {} FOR PORT {}", d.pid, port);
+                        } else {
+                            info!("Sent SIGKILL to PID {} for Storage Daemon on port {}.", d.pid, port);
+                            println!("===> SENT SIGKILL TO PID {} FOR STORAGE DAEMON ON PORT {}", d.pid, port);
+                            // Wait briefly after SIGKILL
+                            sleep(TokioDuration::from_millis(1000)).await;
+                        }
+                    } else {
+                        info!("Process (PID {}) exited gracefully after SIGTERM.", d.pid);
+                        println!("===> PROCESS (PID {}) EXITED GRACEFULLY AFTER SIGTERM.", d.pid);
+                    }
+                } else {
+                    warn!("Stale PID {} found for Storage Daemon on port {}. Cleaning up...", d.pid, port);
+                    println!("===> STALE PID {} FOUND FOR STORAGE DAEMON ON PORT {}. CLEANING UP...", d.pid, port);
+                }
+            }
+            Some(_) => {
+                warn!("No valid PID found for Storage Daemon on port {}. Cleaning up registry and lock file...", port);
+                println!("===> NO VALID PID FOUND FOR STORAGE DAEMON ON PORT {}. CLEANING UP REGISTRY AND LOCK FILE...", port);
+            }
+            None => {
+                info!("No Storage Daemon found on port {} in registry. Checking for stray processes...", port);
+                println!("===> NO STORAGE DAEMON FOUND ON PORT {} IN REGISTRY. CHECKING FOR STRAY PROCESSES...", port);
+            }
+        }
+
+        // Clean up lock file
+        if lock_path.exists() {
+            RocksDBStorage::force_unlock(&db_path).await
+                .context(format!("Failed to clean up lock file at {:?}", lock_path))?;
+            info!("Successfully cleaned up lock file at {:?}", lock_path);
+            println!("===> SUCCESSFULLY CLEANED UP LOCK FILE AT {:?}", lock_path);
+        }
+
+        // Clean up ZMQ socket file
+        if std::path::Path::new(&socket_path).exists() {
+            std::fs::remove_file(&socket_path)
+                .context(format!("Failed to remove ZMQ socket file at {}", socket_path))?;
+            info!("Successfully removed ZMQ socket file at {}", socket_path);
+            println!("===> SUCCESSFULLY REMOVED ZMQ SOCKET FILE AT {}", socket_path);
+        }
+
+        // Remove from registry
+        daemon_registry
+            .unregister_daemon(port)
+            .await
+            .context(format!("Failed to remove daemon on port {} from registry", port))?;
+        info!("Storage daemon on port {} removed from registry.", port);
+        println!("===> STORAGE DAEMON ON PORT {} REMOVED FROM REGISTRY", port);
+
+        // Robust port check with extended retries
+        let max_attempts_port_check = 10; // Total 10 seconds wait
+        let mut attempts_port_check = 0;
+        while !is_port_free(port).await && attempts_port_check < max_attempts_port_check {
+            warn!(
+                "Port {} still in use after cleanup. Waiting 1000ms before re-check (Attempt {}).",
+                port, attempts_port_check + 1
+            );
+            println!(
+                "===> WARNING: PORT {} IS STILL IN USE AFTER CLEANUP. WAITING 1000MS BEFORE RE-CHECK (ATTEMPT {}).",
+                port, attempts_port_check + 1
+            );
+
+            // Check for stray processes and terminate them
+            let system = System::new_with_specifics(RefreshKind::everything().with_processes(ProcessRefreshKind::everything()));
+            if let Some(new_pid) = find_pid_by_port(port).await {
+                warn!("Stray process (PID {}) found on port {}. Sending SIGKILL...", new_pid, port);
+                println!("===> STRAY PROCESS (PID {}) FOUND ON PORT {}. SENDING SIGKILL...", new_pid, port);
+                if let Err(e) = kill(Pid::from_raw(new_pid as i32), Signal::SIGKILL) {
+                    warn!("Failed to send SIGKILL to stray PID {} for port {}: {}", new_pid, port, e);
+                    println!("===> WARNING: FAILED TO SEND SIGKILL TO STRAY PID {} FOR PORT {}", new_pid, port);
+                } else {
+                    info!("Sent SIGKILL to stray PID {} for port {}.", new_pid, port);
+                    println!("===> SENT SIGKILL TO STRAY PID {} FOR PORT {}", new_pid, port);
+                }
+                sleep(TokioDuration::from_millis(1000)).await;
             }
 
-            // Remove the daemon from the registry
-            daemon_registry
-                .unregister_daemon(port)
-                .await
-                .context(format!("Failed to remove daemon on port {} from registry", port))?;
-            info!("Storage daemon on port {} removed from registry.", port);
+            sleep(TokioDuration::from_millis(1000)).await;
+            attempts_port_check += 1;
         }
-        Some(_) => {
-            info!("No valid PID found for Storage Daemon on port {}. Removing from registry.", port);
-            daemon_registry
-                .unregister_daemon(port)
-                .await
-                .context(format!("Failed to remove daemon on port {} from registry", port))?;
-        }
-        None => {
-            info!("No Storage Daemon found on port {} in registry.", port);
+
+        // Final port check
+        if is_port_free(port).await {
+            info!("Port {} is now free.", port);
+            println!("===> PORT {} IS NOW FREE", port);
+        } else {
+            // Get the new PID and process name for detailed error reporting
+            let system = System::new_with_specifics(RefreshKind::everything().with_processes(ProcessRefreshKind::everything()));
+            let error_msg = if let Some(new_pid) = find_pid_by_port(port).await {
+                let process_name = system
+                    .process(NixPid::from_u32(new_pid))
+                    .map(|p| p.name().to_string_lossy().to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                format!("Port {} still in use by PID {} ({}) after cleanup", port, new_pid, process_name)
+            } else {
+                format!("Port {} still in use after cleanup, but no PID found", port)
+            };
+            warn!("{}", error_msg);
+            println!("===> WARNING: {}", error_msg);
+            failed_ports.push(error_msg);
         }
     }
 
-    // Clear shutdown_tx and daemon_handle for the specified port
+    // Clear shutdown_tx and daemon_handle
     let mut shutdown_tx_guard = shutdown_tx.lock().await;
     if shutdown_tx_guard.is_some() {
         if let Some(tx) = shutdown_tx_guard.take() {
             let _ = tx.send(());
+            info!("Sent shutdown signal for storage daemon(s).");
+            println!("===> SENT SHUTDOWN SIGNAL FOR STORAGE DAEMON(S)");
         }
     }
 
     let mut daemon_handle_guard = daemon_handle.lock().await;
     if let Some(handle) = daemon_handle_guard.take() {
         let _ = handle.await;
+        info!("Daemon handle cleared.");
+        println!("===> DAEMON HANDLE CLEARED");
     }
 
     let mut daemon_port_guard = daemon_port.lock().await;
     *daemon_port_guard = None;
+    info!("Daemon port cleared.");
+    println!("===> DAEMON PORT CLEARED");
 
-    info!("Storage daemon on port {} stopped.", port);
-    println!("Storage daemon on port {} stopped.", port);
-    Ok(())
+    if failed_ports.is_empty() {
+        info!(
+            "Storage daemon(s) stopped successfully for port(s): {:?}",
+            port.unwrap_or(0)
+        );
+        println!(
+            "===> STORAGE DAEMON(S) STOPPED SUCCESSFULLY FOR PORT(S): {:?}",
+            port.unwrap_or(0)
+        );
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "Failed to stop one or more storage daemons: {:?}", failed_ports
+        ))
+    }
 }
 
 /// Displays status of storage daemons only.

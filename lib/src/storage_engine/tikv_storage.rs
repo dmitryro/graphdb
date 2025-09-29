@@ -11,7 +11,7 @@ use uuid::Uuid;
 use models::{Edge, Identifier, Vertex};
 use models::errors::{GraphError, GraphResult};
 use models::identifiers::SerializableUuid;
-use crate::config::{TikvConfig, StorageEngineType, QueryResult, QueryPlan,};
+pub use crate::config::{TikvStorage, TikvConfig, StorageEngineType, QueryResult, QueryPlan,};
 use crate::storage_engine::storage_utils::{
     serialize_vertex, deserialize_vertex, serialize_edge, deserialize_edge,
 };
@@ -77,12 +77,6 @@ pub fn create_prefix_range(prefix: &[u8]) -> (Key, Option<Key>) {
     }
     
     (start, Some(Key::from(end)))
-}
-
-pub struct TikvStorage {
-    client: Arc<TransactionClient>,
-    config: TikvConfig,
-    running: TokioMutex<bool>,
 }
 
 impl std::fmt::Debug for TikvStorage {

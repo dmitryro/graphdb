@@ -63,48 +63,60 @@ impl SledStorage {
 
     pub async fn check_and_cleanup_stale_daemon(port: u16, db_path: &PathBuf) -> GraphResult<()> {
         info!("Checking for stale SledDaemon on port {} with db_path {:?}", port, db_path);
+        println!("===> CHECKING FOR STALE SLED DAEMON ON PORT {} WITH DB_PATH {:?}", port, db_path);
+
         let socket_path = format!("/opt/graphdb/graphdb-{}.ipc", port);
         let lock_path = db_path.join("db.lck");
 
-        // Check if socket file exists
+        // Check and clean up IPC socket
         if tokio::fs::metadata(&socket_path).await.is_ok() {
             info!("Found IPC socket file at {}", socket_path);
-            // Attempt to ping the daemon
+            println!("===> FOUND IPC SOCKET FILE AT {}", socket_path);
+
+            // Attempt to ping the daemon to verify if it's responsive
             match SledClient::ping_daemon(port, &socket_path).await {
                 Ok(_) => {
-                    info!("SledDaemon on port {} is responsive", port);
-                    return Ok(());
+                    info!("SledDaemon on port {} is responsive, attempting graceful shutdown", port);
+                    println!("===> SLED DAEMON ON PORT {} IS RESPONSIVE, ATTEMPTING GRACEFUL SHUTDOWN", port);
+
+                    // Find and stop the process
+                    if let Some(pid) = find_pid_by_port(port).await {
+                        if check_pid_validity(pid).await {
+                            if let Err(e) = stop_process_by_pid("Storage Daemon", pid).await {
+                                warn!("Failed to stop process {} for port {}: {}", pid, port, e);
+                                println!("===> ERROR: FAILED TO STOP PROCESS {} FOR PORT {}", pid, port);
+                            } else {
+                                info!("Successfully stopped process {} for port {}", pid, port);
+                                println!("===> SUCCESSFULLY STOPPED PROCESS {} FOR PORT {}", pid, port);
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     warn!("SledDaemon on port {} is unresponsive: {}. Cleaning up.", port, e);
-                    // Remove stale socket and lock files
-                    if let Err(e) = tokio::fs::remove_file(&socket_path).await {
-                        if e.kind() != std::io::ErrorKind::NotFound {
-                            error!("Failed to remove stale IPC socket {}: {}", socket_path, e);
-                            return Err(GraphError::StorageError(format!("Failed to remove stale IPC socket {}: {}", socket_path, e)));
-                        }
-                    }
-                    if let Err(e) = tokio::fs::remove_file(&lock_path).await {
-                        if e.kind() != std::io::ErrorKind::NotFound {
-                            error!("Failed to remove stale lock file {}: {}", lock_path.display(), e);
-                            return Err(GraphError::StorageError(format!("Failed to remove stale lock file {}: {}", lock_path.display(), e)));
-                        }
-                    }
-                    info!("Cleaned up stale socket and lock files for port {}", port);
+                    println!("===> SLED DAEMON ON PORT {} IS UNRESPONSIVE, CLEANING UP", port);
                 }
             }
+
+            // Remove stale socket file
+            if let Err(e) = tokio::fs::remove_file(&socket_path).await {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    error!("Failed to remove stale IPC socket {}: {}", socket_path, e);
+                    println!("===> ERROR: FAILED TO REMOVE STALE IPC SOCKET {}: {}", socket_path, e);
+                    return Err(GraphError::StorageError(format!("Failed to remove stale IPC socket {}: {}", socket_path, e)));
+                }
+            }
+            info!("Cleaned up IPC socket for port {}", port);
+            println!("===> CLEANED UP IPC SOCKET FOR PORT {}", port);
         } else {
-            info!("No IPC socket found for port {}. Checking lock file.", port);
-            if tokio::fs::metadata(&lock_path).await.is_ok() {
-                info!("Found stale lock file at {}. Removing.", lock_path.display());
-                if let Err(e) = tokio::fs::remove_file(&lock_path).await {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        error!("Failed to remove stale lock file {}: {}", lock_path.display(), e);
-                        return Err(GraphError::StorageError(format!("Failed to remove stale lock file {}: {}", lock_path.display(), e)));
-                    }
-                }
-                info!("Removed stale lock file for port {}", port);
-            }
+            info!("No IPC socket found for port {}", port);
+            println!("===> NO IPC SOCKET FOUND FOR PORT {}", port);
+        }
+
+        // Check for stale lock file (only log, don’t remove since we assume it’s not locked)
+        if tokio::fs::metadata(&lock_path).await.is_ok() {
+            warn!("Found lock file at {}. Logging for diagnostics but not removing.", lock_path.display());
+            println!("===> FOUND LOCK FILE AT {}. LOGGING BUT NOT REMOVING", lock_path.display());
         }
 
         // Check for running processes using sysinfo
@@ -114,21 +126,46 @@ impl SledStorage {
         for (pid, process) in system.processes() {
             if process.cmd().iter().any(|arg| arg.to_string_lossy().contains(&format!("graphdb-{}", port))) {
                 warn!("Found process {} running for port {}. Attempting to terminate.", pid, port);
+                println!("===> FOUND PROCESS {} RUNNING FOR PORT {}. TERMINATING", pid, port);
                 if process.kill() {
                     info!("Successfully terminated process {} for port {}", pid, port);
+                    println!("===> SUCCESSFULLY TERMINATED PROCESS {} FOR PORT {}", pid, port);
+                    found_process = true;
                 } else {
                     error!("Failed to terminate process {} for port {}", pid, port);
+                    println!("===> ERROR: FAILED TO TERMINATE PROCESS {} FOR PORT {}", pid, port);
                     return Err(GraphError::StorageError(format!("Failed to terminate process {} for port {}", pid, port)));
                 }
-                found_process = true;
             }
         }
 
-        if !found_process {
+        if found_process {
+            // Wait briefly to ensure process termination completes
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        } else {
             info!("No running processes found for port {}", port);
+            println!("===> NO RUNNING PROCESSES FOUND FOR PORT {}", port);
+        }
+
+        // Clean up any temporary Sled files (e.g., snapshots or logs)
+        let temp_files = ["snap", "log"];
+        for file in temp_files.iter() {
+            let temp_path = db_path.join(file);
+            if tokio::fs::metadata(&temp_path).await.is_ok() {
+                if let Err(e) = tokio::fs::remove_file(&temp_path).await {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        warn!("Failed to remove temporary file {}: {}", temp_path.display(), e);
+                        println!("===> WARNING: FAILED TO REMOVE TEMPORARY FILE {}: {}", temp_path.display(), e);
+                    }
+                } else {
+                    info!("Removed temporary file {}", temp_path.display());
+                    println!("===> REMOVED TEMPORARY FILE {}", temp_path.display());
+                }
+            }
         }
 
         info!("Stale daemon check and cleanup complete for port {}", port);
+        println!("===> STALE DAEMON CHECK AND CLEANUP COMPLETE FOR PORT {}", port);
         Ok(())
     }
 
@@ -166,8 +203,36 @@ impl SledStorage {
             println!("===> ERROR: DIRECTORY AT {:?} IS NOT WRITABLE", db_path);
             return Err(GraphError::StorageError(format!("Directory at {:?} is not writable", db_path)));
         }
-        info!("Directory at {:?} is writable", db_path);
+        info!("Directory at {:?}", db_path);
         println!("===> Directory at {:?} is writable", db_path);
+
+        // Check if compression is requested but not supported
+        #[cfg(not(feature = "compression"))]
+        if config.use_compression {
+            error!("Compression is enabled in config but Sled was compiled without compression feature");
+            println!("===> ERROR: COMPRESSION ENABLED BUT SLED COMPILED WITHOUT COMPRESSION FEATURE");
+            return Err(GraphError::StorageError(
+                "Sled compression feature is not enabled in this build. Please disable use_compression in config or recompile with compression feature.".to_string()
+            ));
+        }
+
+        // Clean up stale directories for other engines (RocksDB, TiKV)
+        for engine in &["rocksdb", "tikv"] {
+            let other_engine_path = base_data_dir.join(engine).join(port.to_string());
+            if tokio::fs::metadata(&other_engine_path).await.is_ok() {
+                warn!("Found stale {} directory at {:?}", engine, other_engine_path);
+                println!("===> WARNING: FOUND STALE {} DIRECTORY AT {:?}", engine.to_uppercase(), other_engine_path);
+                if let Err(e) = tokio::fs::remove_dir_all(&other_engine_path).await {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        warn!("Failed to remove stale {} directory at {:?}: {}", engine, other_engine_path, e);
+                        println!("===> WARNING: FAILED TO REMOVE STALE {} DIRECTORY AT {:?}", engine.to_uppercase(), other_engine_path);
+                    }
+                } else {
+                    info!("Removed stale {} directory at {:?}", engine, other_engine_path);
+                    println!("===> REMOVED STALE {} DIRECTORY AT {:?}", engine.to_uppercase(), other_engine_path);
+                }
+            }
+        }
 
         // Check for existing SLED_DB instance
         if let Some(sled_db) = SLED_DB.get() {
@@ -235,17 +300,28 @@ impl SledStorage {
                 let sled_db_instance = SLED_DB.get_or_try_init(|| async {
                     info!("Opening new Sled database at {:?}", db_path_clone);
                     println!("===> ATTEMPTING TO OPEN SLED DB AT {:?}", db_path_clone);
-                    Self::force_unlock(&db_path_clone).await?;
-                    let db = sled::Config::new()
+                    // Clean up stale resources
+                    Self::check_and_cleanup_stale_daemon(port, &db_path_clone).await?;
+                    let mut sled_config = sled::Config::new()
                         .path(&db_path_clone)
-                        .use_compression(config.use_compression)
-                        .cache_capacity(config.cache_capacity.unwrap_or(1024 * 1024 * 1024))
+                        .cache_capacity(config.cache_capacity.unwrap_or(1024 * 1024 * 1024));
+                    #[cfg(feature = "compression")]
+                    {
+                        sled_config = sled_config.use_compression(config.use_compression);
+                    }
+                    let db = sled_config
                         .open()
                         .map_err(|e| {
                             error!("Failed to open Sled database at {:?}: {}", db_path_clone, e);
                             println!("===> ERROR: FAILED TO OPEN SLED DB AT {:?}", db_path_clone);
                             GraphError::StorageError(format!("Failed to open Sled database at {:?}: {}", db_path_clone, e))
                         })?;
+                    // Verify database state
+                    let vertices = db.open_tree("vertices").map_err(|e| GraphError::StorageError(e.to_string()))?;
+                    let edges = db.open_tree("edges").map_err(|e| GraphError::StorageError(e.to_string()))?;
+                    let kv_count = db.iter().count();
+                    info!("Opened database at {:?} with {} kv_pairs, {} vertices, {} edges", db_path_clone, kv_count, vertices.iter().count(), edges.iter().count());
+                    println!("===> OPENED DATABASE AT {:?} WITH {} KV_PAIRS, {} VERTICES, {} EDGES", db_path_clone, kv_count, vertices.iter().count(), edges.iter().count());
                     Ok::<TokioMutex<SledDbWithPath>, GraphError>(TokioMutex::new(SledDbWithPath {
                         db: Arc::new(db),
                         path: db_path_clone.clone(),
@@ -262,6 +338,8 @@ impl SledStorage {
                             println!("===> ERROR: FAILED TO ACQUIRE POOL LOCK FOR INITIALIZATION ON PORT {}", port);
                             GraphError::StorageError("Failed to acquire pool lock for initialization".to_string())
                         })?;
+                    info!("Initializing cluster with use_raft_for_scale: {}", storage_config.use_raft_for_scale);
+                    println!("===> INITIALIZING CLUSTER WITH USE_RAFT_FOR_SCALE: {}", storage_config.use_raft_for_scale);
                     let sled_db_guard = sled_db_instance.lock().await;
                     timeout(Duration::from_secs(10), pool_guard.initialize_cluster_with_db(storage_config, config, Some(port), sled_db_guard.db.clone()))
                         .await
@@ -274,7 +352,7 @@ impl SledStorage {
                     println!("===> INITIALIZED CLUSTER ON PORT {} WITH EXISTING DB", port);
                 }
 
-                // Now initialize the client
+                // Initialize the client
                 let (client, socket) = SledClient::new_with_port(port).await
                     .map_err(|e| {
                         error!("Failed to initialize ZMQ client for port {}: {}", port, e);
@@ -356,11 +434,14 @@ impl SledStorage {
         let sled_db_instance = match SLED_DB.get_or_try_init(|| async {
             info!("Opening new Sled database at {:?}", db_path_clone);
             println!("===> ATTEMPTING TO OPEN SLED DB AT {:?}", db_path_clone);
-            Self::force_unlock(&db_path_clone).await?;
-            let db = sled::Config::new()
+            let mut sled_config = sled::Config::new()
                 .path(&db_path_clone)
-                .use_compression(config.use_compression)
-                .cache_capacity(config.cache_capacity.unwrap_or(1024 * 1024 * 1024))
+                .cache_capacity(config.cache_capacity.unwrap_or(1024 * 1024 * 1024));
+            #[cfg(feature = "compression")]
+            {
+                sled_config = sled_config.use_compression(config.use_compression);
+            }
+            let db = sled_config
                 .open()
                 .map_err(|e| {
                     error!("Failed to open Sled database at {:?}: {}", db_path_clone, e);
@@ -409,7 +490,7 @@ impl SledStorage {
             println!("===> INITIALIZED CLUSTER ON PORT {} WITH EXISTING DB", port);
         }
 
-        // Now initialize the client
+        // Initialize the client
         let (client, socket) = SledClient::new_with_port(port).await
             .map_err(|e| {
                 error!("Failed to initialize ZMQ client for port {}: {}", port, e);
@@ -458,6 +539,16 @@ impl SledStorage {
         info!("Using Sled path {:?}", db_path);
         println!("===> USING SLED PATH {:?}", db_path);
 
+        // Check if compression is requested but not supported
+        #[cfg(not(feature = "compression"))]
+        if config.use_compression {
+            error!("Compression is enabled in config but Sled was compiled without compression feature");
+            println!("===> ERROR: COMPRESSION ENABLED BUT SLED COMPILED WITHOUT COMPRESSION FEATURE");
+            return Err(GraphError::StorageError(
+                "Sled compression feature is not enabled in this build. Please disable use_compression in config or recompile with compression feature.".to_string()
+            ));
+        }
+
         // Create directory if it doesn't exist
         fs::create_dir_all(&db_path)
             .await
@@ -480,8 +571,26 @@ impl SledStorage {
             println!("===> ERROR: DIRECTORY AT {:?} IS NOT WRITABLE", db_path);
             return Err(GraphError::StorageError(format!("Directory at {:?} is not writable", db_path)));
         }
-        info!("Directory at {:?} is writable", db_path);
+        info!("Directory at {:?}", db_path);
         println!("===> Directory at {:?} is writable", db_path);
+
+        // Clean up stale directories for other engines (RocksDB, TiKV)
+        for engine in &["rocksdb", "tikv"] {
+            let other_engine_path = base_data_dir.join(engine).join(port.to_string());
+            if tokio::fs::metadata(&other_engine_path).await.is_ok() {
+                warn!("Found stale {} directory at {:?}", engine, other_engine_path);
+                println!("===> WARNING: FOUND STALE {} DIRECTORY AT {:?}", engine.to_uppercase(), other_engine_path);
+                if let Err(e) = tokio::fs::remove_dir_all(&other_engine_path).await {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        warn!("Failed to remove stale {} directory at {:?}: {}", engine, other_engine_path, e);
+                        println!("===> WARNING: FAILED TO REMOVE STALE {} DIRECTORY AT {:?}", engine.to_uppercase(), other_engine_path);
+                    }
+                } else {
+                    info!("Removed stale {} directory at {:?}", engine, other_engine_path);
+                    println!("===> REMOVED STALE {} DIRECTORY AT {:?}", engine.to_uppercase(), other_engine_path);
+                }
+            }
+        }
 
         // Check for existing SLED_DB instance
         if let Some(sled_db) = SLED_DB.get() {
@@ -549,7 +658,8 @@ impl SledStorage {
                 let sled_db_instance = SLED_DB.get_or_try_init(|| async {
                     info!("Storing provided Sled database in singleton at {:?}", db_path_clone);
                     println!("===> STORING PROVIDED SLED DB IN SINGLETON AT {:?}", db_path_clone);
-                    Self::force_unlock(&db_path_clone).await?;
+                    // Clean up stale resources
+                    Self::check_and_cleanup_stale_daemon(port, &db_path_clone).await?;
                     // Verify database state
                     let vertices = existing_db.open_tree("vertices").map_err(|e| GraphError::StorageError(e.to_string()))?;
                     let edges = existing_db.open_tree("edges").map_err(|e| GraphError::StorageError(e.to_string()))?;
@@ -586,7 +696,7 @@ impl SledStorage {
                     println!("===> INITIALIZED CLUSTER ON PORT {} WITH EXISTING DB", port);
                 }
 
-                // Initialize the client using new_with_port for consistency
+                // Initialize the client
                 let (client, socket) = SledClient::new_with_port(port).await
                     .map_err(|e| {
                         error!("Failed to initialize ZMQ client for port {}: {}", port, e);
@@ -657,7 +767,6 @@ impl SledStorage {
         let sled_db_instance = match SLED_DB.get_or_try_init(|| async {
             info!("Storing provided Sled database in singleton at {:?}", db_path_clone);
             println!("===> STORING PROVIDED SLED DB IN SINGLETON AT {:?}", db_path_clone);
-            Self::force_unlock(&db_path_clone).await?;
             // Verify database state
             let vertices = existing_db.open_tree("vertices").map_err(|e| GraphError::StorageError(e.to_string()))?;
             let edges = existing_db.open_tree("edges").map_err(|e| GraphError::StorageError(e.to_string()))?;
@@ -700,7 +809,7 @@ impl SledStorage {
             println!("===> INITIALIZED CLUSTER ON PORT {} WITH EXISTING DB", port);
         }
 
-        // Initialize the client using new_with_port for consistency
+        // Initialize the client
         let (client, socket) = SledClient::new_with_port(port).await
             .map_err(|e| {
                 error!("Failed to initialize ZMQ client for port {}: {}", port, e);
