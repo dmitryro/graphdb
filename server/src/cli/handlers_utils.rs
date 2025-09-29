@@ -2,24 +2,36 @@ use anyhow::{Result, Context, anyhow}; // Added `anyhow` macro import
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
-use std::path::{PathBuf};
+use tokio::fs as tokio_fs;
+use std::path::{PathBuf, Path};
 use std::io::{self, Write};
 use std::collections::HashMap;
 use std::fs;
+use std::process;
 use log::{info, error, warn, debug};
 use tokio::time::{sleep, Duration};
 use serde_json::{self, Value};
+use sysinfo::{System, Pid, ProcessesToUpdate};
+use zmq::{Context as ZmqContext, SocketType};
+
 use lib::commands::{CommandType, ShowAction,  ConfigAction};
 use lib::config::{StorageConfig, SelectedStorageConfig, 
+                         get_default_rest_port_from_config,
                          daemon_api_storage_engine_type_to_string, 
                          load_storage_config_from_yaml, 
-                         DAEMON_REGISTRY_DB_PATH};
+                         load_main_daemon_config,
+                         DEFAULT_CONFIG_ROOT_DIRECTORY_STR,
+                         DAEMON_REGISTRY_DB_PATH,
+                         DEFAULT_STORAGE_CONFIG_PATH_RELATIVE,
+                         CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS,};
 use lib::config::{StorageEngineType};
+use lib::daemon::daemon_management::{ start_graphdb_daemon_core };
 use crossterm::style::{self, Stylize};
 use crossterm::terminal::{Clear, ClearType, size as terminal_size};
 use crossterm::execute;
 use crossterm::cursor::MoveTo;
 use lib::daemon::daemon_registry::{DaemonMetadata};
+
 
 /// Helper to get the path to the current executable.
 pub fn get_current_exe_path() -> Result<PathBuf> {
@@ -380,3 +392,100 @@ pub async fn load_tikv_pd_port() -> Option<u16> {
     }
 }
 
+pub async fn handle_internal_daemon_run(
+    is_rest_api_run: bool,
+    is_storage_daemon_run: bool,
+    internal_port: Option<u16>,
+    internal_storage_config_path: Option<PathBuf>,
+    internal_storage_engine: Option<StorageEngineType>, // Fixed parameter syntax
+) -> Result<(), anyhow::Error> {
+    if is_rest_api_run {
+        let daemon_listen_port = internal_port.unwrap_or_else(get_default_rest_port_from_config);
+        let (tx_shutdown, rx_shutdown) = tokio::sync::oneshot::channel::<()>();
+        let rest_api_shutdown_tx_opt = Arc::new(TokioMutex::new(Some(tx_shutdown)));
+        let rest_api_port_arc = Arc::new(TokioMutex::new(None));
+        let rest_api_handle = Arc::new(TokioMutex::new(None));
+        info!("[DAEMON PROCESS] Starting REST API server (daemonized) on port {}...", daemon_listen_port);
+        let result = crate::cli::handlers::start_rest_api_interactive(
+            Some(daemon_listen_port),
+            None,
+            rest_api_shutdown_tx_opt.clone(),
+            rest_api_port_arc.clone(),
+            rest_api_handle.clone(),
+        ).await;
+        if let Err(e) = result {
+            error!("[DAEMON PROCESS] REST API server failed: {:?}", e);
+            return Err(e);
+        }
+        info!("[DAEMON PROCESS] REST API server (daemonized) stopped.");
+        Ok(())
+    } else if is_storage_daemon_run {
+        let daemon_listen_port = internal_port.unwrap_or_else(|| {
+            // Fixed: added .await and proper error handling
+            match tokio::runtime::Handle::try_current() {
+                Ok(_) => {
+                    // We're in an async context, but can't await here in a closure
+                    // Use a default value instead
+                    CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS
+                }
+                Err(_) => CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS
+            }
+        });
+        let storage_config_path = internal_storage_config_path.unwrap_or_else(|| {
+            PathBuf::from(DEFAULT_CONFIG_ROOT_DIRECTORY_STR)
+                .join(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE)
+        });
+        let storage_daemon_shutdown_tx_opt = Arc::new(TokioMutex::new(None));
+        let storage_daemon_port_arc = Arc::new(TokioMutex::new(None));
+        let storage_daemon_handle = Arc::new(TokioMutex::new(None));
+        info!("[DAEMON PROCESS] Starting Storage daemon (daemonized) on port {}...", daemon_listen_port);
+        let result = crate::cli::handlers::start_storage_interactive(
+            Some(daemon_listen_port),
+            Some(storage_config_path),
+            None,
+            None,
+            storage_daemon_shutdown_tx_opt,
+            storage_daemon_handle,
+            storage_daemon_port_arc,
+        ).await;
+        if let Err(e) = result {
+            error!("[DAEMON PROCESS] Storage daemon failed: {:?}", e);
+            return Err(e);
+        }
+        info!("[DAEMON PROCESS] Storage daemon (daemonized) stopped.");
+        Ok(())
+    } else {
+        let main_app_config = load_main_daemon_config(None)
+            .unwrap_or_else(|e| {
+                error!("[DAEMON PROCESS] Could not load main app config: {}. Using default daemon port.", e);
+                Default::default()
+            });
+        let daemon_listen_port = internal_port.unwrap_or(main_app_config.default_port);
+        info!("[DAEMON PROCESS] Starting GraphDB Daemon (daemonized) on port {}...", daemon_listen_port);
+        let result = start_graphdb_daemon_core(daemon_listen_port).await;
+        if let Err(e) = result {
+            error!("[DAEMON PROCESS] GraphDB Daemon failed: {:?}", e);
+            return Err(e);
+        }
+        info!("[DAEMON PROCESS] GraphDB Daemon (daemonized) stopped.");
+        Ok(())
+    }
+}
+
+// Helper function to map engine type string to StorageEngineType
+pub fn map_engine_type_str(engine_str: &str) -> StorageEngineType {
+    match engine_str.to_lowercase().as_str() {
+        "hybrid" => StorageEngineType::Hybrid,
+        "sled" => StorageEngineType::Sled,
+        "rocksdb" => StorageEngineType::RocksDB,
+        "tikv" => StorageEngineType::TiKV,
+        "inmemory" => StorageEngineType::InMemory,
+        "redis" => StorageEngineType::Redis,
+        "postgresql" => StorageEngineType::PostgreSQL,
+        "mysql" => StorageEngineType::MySQL,
+        _ => {
+            warn!("Unknown engine type '{}', defaulting to Sled", engine_str);
+            StorageEngineType::Sled
+        }
+    }
+}
