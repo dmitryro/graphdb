@@ -10,7 +10,7 @@ use rmp_serde::encode::Error as RmpEncodeError;
 use rmp_serde::decode::Error as RmpDecodeError;
 use zmq::Error as ZmqError;
 use tokio::task::JoinError;
-
+use std::time::SystemTimeError;
 use crate::{identifiers::Identifier, properties::PropertyMap, PropertyValue};
 
 #[derive(Debug, Serialize, Deserialize, Error)]
@@ -19,6 +19,8 @@ pub enum GraphError {
     Io(String),
     #[error("Storage error: {0}")]
     StorageError(String), // General storage operation error
+    #[error("Timeout error: {0}")]
+    TimeoutError(String),
     #[error("Serialization error: {0}")]
     SerializationError(String), // Error during data serialization
     #[error("Deserialization error: {0}")]
@@ -73,6 +75,13 @@ pub enum GraphError {
     Storage(String),
 }
 
+
+impl From<tokio::time::error::Elapsed> for GraphError {
+    fn from(_: tokio::time::error::Elapsed) -> Self {
+        GraphError::TimeoutError("operation timed out".into())
+    }
+}
+
 // Implement From for rmp_serde::encode::Error
 impl From<RmpEncodeError> for GraphError {
     fn from(err: RmpEncodeError) -> Self {
@@ -105,6 +114,12 @@ impl From<AnyhowError> for GraphError {
 impl From<ZmqError> for GraphError {
     fn from(err: ZmqError) -> Self {
         GraphError::NetworkError(format!("ZeroMQ error: {}", err))
+    }
+}
+
+impl From<SystemTimeError> for GraphError {
+    fn from(err: SystemTimeError) -> Self {
+        GraphError::StorageError(format!("System time error: {}", err))
     }
 }
 

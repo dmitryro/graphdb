@@ -4,14 +4,14 @@ use std::sync::Arc;
 use std::io::{Cursor, Read, Write};
 use sled::{Config, Db, IVec, Tree, Batch};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex as TokioMutex, RwLock};
+use tokio::sync::{oneshot, Mutex as TokioMutex, RwLock};
 use tokio::time::{sleep, Duration, timeout, interval};
 use tokio::task::JoinError;
 use tokio::fs;
 use log::{info, debug, warn, error};
 use crate::config::{SledConfig, SledDaemon, SledDaemonPool, SledStorage, StorageConfig, StorageEngineType, 
                     DAEMON_REGISTRY_DB_PATH, DEFAULT_DATA_DIRECTORY, DEFAULT_STORAGE_PORT, ReplicationStrategy, 
-                    NodeHealth, LoadBalancer, HealthCheckConfig, };
+                    NodeHealth, LoadBalancer, HealthCheckConfig, SledClientMode, SledClient };
 use crate::storage_engine::storage_utils::{create_edge_key, deserialize_edge, deserialize_vertex, serialize_edge, serialize_vertex};
 use models::{Edge, Identifier, Vertex};
 use models::errors::{GraphError, GraphResult};
@@ -26,6 +26,8 @@ use std::fs::Permissions;
 use std::os::unix::fs::PermissionsExt;
 use sysinfo::{System, RefreshKind, ProcessRefreshKind, Pid, ProcessesToUpdate};
 use async_trait::async_trait;
+use base64::engine::general_purpose;
+use base64::Engine;
 
 #[cfg(feature = "with-openraft-sled")]
 use {
@@ -36,28 +38,32 @@ use {
 };
 
 impl SledDaemon {
-
     pub async fn new(config: SledConfig) -> GraphResult<Self> {
         println!("SledDaemon =================> LET US SEE IF THIS WAS EVER CALLED");
         let port = config.port.ok_or_else(|| {
             GraphError::ConfigurationError("No port specified in SledConfig".to_string())
         })?;
-        
+
         // Construct proper path structure
         let db_path = if config.path.ends_with(&port.to_string()) {
             config.path.clone()
         } else {
             config.path.join(port.to_string())
         };
-        
+
         println!("===> Initializing Sled daemon at {:?}", db_path);
-        
+
         // Ensure the database directory exists and is writable
         if !db_path.exists() {
             println!("===> Creating database directory at {:?}", db_path);
             fs::create_dir_all(&db_path).await.map_err(|e| {
                 GraphError::StorageError(format!("Failed to create directory at {:?}: {}", db_path, e))
             })?;
+            fs::set_permissions(&db_path, Permissions::from_mode(0o755))
+                .await
+                .map_err(|e| {
+                    GraphError::StorageError(format!("Failed to set permissions on directory at {:?}: {}", db_path, e))
+                })?;
         } else if !db_path.is_dir() {
             return Err(GraphError::StorageError(format!("Path {:?} is not a directory", db_path)));
         }
@@ -69,7 +75,7 @@ impl SledDaemon {
             return Err(GraphError::StorageError(format!("Directory at {:?} is not writable", db_path)));
         }
 
-        // Open database on a blocking thread
+        // Open database with enhanced configuration
         let db_path_clone = db_path.clone();
         let cache_capacity = config.cache_capacity.unwrap_or(1024 * 1024 * 1024);
         let use_compression = config.use_compression;
@@ -79,9 +85,10 @@ impl SledDaemon {
                 let mut sled_config = sled::Config::new()
                     .path(db_path_clone)
                     .cache_capacity(cache_capacity)
-                    .flush_every_ms(Some(100));
+                    .flush_every_ms(Some(100))
+                    .snapshot_after_ops(1000); // Ensure periodic snapshots
                 if use_compression {
-                    sled_config = sled_config.use_compression(use_compression);
+                    sled_config = sled_config.use_compression(true).compression_factor(10);
                 }
                 sled_config.open()
             })
@@ -113,7 +120,7 @@ impl SledDaemon {
             GraphError::StorageError(format!("Failed to open Sled trees: {}", e))
         })?;
         println!("===> Successfully opened Sled trees");
-        
+
         // Log key count
         let kv_key_count = kv_pairs.len();
         println!("===> Initial kv_pairs key count at {:?}: {}", db_path, kv_key_count);
@@ -125,14 +132,19 @@ impl SledDaemon {
                 fs::create_dir_all(&raft_db_path).await.map_err(|e| {
                     GraphError::StorageError(format!("Failed to create Raft DB directory at {:?}: {}", raft_db_path, e))
                 })?;
+                fs::set_permissions(&raft_db_path, Permissions::from_mode(0o755))
+                    .await
+                    .map_err(|e| {
+                        GraphError::StorageError(format!("Failed to set permissions on Raft directory at {:?}: {}", raft_db_path, e))
+                    })?;
             }
             let raft_storage = SledRaftStorage::new(&raft_db_path).await?;
-            
-            let raft_config = Arc::new(openraft::RaftConfig {
+            let raft_config = Arc::new(RaftConfig {
                 cluster_name: "graphdb-cluster".to_string(),
                 heartbeat_interval: 250,
                 election_timeout_min: 1000,
                 election_timeout_max: 2000,
+                snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(500),
                 ..Default::default()
             });
 
@@ -189,7 +201,7 @@ impl SledDaemon {
                 }
             });
         }
-        
+
         println!("===> Sled daemon initialization complete for port {}", port);
         Ok(daemon)
     }
@@ -198,15 +210,26 @@ impl SledDaemon {
         let port = config.port.ok_or_else(|| {
             GraphError::ConfigurationError("No port specified in SledConfig".to_string())
         })?;
-        
+
         let db_path = if config.path.ends_with(&port.to_string()) {
             config.path.clone()
         } else {
             config.path.join(port.to_string())
         };
-        
+
         println!("===> Initializing Sled daemon with existing DB at {:?}", db_path);
-        
+
+        if !db_path.exists() {
+            fs::create_dir_all(&db_path).await.map_err(|e| {
+                GraphError::StorageError(format!("Failed to create directory at {:?}: {}", db_path, e))
+            })?;
+            fs::set_permissions(&db_path, Permissions::from_mode(0o755))
+                .await
+                .map_err(|e| {
+                    GraphError::StorageError(format!("Failed to set permissions on directory at {:?}: {}", db_path, e))
+                })?;
+        }
+
         let db_clone = Arc::clone(&existing_db);
         let (vertices, edges, kv_pairs) = tokio::task::spawn_blocking(move || {
             Ok::<_, sled::Error>((
@@ -218,7 +241,7 @@ impl SledDaemon {
         .await
         .map_err(|e| GraphError::StorageError(format!("Task panic while opening trees: {:?}", e)))?
         .map_err(|e| GraphError::StorageError(format!("Failed to open trees from existing DB: {}", e)))?;
-        
+
         println!("===> Successfully opened Sled trees from existing DB");
 
         let kv_key_count = kv_pairs.len();
@@ -231,14 +254,19 @@ impl SledDaemon {
                 fs::create_dir_all(&raft_db_path).await.map_err(|e| {
                     GraphError::StorageError(format!("Failed to create Raft DB directory at {:?}: {}", raft_db_path, e))
                 })?;
+                fs::set_permissions(&raft_db_path, Permissions::from_mode(0o755))
+                    .await
+                    .map_err(|e| {
+                        GraphError::StorageError(format!("Failed to set permissions on Raft directory at {:?}: {}", raft_db_path, e))
+                    })?;
             }
             let raft_storage = SledRaftStorage::new(&raft_db_path).await?;
-            
-            let raft_config = Arc::new(openraft::RaftConfig {
+            let raft_config = Arc::new(RaftConfig {
                 cluster_name: "graphdb-cluster".to_string(),
                 heartbeat_interval: 250,
                 election_timeout_min: 1000,
                 election_timeout_max: 2000,
+                snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(500),
                 ..Default::default()
             });
 
@@ -295,7 +323,7 @@ impl SledDaemon {
                 }
             });
         }
-        
+
         println!("===> Sled daemon initialization complete for port {}", port);
         Ok(daemon)
     }
@@ -305,48 +333,40 @@ impl SledDaemon {
         const MAX_MESSAGE_SIZE: i32 = 1024 * 1024;
 
         println!("===> STARTING ZMQ SERVER FOR PORT {}", self.port);
-        
-        let context = zmq::Context::new();
+
+        let context = ZmqContext::new();
         let responder = context.socket(zmq::REP)
             .map_err(|e| {
                 error!("Failed to create ZeroMQ socket for port {}: {}", self.port, e);
-                println!("===> ERROR: FAILED TO CREATE ZEROMQ SOCKET FOR PORT {}: {}", self.port, e);
                 GraphError::StorageError(format!("Failed to create ZeroMQ socket for port {}: {}", self.port, e))
             })?;
 
         responder.set_linger(1000)
             .map_err(|e| GraphError::StorageError(format!("Failed to set socket linger for port {}: {}", self.port, e)))?;
-        
         responder.set_rcvtimeo(SOCKET_TIMEOUT_MS)
             .map_err(|e| GraphError::StorageError(format!("Failed to set receive timeout for port {}: {}", self.port, e)))?;
-        
         responder.set_sndtimeo(SOCKET_TIMEOUT_MS)
             .map_err(|e| GraphError::StorageError(format!("Failed to set send timeout for port {}: {}", self.port, e)))?;
-
         responder.set_maxmsgsize(MAX_MESSAGE_SIZE as i64)
             .map_err(|e| GraphError::StorageError(format!("Failed to set max message size for port {}: {}", self.port, e)))?;
 
-        let socket_path = format!("/opt/graphdb/graphdb-{}.ipc", self.port);
-        let socket_dir = Path::new("/opt/graphdb");
+        let socket_path = format!("/tmp/graphdb-{}.ipc", self.port);
+        let socket_dir = Path::new("/tmp");
 
         if !socket_dir.exists() {
             info!("Creating {} directory for IPC socket", socket_dir.display());
-            println!("===> CREATING {} DIRECTORY FOR IPC SOCKET", socket_dir.display());
-            tokio::fs::create_dir_all(socket_dir)
+            fs::create_dir_all(socket_dir)
                 .await
                 .map_err(|e| {
                     error!("Failed to create {} directory: {}", socket_dir.display(), e);
-                    println!("===> ERROR: FAILED TO CREATE {} DIRECTORY: {}", socket_dir.display(), e);
                     GraphError::StorageError(format!("Failed to create {} directory: {}", socket_dir.display(), e))
                 })?;
-            
             #[cfg(unix)]
             {
-                tokio::fs::set_permissions(socket_dir, std::fs::Permissions::from_mode(0o755))
+                fs::set_permissions(socket_dir, Permissions::from_mode(0o755))
                     .await
                     .map_err(|e| {
                         error!("Failed to set permissions on {} directory: {}", socket_dir.display(), e);
-                        println!("===> ERROR: FAILED TO SET PERMISSIONS ON {} DIRECTORY: {}", socket_dir.display(), e);
                         GraphError::StorageError(format!("Failed to set permissions on {} directory: {}", socket_dir.display(), e))
                     })?;
             }
@@ -354,80 +374,79 @@ impl SledDaemon {
 
         #[cfg(unix)]
         {
-            let dir_metadata = tokio::fs::metadata(socket_dir)
+            let dir_metadata = fs::metadata(socket_dir)
                 .await
                 .map_err(|e| {
                     error!("Failed to read metadata for {} directory: {}", socket_dir.display(), e);
-                    println!("===> ERROR: FAILED TO READ METADATA FOR {} DIRECTORY: {}", socket_dir.display(), e);
                     GraphError::StorageError(format!("Failed to read metadata for {} directory: {}", socket_dir.display(), e))
                 })?;
             let dir_permissions = dir_metadata.permissions();
             info!("Directory {} permissions: {:o}", socket_dir.display(), dir_permissions.mode() & 0o777);
-            println!("===> DIRECTORY {} PERMISSIONS: {:o}", socket_dir.display(), dir_permissions.mode() & 0o777);
         }
 
-        if tokio::fs::metadata(&socket_path).await.is_ok() {
+        if fs::metadata(&socket_path).await.is_ok() {
             info!("Removing existing IPC socket file: {}", socket_path);
-            println!("===> REMOVING EXISTING IPC SOCKET FILE: {}", socket_path);
-            match tokio::fs::remove_file(&socket_path).await {
+            match fs::remove_file(&socket_path).await {
                 Ok(_) => {
                     info!("Successfully removed existing IPC socket file: {}", socket_path);
-                    println!("===> SUCCESSFULLY REMOVED EXISTING IPC SOCKET FILE: {}", socket_path);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     info!("IPC socket file {} already removed", socket_path);
-                    println!("===> IPC SOCKET FILE {} ALREADY REMOVED", socket_path);
                 }
                 Err(e) => {
                     error!("Failed to remove existing IPC socket {}: {}", socket_path, e);
-                    println!("===> ERROR: FAILED TO REMOVE EXISTING IPC SOCKET {}: {}", socket_path, e);
                     return Err(GraphError::StorageError(format!("Failed to remove existing IPC socket {}: {}", socket_path, e)));
                 }
             }
         }
 
         let endpoint = format!("ipc://{}", socket_path);
-        info!("Attempting to bind ZeroMQ socket to {} for port {}", endpoint, self.port);
-        println!("===> ATTEMPTING TO BIND ZEROMQ SOCKET TO {} FOR PORT {}", endpoint, self.port);
-        
+        info!("Binding ZeroMQ socket to {} for port {}", endpoint, self.port);
         if let Err(e) = responder.bind(&endpoint) {
             error!("Failed to bind ZeroMQ socket to {} for port {}: {}", endpoint, self.port, e);
-            println!("===> ERROR: FAILED TO BIND ZEROMQ SOCKET TO {} FOR PORT {}: {}", endpoint, self.port, e);
             return Err(GraphError::StorageError(format!("Failed to bind ZeroMQ socket on port {}: {}", self.port, e)));
         }
 
-        if !tokio::fs::metadata(&socket_path).await.is_ok() {
+        if !fs::metadata(&socket_path).await.is_ok() {
             error!("IPC socket file {} was not created after binding for port {}", socket_path, self.port);
-            println!("===> ERROR: IPC SOCKET FILE {} WAS NOT CREATED AFTER BINDING FOR PORT {}", socket_path, self.port);
             return Err(GraphError::StorageError(format!("IPC socket file {} was not created after binding for port {}", socket_path, self.port)));
         }
 
         #[cfg(unix)]
         {
-            tokio::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o666))
+            fs::set_permissions(&socket_path, Permissions::from_mode(0o666))
                 .await
                 .map_err(|e| {
                     error!("Failed to set permissions on IPC socket {} for port {}: {}", socket_path, self.port, e);
-                    println!("===> ERROR: FAILED TO SET PERMISSIONS ON IPC SOCKET {} FOR PORT {}: {}", socket_path, self.port, e);
                     GraphError::StorageError(format!("Failed to set permissions on IPC socket {} for port {}: {}", socket_path, self.port, e))
                 })?;
             info!("Set permissions on IPC socket {} to 0o666 for port {}", socket_path, self.port);
-            println!("===> SET PERMISSIONS ON IPC SOCKET {} TO 0o666 FOR PORT {}", socket_path, self.port);
         }
 
         info!("ZeroMQ server started on {} for port {}", endpoint, self.port);
-        println!("===> ZEROMQ SERVER STARTED ON {} FOR PORT {}", endpoint, self.port);
-
         let mut consecutive_errors = 0;
         const MAX_CONSECUTIVE_ERRORS: u32 = 10;
 
         while *self.running.lock().await {
-            let msg = match responder.recv_bytes(zmq::DONTWAIT) {
-                Ok(msg) => {
+            // Fix: Handle ZMQ socket blocking operations properly without moving between threads
+            let msg_result = {
+                // Use a small timeout to make this non-blocking-ish
+                match responder.recv_bytes(zmq::DONTWAIT) {
+                    Ok(bytes) => Ok(bytes),
+                    Err(zmq::Error::EAGAIN) => {
+                        // No message available, continue to next iteration
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        continue;
+                    }
+                    Err(e) => Err(e),
+                }
+            };
+
+            let msg: Vec<u8> = match msg_result {
+                Ok(msg_bytes) => {
                     consecutive_errors = 0;
-                    debug!("Received ZeroMQ message for port {}: {:?}", self.port, String::from_utf8_lossy(&msg));
-                    println!("===> RECEIVED ZEROMQ MESSAGE FOR PORT {}: {:?}", self.port, String::from_utf8_lossy(&msg));
-                    msg
+                    debug!("Received ZeroMQ message for port {}: {:?}", self.port, String::from_utf8_lossy(&msg_bytes));
+                    msg_bytes
                 }
                 Err(zmq::Error::EAGAIN) => {
                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -436,14 +455,10 @@ impl SledDaemon {
                 Err(e) => {
                     consecutive_errors += 1;
                     warn!("Failed to receive ZeroMQ message for port {} (attempt {}): {}", self.port, consecutive_errors, e);
-                    println!("===> WARNING: FAILED TO RECEIVE ZEROMQ MESSAGE FOR PORT {} (ATTEMPT {}): {}", self.port, consecutive_errors, e);
-                    
                     if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
                         error!("Too many consecutive ZeroMQ errors for port {}, shutting down server", self.port);
-                        println!("===> ERROR: TOO MANY CONSECUTIVE ZEROMQ ERRORS FOR PORT {}, SHUTTING DOWN SERVER", self.port);
                         break;
                     }
-                    
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
@@ -452,15 +467,13 @@ impl SledDaemon {
             let request: Value = match serde_json::from_slice(&msg) {
                 Ok(req) => {
                     debug!("Parsed request for port {}: {:?}", self.port, req);
-                    println!("===> PARSED ZEROMQ REQUEST FOR PORT {}: {:?}", self.port, req);
                     req
                 }
                 Err(e) => {
                     error!("Failed to parse ZeroMQ request for port {}: {}", self.port, e);
-                    println!("===> ERROR: FAILED TO PARSE ZEROMQ REQUEST FOR PORT {}: {}", self.port, e);
-                    self.send_zmq_response(&responder, &json!({ 
-                        "status": "error", 
-                        "message": format!("Failed to parse request: {}", e) 
+                    self.send_zmq_response(&responder, &json!({
+                        "status": "error",
+                        "message": format!("Failed to parse request: {}", e)
                     })).await;
                     continue;
                 }
@@ -468,12 +481,10 @@ impl SledDaemon {
 
             let response = match request.get("command").and_then(|c| c.as_str()) {
                 Some("status") => {
-                    println!("===> PROCESSING STATUS FOR PORT {}", self.port);
                     json!({ "status": "success", "port": self.port })
                 }
                 Some("ping") => {
-                    println!("===> PROCESSING PING FOR PORT {}", self.port);
-                    json!({ "status": "success", "port": self.port })  // Return "success" not "ok"
+                    json!({ "status": "success", "port": self.port })
                 }
                 Some("set_key") => {
                     let key = match request.get("key").and_then(|k| k.as_str()) {
@@ -492,17 +503,9 @@ impl SledDaemon {
                             continue;
                         }
                     };
-                    
-                    println!("===> PROCESSING SET_KEY FOR PORT {}: key={}, value={}", self.port, key, value);
                     match self.insert(key.as_bytes(), value.as_bytes()).await {
-                        Ok(_) => {
-                            println!("===> SET_KEY SUCCESS FOR PORT {}: key={}", self.port, key);
-                            json!({ "status": "success" })
-                        }
-                        Err(e) => {
-                            println!("===> SET_KEY ERROR FOR PORT {}: key={}, error={}", self.port, key, e);
-                            json!({ "status": "error", "message": e.to_string() })
-                        }
+                        Ok(_) => json!({ "status": "success" }),
+                        Err(e) => json!({ "status": "error", "message": e.to_string() }),
                     }
                 }
                 Some("get_key") => {
@@ -514,22 +517,13 @@ impl SledDaemon {
                             continue;
                         }
                     };
-                    
-                    println!("===> PROCESSING GET_KEY: key={}", key);
                     match self.retrieve(key.as_bytes()).await {
                         Ok(Some(val)) => {
                             let value_str = String::from_utf8_lossy(&val).to_string();
-                            println!("===> GET_KEY SUCCESS: key={}, value={}", key, value_str);
                             json!({ "status": "success", "value": value_str })
                         }
-                        Ok(None) => {
-                            println!("===> GET_KEY SUCCESS: key={} not found", key);
-                            json!({ "status": "success", "value": null })
-                        }
-                        Err(e) => {
-                            println!("===> GET_KEY ERROR: key={}, error={}", key, e);
-                            json!({ "status": "error", "message": e.to_string() })
-                        }
+                        Ok(None) => json!({ "status": "success", "value": null }),
+                        Err(e) => json!({ "status": "error", "message": e.to_string() }),
                     }
                 }
                 Some("delete_key") => {
@@ -541,164 +535,132 @@ impl SledDaemon {
                             continue;
                         }
                     };
-                    
-                    println!("===> PROCESSING DELETE_KEY: key={}", key);
                     match self.delete(key.as_bytes()).await {
-                        Ok(_) => {
-                            println!("===> DELETE_KEY SUCCESS: key={}", key);
-                            json!({ "status": "success" })
-                        }
-                        Err(e) => {
-                            println!("===> DELETE_KEY ERROR: key={}, error={}", key, e);
-                            json!({ "status": "error", "message": e.to_string() })
-                        }
+                        Ok(_) => json!({ "status": "success" }),
+                        Err(e) => json!({ "status": "error", "message": e.to_string() }),
                     }
                 }
                 Some("flush") => {
-                    println!("===> PROCESSING FLUSH");
-                    match self.db.flush_async().await {
-                        Ok(bytes_flushed) => {
+                    match timeout(Duration::from_secs(5), self.db.flush_async()).await {
+                        Ok(Ok(bytes_flushed)) => {
                             info!("Flushed {} bytes for database at {:?}", bytes_flushed, self.db_path);
-                            println!("===> FLUSH SUCCESS: {} bytes", bytes_flushed);
-                            
                             #[cfg(feature = "with-openraft-sled")]
-                            {
+                            if let Some(raft) = &self.raft {
                                 let request = openraft::raft::ClientWriteRequest::new(
                                     openraft::EntryPayload::AppWrite {
                                         key: b"flush".to_vec(),
                                         value: vec![],
                                     }
                                 );
-                                match self.raft.client_write(request).await {
+                                return match raft.client_write(request).await {
                                     Ok(_) => {
                                         info!("Raft flush replicated at {:?}", self.db_path);
-                                        println!("===> FLUSH: RAFT FLUSH REPLICATED AT {:?}", self.db_path);
                                         json!({ "status": "success", "bytes_flushed": bytes_flushed })
                                     }
                                     Err(e) => {
                                         error!("Raft flush replication failed: {}", e);
-                                        println!("===> FLUSH ERROR: RAFT FLUSH REPLICATION FAILED: {}", e);
                                         json!({ "status": "error", "message": format!("Raft flush replication failed: {}", e) })
                                     }
-                                }
+                                };
                             }
-                            
-                            #[cfg(not(feature = "with-openraft-sled"))]
                             json!({ "status": "success", "bytes_flushed": bytes_flushed })
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             error!("Failed to flush database at {:?}: {}", self.db_path, e);
-                            println!("===> FLUSH ERROR: {}", e);
                             json!({ "status": "error", "message": e.to_string() })
+                        }
+                        Err(_) => {
+                            json!({ "status": "error", "message": "Flush operation timed out" })
                         }
                     }
                 }
                 Some("get_all_vertices") => {
-                    println!("===> PROCESSING GET_ALL_VERTICES");
                     let vertices: Vec<Vertex> = self.vertices.iter()
                         .filter_map(|res| res.ok())
                         .filter_map(|(_k, v)| Self::deserialize_from_ivec(v).ok())
                         .collect();
                     match serde_json::to_value(&vertices) {
-                        Ok(value) => {
-                            println!("===> GET_ALL_VERTICES SUCCESS: {} vertices", vertices.len());
-                            json!({ "status": "success", "vertices": value })
-                        }
+                        Ok(value) => json!({ "status": "success", "vertices": value }),
                         Err(e) => {
                             error!("Failed to serialize vertices: {}", e);
-                            println!("===> GET_ALL_VERTICES ERROR: {}", e);
                             json!({ "status": "error", "message": e.to_string() })
                         }
                     }
                 }
                 Some("get_all_edges") => {
-                    println!("===> PROCESSING GET_ALL_EDGES");
                     let edges: Vec<Edge> = self.edges.iter()
                         .filter_map(|res| res.ok())
                         .filter_map(|(_k, v)| Self::deserialize_from_ivec(v).ok())
                         .collect();
                     match serde_json::to_value(&edges) {
-                        Ok(value) => {
-                            println!("===> GET_ALL_EDGES SUCCESS: {} edges", edges.len());
-                            json!({ "status": "success", "edges": value })
-                        }
+                        Ok(value) => json!({ "status": "success", "edges": value }),
                         Err(e) => {
                             error!("Failed to serialize edges: {}", e);
-                            println!("===> GET_ALL_EDGES ERROR: {}", e);
                             json!({ "status": "error", "message": e.to_string() })
                         }
                     }
                 }
                 Some("clear_data") => {
-                    println!("===> PROCESSING CLEAR_DATA");
-                    match self.db.clear() {
-                        Ok(_) => {
-                            // Clear all trees - handle errors without using ?
-                            let vertices_result = self.vertices.clear();
-                            let edges_result = self.edges.clear();
-                            let kv_pairs_result = self.kv_pairs.clear();
-                            
-                            if let Err(e) = vertices_result {
-                                json!({ "status": "error", "message": format!("Failed to clear vertices: {}", e) })
-                            } else if let Err(e) = edges_result {
-                                json!({ "status": "error", "message": format!("Failed to clear edges: {}", e) })
-                            } else if let Err(e) = kv_pairs_result {
-                                json!({ "status": "error", "message": format!("Failed to clear kv_pairs: {}", e) })
-                            } else {
-                                // All clears successful, now flush
-                                match self.db.flush_async().await {
-                                    Ok(bytes_flushed) => {
-                                        info!("Cleared database at {:?}, flushed {} bytes", self.db_path, bytes_flushed);
-                                        println!("===> CLEAR_DATA SUCCESS: Flushed {} bytes", bytes_flushed);
-                                        
-                                        #[cfg(feature = "with-openraft-sled")]
-                                        {
-                                            let request = openraft::raft::ClientWriteRequest::new(
-                                                openraft::EntryPayload::AppWrite {
-                                                    key: b"clear_data".to_vec(),
-                                                    value: vec![],
-                                                }
-                                            );
-                                            match self.raft.client_write(request).await {
-                                                Ok(_) => {
-                                                    info!("Raft clear_data replicated at {:?}", self.db_path);
-                                                    println!("===> CLEAR_DATA: RAFT CLEAR_DATA REPLICATED AT {:?}", self.db_path);
-                                                    json!({ "status": "success", "bytes_flushed": bytes_flushed })
-                                                }
-                                                Err(e) => {
-                                                    error!("Raft clear_data replication failed: {}", e);
-                                                    println!("===> CLEAR_DATA ERROR: RAFT CLEAR_DATA REPLICATION FAILED: {}", e);
-                                                    json!({ "status": "error", "message": format!("Raft clear_data replication failed: {}", e) })
-                                                }
-                                            }
-                                        }
-                                        
-                                        #[cfg(not(feature = "with-openraft-sled"))]
-                                        json!({ "status": "success", "bytes_flushed": bytes_flushed })
-                                    }
-                                    Err(e) => {
-                                        error!("Failed to flush after clearing database at {:?}: {}", self.db_path, e);
-                                        println!("===> CLEAR_DATA ERROR: Failed to flush: {}", e);
-                                        json!({ "status": "error", "message": e.to_string() })
-                                    }
-                                }
-                            }
+                    match timeout(Duration::from_secs(5), async {
+                        let mut batch_vertices = Batch::default();
+                        let mut batch_edges = Batch::default();
+                        let mut batch_kv = Batch::default();
+
+                        for item in self.vertices.iter().keys().filter_map(|k| k.ok()) {
+                            batch_vertices.remove(item);
                         }
-                        Err(e) => {
+                        for item in self.edges.iter().keys().filter_map(|k| k.ok()) {
+                            batch_edges.remove(item);
+                        }
+                        for item in self.kv_pairs.iter().keys().filter_map(|k| k.ok()) {
+                            batch_kv.remove(item);
+                        }
+
+                        self.vertices.apply_batch(batch_vertices)
+                            .map_err(|e| GraphError::StorageError(format!("Failed to clear vertices: {}", e)))?;
+                        self.edges.apply_batch(batch_edges)
+                            .map_err(|e| GraphError::StorageError(format!("Failed to clear edges: {}", e)))?;
+                        self.kv_pairs.apply_batch(batch_kv)
+                            .map_err(|e| GraphError::StorageError(format!("Failed to clear kv_pairs: {}", e)))?;
+
+                        let bytes_flushed = self.db.flush_async().await
+                            .map_err(|e| GraphError::StorageError(format!("Failed to flush after clear: {}", e)))?;
+
+                        if self.vertices.iter().next().is_some() ||
+                           self.edges.iter().next().is_some() ||
+                           self.kv_pairs.iter().next().is_some() {
+                            return Err(GraphError::StorageError("Failed to clear all data".to_string()));
+                        }
+
+                        info!("Cleared database at {:?}, flushed {} bytes", self.db_path, bytes_flushed);
+                        #[cfg(feature = "with-openraft-sled")]
+                        if let Some(raft) = &self.raft {
+                            let request = openraft::raft::ClientWriteRequest::new(
+                                openraft::EntryPayload::AppWrite {
+                                    key: b"clear_data".to_vec(),
+                                    value: vec![],
+                                }
+                            );
+                            raft.client_write(request).await
+                                .map_err(|e| GraphError::StorageError(format!("Raft clear_data replication failed: {}", e)))?;
+                            info!("Raft clear_data replicated at {:?}", self.db_path);
+                        }
+                        Ok::<usize, GraphError>(bytes_flushed)
+                    }).await {
+                        Ok(Ok(bytes_flushed)) => json!({ "status": "success", "bytes_flushed": bytes_flushed }),
+                        Ok(Err(e)) => {
                             error!("Failed to clear database at {:?}: {}", self.db_path, e);
-                            println!("===> CLEAR_DATA ERROR: {}", e);
                             json!({ "status": "error", "message": e.to_string() })
                         }
+                        Err(_) => json!({ "status": "error", "message": "Operation timed out" }),
                     }
                 }
                 Some(cmd) => {
                     error!("Unsupported command for port {}: {}", self.port, cmd);
-                    println!("===> ERROR: UNSUPPORTED ZEROMQ COMMAND FOR PORT {}: {}", self.port, cmd);
                     json!({ "status": "error", "message": format!("Unsupported command: {}", cmd) })
                 }
                 None => {
                     error!("No command specified in request for port {}: {:?}", self.port, request);
-                    println!("===> ERROR: NO COMMAND SPECIFIED IN ZEROMQ REQUEST FOR PORT {}: {:?}", self.port, request);
                     json!({ "status": "error", "message": "No command specified" })
                 }
             };
@@ -706,8 +668,19 @@ impl SledDaemon {
             self.send_zmq_response(&responder, &response).await;
         }
 
+        info!("ZeroMQ server shutting down for port {}", self.port);
+        if let Err(e) = responder.disconnect(&endpoint) {
+            error!("Failed to disconnect ZeroMQ socket for port {}: {}", self.port, e);
+        }
+        drop(responder);
+        if fs::metadata(&socket_path).await.is_ok() {
+            if let Err(e) = fs::remove_file(&socket_path).await {
+                error!("Failed to remove IPC socket file {}: {}", socket_path, e);
+            } else {
+                info!("Successfully removed IPC socket file {}", socket_path);
+            }
+        }
         info!("ZeroMQ server stopped for port {}", self.port);
-        println!("===> ZEROMQ SERVER STOPPED FOR PORT {}", self.port);
         Ok(())
     }
 
@@ -715,47 +688,44 @@ impl SledDaemon {
         let context = zmq::Context::new();
         let socket = context.socket(zmq::REQ)
             .map_err(|e| GraphError::StorageError(format!("Failed to create ZeroMQ socket: {}", e)))?;
-        
-        socket.set_rcvtimeo(10000)
+        socket.set_rcvtimeo(5000)
             .map_err(|e| GraphError::StorageError(format!("Failed to set receive timeout: {}", e)))?;
-        socket.set_sndtimeo(10000)
+        socket.set_sndtimeo(5000)
             .map_err(|e| GraphError::StorageError(format!("Failed to set send timeout: {}", e)))?;
+        socket.set_linger(1000)
+            .map_err(|e| GraphError::StorageError(format!("Failed to set linger: {}", e)))?;
 
-        let endpoint = format!("ipc:///opt/graphdb/graphdb-{}.ipc", port);
-        println!("===> SLED STORAGE: CONNECTING TO ZMQ ENDPOINT {} FOR PORT {}", endpoint, port);
-        
+        let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", port);
         socket.connect(&endpoint)
             .map_err(|e| {
                 error!("Failed to connect to ZeroMQ socket {} for port {}: {}", endpoint, port, e);
-                println!("===> ERROR: FAILED TO CONNECT TO ZMQ SOCKET {} FOR PORT {}: {}", endpoint, port, e);
                 GraphError::StorageError(format!("Failed to connect to ZeroMQ socket {}: {}", endpoint, e))
             })?;
 
-        println!("===> SLED STORAGE: SENDING REQUEST TO PORT {}: {:?}", port, request);
-        socket.send(serde_json::to_vec(&request)?, 0)
+        let request_data = serde_json::to_vec(&request)
+            .map_err(|e| GraphError::StorageError(format!("Failed to serialize request: {}", e)))?;
+        socket.send(request_data, 0)
             .map_err(|e| {
                 error!("Failed to send request to port {}: {}", port, e);
-                println!("===> ERROR: FAILED TO SEND REQUEST TO PORT {}: {}", port, e);
                 GraphError::StorageError(format!("Failed to send request: {}", e))
             })?;
 
-        println!("===> SLED STORAGE: REQUEST SENT SUCCESSFULLY TO PORT {}", port);
-        
         let reply = socket.recv_bytes(0)
             .map_err(|e| {
                 error!("Failed to receive response from port {}: {}", port, e);
-                println!("===> ERROR: FAILED TO RECEIVE RESPONSE FROM PORT {}: {}", port, e);
                 GraphError::StorageError(format!("Failed to receive response: {}", e))
             })?;
-        
+
         let response: Value = serde_json::from_slice(&reply)
             .map_err(|e| {
                 error!("Failed to parse response from port {}: {}", port, e);
-                println!("===> ERROR: FAILED TO PARSE RESPONSE FROM PORT {}: {}", port, e);
                 GraphError::StorageError(format!("Failed to parse response: {}", e))
             })?;
 
-        println!("===> SLED STORAGE: RECEIVED RESPONSE FROM PORT {}: {:?}", port, response);
+        socket.disconnect(&endpoint)
+            .map_err(|e| GraphError::StorageError(format!("Failed to disconnect socket: {}", e)))?;
+        drop(socket);
+
         Ok(response)
     }
 
@@ -763,23 +733,15 @@ impl SledDaemon {
         match serde_json::to_vec(response) {
             Ok(response_data) => {
                 debug!("Sending ZeroMQ response: {:?}", response);
-                println!("===> SENDING ZEROMQ RESPONSE: {:?}", response);
-                
                 if let Err(e) = responder.send(&response_data, 0) {
                     warn!("Failed to send ZeroMQ response: {}", e);
-                    println!("===> WARNING: FAILED TO SEND ZEROMQ RESPONSE: {}", e);
-                } else {
-                    println!("===> ZEROMQ RESPONSE SENT SUCCESSFULLY");
                 }
             }
             Err(e) => {
                 error!("Failed to serialize ZeroMQ response: {}", e);
-                println!("===> ERROR: FAILED TO SERIALIZE ZEROMQ RESPONSE: {}", e);
-                
                 let error_response = format!(r#"{{"status":"error","message":"Serialization error: {}"}}"#, e);
                 if let Err(send_err) = responder.send(error_response.as_bytes(), 0) {
                     error!("Failed to send error response: {}", send_err);
-                    println!("===> ERROR: FAILED TO SEND ERROR RESPONSE: {}", send_err);
                 }
             }
         }
@@ -787,7 +749,23 @@ impl SledDaemon {
 
     pub async fn shutdown(&self) -> GraphResult<()> {
         info!("Shutting down SledDaemon at path {:?}", self.db_path);
-        println!("===> SHUTTING DOWN SLED DAEMON AT PATH {:?}", self.db_path);
+        let mut running = self.running.lock().await;
+        if !*running {
+            info!("SledDaemon already shut down at {:?}", self.db_path);
+            return Ok(());
+        }
+        *running = false;
+        drop(running);
+
+        let socket_path = format!("/tmp/graphdb-{}.ipc", self.port);
+        if fs::metadata(&socket_path).await.is_ok() {
+            if let Err(e) = fs::remove_file(&socket_path).await {
+                error!("Failed to remove IPC socket file {}: {}", socket_path, e);
+            } else {
+                info!("Successfully removed IPC socket file {}", socket_path);
+            }
+        }
+
         let db_flush = self.db.flush_async()
             .await
             .map_err(|e| GraphError::StorageError(format!("Failed to flush Sled DB: {}", e)))?;
@@ -802,9 +780,6 @@ impl SledDaemon {
             .map_err(|e| GraphError::StorageError(format!("Failed to flush kv_pairs tree: {}", e)))?;
         info!("Flushed SledDaemon at {:?}: db={} bytes, vertices={} bytes, edges={} bytes, kv_pairs={} bytes",
             self.db_path, db_flush, vertices_flush, edges_flush, kv_pairs_flush);
-        println!("===> FLUSHED SLED DAEMON AT {:?}: DB={} bytes, VERTICES={} bytes, EDGES={} bytes, KV_PAIRS={} bytes",
-            self.db_path, db_flush, vertices_flush, edges_flush, kv_pairs_flush);
-        *self.running.lock().await = false;
         Ok(())
     }
 
@@ -822,7 +797,8 @@ impl SledDaemon {
 
     #[cfg(feature = "with-openraft-sled")]
     pub async fn is_leader(&self) -> GraphResult<bool> {
-        let metrics = self.raft.metrics().await;
+        let metrics = self.raft.as_ref().ok_or_else(|| GraphError::StorageError("Raft not initialized".to_string()))?
+            .metrics().await;
         let is_leader = matches!(metrics.raft_state, openraft::RaftState::Leader);
         info!("Checking Raft leader status for node {} at path {:?}", self.node_id, self.db_path);
         println!("===> CHECKING RAFT LEADER STATUS FOR NODE {} AT PATH {:?}", self.node_id, self.db_path);
@@ -836,7 +812,7 @@ impl SledDaemon {
             return Err(GraphError::StorageError(format!("Daemon at path {:?} is not running", self.db_path)));
         }
         #[cfg(feature = "with-openraft-sled")]
-        {
+        if let Some(raft) = &self.raft {
             if !self.is_leader().await? {
                 error!("Node {} at path {:?} is not Raft leader, write access denied", self.node_id, self.db_path);
                 println!("===> ERROR: NODE {} AT PATH {:?} IS NOT RAFT LEADER, WRITE ACCESS DENIED", self.node_id, self.db_path);
@@ -849,35 +825,20 @@ impl SledDaemon {
     }
 
     fn serialize_to_ivec<T: serde::Serialize>(data: &T) -> GraphResult<IVec> {
-        let mut cursor = Cursor::new(Vec::new());
         let serialized = serde_json::to_vec(data)
             .map_err(|e| GraphError::StorageError(format!("Serialization failed: {}", e)))?;
-        cursor.write_all(&serialized)
-            .map_err(|e| GraphError::StorageError(format!("Failed to write to cursor: {}", e)))?;
-        let bytes = cursor.into_inner();
-        Ok(IVec::from(bytes))
+        Ok(IVec::from(serialized))
     }
 
     fn deserialize_from_ivec<T: serde::de::DeserializeOwned>(ivec: IVec) -> GraphResult<T> {
-        let mut cursor = Cursor::new(ivec.to_vec());
-        let mut bytes = Vec::new();
-        cursor
-            .read_to_end(&mut bytes)
-            .map_err(|e| GraphError::StorageError(format!("Failed to read from cursor: {}", e)))?;
-        serde_json::from_slice(&bytes)
+        serde_json::from_slice(&ivec)
             .map_err(|e| GraphError::StorageError(format!("Deserialization failed: {}", e)))
     }
 
     pub async fn insert(&self, key: &[u8], value: &[u8]) -> GraphResult<()> {
         self.ensure_write_access().await?;
         info!("Inserting key into kv_pairs at path {:?}", self.db_path);
-        println!("===> IN INSERT - TRYING TO INSERT KEY {:?}", key);
-
         timeout(Duration::from_secs(5), async {
-            let pre_keys: Vec<_> = self.kv_pairs.iter().keys().filter_map(|k| k.ok()).collect();
-            debug!("Keys before insert at {:?}: {:?}", self.db_path, pre_keys);
-            println!("===> IN INSERT - KEYS BEFORE INSERT AT {:?}: {:?}", self.db_path, pre_keys);
-
             let mut batch = Batch::default();
             batch.insert(key, value);
             self.kv_pairs
@@ -887,15 +848,12 @@ impl SledDaemon {
             let bytes_flushed = self.db.flush_async().await
                 .map_err(|e| GraphError::StorageError(format!("Failed to flush DB: {}", e)))?;
             info!("Flushed {} bytes after insert at {:?}", bytes_flushed, self.db_path);
-            println!("===> IN INSERT - FLUSHED {} BYTES", bytes_flushed);
 
             let persisted = self.kv_pairs
                 .get(key)
                 .map_err(|e| GraphError::StorageError(format!("Failed to verify insert: {}", e)))?;
-            println!("===> IN INSERT - INSERTED KEY {:?} AND VALUE {:?}", key, persisted);
             if persisted.is_none() || persisted.as_ref().map(|v| v.as_ref()) != Some(value) {
                 error!("Persistence verification failed for key at {:?}", self.db_path);
-                println!("===> IN INSERT - ERROR: PERSISTENCE VERIFICATION FAILED FOR KEY AT {:?}", self.db_path);
                 return Err(GraphError::StorageError("Insert not persisted correctly".to_string()));
             }
 
@@ -905,20 +863,18 @@ impl SledDaemon {
                 .filter_map(|k| k.ok())
                 .collect();
             info!("Current kv_pairs keys at {:?}: {:?}", self.db_path, keys);
-            println!("===> IN INSERT - CURRENT KV_PAIRS KEYS AT {:?}: {:?}", self.db_path, keys);
 
             #[cfg(feature = "with-openraft-sled")]
-            {
+            if let Some(raft) = &self.raft {
                 let request = openraft::raft::ClientWriteRequest::new(
                     openraft::EntryPayload::AppWrite {
                         key: key.to_vec(),
                         value: value.to_vec(),
                     }
                 );
-                self.raft.client_write(request).await
+                raft.client_write(request).await
                     .map_err(|e| GraphError::StorageError(format!("Raft write failed: {}", e)))?;
                 info!("Raft write replicated for key at {:?}", self.db_path);
-                println!("===> IN INSERT - RAFT WRITE REPLICATED FOR KEY AT {:?}", self.db_path);
             }
             Ok(())
         })
@@ -929,35 +885,17 @@ impl SledDaemon {
     pub async fn retrieve(&self, key: &[u8]) -> GraphResult<Option<Vec<u8>>> {
         if !self.is_running().await {
             error!("Daemon at path {:?} is not running", self.db_path);
-            println!("===> ERROR: DAEMON AT PATH {:?} IS NOT RUNNING", self.db_path);
             return Err(GraphError::StorageError(format!("Daemon at path {:?} is not running", self.db_path)));
         }
         if key == b"test_key" {
             warn!("Retrieving test_key, caller stack trace: {:#?}", std::backtrace::Backtrace::capture());
-            println!("===> WARNING: RETRIEVING TEST_KEY, CALLER STACK TRACE: {:#?}", std::backtrace::Backtrace::capture());
         }
         info!("Retrieving key from kv_pairs at path {:?}", self.db_path);
-        println!("===> RETRIEVE: RETRIEVING KEY FROM KV_PAIRS AT PATH {:?} AND KEY IS {:?}", self.db_path, key);
-
         let value = timeout(Duration::from_secs(5), async {
-            let pre_keys: Vec<_> = self.kv_pairs.iter().keys().filter_map(|k| k.ok()).collect();
-            debug!("Keys before retrieve at {:?}: {:?}", self.db_path, pre_keys);
-            println!("===> RETRIEVE: KEYS BEFORE RETRIEVE AT {:?}: {:?}", self.db_path, pre_keys);
-
             let opt = self.kv_pairs
                 .get(key)
                 .map_err(|e| GraphError::StorageError(format!("Failed to retrieve key: {}", e)))?;
-            match opt {
-                Some(ivec) => {
-                    let mut cursor = Cursor::new(ivec.to_vec());
-                    let mut bytes = Vec::new();
-                    cursor
-                        .read_to_end(&mut bytes)
-                        .map_err(|e| GraphError::StorageError(format!("Failed to read from cursor: {}", e)))?;
-                    Ok::<Option<Vec<u8>>, GraphError>(Some(bytes))
-                }
-                None => Ok::<Option<Vec<u8>>, GraphError>(None),
-            }
+            Ok::<Option<Vec<u8>>, GraphError>(opt.map(|ivec| ivec.to_vec()))
         })
         .await
         .map_err(|_| GraphError::StorageError("Timeout during retrieve".to_string()))??;
@@ -968,45 +906,50 @@ impl SledDaemon {
             .filter_map(|k| k.ok())
             .collect();
         info!("Current kv_pairs keys at {:?}: {:?}", self.db_path, keys);
-        println!("===> RETRIEVE: KV_PAIRS KEYS AT {:?}: {:?} AND VALUE {:?}", self.db_path, keys, value);
         Ok(value)
     }
 
     pub async fn delete(&self, key: &[u8]) -> GraphResult<()> {
         self.ensure_write_access().await?;
         info!("Deleting key from kv_pairs at path {:?}", self.db_path);
-        println!("===> DELETING KEY FROM KV_PAIRS AT PATH {:?}", self.db_path);
         timeout(Duration::from_secs(5), async {
-            let pre_keys: Vec<_> = self.kv_pairs.iter().keys().filter_map(|k| k.ok()).collect();
-            debug!("Keys before delete at {:?}: {:?}", self.db_path, pre_keys);
-            println!("===> DELETE: KEYS BEFORE DELETE AT {:?}: {:?}", self.db_path, pre_keys);
-
+            let mut batch = Batch::default();
+            batch.remove(key);
             self.kv_pairs
-                .remove(key)
-                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+                .apply_batch(batch)
+                .map_err(|e| GraphError::StorageError(format!("Failed to apply batch: {}", e)))?;
+
             let bytes_flushed = self.db
                 .flush_async()
                 .await
-                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+                .map_err(|e| GraphError::StorageError(format!("Failed to flush DB: {}", e)))?;
+
+            let persisted = self.kv_pairs
+                .get(key)
+                .map_err(|e| GraphError::StorageError(format!("Failed to verify delete: {}", e)))?;
+            if persisted.is_some() {
+                error!("Persistence verification failed for key delete at {:?}", self.db_path);
+                return Err(GraphError::StorageError("Delete not persisted correctly".to_string()));
+            }
+
             let keys: Vec<_> = self.kv_pairs
                 .iter()
                 .keys()
                 .filter_map(|k| k.ok())
                 .collect();
             info!("Flushed {} bytes after delete at {:?}, current kv_pairs keys: {:?}", bytes_flushed, self.db_path, keys);
-            println!("===> DELETE: FLUSHED {} BYTES, CURRENT KV_PAIRS KEYS: {:?}", bytes_flushed, keys);
+
             #[cfg(feature = "with-openraft-sled")]
-            {
+            if let Some(raft) = &self.raft {
                 let request = openraft::raft::ClientWriteRequest::new(
                     openraft::EntryPayload::AppWrite {
                         key: key.to_vec(),
                         value: vec![],
                     }
                 );
-                self.raft.client_write(request).await
+                raft.client_write(request).await
                     .map_err(|e| GraphError::StorageError(format!("Raft delete failed: {}", e)))?;
                 info!("Raft delete replicated for key at {:?}", self.db_path);
-                println!("===> DELETE: RAFT DELETE REPLICATED FOR KEY AT {:?}", self.db_path);
             }
             Ok(())
         })
@@ -1019,8 +962,6 @@ impl SledDaemon {
         let key = vertex.id.0.as_bytes();
         let value = Self::serialize_to_ivec(vertex)?;
         info!("Creating vertex with id {} at path {:?}", vertex.id, self.db_path);
-        println!("===> CREATING VERTEX WITH ID {} AT PATH {:?}", vertex.id, self.db_path);
-
         timeout(Duration::from_secs(5), async {
             let mut batch = Batch::default();
             batch.insert(key, value);
@@ -1033,14 +974,12 @@ impl SledDaemon {
                 .await
                 .map_err(|e| GraphError::StorageError(format!("Failed to flush DB: {}", e)))?;
             info!("Flushed {} bytes after creating vertex at {:?}", bytes_flushed, self.db_path);
-            println!("===> CREATE_VERTEX: FLUSHED {} BYTES", bytes_flushed);
 
             let persisted = self.vertices
                 .get(key)
                 .map_err(|e| GraphError::StorageError(format!("Failed to verify vertex insert: {}", e)))?;
             if persisted.is_none() {
                 error!("Persistence verification failed for vertex id {} at {:?}", vertex.id, self.db_path);
-                println!("===> CREATE_VERTEX: ERROR: PERSISTENCE VERIFICATION FAILED FOR VERTEX ID {} AT {:?}", vertex.id, self.db_path);
                 return Err(GraphError::StorageError("Vertex insert not persisted".to_string()));
             }
 
@@ -1050,20 +989,18 @@ impl SledDaemon {
                 .filter_map(|k| k.ok())
                 .collect();
             info!("Current vertices keys at {:?}: {:?}", self.db_path, vertex_keys);
-            println!("===> CREATE_VERTEX: CURRENT VERTICES KEYS AT {:?}: {:?}", self.db_path, vertex_keys);
 
             #[cfg(feature = "with-openraft-sled")]
-            {
+            if let Some(raft) = &self.raft {
                 let request = openraft::raft::ClientWriteRequest::new(
                     openraft::EntryPayload::AppWrite {
                         key: key.to_vec(),
-                        value: vertex.id.0.as_bytes().to_vec(),
+                        value: serialize_vertex(vertex)?,
                     }
                 );
-                self.raft.client_write(request).await
+                raft.client_write(request).await
                     .map_err(|e| GraphError::StorageError(format!("Raft vertex create failed: {}", e)))?;
                 info!("Raft vertex create replicated at {:?}", self.db_path);
-                println!("===> CREATE_VERTEX: RAFT VERTEX CREATE REPLICATED AT {:?}", self.db_path);
             }
             Ok(())
         })
@@ -1074,13 +1011,10 @@ impl SledDaemon {
     pub async fn get_vertex(&self, id: &Uuid) -> GraphResult<Option<Vertex>> {
         if !self.is_running().await {
             error!("Daemon at path {:?} is not running", self.db_path);
-            println!("===> ERROR: DAEMON AT PATH {:?} IS NOT RUNNING", self.db_path);
             return Err(GraphError::StorageError(format!("Daemon at path {:?} is not running", self.db_path)));
         }
         let key = id.as_bytes();
         info!("Retrieving vertex with id {} from path {:?}", id, self.db_path);
-        println!("===> RETRIEVING VERTEX WITH ID {} FROM PATH {:?}", id, self.db_path);
-
         let res = timeout(Duration::from_secs(5), async {
             let opt = self.vertices
                 .get(key)
@@ -1102,20 +1036,66 @@ impl SledDaemon {
             .filter_map(|k| k.ok())
             .collect();
         info!("Current vertices keys at {:?}: {:?}", self.db_path, vertex_keys);
-        println!("===> GET_VERTEX: CURRENT VERTICES KEYS AT {:?}: {:?}", self.db_path, vertex_keys);
         Ok(res)
     }
 
     pub async fn update_vertex(&self, vertex: &Vertex) -> GraphResult<()> {
-        self.delete_vertex(&vertex.id.0).await?;
-        self.create_vertex(vertex).await
+        self.ensure_write_access().await?;
+        info!("Updating vertex with id {} at path {:?}", vertex.id, self.db_path);
+        timeout(Duration::from_secs(5), async {
+            let key = vertex.id.0.as_bytes();
+            let value = Self::serialize_to_ivec(vertex)?;
+            let mut batch = Batch::default();
+            batch.insert(key, value);
+            self.vertices
+                .apply_batch(batch)
+                .map_err(|e| GraphError::StorageError(format!("Failed to apply batch for vertex update: {}", e)))?;
+            let bytes_flushed = self.db
+                .flush_async()
+                .await
+                .map_err(|e| GraphError::StorageError(format!("Failed to flush DB: {}", e)))?;
+            let persisted = self.vertices
+                .get(key)
+                .map_err(|e| GraphError::StorageError(format!("Failed to verify vertex update: {}", e)))?;
+            if persisted.is_none() {
+                error!("Persistence verification failed for vertex update id {} at {:?}", vertex.id, self.db_path);
+                return Err(GraphError::StorageError("Vertex update not persisted".to_string()));
+            }
+            let vertex_keys: Vec<_> = self.vertices
+                .iter()
+                .keys()
+                .filter_map(|k| k.ok())
+                .collect();
+            info!("Flushed {} bytes after updating vertex at {:?}, current vertices keys: {:?}", bytes_flushed, self.db_path, vertex_keys);
+            #[cfg(feature = "with-openraft-sled")]
+            if let Some(raft) = &self.raft {
+                let request = openraft::raft::ClientWriteRequest::new(
+                    openraft::EntryPayload::AppWrite {
+                        key: key.to_vec(),
+                        value: serialize_vertex(vertex)?,
+                    }
+                );
+                raft.client_write(request).await
+                    .map_err(|e| GraphError::StorageError(format!("Raft vertex update failed: {}", e)))?;
+                info!("Raft vertex update replicated at {:?}", self.db_path);
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| GraphError::StorageError("Timeout during update_vertex".to_string()))??;
+        let vertex_keys: Vec<_> = self.vertices
+            .iter()
+            .keys()
+            .filter_map(|k| k.ok())
+            .collect();
+        info!("Current vertices keys at {:?}: {:?}", self.db_path, vertex_keys);
+        Ok(())
     }
 
     pub async fn delete_vertex(&self, id: &Uuid) -> GraphResult<()> {
         self.ensure_write_access().await?;
         let key = id.as_bytes();
         info!("Deleting vertex with id {} from path {:?}", id, self.db_path);
-        println!("===> DELETING VERTEX WITH ID {} FROM PATH {:?}", id, self.db_path);
         timeout(Duration::from_secs(5), async {
             self.vertices
                 .remove(key)
@@ -1147,19 +1127,17 @@ impl SledDaemon {
                 .filter_map(|k| k.ok())
                 .collect();
             info!("Flushed {} bytes after deleting vertex at {:?}, current vertices keys: {:?}, edges keys: {:?}", bytes_flushed, self.db_path, vertex_keys, edge_keys);
-            println!("===> DELETE_VERTEX: FLUSHED {} BYTES, CURRENT VERTICES KEYS: {:?}, EDGES KEYS: {:?}", bytes_flushed, vertex_keys, edge_keys);
             #[cfg(feature = "with-openraft-sled")]
-            {
+            if let Some(raft) = &self.raft {
                 let request = openraft::raft::ClientWriteRequest::new(
                     openraft::EntryPayload::AppWrite {
                         key: key.to_vec(),
                         value: vec![],
                     }
                 );
-                self.raft.client_write(request).await
+                raft.client_write(request).await
                     .map_err(|e| GraphError::StorageError(format!("Raft vertex delete failed: {}", e)))?;
                 info!("Raft vertex delete replicated at {:?}", self.db_path);
-                println!("===> DELETE_VERTEX: RAFT VERTEX DELETE REPLICATED AT {:?}", self.db_path);
             }
             Ok(())
         })
@@ -1172,8 +1150,6 @@ impl SledDaemon {
         let key = create_edge_key(&edge.outbound_id.into(), &edge.t, &edge.inbound_id.into())?;
         let value = Self::serialize_to_ivec(edge)?;
         info!("Creating edge ({}, {}, {}) at path {:?}", edge.outbound_id, edge.t, edge.inbound_id, self.db_path);
-        println!("===> CREATING EDGE ({}, {}, {}) AT PATH {:?}", edge.outbound_id, edge.t, edge.inbound_id, self.db_path);
-
         timeout(Duration::from_secs(5), async {
             let mut batch = Batch::default();
             batch.insert(&*key, value);
@@ -1186,15 +1162,12 @@ impl SledDaemon {
                 .await
                 .map_err(|e| GraphError::StorageError(format!("Failed to flush DB: {}", e)))?;
             info!("Flushed {} bytes after creating edge at {:?}", bytes_flushed, self.db_path);
-            println!("===> CREATE_EDGE: FLUSHED {} BYTES", bytes_flushed);
 
             let persisted = self.edges
                 .get(&key)
                 .map_err(|e| GraphError::StorageError(format!("Failed to verify edge insert: {}", e)))?;
             if persisted.is_none() {
                 error!("Persistence verification failed for edge ({}, {}, {}) at {:?}", 
-                    edge.outbound_id, edge.t, edge.inbound_id, self.db_path);
-                println!("===> CREATE_EDGE: ERROR: PERSISTENCE VERIFICATION FAILED FOR EDGE ({}, {}, {}) AT {:?}", 
                     edge.outbound_id, edge.t, edge.inbound_id, self.db_path);
                 return Err(GraphError::StorageError("Edge insert not persisted".to_string()));
             }
@@ -1205,20 +1178,18 @@ impl SledDaemon {
                 .filter_map(|k| k.ok())
                 .collect();
             info!("Current edges keys at {:?}: {:?}", self.db_path, edge_keys);
-            println!("===> CREATE_EDGE: CURRENT EDGES KEYS AT {:?}: {:?}", self.db_path, edge_keys);
 
             #[cfg(feature = "with-openraft-sled")]
-            {
+            if let Some(raft) = &self.raft {
                 let request = openraft::raft::ClientWriteRequest::new(
                     openraft::EntryPayload::AppWrite {
                         key: key.to_vec(),
                         value: edge.t.to_string().into_bytes(),
                     }
                 );
-                self.raft.client_write(request).await
+                raft.client_write(request).await
                     .map_err(|e| GraphError::StorageError(format!("Raft edge create failed: {}", e)))?;
                 info!("Raft edge create replicated at {:?}", self.db_path);
-                println!("===> CREATE_EDGE: RAFT EDGE CREATE REPLICATED AT {:?}", self.db_path);
             }
             Ok(())
         })
@@ -1234,13 +1205,10 @@ impl SledDaemon {
     ) -> GraphResult<Option<Edge>> {
         if !self.is_running().await {
             error!("Daemon at path {:?} is not running", self.db_path);
-            println!("===> ERROR: DAEMON AT PATH {:?} IS NOT RUNNING", self.db_path);
             return Err(GraphError::StorageError(format!("Daemon at path {:?} is not running", self.db_path)));
         }
         let key = create_edge_key(&(*outbound_id).into(), edge_type, &(*inbound_id).into())?;
         info!("Retrieving edge ({}, {}, {}) from path {:?}", outbound_id, edge_type, inbound_id, self.db_path);
-        println!("===> RETRIEVING EDGE ({}, {}, {}) FROM PATH {:?}", outbound_id, edge_type, inbound_id, self.db_path);
-
         let res = timeout(Duration::from_secs(5), async {
             let opt = self.edges
                 .get(&key)
@@ -1262,7 +1230,6 @@ impl SledDaemon {
             .filter_map(|k| k.ok())
             .collect();
         info!("Current edges keys at {:?}: {:?}", self.db_path, edge_keys);
-        println!("===> GET_EDGE: CURRENT EDGES KEYS AT {:?}: {:?}", self.db_path, edge_keys);
         Ok(res)
     }
 
@@ -1279,7 +1246,6 @@ impl SledDaemon {
         self.ensure_write_access().await?;
         let key = create_edge_key(&(*outbound_id).into(), edge_type, &(*inbound_id).into())?;
         info!("Deleting edge ({}, {}, {}) from path {:?}", outbound_id, edge_type, inbound_id, self.db_path);
-        println!("===> DELETING EDGE ({}, {}, {}) FROM PATH {:?}", outbound_id, edge_type, inbound_id, self.db_path);
         timeout(Duration::from_secs(5), async {
             self.edges
                 .remove(key)
@@ -1294,19 +1260,17 @@ impl SledDaemon {
                 .filter_map(|k| k.ok())
                 .collect();
             info!("Flushed {} bytes after deleting edge at {:?}, current edges keys: {:?}", bytes_flushed, self.db_path, edge_keys);
-            println!("===> DELETE_EDGE: FLUSHED {} BYTES, CURRENT EDGES KEYS: {:?}", bytes_flushed, edge_keys);
             #[cfg(feature = "with-openraft-sled")]
-            {
+            if let Some(raft) = &self.raft {
                 let request = openraft::raft::ClientWriteRequest::new(
                     openraft::EntryPayload::AppWrite {
                         key: key.to_vec(),
                         value: vec![],
                     }
                 );
-                self.raft.client_write(request).await
+                raft.client_write(request).await
                     .map_err(|e| GraphError::StorageError(format!("Raft edge delete failed: {}", e)))?;
                 info!("Raft edge delete replicated at {:?}", self.db_path);
-                println!("===> DELETE_EDGE: RAFT EDGE DELETE REPLICATED AT {:?}", self.db_path);
             }
             Ok(())
         })
@@ -1356,7 +1320,7 @@ impl SledDaemon {
         let context = ZmqContext::new();
         let socket = context.socket(zmq::REQ)
             .map_err(|e| GraphError::StorageError(format!("Failed to create ZeroMQ socket: {}", e)))?;
-        let endpoint = format!("ipc:///opt/graphdb/graphdb-{}.ipc", self.port);
+        let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", self.port);
         socket.connect(&endpoint)
             .map_err(|e| GraphError::StorageError(format!("Failed to connect to ZeroMQ socket {}: {}", endpoint, e)))?;
 
@@ -1385,7 +1349,7 @@ impl SledDaemon {
         let context = ZmqContext::new();
         let socket = context.socket(zmq::REQ)
             .map_err(|e| GraphError::StorageError(format!("Failed to create ZeroMQ socket: {}", e)))?;
-        let endpoint = format!("ipc:///opt/graphdb/graphdb-{}.ipc", self.port);
+        let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", self.port);
         socket.connect(&endpoint)
             .map_err(|e| GraphError::StorageError(format!("Failed to connect to ZeroMQ socket {}: {}", endpoint, e)))?;
 
@@ -1416,7 +1380,7 @@ impl SledDaemon {
         let context = ZmqContext::new();
         let socket = context.socket(zmq::REQ)
             .map_err(|e| GraphError::StorageError(format!("Failed to create ZeroMQ socket: {}", e)))?;
-        let endpoint = format!("ipc:///opt/graphdb/graphdb-{}.ipc", self.port);
+        let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", self.port);
         socket.connect(&endpoint)
             .map_err(|e| GraphError::StorageError(format!("Failed to connect to ZeroMQ socket {}: {}", endpoint, e)))?;
 
@@ -1447,7 +1411,7 @@ impl SledDaemon {
         let context = ZmqContext::new();
         let socket = context.socket(zmq::REQ)
             .map_err(|e| GraphError::StorageError(format!("Failed to create ZeroMQ socket: {}", e)))?;
-        let endpoint = format!("ipc:///opt/graphdb/graphdb-{}.ipc", self.port);
+        let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", self.port);
         socket.connect(&endpoint)
             .map_err(|e| GraphError::StorageError(format!("Failed to connect to ZeroMQ socket {}: {}", endpoint, e)))?;
 
@@ -1471,6 +1435,7 @@ impl SledDaemon {
     }
 }
 
+
 impl SledDaemonPool {
 
 
@@ -1491,12 +1456,65 @@ impl SledDaemonPool {
         Ok(pool)
     }
 
+    pub async fn new_with_client(client: SledClient, db_path: &Path, port: u16) -> GraphResult<Self> {
+        println!("============> In pool new_with_client - this must start zeromq server");
+        let mut pool = Self::new();
+        let db = client.inner.lock().await.clone();
+        let vertices = db.open_tree("vertices").map_err(|e| GraphError::StorageError(format!("Failed to open vertices tree: {}", e)))?;
+        let edges = db.open_tree("edges").map_err(|e| GraphError::StorageError(format!("Failed to open edges tree: {}", e)))?;
+        let kv_pairs = db.open_tree("kv_pairs").map_err(|e| GraphError::StorageError(format!("Failed to open kv_pairs tree: {}", e)))?;
+        
+        pool.daemons.insert(port, Arc::new(SledDaemon {
+            port,
+            db_path: db_path.to_path_buf(),
+            db,
+            vertices,
+            edges,
+            kv_pairs,
+            running: Arc::new(TokioMutex::new(true)),
+            #[cfg(feature = "with-openraft-sled")]
+            raft_storage: Arc::new(SledRaftStorage::new(db.clone()).await.map_err(|e| GraphError::StorageError(format!("Failed to create Raft storage: {}", e)))?),
+            #[cfg(feature = "with-openraft-sled")]
+            node_id: port as u64, // Use port as node_id for simplicity
+        }));
+        Ok(pool)
+    }
     /// Adds a new SledDaemon instance to the pool.
     /// This method is essential for `SledStorage::new_with_client` to work.
     pub fn add_daemon(&mut self, daemon: Arc<SledDaemon>) {
         self.daemons.insert(daemon.port, daemon);
     }
 
+    pub async fn delete_replicated(&self, key: &[u8], use_raft_for_scale: bool, _mode: Option<SledClientMode>) -> GraphResult<()> {
+        if use_raft_for_scale {
+                #[cfg(feature = "with-openraft-sled")]
+                {
+                    // Handle Raft deletion
+                    let daemon = self.daemons.iter().next();
+                    if let Some((port, daemon)) = daemon {
+                        let raft_storage = &daemon.raft_storage;
+                        // Placeholder for Raft deletion logic
+                        // Example: Submit a Raft command to delete the key
+                        return Err(GraphError::StorageError("Raft deletion not implemented".to_string()));
+                    } else {
+                        return Err(GraphError::StorageError("No daemon available for Raft deletion".to_string()));
+                    }
+                }
+                #[cfg(not(feature = "with-openraft-sled"))]
+                {
+                    return Err(GraphError::StorageError("Raft support not enabled".to_string()));
+                }
+            } else {
+                // Direct deletion
+                let daemon = self.daemons.iter().next();
+                if let Some((port, daemon)) = daemon {
+                    daemon.db.remove(key).map_err(|e| GraphError::StorageError(format!("Failed to delete key: {}", e)))?;
+                    Ok(())
+                } else {
+                    Err(GraphError::StorageError("No daemon available for deletion".to_string()))
+                }
+            }
+    }
     /// Enhanced insert with replication across multiple nodes
     pub async fn insert_replicated(&self, key: &[u8], value: &[u8], use_raft_for_scale: bool) -> GraphResult<()> {
         let strategy = if use_raft_for_scale && self.use_raft_for_scale {
@@ -1563,7 +1581,7 @@ impl SledDaemonPool {
         socket.set_sndtimeo(5000)
             .map_err(|e| GraphError::StorageError(format!("Failed to set send timeout: {}", e)))?;
 
-        let endpoint = format!("ipc:///opt/graphdb/graphdb-{}.ipc", port);
+        let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", port);
         socket.connect(&endpoint)
             .map_err(|e| GraphError::StorageError(format!("Failed to connect to {}: {}", endpoint, e)))?;
 
@@ -1632,7 +1650,7 @@ impl SledDaemonPool {
         socket.set_sndtimeo(5000)
             .map_err(|e| GraphError::StorageError(format!("Failed to set send timeout: {}", e)))?;
 
-        let endpoint = format!("ipc:///opt/graphdb/graphdb-{}.ipc", port);
+        let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", port);
         socket.connect(&endpoint)
             .map_err(|e| GraphError::StorageError(format!("Failed to connect to {}: {}", endpoint, e)))?;
 
@@ -1840,7 +1858,7 @@ impl SledDaemonPool {
         });
     }
 
-    async fn initialize_with_db(&mut self, config: &SledConfig, existing_db: Arc<sled::Db>) -> GraphResult<()> {
+    pub async fn initialize_with_db(&mut self, config: &SledConfig, existing_db: Arc<sled::Db>) -> GraphResult<()> {
         let mut initialized = self.initialized.write().await;
         if *initialized {
             warn!("SledDaemonPool already initialized, skipping");
@@ -1911,52 +1929,91 @@ impl SledDaemonPool {
             fs::set_permissions(&db_path, PermissionsExt::from_mode(0o700))
                 .await
                 .map_err(|e| {
-                    error!("Failed to set permissions for directory at {:?}: {}", db_path, e);
-                    println!("===> ERROR: FAILED TO SET PERMISSIONS FOR DIRECTORY AT {:?}: {}", db_path, e);
-                    GraphError::StorageError(format!("Failed to set permissions for directory at {:?}", db_path))
+                    error!("Failed to set permissions on directory at {:?}: {}", db_path, e);
+                    println!("===> ERROR: FAILED TO SET PERMISSIONS ON DIRECTORY AT {:?}: {}", db_path, e);
+                    GraphError::StorageError(format!("Failed to set permissions on directory at {:?}", db_path))
                 })?;
+        } else if !db_path.is_dir() {
+            error!("Path {:?} is not a directory", db_path);
+            println!("===> ERROR: PATH {:?} IS NOT A DIRECTORY", db_path);
+            return Err(GraphError::StorageError(format!("Path {:?} is not a directory", db_path)));
         }
 
-        // Initialize SledDaemon with existing DB
-        let daemon = SledDaemon::new_with_db(config.clone(), existing_db.clone()).await?;
-        info!("Created new SledDaemon on port {}", port);
-        println!("===> CREATED NEW SLED DAEMON ON PORT {}", port);
+        let metadata = fs::metadata(&db_path).await.map_err(|e| {
+            error!("Failed to access directory metadata at {:?}: {}", db_path, e);
+            println!("===> ERROR: FAILED TO ACCESS DIRECTORY METADATA AT {:?}: {}", db_path, e);
+            GraphError::StorageError(format!("Failed to access directory metadata at {:?}", db_path))
+        })?;
+        if metadata.permissions().readonly() {
+            error!("Directory at {:?} is not writable", db_path);
+            println!("===> ERROR: DIRECTORY AT {:?} IS NOT WRITABLE", db_path);
+            return Err(GraphError::StorageError(format!("Directory at {:?} is not writable", db_path)));
+        }
 
-        let metadata = DaemonMetadata {
-            service_type: "sled".to_string(),
-            ip_address: "127.0.0.1".to_string(),
-            config_path: Some(db_path.clone()),
-            engine_type: Some("Sled".to_string()),
-            last_seen_nanos: SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64 as i64)
-                .unwrap_or(0),
-            data_dir: Some(db_path),
-            pid: std::process::id(),
+        // Create a new SledDaemon with the existing database
+        info!("Creating new SledDaemon for port {}", port);
+        println!("===> CREATING NEW SLED DAEMON FOR PORT {}", port);
+        let mut updated_config = config.clone();
+        updated_config.path = db_path.clone();
+        let daemon = SledDaemon::new_with_db(updated_config, existing_db).await?;
+
+        // Wait a moment for the daemon to initialize properly
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        
+        info!("SledDaemon created successfully for port {}", port);
+        println!("===> SLED DAEMON CREATED SUCCESSFULLY FOR PORT {}", port);
+
+        // Add daemon to pool
+        self.daemons.insert(port, Arc::new(daemon.clone()));
+        info!("Added daemon to pool for port {}", port);
+        println!("===> ADDED DAEMON TO POOL FOR PORT {}", port);
+
+        // Register daemon in GLOBAL_DAEMON_REGISTRY
+        let daemon_metadata = DaemonMetadata {
+            service_type: "storage".to_string(),
             port,
+            pid: std::process::id(),
+            ip_address: "127.0.0.1".to_string(),
+            data_dir: Some(db_path.clone()),
+            config_path: None,
+            engine_type: Some(StorageEngineType::Sled.to_string()),
+            last_seen_nanos: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as i64)
+                .unwrap_or(0),
         };
 
-        timeout(Duration::from_secs(5), GLOBAL_DAEMON_REGISTRY.register_daemon(metadata.clone()))
+        timeout(Duration::from_secs(5), GLOBAL_DAEMON_REGISTRY.register_daemon(daemon_metadata))
             .await
             .map_err(|_| {
-                warn!("Timeout registering daemon on port {}", port);
-                println!("===> WARNING: TIMEOUT REGISTERING DAEMON ON PORT {}", port);
+                error!("Timeout registering daemon on port {}", port);
+                println!("===> ERROR: TIMEOUT REGISTERING DAEMON ON PORT {}", port);
                 GraphError::StorageError(format!("Timeout registering daemon on port {}", port))
-            })??;
-        info!("Registered daemon in global registry on port {}", port);
-        println!("===> REGISTERED DAEMON IN GLOBAL REGISTRY ON PORT {}", port);
+            })?
+            .map_err(|e| {
+                error!("Failed to register daemon on port {}: {}", port, e);
+                println!("===> ERROR: FAILED TO REGISTER DAEMON ON PORT {}: {}", port, e);
+                GraphError::StorageError(format!("Failed to register daemon on port {}: {}", port, e))
+            })?;
+        info!("Registered daemon for port {} with path {:?}", port, db_path);
+        println!("===> REGISTERED DAEMON FOR PORT {} WITH PATH {:?}", port, db_path);
 
-        self.daemons.insert(port, Arc::new(daemon));
-        info!("Stored daemon in pool for port {}", port);
-        println!("===> STORED DAEMON IN POOL FOR PORT {}", port);
+        // Start health monitoring after daemon creation
+        let health_config = HealthCheckConfig {
+            interval: Duration::from_secs(10),
+            connect_timeout: Duration::from_secs(2),
+            response_buffer_size: 1024,
+        };
+        self.start_health_monitoring(health_config).await;
+        info!("Started health monitoring for port {}", port);
+        println!("===> STARTED HEALTH MONITORING FOR PORT {}", port);
 
         *initialized = true;
         info!("SledDaemonPool initialization complete for port {}", port);
         println!("===> SLED DAEMON POOL INITIALIZATION COMPLETE FOR PORT {}", port);
         Ok(())
     }
-
-    /// Enhanced initialization with load balancing support
+        
     async fn _initialize_cluster_core<F, Fut>(
         &mut self,
         storage_config: &StorageConfig,
@@ -1966,11 +2023,12 @@ impl SledDaemonPool {
     ) -> GraphResult<()>
     where
         F: Fn(SledConfig) -> Fut,
-        Fut: std::future::Future<Output = GraphResult<SledDaemon>>,
+        Fut: std::future::Future<Output = GraphResult<(SledDaemon, oneshot::Receiver<()>)>>,
     {
-        let mut initialized = self.initialized.write().await;
+        let mut initialized = self.initialized.write().await; // Use write().await for RwLock
         if *initialized {
             warn!("SledDaemonPool already initialized, skipping");
+            println!("===> WARNING: SLED DAEMON POOL ALREADY INITIALIZED, SKIPPING");
             return Ok(());
         }
 
@@ -1991,15 +2049,45 @@ impl SledDaemonPool {
 
         // Ensure directory exists
         if !db_path.exists() {
+            info!("Creating Sled directory at {:?}", db_path);
+            println!("===> CREATING SLED DIRECTORY AT {:?}", db_path);
             fs::create_dir_all(&db_path).await
-                .map_err(|e| GraphError::Io(e.to_string()))?;
+                .map_err(|e| {
+                    error!("Failed to create directory at {:?}: {}", db_path, e);
+                    println!("===> ERROR: FAILED TO CREATE DIRECTORY AT {:?}: {}", db_path, e);
+                    GraphError::Io(e.to_string())
+                })?;
+            fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o700))
+                .await
+                .map_err(|e| {
+                    error!("Failed to set permissions on directory at {:?}: {}", db_path, e);
+                    println!("===> ERROR: FAILED TO SET PERMISSIONS ON DIRECTORY AT {:?}: {}", db_path, e);
+                    GraphError::Io(e.to_string())
+                })?;
         }
 
         // Initialize daemon
         let mut daemon_config = config.clone();
         daemon_config.path = db_path.clone();
         daemon_config.port = Some(port);
-        let daemon = daemon_creator(daemon_config).await?;
+        let (daemon, ready_rx) = daemon_creator(daemon_config).await?;
+
+        // Wait for the ZeroMQ server to be ready
+        timeout(Duration::from_secs(10), ready_rx)
+            .await
+            .map_err(|_| {
+                error!("Timeout waiting for ZeroMQ server to be ready on port {}", port);
+                println!("===> ERROR: TIMEOUT WAITING FOR ZEROMQ SERVER TO BE READY ON PORT {}", port);
+                GraphError::StorageError(format!("Timeout waiting for ZeroMQ server on port {}", port))
+            })?
+            .map_err(|_| {
+                error!("ZeroMQ server readiness signal failed for port {}", port);
+                println!("===> ERROR: ZEROMQ SERVER READINESS SIGNAL FAILED FOR PORT {}", port);
+                GraphError::StorageError("ZeroMQ server readiness signal failed".to_string())
+            })?;
+
+        info!("ZeroMQ server is ready for port {}", port);
+        println!("===> ZEROMQ SERVER IS READY FOR PORT {}", port);
 
         // Register daemon in GLOBAL_DAEMON_REGISTRY
         let daemon_metadata = DaemonMetadata {
@@ -2016,13 +2104,27 @@ impl SledDaemonPool {
                 .unwrap_or(0),
         };
 
-        GLOBAL_DAEMON_REGISTRY.register_daemon(daemon_metadata).await?;
+        timeout(Duration::from_secs(5), GLOBAL_DAEMON_REGISTRY.register_daemon(daemon_metadata))
+            .await
+            .map_err(|_| GraphError::StorageError("Timeout registering daemon".to_string()))?
+            .map_err(|e| {
+                error!("Failed to register daemon on port {}: {}", port, e);
+                println!("===> ERROR: FAILED TO REGISTER DAEMON ON PORT {}: {}", port, e);
+                GraphError::StorageError(format!("Failed to register daemon on port {}: {}", port, e))
+            })?;
+        info!("Registered daemon for port {} with path {:?}", port, db_path);
+        println!("===> REGISTERED DAEMON FOR PORT {} WITH PATH {:?}", port, db_path);
         
         // Add to load balancer
         self.load_balancer.update_node_health(port, true, 0).await;
+        info!("Updated node health in load balancer for port {}", port);
+        println!("===> UPDATED NODE HEALTH IN LOAD BALANCER FOR PORT {}", port);
         
         // Store daemon in pool
         self.daemons.insert(port, Arc::new(daemon));
+        info!("Added daemon to pool for port {}", port);
+        println!("===> ADDED DAEMON TO POOL FOR PORT {}", port);
+        
         *initialized = true;
         
         // Create HealthCheckConfig (use config values or defaults)
@@ -2032,8 +2134,10 @@ impl SledDaemonPool {
             response_buffer_size: 1024,
         };
 
-        // Start health monitoring
+        // Start health monitoring after ZeroMQ server is ready
         self.start_health_monitoring(health_config).await;
+        info!("Started health monitoring for port {}", port);
+        println!("===> STARTED HEALTH MONITORING FOR PORT {}", port);
         
         info!("SledDaemonPool initialized successfully with replication on port {}", port);
         println!("===> SLED DAEMON POOL INITIALIZED SUCCESSFULLY WITH REPLICATION ON PORT {}", port);
@@ -2051,7 +2155,13 @@ impl SledDaemonPool {
             storage_config,
             config,
             cli_port,
-            |daemon_config| SledDaemon::new(daemon_config), // Remove _port parameter
+            |daemon_config| async {
+                let daemon = SledDaemon::new(daemon_config).await?;
+                // Create a dummy receiver since the core expects a tuple
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let _ = tx.send(()); // Signal immediately that it's "ready"
+                Ok((daemon, rx))
+            },
         ).await
     }
 
@@ -2062,11 +2172,21 @@ impl SledDaemonPool {
         cli_port: Option<u16>,
         existing_db: Arc<sled::Db>,
     ) -> GraphResult<()> {
+        let existing_db_clone = existing_db.clone();
         self._initialize_cluster_core(
             storage_config,
             config,
             cli_port,
-            |daemon_config| SledDaemon::new_with_db(daemon_config, existing_db.clone()), // Remove _port parameter
+            move |daemon_config| {
+                let existing_db = existing_db_clone.clone();
+                async move {
+                    let daemon = SledDaemon::new_with_db(daemon_config, existing_db).await?;
+                    // Create a dummy receiver since the core expects a tuple
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let _ = tx.send(()); // Signal immediately that it's "ready"
+                    Ok((daemon, rx))
+                }
+            },
         ).await
     }
 
@@ -2350,7 +2470,7 @@ impl SledDaemonPool {
         let context = ZmqContext::new();
         let socket = context.socket(zmq::REQ)
             .map_err(|e| GraphError::StorageError(format!("Failed to create ZeroMQ socket: {}", e)))?;
-        let endpoint = format!("ipc:///opt/graphdb/graphdb-{}.ipc", port);
+        let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", port);
         socket.connect(&endpoint)
             .map_err(|e| GraphError::StorageError(format!("Failed to connect to ZeroMQ socket {}: {}", endpoint, e)))?;
 
@@ -2381,7 +2501,7 @@ impl SledDaemonPool {
         let context = ZmqContext::new();
         let socket = context.socket(zmq::REQ)
             .map_err(|e| GraphError::StorageError(format!("Failed to create ZeroMQ socket: {}", e)))?;
-        let endpoint = format!("ipc:///opt/graphdb/graphdb-{}.ipc", port);
+        let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", port);
         socket.connect(&endpoint)
             .map_err(|e| GraphError::StorageError(format!("Failed to connect to ZeroMQ socket {}: {}", endpoint, e)))?;
 
@@ -2414,7 +2534,7 @@ impl SledDaemonPool {
         let context = ZmqContext::new();
         let socket = context.socket(zmq::REQ)
             .map_err(|e| GraphError::StorageError(format!("Failed to create ZeroMQ socket: {}", e)))?;
-        let endpoint = format!("ipc:///opt/graphdb/graphdb-{}.ipc", port);
+        let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", port);
         socket.connect(&endpoint)
             .map_err(|e| GraphError::StorageError(format!("Failed to connect to ZeroMQ socket {}: {}", endpoint, e)))?;
 
@@ -2447,7 +2567,7 @@ impl SledDaemonPool {
         let context = ZmqContext::new();
         let socket = context.socket(zmq::REQ)
             .map_err(|e| GraphError::StorageError(format!("Failed to create ZeroMQ socket: {}", e)))?;
-        let endpoint = format!("ipc:///opt/graphdb/graphdb-{}.ipc", port);
+        let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", port);
         socket.connect(&endpoint)
             .map_err(|e| GraphError::StorageError(format!("Failed to connect to ZeroMQ socket {}: {}", endpoint, e)))?;
 

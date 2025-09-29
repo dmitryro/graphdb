@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use serde_yaml2 as serde_yaml;
 use std::fs;
-use storage_daemon_server::{StorageSettings, StorageSettingsWrapper};
+use lib::daemon::storage_daemon_server::{StorageSettings, StorageSettingsWrapper};
 use log::{info, debug, warn, error};
 use models::errors::GraphError;
 use tokio::time::{timeout, Duration as TokioDuration};
@@ -36,7 +36,7 @@ use lib::config as config_mod;
 use crate::cli::daemon_management;
 use crate::cli::handlers as handlers_mod;
 use crate::cli::handlers_storage::{ start_storage_interactive, stop_storage_interactive };
-use crate::cli::handlers_utils::parse_storage_engine;
+use crate::cli::handlers_utils::{ parse_storage_engine, handle_internal_daemon_run };
 use crate::cli::help_display as help_display_mod;
 use crate::cli::interactive as interactive_mod;
 use crate::cli::handlers_queries::initialize_storage_for_query;
@@ -767,7 +767,7 @@ pub async fn start_cli() -> Result<()> {
 
     if args.internal_rest_api_run || args.internal_storage_daemon_run || args.internal_daemon_run {
         let converted_storage_engine = args.internal_storage_engine.map(|se_cli| se_cli.into());
-        return daemon_management::handle_internal_daemon_run(
+        return handle_internal_daemon_run(
             args.internal_rest_api_run,
             args.internal_storage_daemon_run,
             args.internal_port,

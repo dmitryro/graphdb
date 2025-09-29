@@ -4,6 +4,7 @@
 storage:
   storage_engine_type: sled
   # Path to local Sled data directory (required for local setup).
+  use_compression: false
   path: /opt/graphdb/storage_data/sled
   # Optional remote connection fields (uncomment and configure if using a remote Sled server).
   # host: 127.0.0.1

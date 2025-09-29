@@ -9,6 +9,6 @@ members = [
     "caching",
     "client", 
     "rest_api", 
-    "daemon", 
-    "daemon_api", "security", "models", "storage_daemon_server", "storage_caching", "analytics_service", "caching_service", "notifications_service", "validation_service", "observability_service", "compliance_service", "logging_service", 
+    "security", "models", "storage_daemon_server", "storage_caching", "analytics_service", "caching_service", "notifications_service", "validation_service", "observability_service", "compliance_service", "logging_service", 
 ]
+
