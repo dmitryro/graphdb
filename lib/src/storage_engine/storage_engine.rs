@@ -47,6 +47,7 @@ use openraft::{
     storage::Adaptor, LogId, LeaderId, StoredMembership, RaftTypeConfig, storage::RaftStateMachine, storage::RaftSnapshotBuilder,
     OptionalSend, OptionalSync,
 };
+use std::process::Command;
 use super::rocksdb_storage::{ ROCKSDB_POOL_MAP, ROCKSDB_DB };
 use futures::future::Future; 
 use futures::TryFutureExt;
@@ -3024,13 +3025,13 @@ impl StorageEngineManager {
         #[cfg(feature = "mysql-datastore")]
         engines.push(StorageEngineType::MySQL);
         engines
-    }
+    }    
 
     pub async fn use_storage(&mut self, new_config: StorageConfig, permanent: bool) -> Result<(), GraphError> {
         info!("=== Starting use_storage for engine: {:?}, permanent: {} ===", new_config.storage_engine_type, permanent);
         trace!("use_storage called with engine_type: {:?}", new_config.storage_engine_type);
         let start_time = Instant::now();
-        println!("===> USE STORAGE HANDLER - STEP 1");
+        println!("===> USE STORAGE HANDLER - STEP 1: Validating engine availability");
 
         // Check if requested engine is available
         let available_engines = Self::available_engines();
@@ -3056,7 +3057,7 @@ impl StorageEngineManager {
             .as_ref()
             .and_then(|c| c.storage.path.clone())
             .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data"));
-        let new_path = new_config.engine_specific_config
+        let _new_path = new_config.engine_specific_config
             .as_ref()
             .and_then(|c| c.storage.path.clone())
             .unwrap_or_else(|| PathBuf::from(format!("/opt/graphdb/storage_data/{}/{}", new_config.storage_engine_type.to_string().to_lowercase(), new_config.default_port)));
@@ -3080,7 +3081,7 @@ impl StorageEngineManager {
         // Check for running daemon on the port
         let daemon_running = match find_pid_by_port(port).await {
             Ok(Some(pid)) => {
-                let status = std::process::Command::new("ps")
+                let status = Command::new("ps")
                     .arg("-p")
                     .arg(pid.to_string())
                     .output()
@@ -3092,14 +3093,14 @@ impl StorageEngineManager {
         };
 
         // If daemon is running and engine/path are the same, update metadata and reuse
-        if daemon_running && old_engine_type == new_config.storage_engine_type && old_path == new_path {
+        if daemon_running && old_engine_type == new_config.storage_engine_type && old_path == _new_path {
             info!("Valid daemon running on port {}, same engine and path, updating metadata.", port);
             let meta = DaemonMetadata {
                 service_type: "storage".to_string(),
                 port,
                 pid: find_pid_by_port(port).await?.unwrap_or(std::process::id()),
                 ip_address: "127.0.0.1".to_string(),
-                data_dir: Some(new_path.clone()),
+                data_dir: Some(_new_path.clone()),
                 config_path: Some(self.config_path.clone()),
                 engine_type: Some(new_config.storage_engine_type.to_string()),
                 last_seen_nanos: SystemTime::now()
@@ -3114,37 +3115,36 @@ impl StorageEngineManager {
         }
 
         // Skip if no change needed
-        if old_engine_type == new_config.storage_engine_type && old_path == new_path && self.session_engine_type.is_none() {
+        if old_engine_type == new_config.storage_engine_type && old_path == _new_path && self.session_engine_type.is_none() {
             info!("No switch needed: same engine {:?} and path {:?}", old_engine_type, old_path);
             trace!("Skipping switch: current engine matches requested and no session override. Elapsed: {}ms", start_time.elapsed().as_millis());
             return Ok(());
         }
 
         // Stop and close the current engine if running, unless Sled-to-Sled with same path
-        if was_running && !(old_engine_type == StorageEngineType::Sled && new_config.storage_engine_type == StorageEngineType::Sled && old_path == new_path) {
+        if was_running && !(old_engine_type == StorageEngineType::Sled && new_config.storage_engine_type == StorageEngineType::Sled && old_path == _new_path) {
             info!("Stopping current engine {:?} before switch", old_engine_type);
             let engine = self.engine.lock().await;
             (*engine).stop().await
                 .map_err(|e| GraphError::StorageError(format!("Failed to stop current engine: {}", e)))?;
         }
-        if !(old_engine_type == StorageEngineType::Sled && new_config.storage_engine_type == StorageEngineType::Sled && old_path == new_path) {
+        if !(old_engine_type == StorageEngineType::Sled && new_config.storage_engine_type == StorageEngineType::Sled && old_path == _new_path) {
             info!("Closing old persistent engine to release resources");
             old_persistent_arc.close().await
                 .map_err(|e| GraphError::StorageError(format!("Failed to close old persistent engine: {}", e)))?;
         }
 
         // Engine-specific cleanup, skip if daemon is running
-        if !daemon_running && !(old_engine_type == StorageEngineType::Sled && new_config.storage_engine_type == StorageEngineType::Sled && old_path == new_path) {
+        if !daemon_running && !(old_engine_type == StorageEngineType::Sled && new_config.storage_engine_type == StorageEngineType::Sled && old_path == _new_path) {
             match old_engine_type {
                 StorageEngineType::RocksDB => {
                     #[cfg(feature = "with-rocksdb")]
                     {
                         let mut singleton = ROCKSDB_SINGLETON.lock().await;
-                        if let Some(rocksdb_instance) = singleton.as_ref() {
+                        if let Some(rocksdb_instance) = singleton.take() {
                             info!("Closing existing RocksDB instance before switching");
                             rocksdb_instance.close().await
                                 .map_err(|e| GraphError::StorageError(format!("Failed to close RocksDB: {}", e)))?;
-                            *singleton = None;
                         }
                         if old_path.exists() {
                             warn!("Cleaning up RocksDB directory at {:?}", old_path);
@@ -3183,11 +3183,10 @@ impl StorageEngineManager {
                     #[cfg(feature = "with-tikv")]
                     {
                         let mut singleton = TIKV_SINGLETON.lock().await;
-                        if let Some(tikv_instance) = singleton.as_ref() {
+                        if let Some(tikv_instance) = singleton.take() {
                             info!("Closing existing TiKV instance before switching");
                             tikv_instance.close().await
                                 .map_err(|e| GraphError::StorageError(format!("Failed to close TiKV: {}", e)))?;
-                            *singleton = None;
                         }
                     }
                 }
@@ -3198,12 +3197,7 @@ impl StorageEngineManager {
                             info!("Closing existing Redis instance before switching");
                             redis_instance.close().await
                                 .map_err(|e| GraphError::StorageError(format!("Failed to close Redis: {}", e)))?;
-                            // Note: OnceCell cannot be unset, so we rely on close() to release resources
                         }
-                    }
-                    #[cfg(not(feature = "redis-datastore"))]
-                    {
-                        warn!("Redis cleanup skipped: feature not enabled");
                     }
                 }
                 StorageEngineType::PostgreSQL => {
@@ -3213,12 +3207,7 @@ impl StorageEngineManager {
                             info!("Closing existing PostgreSQL instance before switching");
                             postgres_instance.close().await
                                 .map_err(|e| GraphError::StorageError(format!("Failed to close PostgreSQL: {}", e)))?;
-                            // Note: OnceCell cannot be unset
                         }
-                    }
-                    #[cfg(not(feature = "postgres-datastore"))]
-                    {
-                        warn!("PostgreSQL cleanup skipped: feature not enabled");
                     }
                 }
                 StorageEngineType::MySQL => {
@@ -3228,12 +3217,7 @@ impl StorageEngineManager {
                             info!("Closing existing MySQL instance before switching");
                             mysql_instance.close().await
                                 .map_err(|e| GraphError::StorageError(format!("Failed to close MySQL: {}", e)))?;
-                            // Note: OnceCell cannot be unset
                         }
-                    }
-                    #[cfg(not(feature = "mysql-datastore"))]
-                    {
-                        warn!("MySQL cleanup skipped: feature not enabled");
                     }
                 }
                 _ => {}
@@ -3241,7 +3225,6 @@ impl StorageEngineManager {
         }
 
         println!("===> USE STORAGE HANDLER - STEP 2: Loading configuration...");
-
         // Determine config path
         let config_path = self.config_path.clone();
         info!("Using main config path: {:?}", config_path);
@@ -3301,7 +3284,7 @@ impl StorageEngineManager {
         println!("===> Configuration saved successfully.");
 
         // Stop existing daemon only if engine or path differs
-        if daemon_running && !(old_engine_type == new_config.storage_engine_type && old_path == new_path) {
+        if daemon_running && !(old_engine_type == new_config.storage_engine_type && old_path == _new_path) {
             println!("===> USE STORAGE HANDLER - STEP 5: Managing daemon on port {}...", port);
             let max_attempts = 5;
             let mut attempt = 0;
@@ -3309,7 +3292,7 @@ impl StorageEngineManager {
                 match find_pid_by_port(port).await {
                     Ok(Some(found_pid)) => {
                         debug!("Found PID {} for port {} on attempt {}", found_pid, port, attempt);
-                        let status = std::process::Command::new("ps")
+                        let status = Command::new("ps")
                             .arg("-p")
                             .arg(found_pid.to_string())
                             .output()
@@ -3339,7 +3322,7 @@ impl StorageEngineManager {
         }
 
         // Initialize new engine only if no running daemon or engine/path differs
-        let new_persistent = if daemon_running && old_engine_type == new_config.storage_engine_type && old_path == new_path {
+        let new_persistent = if daemon_running && old_engine_type == new_config.storage_engine_type && old_path == _new_path {
             info!("Reusing existing Sled engine for port {}", port);
             #[cfg(feature = "with-sled")]
             {
@@ -3349,7 +3332,7 @@ impl StorageEngineManager {
                 let storage = SledStorage::new_with_db(
                     &SledConfig {
                         storage_engine_type: StorageEngineType::Sled,
-                        path: new_path.clone(),
+                        path: _new_path.clone(),
                         host: new_config.engine_specific_config.as_ref().and_then(|c| c.storage.host.clone()),
                         port: Some(port),
                         temporary: false,
@@ -3541,21 +3524,14 @@ impl StorageEngineManager {
                                     };
                                     
                                     info!("Initializing Sled engine with path: {:?}", sled_config.path);
-                                    let mut sled_singleton = SLED_SINGLETON.lock().await;
-                                    let sled_instance = match sled_singleton.as_ref() {
-                                        Some(instance) => {
-                                            info!("Reusing existing Sled instance");
-                                            instance.clone()
-                                        }
-                                        None => {
-                                            trace!("Creating new SledStorage singleton");
-                                            let storage = SledStorage::new(&sled_config, &config).await?;
-                                            let instance = Arc::new(storage);
-                                            *sled_singleton = Some(instance.clone());
-                                            instance
-                                        }
+                                    let storage = SledStorage::new(&sled_config, &config).await?;
+                                    let sled_db_with_path = SledDbWithPath {
+                                        db: Arc::new(sled::open(&sled_config.path).map_err(|e| GraphError::StorageError(format!("Failed to open Sled DB: {}", e)))?),
+                                        path: sled_config.path.clone(),
+                                        client: None, // Assuming client is optional and can be None if not used
                                     };
-                                    Ok(sled_instance as Arc<dyn GraphStorageEngine + Send + Sync>)
+                                    SLED_DB.set(TokioMutex::new(sled_db_with_path)).map_err(|_| GraphError::StorageError("Failed to set Sled DB".to_string()))?;
+                                    Ok(Arc::new(storage) as Arc<dyn GraphStorageEngine + Send + Sync>)
                                 }
                                 #[cfg(not(feature = "with-sled"))]
                                 {
@@ -3588,19 +3564,18 @@ impl StorageEngineManager {
                                     };
                                     info!("Initializing RocksDB engine with path: {:?}", rocksdb_config.path);
                                     let mut rocksdb_singleton = ROCKSDB_SINGLETON.lock().await;
-                                    let rocksdb_instance = match rocksdb_singleton.as_ref() {
+                                    let rocksdb_instance = match rocksdb_singleton.take() {
                                         Some(instance) => {
                                             info!("Reusing existing RocksDB instance");
-                                            instance.clone()
+                                            instance
                                         }
                                         None => {
                                             trace!("Creating new RocksDBStorage singleton");
                                             let storage = RocksDBStorage::new(&rocksdb_config, &config).await?;
-                                            let instance = Arc::new(storage);
-                                            *rocksdb_singleton = Some(instance.clone());
-                                            instance
+                                            Arc::new(storage)
                                         }
                                     };
+                                    *rocksdb_singleton = Some(rocksdb_instance.clone());
                                     Ok(rocksdb_instance as Arc<dyn GraphStorageEngine + Send + Sync>)
                                 }
                                 #[cfg(not(feature = "with-rocksdb"))]
@@ -3635,16 +3610,15 @@ impl StorageEngineManager {
                                             .and_then(|map| map.storage.password.clone()),
                                     };
                                     let mut tikv_singleton = TIKV_SINGLETON.lock().await;
-                                    let tikv_instance = if let Some(instance) = tikv_singleton.as_ref() {
+                                    let tikv_instance = if let Some(instance) = tikv_singleton.take() {
                                         info!("Reusing existing TiKV instance");
-                                        instance.clone()
+                                        instance
                                     } else {
                                         trace!("Creating new TiKV instance");
                                         let storage = TikvStorage::new(&tikv_config).await?;
-                                        let instance = Arc::new(storage);
-                                        *tikv_singleton = Some(instance.clone());
-                                        instance
+                                        Arc::new(storage)
                                     };
+                                    *tikv_singleton = Some(tikv_instance.clone());
                                     Ok(tikv_instance as Arc<dyn GraphStorageEngine + Send + Sync>)
                                 }
                                 #[cfg(not(feature = "with-tikv"))]
@@ -3776,16 +3750,16 @@ impl StorageEngineManager {
         };
 
         // Migrate or copy data if needed
-        if old_engine_type != new_config.storage_engine_type || old_path != new_path {
+        if old_engine_type != new_config.storage_engine_type || old_path != _new_path {
             info!("Handling data transfer from old {:?} (path {:?}) to new {:?} (path {:?})", 
-                  old_engine_type, old_path, new_config.storage_engine_type, new_path);
+                  old_engine_type, old_path, new_config.storage_engine_type, _new_path);
             if old_engine_type != new_config.storage_engine_type {
                 info!("Migrating data from {} to {}", old_persistent_arc.get_type(), new_persistent.get_type());
                 self.migrate_data(&old_persistent_arc, &new_persistent).await?;
-            } else if let (Some(old_p), Some(new_p)) = (old_path.to_str(), new_path.to_str()) {
+            } else if let (Some(old_p), Some(new_p)) = (old_path.to_str(), _new_path.to_str()) {
                 if old_p != new_p {
                     info!("Copying data directory for same-engine path change");
-                    copy_dir(&old_path, &new_path).await
+                    copy_dir(&old_path, &_new_path).await
                         .map_err(|e| GraphError::Io(e.to_string()))?;
                 }
             }
@@ -3801,7 +3775,7 @@ impl StorageEngineManager {
         self.persistent_engine = new_persistent;
 
         // Start the new engine and register daemon
-        if !daemon_running || old_engine_type != new_config.storage_engine_type || old_path != new_path {
+        if !daemon_running || old_engine_type != new_config.storage_engine_type || old_path != _new_path {
             let engine = self.engine.lock().await;
             (*engine).start().await
                 .map_err(|e| GraphError::StorageError(format!("Failed to start new engine: {}", e)))?;
