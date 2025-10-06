@@ -451,7 +451,7 @@ impl RocksDBClient {
         }
     }
 
-    pub async fn execute_query(&self) -> GraphResult<QueryResult> {
+    pub async fn execute_query(&self, query_plan: QueryPlan) -> GraphResult<QueryResult> {
         info!("Executing query on RocksDBClient (not implemented)");
         println!("===> Executing query on RocksDBClient (not implemented)");
         Ok(QueryResult::Null)

@@ -55,6 +55,7 @@ use futures::TryFutureExt;
 use openraft::error::RPCError;
 use openraft_memstore::MemStore;    // from the openraft-memstore crate
 use openraft_memstore::TypeConfig as RaftMemStoreTypeConfig;
+use zmq::{ Context as ZmqContext};
 // If the above doesn't work, try:
 // use openraft::network::RPCError;
 // Or if it's named differently:
@@ -65,9 +66,9 @@ use crate::config::{DEFAULT_DATA_DIRECTORY, DEFAULT_LOG_DIRECTORY, LOCK_FILE_PAT
                                  RedisConfig, MySQLConfig, PostgreSQLConfig, TypeConfig, QueryPlan, QueryResult,
                                  NodeIdType, StorageConfigInner, SelectedStorageConfig, StorageConfigWrapper, AppResponse, AppRequest,
                                  SledDbWithPath, RocksDbWithPath, load_storage_config_from_yaml,
-                                 create_default_storage_yaml_config,
+                                 create_default_storage_yaml_config, SledClientMode, SledClient,
                                  load_engine_specific_config};
-use crate::daemon::daemon_management::{ is_storage_daemon_running, is_socket_used_by_cli };
+use crate::daemon::daemon_management::{ is_storage_daemon_running, is_socket_used_by_cli, is_daemon_running};
 use crate::daemon::daemon_utils::{find_pid_by_port, stop_process, parse_cluster_range};
 use crate::daemon::daemon_registry::{GLOBAL_DAEMON_REGISTRY,  NonBlockingDaemonRegistry, DaemonMetadata};
 use crate::storage_engine::inmemory_storage::{InMemoryStorage};
@@ -248,8 +249,8 @@ impl SurrealdbGraphStorage {
             println!("===> SUCCESSFULLY REMOVED LOCK FILE AT {:?}", lock_file);
             sleep(TokioDuration::from_millis(500)).await;
         } else {
-            info!("No lock file found at {:?}", lock_file);
-            println!("===> NO LOCK FILE FOUND AT {:?}", lock_file);
+            info!("In Storage Engine No lock file found at {:?}", lock_file);
+            println!("In Storage Engine force_unlock: ==> NO LOCK FILE FOUND AT {:?}", lock_file);
         }
 
         Ok(())
@@ -764,7 +765,7 @@ pub async fn recover_sled(lock_path: PathBuf) -> Result<(), GraphError> {
             }
         }
     } else {
-        debug!("No lock file found for Sled at {:?}", lock_path);
+        debug!("In recover sled: No lock file found for Sled at {:?}", lock_path);
         Ok(())
     }
 }
@@ -944,7 +945,7 @@ pub async fn recover_rocksdb(data_dir: &PathBuf) -> Result<(), GraphError> {
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         info!("No lock file found at {:?}", lock_file);
-                        println!("===> NO LOCK FILE FOUND AT {:?}", lock_file);
+                        println!("In recover_rocksdb ===> NO LOCK FILE FOUND AT {:?}", lock_file);
                         CLEANUP_IN_PROGRESS.store(false, Ordering::SeqCst);
                         return Ok(());
                     }
@@ -1248,7 +1249,7 @@ impl StorageEngineManager {
                     tokio::time::sleep(TokioDuration::from_millis(500)).await;
                 } else {
                     info!("No lock file found at {:?}", lock_file);
-                    println!("===> NO LOCK FILE FOUND AT {:?}", lock_file);
+                    println!("in storage_engine new ===> NO LOCK FILE FOUND AT {:?}", lock_file);
                 }
                 if !engine_path.exists() {
                     info!("Creating new database directory at {:?}", engine_path);
@@ -1366,6 +1367,10 @@ impl StorageEngineManager {
         .await
     }
 
+    // Assuming the necessary import for is_daemon_running is already present,
+    // e.g.: use crate::daemon::daemon_management::is_daemon_running;
+    // and use zmq::Context as ZmqContext is present.
+
     #[cfg(feature = "with-sled")]
     async fn init_sled(config: &StorageConfig) -> Result<Arc<dyn GraphStorageEngine + Send + Sync>, GraphError> {
         info!("Initializing Sled engine: {:?}", config);
@@ -1472,7 +1477,7 @@ impl StorageEngineManager {
 
         Ok(new_instance)
     }
-
+    
     async fn cleanup_legacy_sled_directories_during_reset(base_data_dir: &Path, current_port: u16) {
         info!("Cleaning up legacy port-suffixed Sled directories during reset in {:?}", base_data_dir);
         
@@ -1503,7 +1508,7 @@ impl StorageEngineManager {
                                         if lock_file.exists() {
                                             warn!("Lock file still exists at {:?} after unlock attempt during reset", lock_file);
                                         } else {
-                                            println!("===> NO LOCK FILE FOUND AT {:?}", lock_file);
+                                            println!("in cleanup_legacy_sled_directories_during_reset ===> NO LOCK FILE FOUND AT {:?}", lock_file);
                                         }
                                     }
                                     
@@ -2268,7 +2273,7 @@ impl StorageEngineManager {
                 println!("===> ERROR: LOCK FILE STILL EXISTS AT {}", lock_file.display());
                 return Err(GraphError::StorageError(format!("Lock file still exists at {} after unlock attempt", lock_file.display())));
             }
-            println!("===> NO LOCK FILE FOUND AT {}", lock_file.display());
+            println!("in init_rocksdb ===> NO LOCK FILE FOUND AT {}", lock_file.display());
         }
         // Attempt to get existing metadata
         let daemon_metadata = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await?;

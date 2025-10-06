@@ -5,7 +5,7 @@ use std::process;
 use std::time::{Instant, SystemTime, UNIX_EPOCH, Duration};
 use std::sync::{Arc, LazyLock};
 use std::collections::{HashSet, HashMap};
-use std::fmt;
+use std::fmt; 
 use serde_yaml2 as serde_yaml;
 use regex::Regex;
 use sysinfo::{System, Pid, Process, ProcessStatus, ProcessesToUpdate, RefreshKind, ProcessRefreshKind};
@@ -1618,9 +1618,31 @@ pub async fn find_port_by_pid(pid: u32) -> Option<u16> {
 }
 
 pub async fn check_daemon_health(addr: &str) -> Result<bool> {
-    const HEALTH_TIMEOUT_SECS: u64 = 10;
-    const MAX_RETRIES: u32 = 5;
-    const BASE_RETRY_DELAY_MS: u64 = 500;
+    const HEALTH_TIMEOUT_SECS: u64 = 1; // Reduced from 10s to align with CLI's 3s timeout
+    const MAX_RETRIES: u32 = 3; // Reduced from 5
+    const BASE_RETRY_DELAY_MS: u64 = 100; // Reduced from 500ms
+
+    info!("Starting health check for {}", addr);
+
+    // Initialize ZeroMQ context and socket once
+    let zmq_context = ZmqContext::new();
+    let client = zmq_context
+        .socket(zmq::REQ)
+        .map_err(|e| anyhow!("Failed to create ZMQ socket: {}", e))?;
+
+    client
+        .set_rcvtimeo((HEALTH_TIMEOUT_SECS * 1000) as i32)
+        .map_err(|e| anyhow!("Failed to set receive timeout: {}", e))?;
+    client
+        .set_sndtimeo((HEALTH_TIMEOUT_SECS * 1000) as i32)
+        .map_err(|e| anyhow!("Failed to set send timeout: {}", e))?;
+    client
+        .set_linger(1000) // Increased from 0 to allow response time
+        .map_err(|e| anyhow!("Failed to set linger: {}", e))?;
+
+    client
+        .connect(addr)
+        .map_err(|e| anyhow!("Failed to connect to {}: {}", addr, e))?;
 
     let request = json!({ "command": "ping" });
     let request_data = serde_json::to_vec(&request)
@@ -1630,55 +1652,39 @@ pub async fn check_daemon_health(addr: &str) -> Result<bool> {
     for attempt in 1..=MAX_RETRIES {
         debug!("Health check attempt {}/{} for {}", attempt, MAX_RETRIES, addr);
 
-        let response_result = tokio::time::timeout(
+        let response_result = timeout(
             TokioDuration::from_secs(HEALTH_TIMEOUT_SECS),
-            tokio::task::spawn_blocking({
-                let addr = addr.to_string();
-                let request_data = request_data.clone();
-                move || {
-                    let zmq_context = zmq::Context::new();
-                    let client = zmq_context.socket(zmq::REQ)
-                        .map_err(|e| anyhow!("Failed to create ZMQ socket: {}", e))?;
+            async {
+                // Send ping request
+                client
+                    .send(&request_data, 0)
+                    .map_err(|e| anyhow!("Failed to send ping request to {}: {}", addr, e))?;
 
-                    client.set_rcvtimeo((HEALTH_TIMEOUT_SECS * 1000) as i32)
-                        .map_err(|e| anyhow!("Failed to set receive timeout: {}", e))?;
-                    client.set_sndtimeo((HEALTH_TIMEOUT_SECS * 1000) as i32)
-                        .map_err(|e| anyhow!("Failed to set send timeout: {}", e))?;
-                    client.set_linger(0)
-                        .map_err(|e| anyhow!("Failed to set linger: {}", e))?;
+                // Receive response
+                let mut msg = zmq::Message::new();
+                client
+                    .recv(&mut msg, 0)
+                    .map_err(|e| anyhow!("Failed to receive ping response from {}: {}", addr, e))?;
 
-                    client.connect(&addr)
-                        .map_err(|e| anyhow!("Failed to connect to {}: {}", addr, e))?;
+                // Parse response
+                let response: Value = serde_json::from_slice(msg.as_ref())
+                    .map_err(|e| anyhow!("Failed to deserialize ping response from {}: {}", addr, e))?;
 
-                    client.send(&request_data, 0)
-                        .map_err(|e| anyhow!("Failed to send ping request to {}: {}", addr, e))?;
-
-                    let mut msg = zmq::Message::new();
-                    client.recv(&mut msg, 0)
-                        .map_err(|e| anyhow!("Failed to receive ping response from {}: {}", addr, e))?;
-
-                    let response: Value = serde_json::from_slice(msg.as_ref())
-                        .map_err(|e| anyhow!("Failed to deserialize ping response from {}: {}", addr, e))?;
-
-                    Ok::<bool, anyhow::Error>(response.get("status").and_then(|s| s.as_str()) == Some("success"))
-                }
-            })
+                Ok(response.get("status").and_then(|s| s.as_str()) == Some("success"))
+            },
         )
         .await;
 
         match response_result {
-            Ok(Ok(Ok(true))) => {
+            Ok(Ok(true)) => {
                 info!("Health check succeeded for {}", addr);
                 return Ok(true);
             }
-            Ok(Ok(Ok(false))) => {
+            Ok(Ok(false)) => {
                 last_error = Some(anyhow!("Health check failed: Invalid response from {}", addr));
             }
-            Ok(Ok(Err(e))) => {
-                last_error = Some(e);
-            }
             Ok(Err(e)) => {
-                last_error = Some(e.into());
+                last_error = Some(e);
             }
             Err(_) => {
                 last_error = Some(anyhow!("Health check timed out after {} seconds", HEALTH_TIMEOUT_SECS));
@@ -1695,27 +1701,6 @@ pub async fn check_daemon_health(addr: &str) -> Result<bool> {
     error!("Health check failed after {} attempts: {:?}", MAX_RETRIES, last_error);
     Err(last_error.unwrap_or_else(|| anyhow!("Health check failed after {} attempts", MAX_RETRIES)))
 }
-
-pub fn spawn_storage_daemon(
-    port: u16,
-    config_file: Option<PathBuf>,
-    _shutdown_rx: oneshot::Receiver<()>,
-) -> Result<JoinHandle<()>, anyhow::Error> {
-    let storage_config_path = config_file.unwrap_or_else(|| {
-        PathBuf::from(DEFAULT_CONFIG_ROOT_DIRECTORY_STR)
-            .join(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE)
-    });
-
-    let handle = tokio::spawn(async move {
-        info!("Storage daemon spawned on port {}.", port);
-        match start_storage_server(Some(port), storage_config_path).await {
-            Ok(_) => info!("Storage daemon on port {} stopped successfully.", port),
-            Err(e) => error!("Storage daemon on port {} exited with error: {:?}", port, e),
-        }
-    });
-    Ok(handle)
-}
-
 
 /// Starts a daemon process based on the service type and returns its PID.
 pub async fn spawn_daemon_process(
@@ -2624,3 +2609,40 @@ pub async fn force_cleanup_engine_lock(engine: StorageEngineType, data_directory
 
     Ok(())
 }
+
+/// Helper function to generate the standardized ZMQ IPC address.
+/// Format: ipc:///tmp/graphdb-storage-{port}.ipc
+pub fn get_ipc_addr(port: u16) -> String {
+    format!("ipc:///tmp/graphdb-{}.ipc", port)
+}
+
+pub fn get_sled_zmq_uri(port: u16) -> String {
+   format!("tcp://127.0.0.1:{}", port)
+}
+
+pub fn get_ipc_endpoint(port: u16) -> String {
+    format!("ipc:///tmp/graphdb-{}.ipc", port)
+}
+
+pub fn resolve_zmq_address(port: u16, host: Option<&str>) -> String {
+    // Default to loopback for local daemons since the log confirms it is listening on 127.0.0.1
+    let final_host = host.unwrap_or("127.0.0.1"); 
+    let tcp_address = format!("tcp://{}:{}", final_host, port);
+    debug!("Resolved ZMQ connection address: {}", tcp_address);
+    tcp_address
+}
+
+pub fn extract_port(ipc_endpoint: &str) -> GraphResult<u16> {
+    let port_str = ipc_endpoint
+        .split(':')
+        .last()
+        .unwrap_or(ipc_endpoint);
+
+    port_str.parse::<u16>().map_err(|e| {
+        GraphError::ConfigurationError(format!(
+            "Invalid ZMQ port format in endpoint: {}. Error: {}",
+            ipc_endpoint, e
+        ))
+    })
+}
+

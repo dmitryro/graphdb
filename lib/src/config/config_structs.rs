@@ -4,6 +4,7 @@ use derivative::Derivative;
 use tokio::sync::{Mutex as TokioMutex, RwLock, mpsc };
 use tokio::time::{timeout, Duration};
 use tokio::net::TcpStream;
+use tokio::task::JoinHandle;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use clap::{Args, Parser, Subcommand};
 use uuid::Uuid;
@@ -24,7 +25,7 @@ use crate::commands::{Commands, CommandType, StatusArgs, RestartArgs, ReloadArgs
                       ReloadAction, RestCliCommand, StatusAction, StorageAction, ShowAction, ShowArgs,
                       StartAction, StopAction, StopArgs, DaemonCliCommand, UseAction, SaveAction};
 use crate::daemon_utils::{is_port_in_cluster_range, is_valid_cluster_range, parse_cluster_range};
-pub use crate::storage_engine::storage_engine::{StorageEngineManager, GLOBAL_STORAGE_ENGINE_MANAGER};
+pub use crate::storage_engine::storage_engine::{StorageEngineManager, GraphStorageEngine, GLOBAL_STORAGE_ENGINE_MANAGER};
 pub use crate::storage_engine::sled_client::{ZmqSocketWrapper};
 use models::{Vertex, Edge, Identifier, identifiers::SerializableUuid};
 use models::errors::{GraphError, GraphResult};
@@ -56,6 +57,9 @@ pub struct TypeConfig;
 /// The type for a Raft node's unique ID.
 pub type NodeIdType = u64;
 
+// --- FIX: Define the required public type aliases at the module level ---
+// This resolves the error: "cannot find type `DbArc` in this scope"
+pub type DbArc = Arc<sled::Db>;
 // The NodeId must be `u64` as per the `openraft` crate's definition.
 
 // Define Raft application's request and response types.
@@ -218,6 +222,7 @@ pub struct NodeHealth {
     pub last_check: SystemTime,
     pub response_time_ms: u64,
     pub error_count: u32,
+    pub request_count: u64,
 }
 /// Load balancer for routing requests across healthy nodes
 #[derive(Derivative, Clone, Serialize, Deserialize)]
@@ -240,6 +245,11 @@ pub struct LoadBalancer {
     #[serde(skip)]
     #[derivative(Debug = "ignore")]
     pub health_check_config: HealthCheckConfig,
+
+
+    #[serde(skip)]
+    #[derivative(Debug = "ignore")]
+    pub next_node: usize,
 }
 
 
@@ -285,7 +295,7 @@ pub struct EngineConfig {
 }
 
 /// Struct to hold sled::Db and its path
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SledDbWithPath {
     pub db: Arc<sled::Db>,
     pub path: PathBuf,
@@ -309,14 +319,34 @@ pub struct SledDaemon {
 }
 
 /// Sled daemon pool
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub struct SledDaemonPool {
     pub daemons: HashMap<u16, Arc<SledDaemon>>,
     pub registry: Arc<RwLock<HashMap<u16, DaemonMetadata>>>,
     pub initialized: Arc<RwLock<bool>>,
     pub load_balancer: Arc<LoadBalancer>,
     pub use_raft_for_scale: bool, // Changed from use_raft
+    // FIX 2: Wrapped the TokioMutex in an Arc to allow for safe, shared cloning.
+    pub clients: Arc<TokioMutex<HashMap<u16, Arc<dyn GraphStorageEngine>>>>,
 }
+
+// FIX 3: Manual implementation of Clone.
+// This implements Clone by calling .clone() on all fields.
+// For Arc, this increases the reference count.
+impl Clone for SledDaemonPool {
+    fn clone(&self) -> Self {
+        Self {
+            daemons: self.daemons.clone(),
+            registry: self.registry.clone(),
+            initialized: self.initialized.clone(),
+            load_balancer: self.load_balancer.clone(),
+            use_raft_for_scale: self.use_raft_for_scale.clone(),
+            // Arc::clone() is called here, which is what we need.
+            clients: self.clients.clone(), 
+        }
+    }
+}
+
 
 /// Sled storage configuration
 #[derive(Debug, Clone)]
@@ -381,10 +411,42 @@ pub struct RocksDBClient {
 
 #[derive(Clone, Debug)]
 pub struct SledClient {
-    pub inner: Arc<TokioMutex<Arc<Db>>>,
-    pub db_path: PathBuf,
-    pub is_running: Arc<TokioMutex<bool>>,  // Changed from bool
+    /// The actual Sled database handle (only present in local mode). 
+    /// Protected by Arc and TokioMutex for thread-safe access.
+    pub inner: Option<Arc<TokioMutex<Arc<Db>>>>,
+    
+    /// The path to the Sled database on disk.
+    pub db_path: Option<PathBuf>,
+    
+    /// A thread-safe, mutable flag indicating if the client's associated service is running.
+    pub is_running: Arc<TokioMutex<bool>>, 
+    
+    /// The mode of operation (Local or ZMQ-based).
     pub mode: Option<SledClientMode>,
+    
+    /// The ZMQ socket handle (only present in ZMQ mode), protected for concurrent use.
+    pub zmq_socket: Option<Arc<TokioMutex<ZmqSocketWrapper>>>,
+}
+
+impl Drop for SledClient {
+    fn drop(&mut self) {
+        if let Some(socket_wrapper) = self.zmq_socket.take() {
+            let socket_path = format!("/tmp/graphdb-{}.ipc", match self.mode {
+                Some(SledClientMode::ZMQ(port)) => port,
+                _ => DEFAULT_STORAGE_PORT,
+            });
+            let addr = format!("ipc://{}", socket_path);
+            // Spawn a task to disconnect the socket asynchronously
+            tokio::spawn(async move {
+                let mut socket_guard = socket_wrapper.lock().await;
+                if let Err(e) = socket_guard.disconnect(&addr) {
+                    warn!("Failed to disconnect ZMQ socket from {} during drop: {}", addr, e);
+                } else {
+                    info!("Disconnected ZMQ socket from {} during SledClient drop", addr);
+                }
+            });
+        }
+    }
 }
 
 
@@ -418,6 +480,7 @@ pub struct RocksDBDaemon {
     /// The ZeroMQ context used by the daemon for handling network communication.
     pub zmq_context: Arc<ZmqContext>,
 
+    pub zmq_thread: Arc<TokioMutex<Option<std::thread::JoinHandle<()>>>>, 
     // Fix E0063: Changed feature flag to the consistent `with-openraft-rocksdb`.
     // Fix E0277: These fields are handled in the manual Debug implementation below.
    // #[cfg(feature = "with-rocksdb")]
@@ -425,6 +488,12 @@ pub struct RocksDBDaemon {
    // #[cfg(feature = "with-rocksdb")]
     //pub node_id: u64,
 }
+
+// IMPORTANT: Place this code block near the definition of the RocksDBDaemon struct.
+// You are asserting thread safety, so ensure the underlying C library logic (RocksDB/ZMQ)
+// handles concurrent access correctly when using clones/handles.
+unsafe impl Send for RocksDBDaemon {}
+unsafe impl Sync for RocksDBDaemon {}
 
 // Manual implementation of Debug to handle non-Debug fields (ZmqContext, mpsc::Sender, RaftStorage).
 impl std::fmt::Debug for RocksDBDaemon {
@@ -451,16 +520,18 @@ impl std::fmt::Debug for RocksDBDaemon {
     }
 }
 
-
 /// RocksDB daemon pool
+// Note: 'Clone' attribute is removed because RwLock does not implement Clone.
+// You will need to implement your own clone logic if needed, or rely on Arc<T>.
 #[derive(Debug, Default, Clone)]
 pub struct RocksDBDaemonPool {
-    pub daemons: HashMap<u16, Arc<RocksDBDaemon>>,
-    pub registry: Arc<RwLock<HashMap<u16, DaemonMetadata>>>,
-    pub initialized: Arc<RwLock<bool>>,
-    pub load_balancer: Arc<LoadBalancer>,
-    pub use_raft_for_scale: bool, // Changed from use_raft
+  pub daemons: Arc<RwLock<HashMap<u16, Arc<RocksDBDaemon>>>>, 
+  pub registry: Arc<RwLock<HashMap<u16, DaemonMetadata>>>,
+  pub initialized: Arc<RwLock<bool>>,
+  pub load_balancer: Arc<LoadBalancer>,
+  pub use_raft_for_scale: bool, // Changed from use_raft
 }
+
 
 /// RocksDB storage configuration
 #[derive(Debug, Clone)]

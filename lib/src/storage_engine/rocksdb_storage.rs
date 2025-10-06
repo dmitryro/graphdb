@@ -4,10 +4,11 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use once_cell::sync::Lazy;
 use tokio::fs;
+use tokio::runtime::{Handle, Runtime};
 use tokio::sync::{OnceCell, Mutex as TokioMutex, RwLock};
 use tokio::time::{timeout, sleep, Duration as TokioDuration};
 use log::{info, debug, warn, error, trace};
-use rocksdb::{ColumnFamilyDescriptor, DB, Options, DBCompactionStyle, WriteOptions};
+use rocksdb::{ColumnFamilyDescriptor, DB, Options, DBCompactionStyle, WriteOptions, BoundColumnFamily, IteratorMode};
 use serde_json::{json, Value};
 use futures::future::join_all;
 use uuid::Uuid;
@@ -157,6 +158,56 @@ impl RocksDBStorage {
         info!("Using RocksDB path {:?}", db_path);
         println!("===> USING ROCKSDB PATH {:?}", db_path);
 
+        // Create and validate directory with retries
+        let max_retries = 3;
+        let mut attempt = 0;
+        while attempt < max_retries {
+            match fs::create_dir_all(&db_path).await {
+                Ok(_) => {
+                    info!("Successfully created/verified directory at {:?}", db_path);
+                    println!("===> SUCCESSFULLY CREATED/VERIFIED DIRECTORY AT {:?}", db_path);
+                    break;
+                }
+                Err(e) => {
+                    error!("Attempt {}/{}: Failed to create database directory at {:?}: {}", attempt + 1, max_retries, db_path, e);
+                    println!("===> ERROR: ATTEMPT {}/{}: FAILED TO CREATE ROCKSDB DIRECTORY AT {:?}", attempt + 1, max_retries, db_path);
+                    attempt += 1;
+                    if attempt == max_retries {
+                        return Err(GraphError::StorageError(format!("Failed to create database directory at {:?} after {} attempts: {}", db_path, max_retries, e)));
+                    }
+                    tokio::time::sleep(TokioDuration::from_millis(100)).await;
+                }
+            }
+        }
+
+        // Check if directory is writable
+        let metadata = fs::metadata(&db_path)
+            .await
+            .map_err(|e| {
+                error!("Failed to access directory metadata at {:?}: {}", db_path, e);
+                println!("===> ERROR: FAILED TO ACCESS DIRECTORY METADATA AT {:?}", db_path);
+                GraphError::StorageError(format!("Failed to access directory metadata at {:?}: {}", db_path, e))
+            })?;
+        if metadata.permissions().readonly() {
+            error!("Directory at {:?} is not writable", db_path);
+            println!("===> ERROR: DIRECTORY AT {:?} IS NOT WRITABLE", db_path);
+            return Err(GraphError::StorageError(format!("Directory at {:?} is not writable", db_path)));
+        }
+
+        // Log directory contents for debugging
+        async fn log_directory_contents(path: &Path) {
+            // FIX: Add 'mut' to the binding so next_entry().await can modify the state.
+            if let Ok(mut entries) = fs::read_dir(path).await {
+                println!("===> DIRECTORY CONTENTS AT {:?}", path);
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    println!("===> - {:?}", entry.path());
+                }
+            } else {
+                println!("===> ERROR: FAILED TO READ DIRECTORY {:?}", path);
+            }
+        }
+        log_directory_contents(&db_path).await;
+
         // Check for existing ROCKSDB_DB singleton
         if let Some(rocks_db) = ROCKSDB_DB.get() {
             let rocks_db_guard = rocks_db.lock().await;
@@ -167,6 +218,17 @@ impl RocksDBStorage {
                 let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
                 let daemon_metadata_opt = daemon_registry.get_daemon_metadata(port).await.ok().flatten();
                 if let Some(daemon_metadata) = daemon_metadata_opt {
+                    if daemon_metadata.data_dir.as_ref() != Some(&db_path) {
+                        warn!(
+                            "PATH MISMATCH FOR ROCKSDB: REGISTRY SHOWS {:?}, BUT CONFIG SPECIFIES {:?}. Updating registry...",
+                            daemon_metadata.data_dir, db_path
+                        );
+                        println!(
+                            "===> PATH MISMATCH FOR ROCKSDB: REGISTRY SHOWS {:?}, BUT CONFIG SPECIFIES {:?}. UPDATING REGISTRY...",
+                            daemon_metadata.data_dir, db_path
+                        );
+                        daemon_registry.remove_daemon_by_type("storage", port).await?;
+                    }
                     if is_storage_daemon_running(port).await && check_pid_validity(daemon_metadata.pid).await {
                         let pool_map = ROCKSDB_POOL_MAP.get_or_init(|| async {
                             TokioMutex::new(HashMap::new())
@@ -192,29 +254,6 @@ impl RocksDBStorage {
                     }
                 }
             }
-        }
-
-        // Create directory if it doesn't exist
-        fs::create_dir_all(&db_path)
-            .await
-            .map_err(|e| {
-                error!("Failed to create database directory at {:?}: {}", db_path, e);
-                println!("===> ERROR: FAILED TO CREATE ROCKSDB DIRECTORY AT {:?}", db_path);
-                GraphError::StorageError(format!("Failed to create database directory at {:?}: {}", db_path, e))
-            })?;
-
-        // Check if directory is writable
-        let metadata = fs::metadata(&db_path)
-            .await
-            .map_err(|e| {
-                error!("Failed to access directory metadata at {:?}: {}", db_path, e);
-                println!("===> ERROR: FAILED TO ACCESS DIRECTORY METADATA AT {:?}", db_path);
-                GraphError::StorageError(format!("Failed to access directory metadata at {:?}: {}", db_path, e))
-            })?;
-        if metadata.permissions().readonly() {
-            error!("Directory at {:?} is not writable", db_path);
-            println!("===> ERROR: DIRECTORY AT {:?} IS NOT WRITABLE", db_path);
-            return Err(GraphError::StorageError(format!("Directory at {:?} is not writable", db_path)));
         }
 
         // Check single instance access
@@ -340,12 +379,24 @@ impl RocksDBStorage {
             println!("===> INITIALIZED CLUSTER ON PORT {} WITH EXISTING DB", port);
         }
 
-        // Register daemon
+        // Validate and create config directory for daemon registry
+        let config_dir = PathBuf::from(storage_config.config_root_directory.clone().unwrap_or_default());
+        if !config_dir.exists() {
+            fs::create_dir_all(&config_dir)
+                .await
+                .map_err(|e| {
+                    error!("Failed to create config directory at {:?}: {}", config_dir, e);
+                    println!("===> ERROR: FAILED TO CREATE CONFIG DIRECTORY AT {:?}", config_dir);
+                    GraphError::StorageError(format!("Failed to create config directory at {:?}: {}", config_dir, e))
+                })?;
+        }
+
+        // Register daemon with updated metadata
         let daemon_metadata = DaemonMetadata {
             service_type: "storage".to_string(),
             ip_address: config.host.clone().unwrap_or("127.0.0.1".to_string()),
             data_dir: Some(db_path.clone()),
-            config_path: Some(PathBuf::from(storage_config.config_root_directory.clone().unwrap_or_default())),
+            config_path: Some(config_dir),
             engine_type: Some("rocksdb".to_string()),
             last_seen_nanos: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64,
             pid: std::process::id() as u32,
@@ -827,6 +878,57 @@ impl RocksDBStorage {
         info!("Using RocksDB path {:?}", db_path);
         println!("===> USING ROCKSDB PATH {:?}", db_path);
 
+        // Create and validate directory with retries
+        let max_retries = 3;
+        let mut attempt = 0;
+        while attempt < max_retries {
+            match fs::create_dir_all(&db_path).await {
+                Ok(_) => {
+                    info!("Successfully created/verified directory at {:?}", db_path);
+                    println!("===> SUCCESSFULLY CREATED/VERIFIED DIRECTORY AT {:?}", db_path);
+                    break;
+                }
+                Err(e) => {
+                    error!("Attempt {}/{}: Failed to create database directory at {:?}: {}", attempt + 1, max_retries, db_path, e);
+                    println!("===> ERROR: ATTEMPT {}/{}: FAILED TO CREATE ROCKSDB DIRECTORY AT {:?}", attempt + 1, max_retries, db_path);
+                    attempt += 1;
+                    if attempt == max_retries {
+                        return Err(GraphError::StorageError(format!("Failed to create database directory at {:?} after {} attempts: {}", db_path, max_retries, e)));
+                    }
+                    tokio::time::sleep(TokioDuration::from_millis(100)).await;
+                }
+            }
+        }
+
+        // Check if directory is writable
+        let metadata = fs::metadata(&db_path)
+            .await
+            .map_err(|e| {
+                error!("Failed to access directory metadata at {:?}: {}", db_path, e);
+                println!("===> ERROR: FAILED TO ACCESS DIRECTORY METADATA AT {:?}", db_path);
+                GraphError::StorageError(format!("Failed to access directory metadata at {:?}: {}", db_path, e))
+            })?;
+        if metadata.permissions().readonly() {
+            error!("Directory at {:?} is not writable", db_path);
+            println!("===> ERROR: DIRECTORY AT {:?} IS NOT WRITABLE", db_path);
+            return Err(GraphError::StorageError(format!("Directory at {:?} is not writable", db_path)));
+        }
+
+        // Log directory contents for debugging
+        async fn log_directory_contents(path: &Path) {
+            // FIX: Add 'mut' to the binding so next_entry().await can modify the state.
+            if let Ok(mut entries) = fs::read_dir(path).await {
+                println!("===> DIRECTORY CONTENTS AT {:?}", path);
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    println!("===> - {:?}", entry.path());
+                }
+            } else {
+                println!("===> ERROR: FAILED TO READ DIRECTORY {:?}", path);
+            }
+        }
+
+        log_directory_contents(&db_path).await;
+
         // Check for existing ROCKSDB_DB singleton
         if let Some(rocks_db) = ROCKSDB_DB.get() {
             let rocks_db_guard = rocks_db.lock().await;
@@ -837,6 +939,17 @@ impl RocksDBStorage {
                 let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
                 let daemon_metadata_opt = daemon_registry.get_daemon_metadata(port).await.ok().flatten();
                 if let Some(daemon_metadata) = daemon_metadata_opt {
+                    if daemon_metadata.data_dir.as_ref() != Some(&db_path) {
+                        warn!(
+                            "PATH MISMATCH FOR ROCKSDB: REGISTRY SHOWS {:?}, BUT CONFIG SPECIFIES {:?}. Updating registry...",
+                            daemon_metadata.data_dir, db_path
+                        );
+                        println!(
+                            "===> PATH MISMATCH FOR ROCKSDB: REGISTRY SHOWS {:?}, BUT CONFIG SPECIFIES {:?}. UPDATING REGISTRY...",
+                            daemon_metadata.data_dir, db_path
+                        );
+                        daemon_registry.remove_daemon_by_type("storage", port).await?;
+                    }
                     if is_storage_daemon_running(port).await && check_pid_validity(daemon_metadata.pid).await {
                         let pool_map = ROCKSDB_POOL_MAP.get_or_init(|| async {
                             TokioMutex::new(HashMap::new())
@@ -862,29 +975,6 @@ impl RocksDBStorage {
                     }
                 }
             }
-        }
-
-        // Create directory if it doesn't exist
-        fs::create_dir_all(&db_path)
-            .await
-            .map_err(|e| {
-                error!("Failed to create database directory at {:?}: {}", db_path, e);
-                println!("===> ERROR: FAILED TO CREATE ROCKSDB DIRECTORY AT {:?}", db_path);
-                GraphError::StorageError(format!("Failed to create database directory at {:?}: {}", db_path, e))
-            })?;
-
-        // Check if directory is writable
-        let metadata = fs::metadata(&db_path)
-            .await
-            .map_err(|e| {
-                error!("Failed to access directory metadata at {:?}: {}", db_path, e);
-                println!("===> ERROR: FAILED TO ACCESS DIRECTORY METADATA AT {:?}", db_path);
-                GraphError::StorageError(format!("Failed to access directory metadata at {:?}: {}", db_path, e))
-            })?;
-        if metadata.permissions().readonly() {
-            error!("Directory at {:?} is not writable", db_path);
-            println!("===> ERROR: DIRECTORY AT {:?} IS NOT WRITABLE", db_path);
-            return Err(GraphError::StorageError(format!("Directory at {:?} is not writable", db_path)));
         }
 
         // Check single instance access
@@ -975,12 +1065,24 @@ impl RocksDBStorage {
             new_pool
         };
 
-        // Register daemon
+        // Validate and create config directory for daemon registry
+        let config_dir = PathBuf::from(storage_config.config_root_directory.clone().unwrap_or_default());
+        if !config_dir.exists() {
+            fs::create_dir_all(&config_dir)
+                .await
+                .map_err(|e| {
+                    error!("Failed to create config directory at {:?}: {}", config_dir, e);
+                    println!("===> ERROR: FAILED TO CREATE CONFIG DIRECTORY AT {:?}", config_dir);
+                    GraphError::StorageError(format!("Failed to create config directory at {:?}: {}", config_dir, e))
+                })?;
+        }
+
+        // Register daemon with updated metadata
         let daemon_metadata = DaemonMetadata {
             service_type: "storage".to_string(),
             ip_address: config.host.clone().unwrap_or("127.0.0.1".to_string()),
             data_dir: Some(db_path.clone()),
-            config_path: Some(PathBuf::from(storage_config.config_root_directory.clone().unwrap_or_default())),
+            config_path: Some(config_dir),
             engine_type: Some("rocksdb".to_string()),
             last_seen_nanos: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64,
             pid: std::process::id() as u32,
@@ -1019,6 +1121,66 @@ impl RocksDBStorage {
         info!("Using RocksDB path {:?}", db_path);
         println!("===> USING ROCKSDB PATH {:?}", db_path);
 
+        // Create and validate directory with retries
+        let max_retries = 3;
+        let mut attempt = 0;
+        while attempt < max_retries {
+            match fs::create_dir_all(&db_path).await {
+                Ok(_) => {
+                    info!("Successfully created/verified directory at {:?}", db_path);
+                    println!("===> SUCCESSFULLY CREATED/VERIFIED DIRECTORY AT {:?}", db_path);
+                    break;
+                }
+                Err(e) => {
+                    error!("Attempt {}/{}: Failed to create database directory at {:?}: {}", attempt + 1, max_retries, db_path, e);
+                    println!("===> ERROR: ATTEMPT {}/{}: FAILED TO CREATE ROCKSDB DIRECTORY AT {:?}", attempt + 1, max_retries, db_path);
+                    attempt += 1;
+                    if attempt == max_retries {
+                        return Err(GraphError::StorageError(format!("Failed to create database directory at {:?} after {} attempts: {}", db_path, max_retries, e)));
+                    }
+                    tokio::time::sleep(TokioDuration::from_millis(100)).await;
+                }
+            }
+        }
+
+        // Check if directory is writable
+        let metadata = fs::metadata(&db_path)
+            .await
+            .map_err(|e| {
+                error!("Failed to access directory metadata at {:?}: {}", db_path, e);
+                println!("===> ERROR: FAILED TO ACCESS DIRECTORY METADATA AT {:?}", db_path);
+                GraphError::StorageError(format!("Failed to access directory metadata at {:?}: {}", db_path, e))
+            })?;
+        if metadata.permissions().readonly() {
+            error!("Directory at {:?} is not writable", db_path);
+            println!("===> ERROR: DIRECTORY AT {:?} IS NOT WRITABLE", db_path);
+            return Err(GraphError::StorageError(format!("Directory at {:?} is not writable", db_path)));
+        }
+
+        // Log directory contents for debugging
+        async fn log_directory_contents(path: &Path) {
+            // FIX: Bind 'entries' as mutable so that next_entry().await can be called on it.
+            if let Ok(mut entries) = fs::read_dir(path).await {
+                println!("===> DIRECTORY CONTENTS AT {:?}", path);
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    println!("===> - {:?}", entry.path());
+                }
+            } else {
+                println!("===> ERROR: FAILED TO READ DIRECTORY {:?}", path);
+            }
+        }
+        log_directory_contents(&db_path).await;
+
+        // Verify column families in existing database
+        let cf_names = vec!["vertices", "edges", "kv_pairs"];
+        for cf_name in &cf_names {
+            if existing_db.cf_handle(cf_name).is_none() {
+                error!("Column family {} not found in existing database at {:?}", cf_name, db_path);
+                println!("===> ERROR: COLUMN FAMILY {} NOT FOUND IN EXISTING DATABASE AT {:?}", cf_name, db_path);
+                return Err(GraphError::StorageError(format!("Column family {} not found in existing database at {:?}", cf_name, db_path)));
+            }
+        }
+
         // Check for existing ROCKSDB_DB singleton
         if let Some(rocks_db) = ROCKSDB_DB.get() {
             let rocks_db_guard = rocks_db.lock().await;
@@ -1029,6 +1191,17 @@ impl RocksDBStorage {
                 let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
                 let daemon_metadata_opt = daemon_registry.get_daemon_metadata(port).await.ok().flatten();
                 if let Some(daemon_metadata) = daemon_metadata_opt {
+                    if daemon_metadata.data_dir.as_ref() != Some(&db_path) {
+                        warn!(
+                            "PATH MISMATCH FOR ROCKSDB: REGISTRY SHOWS {:?}, BUT CONFIG SPECIFIES {:?}. Updating registry...",
+                            daemon_metadata.data_dir, db_path
+                        );
+                        println!(
+                            "===> PATH MISMATCH FOR ROCKSDB: REGISTRY SHOWS {:?}, BUT CONFIG SPECIFIES {:?}. UPDATING REGISTRY...",
+                            daemon_metadata.data_dir, db_path
+                        );
+                        daemon_registry.remove_daemon_by_type("storage", port).await?;
+                    }
                     if is_storage_daemon_running(port).await && check_pid_validity(daemon_metadata.pid).await {
                         let pool_map = ROCKSDB_POOL_MAP.get_or_init(|| async {
                             TokioMutex::new(HashMap::new())
@@ -1053,39 +1226,6 @@ impl RocksDBStorage {
                         }
                     }
                 }
-            }
-        }
-
-        // Create directory if it doesn't exist
-        fs::create_dir_all(&db_path)
-            .await
-            .map_err(|e| {
-                error!("Failed to create database directory at {:?}: {}", db_path, e);
-                println!("===> ERROR: FAILED TO CREATE ROCKSDB DIRECTORY AT {:?}", db_path);
-                GraphError::StorageError(format!("Failed to create database directory at {:?}: {}", db_path, e))
-            })?;
-
-        // Check if directory is writable
-        let metadata = fs::metadata(&db_path)
-            .await
-            .map_err(|e| {
-                error!("Failed to access directory metadata at {:?}: {}", db_path, e);
-                println!("===> ERROR: FAILED TO ACCESS DIRECTORY METADATA AT {:?}", db_path);
-                GraphError::StorageError(format!("Failed to access directory metadata at {:?}: {}", db_path, e))
-            })?;
-        if metadata.permissions().readonly() {
-            error!("Directory at {:?} is not writable", db_path);
-            println!("===> ERROR: DIRECTORY AT {:?} IS NOT WRITABLE", db_path);
-            return Err(GraphError::StorageError(format!("Directory at {:?} is not writable", db_path)));
-        }
-
-        // Verify column families in existing database
-        let cf_names = vec!["vertices", "edges", "kv_pairs"];
-        for cf_name in &cf_names {
-            if existing_db.cf_handle(cf_name).is_none() {
-                error!("Column family {} not found in existing database at {:?}", cf_name, db_path);
-                println!("===> ERROR: COLUMN FAMILY {} NOT FOUND IN EXISTING DATABASE AT {:?}", cf_name, db_path);
-                return Err(GraphError::StorageError(format!("Column family {} not found in existing database at {:?}", cf_name, db_path)));
             }
         }
 
@@ -1215,12 +1355,24 @@ impl RocksDBStorage {
             println!("===> INITIALIZED CLUSTER ON PORT {} WITH EXISTING DB", port);
         }
 
-        // Register daemon
+        // Validate and create config directory for daemon registry
+        let config_dir = PathBuf::from(storage_config.config_root_directory.clone().unwrap_or_default());
+        if !config_dir.exists() {
+            fs::create_dir_all(&config_dir)
+                .await
+                .map_err(|e| {
+                    error!("Failed to create config directory at {:?}: {}", config_dir, e);
+                    println!("===> ERROR: FAILED TO CREATE CONFIG DIRECTORY AT {:?}", config_dir);
+                    GraphError::StorageError(format!("Failed to create config directory at {:?}: {}", config_dir, e))
+                })?;
+        }
+
+        // Register daemon with updated metadata
         let daemon_metadata = DaemonMetadata {
             service_type: "storage".to_string(),
             ip_address: config.host.clone().unwrap_or("127.0.0.1".to_string()),
             data_dir: Some(db_path.clone()),
-            config_path: Some(PathBuf::from(storage_config.config_root_directory.clone().unwrap_or_default())),
+            config_path: Some(config_dir),
             engine_type: Some("rocksdb".to_string()),
             last_seen_nanos: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64,
             pid: std::process::id() as u32,
@@ -1263,7 +1415,6 @@ impl RocksDBStorage {
         Ok(storage)
     }
 
-
     pub async fn force_unlock(path: &Path) -> GraphResult<()> {
         let lock_path = path.join("LOCK");
         info!("Checking for lock file at {:?}", lock_path);
@@ -1294,12 +1445,23 @@ impl RocksDBStorage {
     }
 
     pub async fn force_reset(config: &RocksDBConfig) -> GraphResult<Self> {
-        warn!("FORCE RESET: Completely destroying and recreating database at {:?}", config.path);
-        println!("===> FORCE RESET: DESTROYING DATABASE AT {:?}", config.path);
+        warn!("FORCE RESET: Initiating database reset at {:?}", config.path);
+        println!("===> FORCE RESET: INITIATING DATABASE RESET AT {:?}", config.path);
 
         let port = config.port.unwrap_or(DEFAULT_STORAGE_PORT);
         let default_data_dir = PathBuf::from(DEFAULT_DATA_DIRECTORY);
         let db_path = default_data_dir.join("rocksdb").join(port.to_string());
+
+        // Confirm no active process is using the database
+        if let Some(pid) = find_pid_by_port(port).await {
+            if check_pid_validity(pid).await {
+                error!("Cannot reset database: Active process (PID: {}) on port {}", pid, port);
+                println!("===> ERROR: CANNOT RESET DATABASE: ACTIVE PROCESS (PID: {}) ON PORT {}", pid, port);
+                return Err(GraphError::StorageError(format!(
+                    "Cannot reset database: Active process (PID: {}) on port {}", pid, port
+                )));
+            }
+        }
 
         Self::force_unlock(&db_path).await?;
 
@@ -1339,7 +1501,6 @@ impl RocksDBStorage {
         Self::new(config, &StorageConfig::default()).await
     }
 
-
     pub fn new_pinned(config: &RocksDBConfig, storage_config: &StorageConfig) -> Box<dyn futures::Future<Output = GraphResult<Self>> + Send + 'static> {
         let config = config.clone();
         let storage_config = storage_config.clone();
@@ -1351,11 +1512,18 @@ impl RocksDBStorage {
     // Helper method to get database path from pool
     async fn get_database_path(&self) -> Option<PathBuf> {
         if let Ok(pool_guard) = timeout(TokioDuration::from_secs(1), self.pool.lock()).await {
-            pool_guard.daemons.values().next().map(|daemon| daemon.db_path.clone())
+            // 1. Acquire the read lock on the inner daemons HashMap.
+            //    This is necessary because 'pool_guard.daemons' is an Arc<RwLock<HashMap<...>>>.
+            let daemons_map = pool_guard.daemons.read().await;
+            
+            // 2. Now call .values() on the HashMap guard.
+            daemons_map.values().next().map(|daemon| daemon.db_path.clone())
         } else {
+            warn!("Timeout while trying to acquire lock on the RocksDBDaemonPool.");
             None
         }
     }
+    
 
     pub async fn set_key(&self, key: &str, value: &str) -> GraphResult<()> {
         let pool_guard = timeout(TokioDuration::from_secs(5), self.pool.lock())
@@ -1765,6 +1933,7 @@ impl RocksDBStorage {
         Ok(())
     }
 
+    /// Retrieves all vertices by iterating through all daemons in the pool.
     pub async fn get_all_vertices(&self) -> GraphResult<Vec<Vertex>> {
         let pool_guard = timeout(TokioDuration::from_secs(5), self.pool.lock())
             .await
@@ -1775,7 +1944,11 @@ impl RocksDBStorage {
             })?;
         
         let mut vertices = Vec::new();
-        for daemon in pool_guard.daemons.values() {
+
+        // FIX: Acquire the read lock on the inner daemons HashMap
+        let daemons_map = pool_guard.daemons.read().await;
+
+        for daemon in daemons_map.values() {
             let db = &daemon.db;
             let cf = db.cf_handle("vertices")
                 .ok_or_else(|| {
@@ -1799,6 +1972,7 @@ impl RocksDBStorage {
         Ok(vertices)
     }
 
+    /// Retrieves all edges by iterating through all daemons in the pool.
     pub async fn get_all_edges(&self) -> GraphResult<Vec<Edge>> {
         let pool_guard = timeout(TokioDuration::from_secs(5), self.pool.lock())
             .await
@@ -1809,7 +1983,11 @@ impl RocksDBStorage {
             })?;
         
         let mut edges = Vec::new();
-        for daemon in pool_guard.daemons.values() {
+        
+        // FIX: Acquire the read lock on the inner daemons HashMap
+        let daemons_map = pool_guard.daemons.read().await;
+
+        for daemon in daemons_map.values() {
             let db = &daemon.db;
             let cf = db.cf_handle("edges")
                 .ok_or_else(|| {
@@ -1833,6 +2011,7 @@ impl RocksDBStorage {
         Ok(edges)
     }
 
+    /// Clears all data (vertices, edges, kv_pairs) from all daemons in the pool.
     pub async fn clear_data(&self) -> GraphResult<()> {
         let cf_names = vec!["vertices", "edges", "kv_pairs"];
         let pool_guard = timeout(TokioDuration::from_secs(5), self.pool.lock())
@@ -1843,7 +2022,10 @@ impl RocksDBStorage {
                 GraphError::StorageError("Timeout acquiring RocksDB pool lock".to_string())
             })?;
         
-        for daemon in pool_guard.daemons.values() {
+        // FIX: Acquire the read lock on the inner daemons HashMap
+        let daemons_map = pool_guard.daemons.read().await;
+
+        for daemon in daemons_map.values() {
             let db = &daemon.db;
             for cf_name in &cf_names {
                 let cf = db.cf_handle(cf_name)
@@ -1873,52 +2055,53 @@ impl RocksDBStorage {
         Ok(())
     }
 
+    /// Diagnoses the persistence state of the storage engine.
     pub async fn diagnose_persistence(&self) -> GraphResult<serde_json::Value> {
-        let pool_guard = timeout(TokioDuration::from_secs(5), self.pool.lock())
-            .await
-            .map_err(|_| {
-                error!("Timeout acquiring RocksDB pool lock for diagnose_persistence");
-                println!("===> ERROR: TIMEOUT ACQUIRING ROCKSDB POOL LOCK FOR DIAGNOSE_PERSISTENCE");
-                GraphError::StorageError("Timeout acquiring RocksDB pool lock".to_string())
-            })?;
-        let db_path = pool_guard.daemons.values().next()
+        // Assume `self.pool` is Mutex<RocksDBDaemonPool>
+        let pool_guard = timeout(TokioDuration::from_secs(5), self.pool.lock()).await?; 
+        
+        // daemons is Arc<RwLock<HashMap<u16, Arc<RocksDBDaemon>>>>, so we await the read lock.
+        let daemons_map = pool_guard.daemons.read().await; 
+        
+        let db_path = daemons_map.values().next()
             .map(|daemon| daemon.db_path.clone())
             .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY));
-        info!("Diagnosing persistence for RocksDBStorage at {:?}", db_path);
-        println!("===> DIAGNOSING PERSISTENCE FOR ROCKSDB STORAGE AT {:?}", db_path);
-
-        let db = pool_guard.daemons.values().next()
+        
+        let db = daemons_map.values().next()
             .map(|daemon| daemon.db.clone())
-            .ok_or_else(|| {
-                error!("No daemons available for diagnostics");
-                println!("===> ERROR: NO DAEMONS AVAILABLE FOR DIAGNOSTICS");
-                GraphError::StorageError("No daemons available for diagnostics".to_string())
-            })?;
+            .ok_or_else(|| GraphError::StorageError("No daemons available for diagnostics".to_string()))?;
 
-        let cf_vertices = db.cf_handle("vertices").ok_or_else(|| {
-            error!("vertices column family not found");
-            println!("===> ERROR: VERTICES COLUMN FAMILY NOT FOUND");
-            GraphError::StorageError("vertices column family not found".to_string())
-        })?;
-        let cf_edges = db.cf_handle("edges").ok_or_else(|| {
-            error!("edges column family not found");
-            println!("===> ERROR: EDGES COLUMN FAMILY NOT FOUND");
-            GraphError::StorageError("edges column family not found".to_string())
-        })?;
-        let cf_kv_pairs = db.cf_handle("kv_pairs").ok_or_else(|| {
-            error!("kv_pairs column family not found");
-            println!("===> ERROR: KV_PAIRS COLUMN FAMILY NOT FOUND");
-            GraphError::StorageError("kv_pairs column family not found".to_string())
-        })?;
+        let cf_vertices = db.cf_handle("vertices").ok_or_else(|| GraphError::StorageError("vertices column family not found".to_string()))?;
+        let cf_edges = db.cf_handle("edges").ok_or_else(|| GraphError::StorageError("edges column family not found".to_string()))?;
+        let cf_kv_pairs = db.cf_handle("kv_pairs").ok_or_else(|| GraphError::StorageError("kv_pairs column family not found".to_string()))?;
 
+        // Note: Iterator::count() calls on RocksDB are typically synchronous operations.
         let kv_count = db.iterator_cf(&cf_kv_pairs, rocksdb::IteratorMode::Start).count();
         let vertex_count = db.iterator_cf(&cf_vertices, rocksdb::IteratorMode::Start).count();
         let edge_count = db.iterator_cf(&cf_edges, rocksdb::IteratorMode::Start).count();
-
-        let disk_usage = fs::metadata(&db_path)
-            .await
+        
+        let disk_usage = fs::metadata(&db_path).await
             .map(|m| m.len())
-            .unwrap_or(0);
+            // Convert fs::metadata error into a default value to prevent failing diagnostics
+            .unwrap_or(0); 
+
+        // FIX: Correctly iterate over tokio::fs::ReadDir asynchronously.
+        let mut sst_files = 0;
+        match fs::read_dir(&db_path).await {
+            Ok(mut entries) => {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    if entry.path().extension().map_or(false, |ext| ext == "sst") {
+                        sst_files += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                // Log the error but continue diagnostics with 0 sst files
+                error!("Failed to read directory for SST file count: {}: {}", db_path.display(), e);
+                sst_files = 0;
+            }
+        }
+
 
         let diagnostics = serde_json::json!({
             "path": db_path.to_string_lossy(),
@@ -1926,6 +2109,7 @@ impl RocksDBStorage {
             "vertices_count": vertex_count,
             "edges_count": edge_count,
             "disk_usage_bytes": disk_usage,
+            "sst_files_count": sst_files,
             "is_running": self.is_running().await,
         });
 
@@ -1933,26 +2117,65 @@ impl RocksDBStorage {
         println!("===> PERSISTENCE DIAGNOSTICS: {:?}", diagnostics);
         Ok(diagnostics)
     }
+
+    pub async fn shutdown(&self) -> GraphResult<()> {
+        info!("Shutting down RocksDBStorage");
+        
+        // Flush all daemons
+        let pool_guard = timeout(TokioDuration::from_secs(5), self.pool.lock())
+            .await
+            .map_err(|_| GraphError::StorageError("Timeout acquiring pool lock".to_string()))?;
+        
+        let daemons_map = pool_guard.daemons.read().await;
+        for daemon in daemons_map.values() {
+            if let Err(e) = daemon.db.flush() {
+                error!("Failed to flush RocksDB daemon at {:?}: {}", daemon.db_path, e);
+            }
+            daemon.shutdown().await?;
+        }
+        
+        // Release singleton
+        if let Some(db_path) = self.get_database_path().await {
+            Self::release_instance(&db_path).await;
+        }
+        
+        Ok(())
+    }
 }
 
+// --- Corrected Drop Implementation ---
 impl Drop for RocksDBStorage {
     fn drop(&mut self) {
         // Try to get the database path for cleanup
         let db_path_opt = if let Ok(pool) = self.pool.try_lock() {
-            pool.daemons.values().next().map(|daemon| daemon.db_path.clone())
+            // FIX: pool.daemons is Arc<RwLock<HashMap<...>>>, so we must acquire a read lock (try_read())
+            // to access the inner HashMap methods like values().
+            if let Ok(daemons_map) = pool.daemons.try_read() {
+                daemons_map.values().next().map(|daemon| daemon.db_path.clone())
+            } else {
+                eprintln!("Failed to acquire read lock on daemons map during path retrieval");
+                None
+            }
         } else {
+            eprintln!("Failed to acquire lock on outer pool during path retrieval");
             None
         };
 
         // Flush all databases before dropping
         if let Ok(pool) = self.pool.try_lock() {
-            for daemon in pool.daemons.values() {
-                if let Err(e) = daemon.db.flush() {
-                    eprintln!("Failed to flush RocksDB daemon at {:?}: {}", daemon.db_path, e);
+            // FIX: Must acquire a read lock on the inner daemons map
+            if let Ok(daemons_map) = pool.daemons.try_read() {
+                for daemon in daemons_map.values() {
+                    // daemon is an Arc<RocksDBDaemon>, RocksDB::flush() is called on the inner db field.
+                    if let Err(e) = daemon.db.flush() {
+                        eprintln!("Failed to flush RocksDB daemon at {:?}: {}", daemon.db_path, e);
+                    }
                 }
+            } else {
+                eprintln!("Failed to acquire read lock on daemons map during flush");
             }
         } else {
-            eprintln!("Failed to acquire lock on RocksDBDaemonPool during drop");
+            eprintln!("Failed to acquire lock on outer pool during drop");
         }
 
         // Release the singleton instance
@@ -1966,7 +2189,8 @@ impl Drop for RocksDBStorage {
                             rt.block_on(async move {
                                 RocksDBStorage::release_instance(&path).await;
                             });
-                            return;
+                            // Return here because the newly created runtime was blocked on and executed the cleanup.
+                            return; 
                         }
                         Err(e) => {
                             eprintln!("Failed to create runtime for cleanup: {}", e);
@@ -1976,15 +2200,17 @@ impl Drop for RocksDBStorage {
                 }
             };
 
+            // If a current handle exists, spawn the cleanup task
             if let Some(handle) = rt {
+                // Ensure db_path is moved into the async block
+                let path_to_move = db_path.clone(); 
                 handle.spawn(async move {
-                    RocksDBStorage::release_instance(&db_path).await;
+                    RocksDBStorage::release_instance(&path_to_move).await;
                 });
             }
         }
     }
 }
-
 
 #[async_trait]
 impl StorageEngine for RocksDBStorage {
@@ -2091,17 +2317,29 @@ impl StorageEngine for RocksDBStorage {
         Ok(())
     }
 
+    /// Forces a flush (writes all outstanding memtables to disk) for all RocksDB instances.
     async fn flush(&self) -> GraphResult<()> {
+        // 1. Acquire lock on the outer Mutex for the pool structure.
         let pool_guard = timeout(TokioDuration::from_secs(5), self.pool.lock())
             .await
-            .map_err(|_| GraphError::StorageError("Timeout acquiring RocksDB pool lock".to_string()))?;
-        let db_path = pool_guard.daemons.values().next()
+            .map_err(|_| {
+                error!("Timeout acquiring RocksDB pool lock for flush");
+                GraphError::StorageError("Timeout acquiring RocksDB pool lock".to_string())
+            })?;
+
+        // 2. FIX: Acquire the read lock on the inner RwLock to access the HashMap.
+        let daemons_map = pool_guard.daemons.read().await;
+
+        // Use the read guard to determine the path (for logging/debugging)
+        let db_path = daemons_map.values().next()
             .map(|daemon| daemon.db_path.clone())
             .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY));
+            
         info!("Flushing RocksDB database at {:?}", db_path);
         println!("===> FLUSHING ROCKSDB DATABASE AT {:?}", db_path);
 
-        for daemon in pool_guard.daemons.values() {
+        // Iterate over the daemons using the acquired read guard
+        for daemon in daemons_map.values() {
             daemon.db.flush().map_err(|e| {
                 error!("Failed to flush RocksDB daemon at {:?}: {}", daemon.db_path, e);
                 println!("===> ERROR: FAILED TO FLUSH ROCKSDB DAEMON AT {:?}", daemon.db_path);
@@ -2133,16 +2371,36 @@ impl GraphStorageEngine for RocksDBStorage {
         "rocksdb"
     }
 
+    /// Checks if at least one RocksDB daemon in the pool is currently running.
     async fn is_running(&self) -> bool {
+        // Try to acquire the outer Mutex lock with a timeout
         let pool_guard = timeout(TokioDuration::from_secs(5), self.pool.lock())
             .await;
+        
         if let Ok(pool_guard) = pool_guard {
-            for daemon in pool_guard.daemons.values() {
-                if *daemon.running.lock().await {
-                    return true;
+            // FIX 1: pool_guard.daemons.read().await returns the RwLockReadGuard directly, 
+            // not a Result, so we don't need `if let Ok(...)`.
+            let daemons_map = pool_guard.daemons.read().await;
+
+            // FIX 2: Check the result of the inner daemon lock access.
+            for daemon in daemons_map.values() {
+                // Try to lock the inner running state with a short timeout.
+                match timeout(TokioDuration::from_millis(100), daemon.running.lock()).await {
+                    Ok(running_guard) => {
+                        if *running_guard {
+                            return true;
+                        }
+                    },
+                    Err(_) => {
+                        // Log an error if the inner lock is held too long, but continue checking others.
+                        error!("Timeout acquiring inner daemon 'running' lock.");
+                    }
                 }
             }
+        } else {
+            error!("Timeout acquiring RocksDB pool lock during is_running check.");
         }
+        
         false
     }
 
@@ -2209,27 +2467,66 @@ impl GraphStorageEngine for RocksDBStorage {
         Ok(())
     }
 
+    /// Clears all data in the "vertices", "edges", and "kv_pairs" column families
+    /// across all daemons in the pool.
     async fn clear_data(&self) -> Result<(), GraphError> {
         let cf_names = vec!["vertices", "edges", "kv_pairs"];
+        
+        // 1. Acquire the outer Mutex lock on the pool with a timeout
         let pool_guard = timeout(TokioDuration::from_secs(5), self.pool.lock())
             .await
             .map_err(|_| GraphError::StorageError("Timeout acquiring RocksDB pool lock".to_string()))?;
         
-        for daemon in pool_guard.daemons.values() {
+        // 2. Acquire the asynchronous read lock on the inner RwLock<HashMap>
+        let daemons_map = pool_guard.daemons.read().await;
+        
+        // 3. Iterate over the daemons
+        for daemon in daemons_map.values() {
             let db = &daemon.db;
             for cf_name in &cf_names {
+                // Get column family handle - it returns Arc<BoundColumnFamily>
                 let cf = db.cf_handle(cf_name)
                     .ok_or_else(|| GraphError::StorageError(format!("{} column family not found", cf_name)))?;
-                let iter = db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+                
+                // Use the Arc directly with iterator_cf and delete_cf
+                let iter = db.iterator_cf(&cf, IteratorMode::Start);
+                
                 for result in iter {
+                    // Extract the key (ignoring the value)
                     let (key, _) = result.map_err(|e| GraphError::StorageError(e.to_string()))?;
+                    
+                    // Use the Arc when calling delete_cf
                     db.delete_cf(&cf, &key)
                         .map_err(|e| GraphError::StorageError(e.to_string()))?;
                 }
             }
         }
+        
         info!("Successfully cleared all data");
         println!("===> SUCCESSFULLY CLEARED ALL DATA");
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn test_directory_creation_retry() {
+    let config = RocksDBConfig {
+        port: Some(8051),
+        ..Default::default()
+    };
+    let storage_config = StorageConfig {
+        data_directory: Some(PathBuf::from("/tmp/test_graphdb")),
+        config_root_directory: Some("/tmp/test_graphdb/config".to_string()),
+        ..Default::default()
+    };
+    // Simulate a directory that can't be created initially
+    let db_path = PathBuf::from("/tmp/test_graphdb/rocksdb/8051");
+    fs::create_dir_all(&db_path).await.unwrap();
+    fs::set_permissions(&db_path, fs::Permissions::from_mode(0o444)).await.unwrap(); // Make read-only
+    let result = RocksDBStorage::new(&config, &storage_config).await;
+    assert!(result.is_err());
+    fs::set_permissions(&db_path, fs::Permissions::from_mode(0o755)).await.unwrap(); // Restore permissions
+    fs::remove_dir_all(&db_path).await.unwrap();
+    let result = RocksDBStorage::new(&config, &storage_config).await;
+    assert!(result.is_ok());
 }
