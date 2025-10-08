@@ -7,6 +7,7 @@ use uuid::Uuid;
 use models::{Edge, Identifier, Vertex};
 use tokio::sync::{OnceCell, RwLock, Mutex as TokioMutex};
 use tokio::process::Command as TokioCommand;
+use tokio::fs as tokio_fs;
 use std::fmt::Debug;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -17,13 +18,13 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use surrealdb::engine::local::{Db, Mem, RocksDb};
 use tikv_client::{Config, Transaction, TransactionClient as TiKvClient, RawClient as KvClient};
 use surrealdb::Surreal;
-use sled::Db as SledDB;
+pub use sled::Db as SledDB;
 use surrealdb::engine::any::Any as SurrealAny;
 use surrealdb::sql::Thing;
 use tokio::fs;
 use tokio::net::{TcpStream, TcpListener};
 use tokio::time::{self, sleep, timeout, Duration as TokioDuration};
-use rocksdb::{Options, WriteOptions};
+pub use rocksdb::{Options, WriteOptions};
 use reqwest::Client;
 use std::process;
 use anyhow::{Result, Context, anyhow};
@@ -71,6 +72,7 @@ use crate::config::{DEFAULT_DATA_DIRECTORY, DEFAULT_LOG_DIRECTORY, LOCK_FILE_PAT
 use crate::daemon::daemon_management::{ is_storage_daemon_running, is_socket_used_by_cli, is_daemon_running};
 use crate::daemon::daemon_utils::{find_pid_by_port, stop_process, parse_cluster_range};
 use crate::daemon::daemon_registry::{GLOBAL_DAEMON_REGISTRY,  NonBlockingDaemonRegistry, DaemonMetadata};
+use crate::daemon::db_daemon_registry::{GLOBAL_DB_DAEMON_REGISTRY, DBDaemonMetadata};
 use crate::storage_engine::inmemory_storage::{InMemoryStorage};
 use crate::storage_engine::storage_utils::{cleanup_legacy_sled_paths, copy_dir};
 use crate::storage_engine::raft_storage::{RaftStorage};
@@ -1370,7 +1372,6 @@ impl StorageEngineManager {
     // Assuming the necessary import for is_daemon_running is already present,
     // e.g.: use crate::daemon::daemon_management::is_daemon_running;
     // and use zmq::Context as ZmqContext is present.
-
     #[cfg(feature = "with-sled")]
     async fn init_sled(config: &StorageConfig) -> Result<Arc<dyn GraphStorageEngine + Send + Sync>, GraphError> {
         info!("Initializing Sled engine: {:?}", config);
@@ -1381,38 +1382,50 @@ impl StorageEngineManager {
 
         let sled_path = engine_specific.storage.path.clone()
             .ok_or_else(|| GraphError::ConfigurationError("Missing path for Sled".to_string()))?;
-
         let port = engine_specific.storage.port.unwrap_or(DEFAULT_STORAGE_PORT);
 
-        // Acquire lock on the singleton to ensure only one thread can initialize it at a time.
-        let mut sled_guard = SLED_SINGLETON.lock().await;
-
-        // Check if the database instance has already been initialized.
-        if let Some(ref instance) = *sled_guard {
-            info!("Reusing existing Sled database instance for path: {:?}", sled_path);
-            println!("===> REUSING EXISTING SLED DATABASE INSTANCE FOR PATH {:?}", sled_path);
-            return Ok(Arc::clone(instance) as Arc<dyn GraphStorageEngine + Send + Sync>);
+        // Force unlock RocksDB to ensure no contention
+        #[cfg(feature = "with-rocksdb")]
+        {
+            let rocksdb_path = config.data_directory
+                .as_ref()
+                .unwrap_or(&PathBuf::from(DEFAULT_DATA_DIRECTORY))
+                .join("rocksdb")
+                .join(port.to_string());
+            if rocksdb_path.exists() {
+                info!("Force unlocking RocksDB database at {:?}", rocksdb_path);
+                if let Err(e) = RocksDBStorage::force_unlock(&rocksdb_path).await {
+                    warn!("Failed to force unlock RocksDB database at {:?}: {}", rocksdb_path, e);
+                } else {
+                    info!("Successfully force unlocked RocksDB database at {:?}", rocksdb_path);
+                    println!("===> SUCCESSFULLY FORCE UNLOCKED ROCKSDB DATABASE AT {:?}", rocksdb_path);
+                    let lock_file = rocksdb_path.join("LOCK");
+                    if lock_file.exists() {
+                        return Err(GraphError::StorageError(format!("RocksDB lock file still exists at {:?} after force unlock", lock_file)));
+                    }
+                    println!("===> NO ROCKSDB LOCK FILE FOUND AT {:?}", lock_file);
+                }
+            }
         }
 
-        // Explicitly drop the lock before calling SledStorage::new to prevent deadlock.
-        drop(sled_guard);
-
-        // Check and release any existing locks on the file system before opening the database.
+        // Check and release Sled locks
         if sled_path.exists() {
             if let Err(e) = SledStorage::force_unlock(&sled_path).await {
+                error!("Failed to unlock Sled database at {:?}: {}", sled_path, e);
                 return Err(GraphError::StorageError(format!("Failed to unlock Sled database at {:?}: {}", sled_path, e)));
             }
             info!("Successfully unlocked Sled database at {:?}", sled_path);
             println!("===> SUCCESSFULLY UNLOCKED SLED DATABASE AT {:?}", sled_path);
-            // Verify no lock file exists
             let lock_file = sled_path.join("db.lck");
             if lock_file.exists() {
-                return Err(GraphError::StorageError(format!("Lock file still exists at {:?} after unlock attempt", lock_file)));
+                return Err(GraphError::StorageError(format!("Sled lock file still exists at {:?} after unlock attempt", lock_file)));
             }
-            println!("===> NO LOCK FILE FOUND AT {:?}", lock_file);
+            println!("===> NO SLED LOCK FILE FOUND AT {:?}", lock_file);
         }
-        
-        // If the instance is not present, create and store it.
+
+        // Retry logic for Sled initialization
+        let max_retries = 5;
+        let mut attempt = 0;
         let sled_config = SledConfig {
             storage_engine_type: StorageEngineType::Sled,
             path: sled_path.clone(),
@@ -1423,61 +1436,208 @@ impl StorageEngineManager {
             cache_capacity: engine_specific.storage.cache_capacity,
         };
 
-        let sled_storage = SledStorage::new(&sled_config, config).await
-            .map_err(|e| GraphError::StorageError(format!("Failed to initialize Sled: {}", e)))?;
-        
-        let sled_instance = Arc::new(sled_storage);
-
-        // Re-acquire the lock to store the newly created instance.
-        let mut sled_guard = SLED_SINGLETON.lock().await;
-
-        // A concurrent thread may have initialized the instance while we were unlocked.
-        // Check again and reuse the existing instance if found.
-        if let Some(ref instance) = *sled_guard {
-            info!("Another thread has already initialized the Sled instance. Reusing.");
-            println!("===> ANOTHER THREAD HAS ALREADY INITIALIZED THE SLED INSTANCE. REUSING.");
-            return Ok(Arc::clone(instance) as Arc<dyn GraphStorageEngine + Send + Sync>);
-        }
-
-        // Store the newly created instance in the singleton.
-        let new_instance = Arc::clone(&sled_instance) as Arc<dyn GraphStorageEngine + Send + Sync>;
-        *sled_guard = Some(sled_instance);
-
-        // Handle daemon registry metadata after successful initialization
-        let metadata = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await?;
-
-        if let Some(mut existing_metadata) = metadata {
-            if existing_metadata.data_dir != Some(sled_path.clone()) {
-                warn!("Path mismatch for Sled: registry shows {:?}, but config specifies {:?}", existing_metadata.data_dir, sled_path);
-                println!("===> PATH MISMATCH FOR SLED: REGISTRY SHOWS {:?}, BUT CONFIG SPECIFIES {:?}", existing_metadata.data_dir, sled_path);
-                
-                existing_metadata.data_dir = Some(sled_path.clone());
-                GLOBAL_DAEMON_REGISTRY.update_daemon_metadata(existing_metadata).await?;
-                info!("Updated daemon registry data_dir to {:?}", sled_path);
-                println!("===> UPDATED DAEMON REGISTRY DATA_DIR TO {:?}", sled_path);
+        while attempt < max_retries {
+            let mut sled_guard = SLED_SINGLETON.lock().await;
+            if let Some(ref instance) = *sled_guard {
+                info!("Reusing existing Sled database instance for path: {:?}", sled_path);
+                println!("===> REUSING EXISTING SLED DATABASE INSTANCE FOR PATH {:?}", sled_path);
+                return Ok(Arc::clone(instance) as Arc<dyn GraphStorageEngine + Send + Sync>);
             }
-        } else {
-            let new_metadata = DaemonMetadata {
-                service_type: "storage".to_string(),
-                port,
-                pid: std::process::id(),
-                ip_address: "127.0.0.1".to_string(),
-                data_dir: Some(sled_path.clone()),
-                config_path: None,
-                engine_type: Some("Sled".to_string()),
-                last_seen_nanos: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as i64)
-                    .unwrap_or(0),
-            };
-            GLOBAL_DAEMON_REGISTRY.register_daemon(new_metadata).await?;
-            info!("Created new daemon registry entry for port {} with path {:?}", port, sled_path);
-            println!("===> CREATED NEW DAEMON REGISTRY ENTRY FOR PORT {} WITH PATH {:?}", port, sled_path);
+
+            match SledStorage::new(&sled_config, config).await {
+                Ok(sled_storage) => {
+                    let sled_instance = Arc::new(sled_storage);
+                    *sled_guard = Some(Arc::clone(&sled_instance));
+                    let new_instance = Arc::clone(&sled_instance) as Arc<dyn GraphStorageEngine + Send + Sync>;
+
+                    // Update daemon registry
+                    let metadata = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await?;
+                    if let Some(mut existing_metadata) = metadata {
+                        if existing_metadata.data_dir != Some(sled_path.clone()) {
+                            warn!("Path mismatch for Sled: registry shows {:?}, but config specifies {:?}", existing_metadata.data_dir, sled_path);
+                            println!("===> PATH MISMATCH FOR SLED: REGISTRY SHOWS {:?}, BUT CONFIG SPECIFIES {:?}", existing_metadata.data_dir, sled_path);
+                            existing_metadata.data_dir = Some(sled_path.clone());
+                            GLOBAL_DAEMON_REGISTRY.update_daemon_metadata(existing_metadata).await?;
+                            info!("Updated daemon registry data_dir to {:?}", sled_path);
+                            println!("===> UPDATED DAEMON REGISTRY DATA_DIR TO {:?}", sled_path);
+                        }
+                    } else {
+                        let new_metadata = DaemonMetadata {
+                            service_type: "storage".to_string(),
+                            port,
+                            pid: std::process::id(),
+                            ip_address: "127.0.0.1".to_string(),
+                            data_dir: Some(sled_path.clone()),
+                            config_path: None,
+                            engine_type: Some("Sled".to_string()),
+                            last_seen_nanos: SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map(|d| d.as_nanos() as i64)
+                                .unwrap_or(0),
+                        };
+                        GLOBAL_DAEMON_REGISTRY.register_daemon(new_metadata).await?;
+                        info!("Created new daemon registry entry for port {} with path {:?}", port, sled_path);
+                        println!("===> CREATED NEW DAEMON REGISTRY ENTRY FOR PORT {} WITH PATH {:?}", port, sled_path);
+                    }
+                    return Ok(new_instance);
+                }
+                Err(e) if e.to_string().contains("WouldBlock") || e.to_string().contains("Resource temporarily unavailable") => {
+                    warn!("Lock contention during Sled init (attempt {}/{}), retrying in 1s...", attempt + 1, max_retries);
+                    attempt += 1;
+                    sleep(TokioDuration::from_secs(1)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(GraphError::StorageError("Max retries exceeded for Sled init due to lock contention".to_string()))
+    }
+
+    #[cfg(feature = "with-rocksdb")]
+    async fn init_rocksdb(config: &StorageConfig) -> GraphResult<Arc<dyn GraphStorageEngine + Send + Sync>> {
+        info!("Initializing RocksDB engine: {:?}", config);
+        println!("===> INITIALIZING ROCKSDB ENGINE: {:?}", config);
+
+        let engine_specific = config.engine_specific_config.as_ref()
+            .ok_or_else(|| GraphError::ConfigurationError("Missing engine_specific_config for RocksDB".to_string()))?;
+
+        let rocksdb_path = engine_specific.storage.path.clone()
+            .unwrap_or_else(|| config.data_directory
+                .as_ref()
+                .unwrap_or(&PathBuf::from(DEFAULT_DATA_DIRECTORY))
+                .join("rocksdb")
+                .join(config.default_port.to_string()));
+        let port = engine_specific.storage.port.unwrap_or(DEFAULT_STORAGE_PORT);
+
+        // Force unlock Sled to ensure no contention
+        #[cfg(feature = "with-sled")]
+        {
+            let sled_path = config.data_directory
+                .as_ref()
+                .unwrap_or(&PathBuf::from(DEFAULT_DATA_DIRECTORY))
+                .join("sled")
+                .join(port.to_string());
+            if sled_path.exists() {
+                info!("Force unlocking Sled database at {:?}", sled_path);
+                if let Err(e) = SledStorage::force_unlock(&sled_path).await {
+                    warn!("Failed to force unlock Sled database at {:?}: {}", sled_path, e);
+                } else {
+                    info!("Successfully force unlocked Sled database at {:?}", sled_path);
+                    println!("===> SUCCESSFULLY FORCE UNLOCKED SLED DATABASE AT {:?}", sled_path);
+                    let lock_file = sled_path.join("db.lck");
+                    if lock_file.exists() {
+                        return Err(GraphError::StorageError(format!("Sled lock file still exists at {:?} after force unlock", lock_file)));
+                    }
+                    println!("===> NO SLED LOCK FILE FOUND AT {:?}", lock_file);
+                }
+            }
         }
 
-        Ok(new_instance)
+        // Check and release RocksDB locks
+        if rocksdb_path.exists() {
+            if let Err(e) = RocksDBStorage::force_unlock(&rocksdb_path).await {
+                error!("Failed to unlock RocksDB database at {}: {}", rocksdb_path.display(), e);
+                return Err(GraphError::StorageError(format!("Failed to unlock RocksDB database at {}: {}", rocksdb_path.display(), e)));
+            }
+            info!("Successfully unlocked RocksDB database at {}", rocksdb_path.display());
+            println!("===> SUCCESSFULLY UNLOCKED ROCKSDB DATABASE AT {}", rocksdb_path.display());
+            let lock_file = rocksdb_path.join("LOCK");
+            if lock_file.exists() {
+                return Err(GraphError::StorageError(format!("RocksDB lock file still exists at {} after unlock attempt", lock_file.display())));
+            }
+            println!("===> NO ROCKSDB LOCK FILE FOUND AT {}", lock_file.display());
+        }
+
+        // Ensure directory exists and is writable
+        if !rocksdb_path.exists() {
+            info!("Creating RocksDB directory: {}", rocksdb_path.display());
+            fs::create_dir_all(&rocksdb_path)
+                .await
+                .map_err(|e| GraphError::StorageError(format!("Failed to create RocksDB directory at {}: {}", rocksdb_path.display(), e)))?;
+        }
+
+        if !rocksdb_path.is_dir() {
+            error!("Path {} exists but is not a directory", rocksdb_path.display());
+            return Err(GraphError::StorageError(format!("Path {} is not a directory", rocksdb_path.display())));
+        }
+
+        let metadata = fs::metadata(&rocksdb_path)
+            .await
+            .map_err(|e| GraphError::StorageError(format!("Failed to access directory metadata at {}: {}", rocksdb_path.display(), e)))?;
+        if metadata.permissions().readonly() {
+            error!("Directory at {} is not writable", rocksdb_path.display());
+            return Err(GraphError::StorageError(format!("Directory at {} is not writable", rocksdb_path.display())));
+        }
+
+        // Retry logic for RocksDB initialization
+        let max_retries = 5;
+        let mut attempt = 0;
+        let rocksdb_config = RocksDBConfig {
+            storage_engine_type: StorageEngineType::RocksDB,
+            path: rocksdb_path.clone(),
+            host: engine_specific.storage.host.clone(),
+            port: Some(port),
+            cache_capacity: engine_specific.storage.cache_capacity,
+            max_background_jobs: Some(1000),
+            temporary: false,
+            use_compression: engine_specific.storage.use_compression,
+            use_raft_for_scale: false,
+        };
+
+        while attempt < max_retries {
+            let mut rocksdb_guard = ROCKSDB_SINGLETON.lock().await;
+            if let Some(ref instance) = *rocksdb_guard {
+                info!("Reusing existing RocksDB instance for path: {}", rocksdb_path.display());
+                println!("===> REUSING EXISTING ROCKSDB INSTANCE FOR PATH {}", rocksdb_path.display());
+                return Ok(Arc::clone(instance) as Arc<dyn GraphStorageEngine + Send + Sync>);
+            }
+
+            match RocksDBStorage::new(&rocksdb_config, config).await {
+                Ok(rocksdb_storage) => {
+                    let rocksdb_instance = Arc::new(rocksdb_storage);
+                    *rocksdb_guard = Some(Arc::clone(&rocksdb_instance));
+                    let new_instance = Arc::clone(&rocksdb_instance) as Arc<dyn GraphStorageEngine + Send + Sync>;
+
+                    // Update daemon registry
+                    let metadata = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await?;
+                    if let Some(mut existing_metadata) = metadata {
+                        if existing_metadata.data_dir != Some(rocksdb_path.clone()) {
+                            warn!("Path mismatch for RocksDB: registry shows {:?}, but config specifies {}", existing_metadata.data_dir, rocksdb_path.display());
+                            existing_metadata.data_dir = Some(rocksdb_path.clone());
+                            GLOBAL_DAEMON_REGISTRY.update_daemon_metadata(existing_metadata).await?;
+                            info!("Updated daemon registry data_dir to {}", rocksdb_path.display());
+                            println!("===> UPDATED DAEMON REGISTRY DATA_DIR TO {}", rocksdb_path.display());
+                        }
+                    } else {
+                        let new_metadata = DaemonMetadata {
+                            service_type: "storage".to_string(),
+                            port,
+                            pid: std::process::id(),
+                            ip_address: "127.0.0.1".to_string(),
+                            data_dir: Some(rocksdb_path.clone()),
+                            config_path: config.config_root_directory.clone(),
+                            engine_type: Some("RocksDB".to_string()),
+                            last_seen_nanos: SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map(|d| d.as_nanos() as i64)
+                                .unwrap_or(0),
+                        };
+                        GLOBAL_DAEMON_REGISTRY.register_daemon(new_metadata).await?;
+                        info!("Created new daemon registry entry for port {} with path {}", port, rocksdb_path.display());
+                        println!("===> CREATED NEW DAEMON REGISTRY ENTRY FOR PORT {} WITH PATH {}", port, rocksdb_path.display());
+                    }
+                    return Ok(new_instance);
+                }
+                Err(e) if e.to_string().contains("WouldBlock") || e.to_string().contains("Resource temporarily unavailable") => {
+                    warn!("Lock contention during RocksDB init (attempt {}/{}), retrying in 1s...", attempt + 1, max_retries);
+                    attempt += 1;
+                    sleep(TokioDuration::from_secs(1)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(GraphError::StorageError("Max retries exceeded for RocksDB init due to lock contention".to_string()))
     }
-    
+
     async fn cleanup_legacy_sled_directories_during_reset(base_data_dir: &Path, current_port: u16) {
         info!("Cleaning up legacy port-suffixed Sled directories during reset in {:?}", base_data_dir);
         
@@ -2201,130 +2361,6 @@ impl StorageEngineManager {
         
         info!("TiKV storage engine initialized successfully");
         Ok(arc_engine as Arc<dyn GraphStorageEngine + Send + Sync>)
-    }
-
-    #[cfg(feature = "with-rocksdb")]
-    async fn init_rocksdb(config: &StorageConfig) -> GraphResult<Arc<dyn GraphStorageEngine + Send + Sync>> {
-        info!("Initializing RocksDB engine: {:?}", config);
-        println!("===> in init_rocksdb - INITIALIZING ROCKSDB ENGINE: {:?}", config);
-
-        let engine_specific = config.engine_specific_config.as_ref()
-            .ok_or_else(|| GraphError::ConfigurationError("Missing engine_specific_config for RocksDB".to_string()))?;
-
-        // Use storage_config.data_directory as the base path if no specific path is provided
-        let rocksdb_path = if let Some(path) = &engine_specific.storage.path {
-            path.clone()
-        } else {
-            let default_data_dir = PathBuf::from(DEFAULT_DATA_DIRECTORY);
-            let base_data_dir = config.data_directory.as_ref().unwrap_or(&default_data_dir);
-            base_data_dir.join("rocksdb")
-        };
-
-        let port = engine_specific.storage.port.unwrap_or(DEFAULT_STORAGE_PORT);
-        println!("===> USING ENGINE-SPECIFIC PORT {} FROM CONFIG", port);
-
-        // Ensure directory exists and is writable
-        if !rocksdb_path.exists() {
-            info!("Creating RocksDB directory: {}", rocksdb_path.display());
-            println!("===> CREATING ROCKSDB DIRECTORY: {}", rocksdb_path.display());
-            fs::create_dir_all(&rocksdb_path)
-                .await
-                .map_err(|e| {
-                    error!("Failed to create RocksDB directory at {}: {}", rocksdb_path.display(), e);
-                    println!("===> ERROR: FAILED TO CREATE ROCKSDB DIRECTORY AT {}", rocksdb_path.display());
-                    GraphError::StorageError(format!("Failed to create RocksDB directory at {}: {}", rocksdb_path.display(), e))
-                })?;
-        }
-
-        if !rocksdb_path.is_dir() {
-            error!("Path {} exists but is not a directory", rocksdb_path.display());
-            println!("===> ERROR: PATH {} EXISTS BUT IS NOT A DIRECTORY", rocksdb_path.display());
-            return Err(GraphError::StorageError(format!("Path {} is not a directory", rocksdb_path.display())));
-        }
-
-        let metadata = fs::metadata(&rocksdb_path)
-            .await
-            .map_err(|e| {
-                error!("Failed to access directory metadata at {}: {}", rocksdb_path.display(), e);
-                println!("===> ERROR: FAILED TO ACCESS DIRECTORY METADATA AT {}", rocksdb_path.display());
-                GraphError::StorageError(format!("Failed to access directory metadata at {}: {}", rocksdb_path.display(), e))
-            })?;
-
-        if metadata.permissions().readonly() {
-            error!("Directory at {} is not writable", rocksdb_path.display());
-            println!("===> ERROR: DIRECTORY AT {} IS NOT WRITABLE", rocksdb_path.display());
-            return Err(GraphError::StorageError(format!("Directory at {} is not writable", rocksdb_path.display())));
-        }
-
-        // Check and release any existing locks
-        if rocksdb_path.exists() {
-            if let Err(e) = RocksDBStorage::force_unlock(&rocksdb_path).await {
-                error!("Failed to unlock RocksDB database at {}: {}", rocksdb_path.display(), e);
-                println!("===> ERROR: FAILED TO UNLOCK ROCKSDB DATABASE AT {}", rocksdb_path.display());
-                return Err(GraphError::StorageError(format!("Failed to unlock RocksDB database at {}: {}", rocksdb_path.display(), e)));
-            }
-            info!("Successfully unlocked RocksDB database at {}", rocksdb_path.display());
-            println!("===> SUCCESSFULLY UNLOCKED ROCKSDB DATABASE AT {}", rocksdb_path.display());
-
-            // Verify no lock file exists
-            let lock_file = rocksdb_path.join("LOCK");
-            if lock_file.exists() {
-                error!("Lock file still exists at {} after unlock attempt", lock_file.display());
-                println!("===> ERROR: LOCK FILE STILL EXISTS AT {}", lock_file.display());
-                return Err(GraphError::StorageError(format!("Lock file still exists at {} after unlock attempt", lock_file.display())));
-            }
-            println!("in init_rocksdb ===> NO LOCK FILE FOUND AT {}", lock_file.display());
-        }
-        // Attempt to get existing metadata
-        let daemon_metadata = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await?;
-
-        if let Some(mut existing_metadata) = daemon_metadata {
-            if existing_metadata.data_dir != Some(rocksdb_path.clone()) {
-                warn!("Path mismatch for RocksDB: registry shows {:?}, but config specifies {}", existing_metadata.data_dir, rocksdb_path.display());
-                println!("===> PATH MISMATCH FOR ROCKSDB: REGISTRY SHOWS {:?}, BUT CONFIG SPECIFIES {}", existing_metadata.data_dir, rocksdb_path.display());
-                
-                // Update registry with correct path
-                existing_metadata.data_dir = Some(rocksdb_path.clone());
-                GLOBAL_DAEMON_REGISTRY.update_daemon_metadata(existing_metadata).await?;
-                info!("Updated daemon registry data_dir to {}", rocksdb_path.display());
-                println!("===> UPDATED DAEMON REGISTRY DATA_DIR TO {}", rocksdb_path.display());
-            }
-        } else {
-            // Create new metadata if not exists
-            let new_metadata = DaemonMetadata {
-                service_type: "storage".to_string(),
-                port,
-                pid: std::process::id(),
-                ip_address: "127.0.0.1".to_string(),
-                data_dir: Some(rocksdb_path.clone()),
-                config_path: config.config_root_directory.clone(),
-                engine_type: Some("RocksDB".to_string()),
-                last_seen_nanos: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as i64)
-                    .unwrap_or(0),
-            };
-            GLOBAL_DAEMON_REGISTRY.register_daemon(new_metadata).await?;
-            info!("Created new daemon registry entry for port {} with path {}", port, rocksdb_path.display());
-            println!("===> CREATED NEW DAEMON REGISTRY ENTRY FOR PORT {} WITH PATH {}", port, rocksdb_path.display());
-        }
-        
-        let rocksdb_config = RocksDBConfig {
-            storage_engine_type: StorageEngineType::RocksDB,
-            path: rocksdb_path,
-            host: engine_specific.storage.host.clone(),
-            port: Some(port),
-            cache_capacity: engine_specific.storage.cache_capacity,
-            max_background_jobs: Some(1000),
-            temporary: false,
-            use_compression: engine_specific.storage.use_compression,
-            use_raft_for_scale: false,
-        };
-        
-        // Attempt to open RocksDB database
-        RocksDBStorage::new(&rocksdb_config, config).await
-            .map(|s| Arc::new(s) as Arc<dyn GraphStorageEngine + Send + Sync>)
-            .map_err(|e| GraphError::StorageError(format!("Failed to initialize RocksDB: {}", e)))
     }
 
     #[cfg(not(feature = "redis-datastore"))]
@@ -3061,11 +3097,16 @@ impl StorageEngineManager {
         let old_path = new_config.engine_specific_config
             .as_ref()
             .and_then(|c| c.storage.path.clone())
-            .unwrap_or_else(|| PathBuf::from("/opt/graphdb/storage_data"));
-        let _new_path = new_config.engine_specific_config
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY));
+        let new_path = new_config.engine_specific_config
             .as_ref()
             .and_then(|c| c.storage.path.clone())
-            .unwrap_or_else(|| PathBuf::from(format!("/opt/graphdb/storage_data/{}/{}", new_config.storage_engine_type.to_string().to_lowercase(), new_config.default_port)));
+            .unwrap_or_else(|| PathBuf::from(format!(
+                "{}/{}/{}",
+                DEFAULT_DATA_DIRECTORY,
+                new_config.storage_engine_type.to_string().to_lowercase(),
+                new_config.default_port
+            )));
 
         // Get port
         let port = new_config.engine_specific_config
@@ -3074,12 +3115,50 @@ impl StorageEngineManager {
             .unwrap_or(new_config.default_port);
 
         // Clean up stale ZeroMQ socket file
-        let socket_path = format!("/tmp/graphdb-{}.ipc", port);
-        if fs::metadata(&socket_path).await.is_ok() {
+        let socket_path = format!("/opt/graphdb/graphdb-{}.ipc", port);
+        if tokio_fs::metadata(&socket_path).await.is_ok() {
             if !is_socket_used_by_cli(&socket_path).await? {
                 info!("Removing stale ZeroMQ socket file: {}", socket_path);
-                fs::remove_file(&socket_path).await
+                tokio_fs::remove_file(&socket_path).await
                     .map_err(|e| GraphError::StorageError(format!("Failed to remove stale ZeroMQ socket file {}: {}", socket_path, e)))?;
+            }
+        }
+
+        // Force unlock both Sled and RocksDB to ensure clean state
+        let sled_path = new_path.join("sled").join(port.to_string());
+        let rocksdb_path = new_path.join("rocksdb").join(port.to_string());
+        #[cfg(feature = "with-sled")]
+        {
+            if sled_path.exists() {
+                info!("Force unlocking Sled database at {:?}", sled_path);
+                if let Err(e) = SledStorage::force_unlock(&sled_path).await {
+                    warn!("Failed to force unlock Sled database at {:?}: {}", sled_path, e);
+                } else {
+                    info!("Successfully force unlocked Sled database at {:?}", sled_path);
+                    println!("===> SUCCESSFULLY FORCE UNLOCKED SLED DATABASE AT {:?}", sled_path);
+                    let lock_file = sled_path.join("db.lck");
+                    if lock_file.exists() {
+                        return Err(GraphError::StorageError(format!("Sled lock file still exists at {:?} after force unlock", lock_file)));
+                    }
+                    println!("===> NO SLED LOCK FILE FOUND AT {:?}", lock_file);
+                }
+            }
+        }
+        #[cfg(feature = "with-rocksdb")]
+        {
+            if rocksdb_path.exists() {
+                info!("Force unlocking RocksDB database at {:?}", rocksdb_path);
+                if let Err(e) = RocksDBStorage::force_unlock(&rocksdb_path).await {
+                    warn!("Failed to force unlock RocksDB database at {:?}: {}", rocksdb_path, e);
+                } else {
+                    info!("Successfully force unlocked RocksDB database at {:?}", rocksdb_path);
+                    println!("===> SUCCESSFULLY FORCE UNLOCKED ROCKSDB DATABASE AT {:?}", rocksdb_path);
+                    let lock_file = rocksdb_path.join("LOCK");
+                    if lock_file.exists() {
+                        return Err(GraphError::StorageError(format!("RocksDB lock file still exists at {:?} after force unlock", lock_file)));
+                    }
+                    println!("===> NO ROCKSDB LOCK FILE FOUND AT {:?}", lock_file);
+                }
             }
         }
 
@@ -3098,14 +3177,14 @@ impl StorageEngineManager {
         };
 
         // If daemon is running and engine/path are the same, update metadata and reuse
-        if daemon_running && old_engine_type == new_config.storage_engine_type && old_path == _new_path {
+        if daemon_running && old_engine_type == new_config.storage_engine_type && old_path == new_path {
             info!("Valid daemon running on port {}, same engine and path, updating metadata.", port);
             let meta = DaemonMetadata {
                 service_type: "storage".to_string(),
                 port,
                 pid: find_pid_by_port(port).await?.unwrap_or(std::process::id()),
                 ip_address: "127.0.0.1".to_string(),
-                data_dir: Some(_new_path.clone()),
+                data_dir: Some(new_path.clone()),
                 config_path: Some(self.config_path.clone()),
                 engine_type: Some(new_config.storage_engine_type.to_string()),
                 last_seen_nanos: SystemTime::now()
@@ -3113,34 +3192,109 @@ impl StorageEngineManager {
                     .map_err(|e| GraphError::StorageError(format!("System time error: {}", e)))?
                     .as_nanos() as i64,
             };
-            GLOBAL_DAEMON_REGISTRY.register_daemon(meta).await
-                .map_err(|e| GraphError::StorageError(format!("Failed to update daemon metadata: {}", e)))?;
-            info!("Metadata updated for daemon on port {}.", port);
-            return Ok(());
+            let mut attempts = 0;
+            const MAX_REGISTRY_ATTEMPTS: u32 = 5;
+            while attempts < MAX_REGISTRY_ATTEMPTS {
+                match timeout(TokioDuration::from_secs(10), GLOBAL_DAEMON_REGISTRY.register_daemon(meta.clone())).await {
+                    Ok(Ok(_)) => {
+                        info!("Metadata updated for daemon on port {}.", port);
+                        println!("===> METADATA UPDATED FOR DAEMON ON PORT {}.", port);
+                        return Ok(());
+                    }
+                    Ok(Err(e)) => {
+                        warn!("Failed to update daemon metadata on port {}: {}. Attempt {}/{}", port, e, attempts + 1, MAX_REGISTRY_ATTEMPTS);
+                        println!("===> WARNING: FAILED TO UPDATE DAEMON METADATA ON PORT {}: {}. ATTEMPT {}/{}", port, e, attempts + 1, MAX_REGISTRY_ATTEMPTS);
+                        attempts += 1;
+                        sleep(TokioDuration::from_millis(1000)).await;
+                    }
+                    Err(_) => {
+                        warn!("Timeout updating daemon metadata on port {}. Attempt {}/{}", port, attempts + 1, MAX_REGISTRY_ATTEMPTS);
+                        println!("===> WARNING: TIMEOUT UPDATING DAEMON METADATA ON PORT {}. ATTEMPT {}/{}", port, attempts + 1, MAX_REGISTRY_ATTEMPTS);
+                        attempts += 1;
+                        sleep(TokioDuration::from_millis(1000)).await;
+                    }
+                }
+            }
+            error!("Failed to update daemon metadata on port {} after {} attempts", port, MAX_REGISTRY_ATTEMPTS);
+            println!("===> ERROR: FAILED TO UPDATE DAEMON METADATA ON PORT {} AFTER {} ATTEMPTS", port, MAX_REGISTRY_ATTEMPTS);
+            return Err(GraphError::StorageError(format!("Failed to update daemon metadata on port {} after {} attempts", port, MAX_REGISTRY_ATTEMPTS)));
         }
 
         // Skip if no change needed
-        if old_engine_type == new_config.storage_engine_type && old_path == _new_path && self.session_engine_type.is_none() {
+        if old_engine_type == new_config.storage_engine_type && old_path == new_path && self.session_engine_type.is_none() {
             info!("No switch needed: same engine {:?} and path {:?}", old_engine_type, old_path);
             trace!("Skipping switch: current engine matches requested and no session override. Elapsed: {}ms", start_time.elapsed().as_millis());
             return Ok(());
         }
 
         // Stop and close the current engine if running, unless Sled-to-Sled with same path
-        if was_running && !(old_engine_type == StorageEngineType::Sled && new_config.storage_engine_type == StorageEngineType::Sled && old_path == _new_path) {
+        if was_running && !(old_engine_type == StorageEngineType::Sled && new_config.storage_engine_type == StorageEngineType::Sled && old_path == new_path) {
             info!("Stopping current engine {:?} before switch", old_engine_type);
             let engine = self.engine.lock().await;
             (*engine).stop().await
                 .map_err(|e| GraphError::StorageError(format!("Failed to stop current engine: {}", e)))?;
         }
-        if !(old_engine_type == StorageEngineType::Sled && new_config.storage_engine_type == StorageEngineType::Sled && old_path == _new_path) {
+        if !(old_engine_type == StorageEngineType::Sled && new_config.storage_engine_type == StorageEngineType::Sled && old_path == new_path) {
             info!("Closing old persistent engine to release resources");
             old_persistent_arc.close().await
                 .map_err(|e| GraphError::StorageError(format!("Failed to close old persistent engine: {}", e)))?;
         }
 
-        // Engine-specific cleanup, skip if daemon is running
-        if !daemon_running && !(old_engine_type == StorageEngineType::Sled && new_config.storage_engine_type == StorageEngineType::Sled && old_path == _new_path) {
+        // Unregister old daemon if engine or path differs
+        if daemon_running && !(old_engine_type == new_config.storage_engine_type && old_path == new_path) {
+            let mut attempts = 0;
+            const MAX_REGISTRY_ATTEMPTS: u32 = 5;
+            while attempts < MAX_REGISTRY_ATTEMPTS {
+                match timeout(TokioDuration::from_secs(10), GLOBAL_DB_DAEMON_REGISTRY.get_daemon_metadata(port)).await {
+                    Ok(Ok(Some(_meta))) => {
+                        match timeout(TokioDuration::from_secs(10), GLOBAL_DB_DAEMON_REGISTRY.unregister_daemon(port)).await {
+                            Ok(Ok(_)) => {
+                                info!("Unregistered old DB daemon for port {}", port);
+                                println!("===> UNREGISTERED OLD DB DAEMON FOR PORT {}", port);
+                                break;
+                            }
+                            Ok(Err(e)) => {
+                                warn!("Failed to unregister old DB daemon for port {}: {}. Attempt {}/{}", port, e, attempts + 1, MAX_REGISTRY_ATTEMPTS);
+                                println!("===> WARNING: FAILED TO UNREGISTER OLD DB DAEMON FOR PORT {}: {}. ATTEMPT {}/{}", port, e, attempts + 1, MAX_REGISTRY_ATTEMPTS);
+                                attempts += 1;
+                                sleep(TokioDuration::from_millis(1000)).await;
+                            }
+                            Err(_) => {
+                                warn!("Timeout unregistering old DB daemon for port {}. Attempt {}/{}", port, attempts + 1, MAX_REGISTRY_ATTEMPTS);
+                                println!("===> WARNING: TIMEOUT UNREGISTERING OLD DB DAEMON FOR PORT {}. ATTEMPT {}/{}", port, attempts + 1, MAX_REGISTRY_ATTEMPTS);
+                                attempts += 1;
+                                sleep(TokioDuration::from_millis(1000)).await;
+                            }
+                        }
+                    }
+                    Ok(Ok(None)) => {
+                        info!("No daemon found for port {}, no need to unregister", port);
+                        println!("===> NO DAEMON FOUND FOR PORT {}, NO NEED TO UNREGISTER", port);
+                        break;
+                    }
+                    Ok(Err(e)) => {
+                        warn!("Failed to check daemon metadata for port {}: {}. Attempt {}/{}", port, e, attempts + 1, MAX_REGISTRY_ATTEMPTS);
+                        println!("===> WARNING: FAILED TO CHECK DAEMON METADATA FOR PORT {}: {}. ATTEMPT {}/{}", port, e, attempts + 1, MAX_REGISTRY_ATTEMPTS);
+                        attempts += 1;
+                        sleep(TokioDuration::from_millis(1000)).await;
+                    }
+                    Err(_) => {
+                        warn!("Timeout checking daemon metadata for port {}. Attempt {}/{}", port, attempts + 1, MAX_REGISTRY_ATTEMPTS);
+                        println!("===> WARNING: TIMEOUT CHECKING DAEMON METADATA FOR PORT {}. ATTEMPT {}/{}", port, attempts + 1, MAX_REGISTRY_ATTEMPTS);
+                        attempts += 1;
+                        sleep(TokioDuration::from_millis(1000)).await;
+                    }
+                }
+            }
+            if attempts >= MAX_REGISTRY_ATTEMPTS {
+                error!("Failed to unregister old DB daemon for port {} after {} attempts", port, MAX_REGISTRY_ATTEMPTS);
+                println!("===> ERROR: FAILED TO UNREGISTER OLD DB DAEMON FOR PORT {} AFTER {} ATTEMPTS", port, MAX_REGISTRY_ATTEMPTS);
+                return Err(GraphError::StorageError(format!("Failed to unregister old DB daemon for port {} after {} attempts", port, MAX_REGISTRY_ATTEMPTS)));
+            }
+        }
+
+        // Engine-specific cleanup
+        if !daemon_running && !(old_engine_type == StorageEngineType::Sled && new_config.storage_engine_type == StorageEngineType::Sled && old_path == new_path) {
             match old_engine_type {
                 StorageEngineType::RocksDB => {
                     #[cfg(feature = "with-rocksdb")]
@@ -3164,21 +3318,24 @@ impl StorageEngineManager {
                 StorageEngineType::Sled => {
                     #[cfg(feature = "with-sled")]
                     {
-                        let mut singleton = SLED_SINGLETON.lock().await;
-                        if let Some(sled_instance) = singleton.as_ref() {
+                        let sled_db = SLED_DB.get().ok_or_else(|| GraphError::StorageError("Sled DB not initialized".to_string()))?;
+                        let mut sled_db_guard = sled_db.lock().await;
+                        if sled_db_guard.path == old_path {
                             info!("Closing existing Sled instance before switching");
-                            sled_instance.close().await
-                                .map_err(|e| GraphError::StorageError(format!("Failed to close Sled: {}", e)))?;
-                            *singleton = None;
+                            sled_db_guard.db.flush_async().await
+                                .map_err(|e| GraphError::StorageError(format!("Failed to flush Sled DB: {}", e)))?;
+                            sled_db_guard.client.take(); // Drop client to close ZMQ socket
+                            SledStorage::release_instance(&old_path).await;
                         }
                         if old_path.exists() {
                             warn!("Cleaning up Sled locks at {:?}", old_path);
                             let lock_path = old_path.join("db.lck");
                             if lock_path.exists() {
-                                if let Err(e) = fs::remove_file(&lock_path).await {
+                                if let Err(e) = tokio_fs::remove_file(&lock_path).await {
                                     warn!("Failed to remove Sled lock file at {:?}: {}", lock_path, e);
                                 } else {
                                     info!("Successfully removed Sled lock file at {:?}", lock_path);
+                                    println!("===> SUCCESSFULLY REMOVED SLED LOCK FILE AT {:?}", lock_path);
                                 }
                             }
                         }
@@ -3230,12 +3387,10 @@ impl StorageEngineManager {
         }
 
         println!("===> USE STORAGE HANDLER - STEP 2: Loading configuration...");
-        // Determine config path
         let config_path = self.config_path.clone();
         info!("Using main config path: {:?}", config_path);
         trace!("Resolved config path: {:?}", config_path);
 
-        // Load or create configuration
         let mut loaded_config = if config_path.exists() {
             info!("Loading existing config from {:?}", config_path);
             trace!("Reading config file: {:?}", config_path);
@@ -3256,14 +3411,12 @@ impl StorageEngineManager {
         println!("===> Configuration loaded successfully.");
         debug!("Loaded storage config: {:?}", loaded_config);
 
-        // Update configuration with provided new_config
         loaded_config.storage_engine_type = new_config.storage_engine_type;
         loaded_config.engine_specific_config = new_config.engine_specific_config.clone();
         println!("===> USE STORAGE HANDLER - STEP 3: Loading engine-specific configuration...");
         debug!("Using config root directory: {:?}", loaded_config.config_root_directory);
         println!("===> Engine-specific configuration loaded successfully.");
 
-        // Validate new configuration
         Self::validate_config(&loaded_config, new_config.storage_engine_type)
             .await
             .map_err(|e| {
@@ -3271,7 +3424,6 @@ impl StorageEngineManager {
                 GraphError::ConfigurationError(format!("Configuration validation failed: {}", e))
             })?;
 
-        // If permanent, save the new configuration
         if permanent {
             info!("Saving new configuration for permanent switch to {:?}", new_config.storage_engine_type);
             loaded_config.save().await
@@ -3288,8 +3440,8 @@ impl StorageEngineManager {
         println!("===> Saving configuration to disk...");
         println!("===> Configuration saved successfully.");
 
-        // Stop existing daemon only if engine or path differs
-        if daemon_running && !(old_engine_type == new_config.storage_engine_type && old_path == _new_path) {
+        // Stop existing daemon if engine or path differs
+        if daemon_running && !(old_engine_type == new_config.storage_engine_type && old_path == new_path) {
             println!("===> USE STORAGE HANDLER - STEP 5: Managing daemon on port {}...", port);
             let max_attempts = 5;
             let mut attempt = 0;
@@ -3307,8 +3459,36 @@ impl StorageEngineManager {
                             info!("Active daemon found on port {}, stopping and updating registry.", port);
                             stop_process(found_pid).await
                                 .map_err(|e| GraphError::StorageError(format!("Failed to stop daemon on PID {}: {}", found_pid, e)))?;
-                            GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("storage", port).await?;
+                            let mut attempts = 0;
+                            const MAX_REGISTRY_ATTEMPTS: u32 = 5;
+                            while attempts < MAX_REGISTRY_ATTEMPTS {
+                                match timeout(TokioDuration::from_secs(10), GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("storage", port)).await {
+                                    Ok(Ok(_)) => {
+                                        info!("Removed daemon on port {}", port);
+                                        println!("===> REMOVED DAEMON ON PORT {}", port);
+                                        break;
+                                    }
+                                    Ok(Err(e)) => {
+                                        warn!("Failed to remove daemon on port {}: {}. Attempt {}/{}", port, e, attempts + 1, MAX_REGISTRY_ATTEMPTS);
+                                        println!("===> WARNING: FAILED TO REMOVE DAEMON ON PORT {}: {}. ATTEMPT {}/{}", port, e, attempts + 1, MAX_REGISTRY_ATTEMPTS);
+                                        attempts += 1;
+                                        sleep(TokioDuration::from_millis(1000)).await;
+                                    }
+                                    Err(_) => {
+                                        warn!("Timeout removing daemon on port {}. Attempt {}/{}", port, attempts + 1, MAX_REGISTRY_ATTEMPTS);
+                                        println!("===> WARNING: TIMEOUT REMOVING DAEMON ON PORT {}. ATTEMPT {}/{}", port, attempts + 1, MAX_REGISTRY_ATTEMPTS);
+                                        attempts += 1;
+                                        sleep(TokioDuration::from_millis(1000)).await;
+                                    }
+                                }
+                            }
+                            if attempts >= MAX_REGISTRY_ATTEMPTS {
+                                error!("Failed to remove daemon on port {} after {} attempts", port, MAX_REGISTRY_ATTEMPTS);
+                                println!("===> ERROR: FAILED TO REMOVE DAEMON ON PORT {} AFTER {} ATTEMPTS", port, MAX_REGISTRY_ATTEMPTS);
+                                return Err(GraphError::StorageError(format!("Failed to remove daemon on port {} after {} attempts", port, MAX_REGISTRY_ATTEMPTS)));
+                            }
                             sleep(TokioDuration::from_millis(500)).await;
+                            break;
                         }
                         break;
                     }
@@ -3326,8 +3506,8 @@ impl StorageEngineManager {
             }
         }
 
-        // Initialize new engine only if no running daemon or engine/path differs
-        let new_persistent = if daemon_running && old_engine_type == new_config.storage_engine_type && old_path == _new_path {
+        // Initialize new engine
+        let new_persistent = if daemon_running && old_engine_type == new_config.storage_engine_type && old_path == new_path {
             info!("Reusing existing Sled engine for port {}", port);
             #[cfg(feature = "with-sled")]
             {
@@ -3337,7 +3517,7 @@ impl StorageEngineManager {
                 let storage = SledStorage::new_with_db(
                     &SledConfig {
                         storage_engine_type: StorageEngineType::Sled,
-                        path: _new_path.clone(),
+                        path: new_path.clone(),
                         host: new_config.engine_specific_config.as_ref().and_then(|c| c.storage.host.clone()),
                         port: Some(port),
                         temporary: false,
@@ -3396,7 +3576,7 @@ impl StorageEngineManager {
                                                     path: config.engine_specific_config
                                                         .as_ref()
                                                         .and_then(|map| map.storage.path.clone())
-                                                        .unwrap_or_else(|| PathBuf::from(format!("/opt/graphdb/storage_data/sled/{}", config.default_port))),
+                                                        .unwrap_or_else(|| PathBuf::from(format!("{}/sled/{}", DEFAULT_DATA_DIRECTORY, config.default_port))),
                                                     host: config.engine_specific_config
                                                         .as_ref()
                                                         .and_then(|map| map.storage.host.clone()),
@@ -3406,12 +3586,14 @@ impl StorageEngineManager {
                                                     temporary: false,
                                                     use_compression: config.engine_specific_config
                                                         .as_ref()
-                                                        .map_or(true, |c| c.storage.use_compression),
+                                                        .map_or(false, |c| c.storage.use_compression),
                                                     cache_capacity: config.engine_specific_config
                                                         .as_ref()
-                                                        .and_then(|map| map.storage.cache_capacity.map(|c| c)),
+                                                        .and_then(|map| map.storage.cache_capacity),
                                                 };
-                                                match SledStorage::new(&sled_config, &config).await {
+                                                let sled_db = SLED_DB.get().ok_or_else(|| GraphError::StorageError("Sled DB not initialized".to_string()))?;
+                                                let sled_db_guard = sled_db.lock().await;
+                                                match SledStorage::new_with_db(&sled_config, &config, Arc::clone(&sled_db_guard.db)).await {
                                                     Ok(storage) => Arc::new(storage),
                                                     Err(e) => {
                                                         error!("Failed to create Sled storage for Hybrid: {}", e);
@@ -3430,7 +3612,7 @@ impl StorageEngineManager {
                                                     path: config.engine_specific_config
                                                         .as_ref()
                                                         .and_then(|map| map.storage.path.clone())
-                                                        .unwrap_or_else(|| PathBuf::from(format!("/opt/graphdb/storage_data/rocksdb/{}", config.default_port))),
+                                                        .unwrap_or_else(|| PathBuf::from(format!("{}/rocksdb/{}", DEFAULT_DATA_DIRECTORY, config.default_port))),
                                                     host: config.engine_specific_config
                                                         .as_ref()
                                                         .and_then(|map| map.storage.host.clone()),
@@ -3439,7 +3621,7 @@ impl StorageEngineManager {
                                                         .and_then(|map| map.storage.port),
                                                     cache_capacity: config.engine_specific_config
                                                         .as_ref()
-                                                        .and_then(|map| map.storage.cache_capacity.map(|c| c)),
+                                                        .and_then(|map| map.storage.cache_capacity),
                                                     max_background_jobs: Some(5),
                                                     temporary: false,
                                                     use_compression: config.engine_specific_config
@@ -3512,32 +3694,7 @@ impl StorageEngineManager {
                             }
                             StorageEngineType::Sled => {
                                 #[cfg(feature = "with-sled")]
-                                {
-                                    let engine_specific = config.engine_specific_config
-                                        .as_ref()
-                                        .ok_or_else(|| GraphError::ConfigurationError("Sled configuration missing from `engine_specific_config`".to_string()))?;
-                                    
-                                    let sled_config = SledConfig {
-                                        storage_engine_type: StorageEngineType::Sled,
-                                        path: engine_specific.storage.path.clone()
-                                            .unwrap_or_else(|| PathBuf::from(format!("/opt/graphdb/storage_data/sled/{}", config.default_port))),
-                                        host: engine_specific.storage.host.clone(),
-                                        port: engine_specific.storage.port,
-                                        temporary: engine_specific.storage.temporary,
-                                        use_compression: engine_specific.storage.use_compression,
-                                        cache_capacity: engine_specific.storage.cache_capacity.map(|c| c),
-                                    };
-                                    
-                                    info!("Initializing Sled engine with path: {:?}", sled_config.path);
-                                    let storage = SledStorage::new(&sled_config, &config).await?;
-                                    let sled_db_with_path = SledDbWithPath {
-                                        db: Arc::new(sled::open(&sled_config.path).map_err(|e| GraphError::StorageError(format!("Failed to open Sled DB: {}", e)))?),
-                                        path: sled_config.path.clone(),
-                                        client: None, // Assuming client is optional and can be None if not used
-                                    };
-                                    SLED_DB.set(TokioMutex::new(sled_db_with_path)).map_err(|_| GraphError::StorageError("Failed to set Sled DB".to_string()))?;
-                                    Ok(Arc::new(storage) as Arc<dyn GraphStorageEngine + Send + Sync>)
-                                }
+                                return StorageEngineManager::init_sled(&config).await;
                                 #[cfg(not(feature = "with-sled"))]
                                 {
                                     error!("Sled support is not enabled in this build");
@@ -3546,43 +3703,7 @@ impl StorageEngineManager {
                             }
                             StorageEngineType::RocksDB => {
                                 #[cfg(feature = "with-rocksdb")]
-                                {
-                                    let engine_specific = config.engine_specific_config
-                                        .as_ref()
-                                        .ok_or_else(|| GraphError::ConfigurationError("RocksDB configuration missing from `engine_specific_config`".to_string()))?;
-                                    let rocksdb_path = engine_specific.storage.path.clone()
-                                        .unwrap_or_else(|| PathBuf::from(format!("/opt/graphdb/storage_data/rocksdb/{}", config.default_port)));
-                                    if lock_file_exists(rocksdb_path.join("LOCK")).await? {
-                                        warn!("Lock file exists for RocksDB: {:?}", rocksdb_path.join("LOCK"));
-                                        recover_rocksdb(&rocksdb_path).await?;
-                                    }
-                                    let rocksdb_config = RocksDBConfig {
-                                        storage_engine_type: StorageEngineType::RocksDB,
-                                        path: rocksdb_path,
-                                        host: engine_specific.storage.host.clone(),
-                                        port: engine_specific.storage.port,
-                                        cache_capacity: engine_specific.storage.cache_capacity.map(|c| c),
-                                        max_background_jobs: Some(5),
-                                        temporary: engine_specific.storage.temporary,
-                                        use_compression: engine_specific.storage.use_compression,
-                                        use_raft_for_scale: engine_specific.storage.use_raft_for_scale,
-                                    };
-                                    info!("Initializing RocksDB engine with path: {:?}", rocksdb_config.path);
-                                    let mut rocksdb_singleton = ROCKSDB_SINGLETON.lock().await;
-                                    let rocksdb_instance = match rocksdb_singleton.take() {
-                                        Some(instance) => {
-                                            info!("Reusing existing RocksDB instance");
-                                            instance
-                                        }
-                                        None => {
-                                            trace!("Creating new RocksDBStorage singleton");
-                                            let storage = RocksDBStorage::new(&rocksdb_config, &config).await?;
-                                            Arc::new(storage)
-                                        }
-                                    };
-                                    *rocksdb_singleton = Some(rocksdb_instance.clone());
-                                    Ok(rocksdb_instance as Arc<dyn GraphStorageEngine + Send + Sync>)
-                                }
+                                return StorageEngineManager::init_rocksdb(&config).await;
                                 #[cfg(not(feature = "with-rocksdb"))]
                                 {
                                     error!("RocksDB support is not enabled in this build");
@@ -3755,16 +3876,16 @@ impl StorageEngineManager {
         };
 
         // Migrate or copy data if needed
-        if old_engine_type != new_config.storage_engine_type || old_path != _new_path {
-            info!("Handling data transfer from old {:?} (path {:?}) to new {:?} (path {:?})", 
-                  old_engine_type, old_path, new_config.storage_engine_type, _new_path);
+        if old_engine_type != new_config.storage_engine_type || old_path != new_path {
+            info!("Handling data transfer from old {:?} (path {:?}) to new {:?} (path {:?})",
+                  old_engine_type, old_path, new_config.storage_engine_type, new_path);
             if old_engine_type != new_config.storage_engine_type {
                 info!("Migrating data from {} to {}", old_persistent_arc.get_type(), new_persistent.get_type());
                 self.migrate_data(&old_persistent_arc, &new_persistent).await?;
-            } else if let (Some(old_p), Some(new_p)) = (old_path.to_str(), _new_path.to_str()) {
+            } else if let (Some(old_p), Some(new_p)) = (old_path.to_str(), new_path.to_str()) {
                 if old_p != new_p {
                     info!("Copying data directory for same-engine path change");
-                    copy_dir(&old_path, &_new_path).await
+                    copy_dir(&old_path, &new_path).await
                         .map_err(|e| GraphError::Io(e.to_string()))?;
                 }
             }
@@ -3780,7 +3901,7 @@ impl StorageEngineManager {
         self.persistent_engine = new_persistent;
 
         // Start the new engine and register daemon
-        if !daemon_running || old_engine_type != new_config.storage_engine_type || old_path != _new_path {
+        if !daemon_running || old_engine_type != new_config.storage_engine_type || old_path != new_path {
             let engine = self.engine.lock().await;
             (*engine).start().await
                 .map_err(|e| GraphError::StorageError(format!("Failed to start new engine: {}", e)))?;
@@ -3789,9 +3910,7 @@ impl StorageEngineManager {
                 port,
                 pid: std::process::id(),
                 ip_address: "127.0.0.1".to_string(),
-                data_dir: new_config.engine_specific_config
-                    .as_ref()
-                    .and_then(|c| c.storage.path.clone()),
+                data_dir: Some(new_path),
                 config_path: Some(config_path),
                 engine_type: Some(new_config.storage_engine_type.to_string()),
                 last_seen_nanos: SystemTime::now()
@@ -3799,9 +3918,34 @@ impl StorageEngineManager {
                     .map_err(|e| GraphError::StorageError(format!("System time error: {}", e)))?
                     .as_nanos() as i64,
             };
-            GLOBAL_DAEMON_REGISTRY.register_daemon(meta).await
-                .map_err(|e| GraphError::StorageError(format!("Failed to register daemon: {}", e)))?;
-            info!("Registered new daemon for engine {:?} on port {}", new_config.storage_engine_type, port);
+            let mut attempts = 0;
+            const MAX_REGISTRY_ATTEMPTS: u32 = 5;
+            while attempts < MAX_REGISTRY_ATTEMPTS {
+                match timeout(TokioDuration::from_secs(10), GLOBAL_DAEMON_REGISTRY.register_daemon(meta.clone())).await {
+                    Ok(Ok(_)) => {
+                        info!("Registered new daemon for engine {:?} on port {}", new_config.storage_engine_type, port);
+                        println!("===> REGISTERED NEW DAEMON FOR ENGINE {:?} ON PORT {}", new_config.storage_engine_type, port);
+                        break;
+                    }
+                    Ok(Err(e)) => {
+                        warn!("Failed to register daemon on port {}: {}. Attempt {}/{}", port, e, attempts + 1, MAX_REGISTRY_ATTEMPTS);
+                        println!("===> WARNING: FAILED TO REGISTER DAEMON ON PORT {}: {}. ATTEMPT {}/{}", port, e, attempts + 1, MAX_REGISTRY_ATTEMPTS);
+                        attempts += 1;
+                        sleep(TokioDuration::from_millis(1000)).await;
+                    }
+                    Err(_) => {
+                        warn!("Timeout registering daemon on port {}. Attempt {}/{}", port, attempts + 1, MAX_REGISTRY_ATTEMPTS);
+                        println!("===> WARNING: TIMEOUT REGISTERING DAEMON ON PORT {}. ATTEMPT {}/{}", port, attempts + 1, MAX_REGISTRY_ATTEMPTS);
+                        attempts += 1;
+                        sleep(TokioDuration::from_millis(1000)).await;
+                    }
+                }
+            }
+            if attempts >= MAX_REGISTRY_ATTEMPTS {
+                error!("Failed to register daemon on port {} after {} attempts", port, MAX_REGISTRY_ATTEMPTS);
+                println!("===> ERROR: FAILED TO REGISTER DAEMON ON PORT {} AFTER {} ATTEMPTS", port, MAX_REGISTRY_ATTEMPTS);
+                return Err(GraphError::StorageError(format!("Failed to register daemon on port {} after {} attempts", port, MAX_REGISTRY_ATTEMPTS)));
+            }
         }
 
         info!("Successfully switched to storage engine: {:?}", new_config.storage_engine_type);

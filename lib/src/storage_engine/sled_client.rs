@@ -21,11 +21,20 @@ use zmq::{ Context as ZmqContext, Socket as ZmqSocket, Message};
 // Wrapper for ZmqSocket to implement Debug
 pub struct ZmqSocketWrapper(ZmqSocket);
 
+
 impl ZmqSocketWrapper {
+    /// Public constructor required to initialize the private tuple field.
     pub fn new(socket: ZmqSocket) -> Self {
         ZmqSocketWrapper(socket)
     }
+
+    /// Accesses the underlying ZMQ socket.
+    /// You might need this helper method later for binding/sending/receiving.
+    pub fn socket(&self) -> &ZmqSocket {
+        &self.0
+    }
 }
+
 
 impl std::fmt::Debug for ZmqSocketWrapper {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
