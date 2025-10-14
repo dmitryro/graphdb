@@ -1,10 +1,12 @@
 // Extended RocksDBClient implementation with ZMQ support while preserving original functionality
 use std::any::Any;
 use async_trait::async_trait;
-use std::path::PathBuf;
+use std::path::{PathBuf, Path};
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
+use tokio::task::spawn_blocking; // FIX: Added missing import
 use rocksdb::{DB, ColumnFamily, Options, DBCompressionType, WriteBatch, WriteOptions};
+use tokio::fs as tokio_fs;
 use models::{Vertex, Edge, Identifier, identifiers::SerializableUuid};
 use models::errors::{GraphError, GraphResult};
 pub use crate::config::{QueryResult, RocksDBClient, RaftCommand, RocksDBClientMode};
@@ -15,9 +17,73 @@ use uuid::Uuid;
 use log::{info, error, debug, warn};
 use serde_json::{json, Value};
 use tokio::time::Duration as TokioDuration;
+use base64::engine::general_purpose;
+use base64::Engine;
+use zmq::{Context as ZmqContext, Socket as ZmqSocket, Message};
+
+// Wrapper for ZmqSocket to implement Debug
+pub struct ZmqSocketWrapper(ZmqSocket);
+
+impl ZmqSocketWrapper {
+    /// Public constructor required to initialize the private tuple field.
+    pub fn new(socket: ZmqSocket) -> Self {
+        ZmqSocketWrapper(socket)
+    }
+
+    /// Accesses the underlying ZMQ socket.
+    pub fn socket(&self) -> &ZmqSocket {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for ZmqSocketWrapper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ZmqSocketWrapper")
+            .field("socket", &"ZmqSocket")
+            .finish()
+    }
+}
+
+impl std::ops::Deref for ZmqSocketWrapper {
+    type Target = ZmqSocket;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ZmqSocketWrapper {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+// --- ZMQ Connection Utility ---
+
+/// Helper function to perform the blocking ZMQ connection with internal timeouts.
+/// Must be called inside a spawn_blocking block.
+fn connect_zmq_socket_with_timeout(context: &ZmqContext, ipc_endpoint: &str, timeout_ms: i32) -> zmq::Result<ZmqSocket> {
+    let socket = context.socket(zmq::REQ)?;
+    socket.set_connect_timeout(timeout_ms)?;
+    socket.set_rcvtimeo(timeout_ms)?;
+    socket.set_sndtimeo(timeout_ms)?;
+    socket.connect(ipc_endpoint)?;
+    debug!("Successfully connected ZMQ socket to {}", ipc_endpoint);
+    Ok(socket)
+}
 
 impl RocksDBClient {
-    // Keep the original new() method unchanged
+    /// Creates a new RocksDBClient in ZMQ mode.
+    pub fn new_zmq(port: u16, db_path: PathBuf, socket_arc: Arc<TokioMutex<ZmqSocketWrapper>>) -> Self {
+        RocksDBClient {
+            mode: Some(RocksDBClientMode::ZMQ(port)),
+            inner: None, // ZMQ mode doesn't use the DB directly
+            db_path: Some(db_path), // FIX: Wrap PathBuf in Some
+            is_running: Arc::new(TokioMutex::new(true)), // FIX: Use Arc<TokioMutex<bool>>
+            zmq_socket: Some(socket_arc),
+        }
+    }
+
+    /// Creates a new RocksDBClient in Direct mode.
     pub async fn new(db_path: PathBuf) -> GraphResult<Self> {
         let cf_names = vec![
             "data", "vertices", "edges", "kv_pairs",
@@ -33,10 +99,10 @@ impl RocksDBClient {
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
-        Self::force_unlock(db_path.clone()).await?;
+        Self::force_unlock(&db_path).await?; // Corrected line 102
 
         let db_path_clone = db_path.clone();
-        let db = tokio::task::spawn_blocking(move || {
+        let db = spawn_blocking(move || {
             DB::open_cf_descriptors(&db_opts, &db_path_clone, cfs)
         })
         .await
@@ -47,36 +113,34 @@ impl RocksDBClient {
         println!("===> Created RocksDBClient in Direct mode at {:?}", db_path);
 
         Ok(Self {
-            inner: Arc::new(TokioMutex::new(Arc::new(db))),
-            db_path,
-            is_running: false,
+            inner: Some(Arc::new(TokioMutex::new(Arc::new(db)))), // FIX: Wrap in Some
+            db_path: Some(db_path), // FIX: Wrap PathBuf in Some
+            is_running: Arc::new(TokioMutex::new(false)), // FIX: Use Arc<TokioMutex<bool>>
             mode: Some(RocksDBClientMode::Direct),
+            zmq_socket: None,
         })
     }
 
-    // Keep the original new_with_db() method unchanged
+    /// Creates a new RocksDBClient with a provided DB in Direct mode.
     pub async fn new_with_db(db_path: PathBuf, db: Arc<DB>) -> GraphResult<Self> {
         info!("Created RocksDBClient with provided DB in Direct mode at {:?}", db_path);
         println!("===> Created RocksDBClient with provided DB in Direct mode at {:?}", db_path);
 
         Ok(Self {
-            inner: Arc::new(TokioMutex::new(db)),
-            db_path,
-            is_running: false,
+            inner: Some(Arc::new(TokioMutex::new(db))), // FIX: Wrap in Some
+            db_path: Some(db_path), // FIX: Wrap PathBuf in Some
+            is_running: Arc::new(TokioMutex::new(false)), // FIX: Use Arc<TokioMutex<bool>>
             mode: Some(RocksDBClientMode::Direct),
+            zmq_socket: None,
         })
     }
 
-    /// Creates a new RocksDBClient that connects to an existing daemon via ZMQ
-    /// instead of opening the database directly. This prevents lock conflicts.
+    /// Creates a new RocksDBClient that connects to an existing daemon via ZMQ.
     pub async fn new_with_port(port: u16) -> GraphResult<Self> {
         info!("Creating RocksDBClient in ZMQ mode for port {}", port);
         println!("===> Creating RocksDBClient in ZMQ mode for port {}", port);
 
-        // Create a minimal client structure for ZMQ mode
         let dummy_path = PathBuf::from(format!("/tmp/rocksdb-client-zmq-{}", port));
-
-        // Test the ZMQ connection with retries and TCP fallback
         let max_retries = 3;
         let mut attempt = 0;
         let mut ping_success = false;
@@ -122,43 +186,187 @@ impl RocksDBClient {
             println!("===> ERROR: Failed to connect to RocksDB daemon on port {} after {} attempts", port, max_retries);
             return Err(GraphError::StorageError(format!("Failed to connect to RocksDB daemon on port {}", port)));
         }
-        // Create a dummy DB handle that won't be used
-        let dummy_path_clone = dummy_path.clone(); // Clone for the closure
-        let dummy_db = tokio::task::spawn_blocking(move || {
+
+        let dummy_path_clone = dummy_path.clone();
+        let dummy_db = spawn_blocking(move || {
             let opts = Options::default();
-            DB::open_default(&dummy_path_clone) // Use the clone in the closure
+            DB::open_default(&dummy_path_clone)
         })
         .await
         .map_err(|e| GraphError::StorageError(format!("Failed to create dummy DB: {}", e)))?
         .map_err(|e| GraphError::StorageError(format!("Failed to create dummy DB: {}", e)))?;
+
         info!("Successfully created RocksDBClient in ZMQ mode for port {}", port);
         println!("===> Successfully created RocksDBClient in ZMQ mode for port {}", port);
         Ok(Self {
-            inner: Arc::new(TokioMutex::new(Arc::new(dummy_db))),
-            db_path: dummy_path, // Original can still be used here
-            is_running: false,
+            inner: Some(Arc::new(TokioMutex::new(Arc::new(dummy_db)))), // FIX: Wrap in Some
+            db_path: Some(dummy_path), // FIX: Wrap PathBuf in Some
+            is_running: Arc::new(TokioMutex::new(false)), // FIX: Use Arc<TokioMutex<bool>>
             mode: Some(RocksDBClientMode::ZMQ(port)),
+            zmq_socket: None,
         })
     }
 
-    // Keep original force_unlock unchanged
-    pub async fn force_unlock(db_path: PathBuf) -> GraphResult<()> {
-        let lock_path = db_path.join("LOCK");
-        if let Err(e) = rocksdb::DB::destroy(&rocksdb::Options::default(), &lock_path) {
-            if !e.to_string().contains("No such file or directory") {
-                error!("Failed to unlock database at {:?}: {}", lock_path, e);
-                println!("===> ERROR: Failed to unlock database at {:?}: {}", lock_path, e);
-                return Err(GraphError::StorageError(format!("Failed to unlock database: {}", e)));
+    pub fn send_zmq_request_sync(socket: &zmq::Socket, request: Value) -> GraphResult<Value> {
+        let request_str = serde_json::to_string(&request)
+            .map_err(|e| GraphError::SerializationError(format!("Failed to serialize request: {}", e)))?;
+        socket.send(request_str.as_bytes(), 0)
+            .map_err(|e| GraphError::StorageError(format!("ZMQ send error: {}", e)))?;
+        let mut msg = Message::new();
+        socket.recv(&mut msg, 0)
+            .map_err(|e| GraphError::StorageError(format!("ZMQ recv error: {}", e)))?;
+        let response_str = msg.as_str()
+            .ok_or_else(|| GraphError::StorageError("ZMQ response was not valid UTF-8".to_string()))?;
+        serde_json::from_str(response_str)
+            .map_err(|e| GraphError::DeserializationError(format!("Failed to deserialize response: {}", e)))
+    }
+    
+    /// Connects to a running ZMQ storage daemon.
+    pub async fn connect_zmq_client(port: u16) -> GraphResult<(RocksDBClient, Arc<TokioMutex<ZmqSocketWrapper>>)> {
+        let ipc_endpoint = format!("ipc:///tmp/graphdb-{}.ipc", port);
+        info!("Attempting ZMQ client connection to {}", ipc_endpoint);
+
+        let default_db_path = PathBuf::from(format!("/opt/graphdb/storage_data/rocksdb/{}", port));
+        let connection_result = spawn_blocking(move || {
+            let context = ZmqContext::new();
+            let connect_timeout_ms = 500;
+            match connect_zmq_socket_with_timeout(&context, &ipc_endpoint, connect_timeout_ms) {
+                Ok(socket) => {
+                    let ping_request = json!({ "command": "ping" }); // FIX: Changed comma to colon
+                    match RocksDBClient::send_zmq_request_sync(&socket, ping_request) {
+                        Ok(response) => {
+                            if response.get("status").and_then(|s| s.as_str()) == Some("pong") {
+                                Ok(socket)
+                            } else {
+                                Err(format!(
+                                    "ZMQ ping failed: Unexpected response from daemon at {}: {:?}", 
+                                    ipc_endpoint, response
+                                ))
+                            }
+                        }
+                        Err(e) => Err(format!("ZMQ ping request failed: {}", e)),
+                    }
+                }
+                Err(e) => Err(format!("Failed to connect ZMQ socket to {}: {}", ipc_endpoint, e)),
+            }
+        })
+        .await
+        .map_err(|e| {
+            error!("Spawn blocking task failed for ZMQ connection: {}", e);
+            println!("===> ERROR: Spawn blocking task failed for ZMQ connection: {}", e);
+            GraphError::InternalError(format!("Internal task failure during ZMQ connection: {}", e))
+        })?;
+
+        match connection_result {
+            Ok(socket) => {
+                let socket_arc = Arc::new(TokioMutex::new(ZmqSocketWrapper::new(socket)));
+                let client = RocksDBClient::new_zmq(port, default_db_path, socket_arc.clone());
+                info!("Successfully created ZMQ client for port {}", port);
+                println!("===> Successfully created ZMQ client for port {}", port);
+                Ok((client, socket_arc))
+            }
+            Err(e) => {
+                error!("ZMQ connection failed: {}", e);
+                println!("===> ERROR: ZMQ connection failed: {}", e);
+                Err(GraphError::ConnectionError(e))
             }
         }
-        info!("Successfully unlocked database at {:?}", lock_path);
-        println!("===> Successfully unlocked database at {:?}", lock_path);
+    }
+
+    pub async fn connect_zmq_client_with_readiness_check(port: u16) -> GraphResult<(Self, Arc<TokioMutex<ZmqSocketWrapper>>)> {
+        let context = zmq::Context::new();
+        let socket = context.socket(zmq::REQ)
+            .map_err(|e| {
+                error!("Failed to create ZMQ socket for port {}: {}", port, e);
+                println!("===> ERROR: FAILED TO CREATE ZMQ SOCKET FOR PORT {}: {}", port, e);
+                GraphError::StorageError(format!("Failed to create ZMQ socket: {}", e))
+            })?;
+        socket.set_rcvtimeo(5000)
+            .map_err(|e| {
+                error!("Failed to set receive timeout for port {}: {}", port, e);
+                println!("===> ERROR: FAILED TO SET RECEIVE TIMEOUT FOR PORT {}: {}", port, e);
+                GraphError::StorageError(format!("Failed to set receive timeout: {}", e))
+            })?;
+        socket.set_sndtimeo(5000)
+            .map_err(|e| {
+                error!("Failed to set send timeout for port {}: {}", port, e);
+                println!("===> ERROR: FAILED TO SET SEND TIMEOUT FOR PORT {}: {}", port, e);
+                GraphError::StorageError(format!("Failed to set send timeout: {}", e))
+            })?;
+
+        let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", port);
+        info!("Connecting to ZMQ endpoint {} for port {}", endpoint, port);
+        println!("===> CONNECTING TO ZMQ ENDPOINT {} FOR PORT {}", endpoint, port);
+        if let Err(e) = socket.connect(&endpoint) {
+            error!("Failed to connect to ZMQ endpoint {}: {}", endpoint, e);
+            println!("===> ERROR: FAILED TO CONNECT TO ZMQ ENDPOINT {}: {}", endpoint, e);
+            return Err(GraphError::StorageError(format!("Failed to connect to ZMQ socket {}: {}", endpoint, e)));
+        }
+
+        let request = json!({ "command": "initialize" });
+        info!("Sending initialize request to ZMQ server on port {}", port);
+        println!("===> SENDING INITIALIZE REQUEST TO ZMQ SERVER ON PORT {}", port);
+        if let Err(e) = socket.send(serde_json::to_vec(&request)?, 0) {
+            error!("Failed to send initialize request: {}", e);
+            println!("===> ERROR: FAILED TO SEND INITIALIZE REQUEST: {}", e);
+            return Err(GraphError::StorageError(format!("Failed to send initialize request: {}", e)));
+        }
+
+        let reply = socket.recv_bytes(0)
+            .map_err(|e| {
+                error!("Failed to receive initialize response: {}", e);
+                println!("===> ERROR: FAILED TO RECEIVE INITIALIZE RESPONSE: {}", e);
+                GraphError::StorageError(format!("Failed to receive initialize response: {}", e))
+            })?;
+        let response: Value = serde_json::from_slice(&reply)
+            .map_err(|e| {
+                error!("Failed to parse initialize response: {}", e);
+                println!("===> ERROR: FAILED TO PARSE INITIALIZE RESPONSE: {}", e);
+                GraphError::StorageError(format!("Failed to parse initialize response: {}", e))
+            })?;
+
+        if response["status"] != "success" {
+            error!("ZMQ server not ready for port {}: {:?}", port, response);
+            println!("===> ERROR: ZMQ SERVER NOT READY FOR PORT {}: {:?}", port, response);
+            return Err(GraphError::StorageError(format!("ZMQ server not ready for port {}: {:?}", port, response)));
+        }
+
+        info!("ZMQ server responded successfully for port {}", port);
+        println!("===> ZMQ SERVER RESPONDED SUCCESSFULLY FOR PORT {}", port);
+
+        let socket_wrapper = Arc::new(TokioMutex::new(ZmqSocketWrapper(socket)));
+        let is_running = Arc::new(TokioMutex::new(true));
+        Ok((RocksDBClient {
+            inner: None,
+            db_path: None,
+            is_running,
+            zmq_socket: Some(socket_wrapper.clone()),
+            mode: Some(RocksDBClientMode::ZMQ(port)),
+        }, socket_wrapper))
+    }
+
+    /// Forcefully unlocks a RocksDB database by removing the LOCK file at the specified path.
+    pub async fn force_unlock(db_path: &Path) -> GraphResult<()> {
+        let lock_path = db_path.join("LOCK");
+        if lock_path.exists() {
+            info!("Removing RocksDB lock file at {:?}", lock_path);
+            println!("===> REMOVING ROCKSDB LOCK FILE AT {:?}", lock_path);
+            tokio_fs::remove_file(&lock_path).await
+                .map_err(|e| {
+                    error!("Failed to remove RocksDB lock file at {:?}: {}", lock_path, e);
+                    println!("===> ERROR: FAILED TO REMOVE ROCKSDB LOCK FILE AT {:?}: {}", lock_path, e);
+                    GraphError::StorageError(format!("Failed to remove RocksDB lock file at {:?}", lock_path))
+                })?;
+            info!("Successfully removed RocksDB lock file at {:?}", lock_path);
+            println!("===> SUCCESSFULLY REMOVED ROCKSDB LOCK FILE AT {:?}", lock_path);
+        }
         Ok(())
     }
 
-    // Keep original apply_raft_entry unchanged
     pub async fn apply_raft_entry(&self, data: Vec<u8>) -> GraphResult<()> {
-        let db = self.inner.lock().await;
+        let inner = self.inner.as_ref()
+            .ok_or_else(|| GraphError::StorageError("No database available in ZMQ mode".to_string()))?;
+        let db = inner.lock().await;
         let cf = (*db).cf_handle("kv_pairs")
             .ok_or_else(|| GraphError::StorageError("Missing column family: kv_pairs".to_string()))?;
         let (key, value) = data.split_at(data.len() / 2);
@@ -168,11 +376,12 @@ impl RocksDBClient {
         Ok(())
     }
 
-    // Enhanced insert_into_cf with ZMQ support
     pub async fn insert_into_cf(&self, cf_name: &str, key: &[u8], value: &[u8]) -> GraphResult<()> {
         match &self.mode {
             Some(RocksDBClientMode::Direct) => {
-                let db = self.inner.lock().await;
+                let inner = self.inner.as_ref()
+                    .ok_or_else(|| GraphError::StorageError("No database available".to_string()))?;
+                let db = inner.lock().await;
                 let cf = (*db).cf_handle(cf_name)
                     .ok_or_else(|| GraphError::StorageError(format!("Missing column family: {}", cf_name)))?;
                 (*db).put_cf(&cf, key, value)
@@ -194,11 +403,12 @@ impl RocksDBClient {
         }
     }
 
-    // Enhanced retrieve_from_cf with ZMQ support
     pub async fn retrieve_from_cf(&self, cf_name: &str, key: &[u8]) -> GraphResult<Option<Vec<u8>>> {
         match &self.mode {
             Some(RocksDBClientMode::Direct) => {
-                let db = self.inner.lock().await;
+                let inner = self.inner.as_ref()
+                    .ok_or_else(|| GraphError::StorageError("No database available".to_string()))?;
+                let db = inner.lock().await;
                 let cf = (*db).cf_handle(cf_name)
                     .ok_or_else(|| GraphError::StorageError(format!("Missing column family: {}", cf_name)))?;
                 let result = (*db).get_cf(&cf, key)
@@ -218,11 +428,12 @@ impl RocksDBClient {
         }
     }
 
-    // Enhanced delete_from_cf with ZMQ support
     pub async fn delete_from_cf(&self, cf_name: &str, key: &[u8]) -> GraphResult<()> {
         match &self.mode {
             Some(RocksDBClientMode::Direct) => {
-                let db = self.inner.lock().await;
+                let inner = self.inner.as_ref()
+                    .ok_or_else(|| GraphError::StorageError("No database available".to_string()))?;
+                let db = inner.lock().await;
                 let cf = (*db).cf_handle(cf_name)
                     .ok_or_else(|| GraphError::StorageError(format!("Missing column family: {}", cf_name)))?;
                 let mut batch = WriteBatch::default();
@@ -246,7 +457,6 @@ impl RocksDBClient {
         }
     }
 
-    // Keep original vertex/edge methods unchanged
     pub async fn create_vertex(&self, vertex: Vertex) -> GraphResult<()> {
         let uuid = SerializableUuid(vertex.id.0);
         let key = uuid.0.as_bytes();
@@ -310,9 +520,10 @@ impl RocksDBClient {
         self.delete_from_cf("edges", &key).await
     }
 
-    // Keep original get_all_* methods unchanged
     pub async fn get_all_vertices(&self) -> GraphResult<Vec<Vertex>> {
-        let db = self.inner.lock().await;
+        let inner = self.inner.as_ref()
+            .ok_or_else(|| GraphError::StorageError("No database available".to_string()))?;
+        let db = inner.lock().await;
         let cf = (*db).cf_handle("vertices")
             .ok_or_else(|| GraphError::StorageError(format!("Missing column family: vertices")))?;
         let iter = (*db).iterator_cf(&cf, rocksdb::IteratorMode::Start);
@@ -327,7 +538,9 @@ impl RocksDBClient {
     }
 
     pub async fn get_all_edges(&self) -> GraphResult<Vec<Edge>> {
-        let db = self.inner.lock().await;
+        let inner = self.inner.as_ref()
+            .ok_or_else(|| GraphError::StorageError("No database available".to_string()))?;
+        let db = inner.lock().await;
         let cf = (*db).cf_handle("edges")
             .ok_or_else(|| GraphError::StorageError(format!("Missing column family: edges")))?;
         let iter = (*db).iterator_cf(&cf, rocksdb::IteratorMode::Start);
@@ -341,12 +554,13 @@ impl RocksDBClient {
         Ok(edges)
     }
 
-    // Keep original control methods unchanged
     pub async fn clear_data(&self) -> GraphResult<()> {
         match &self.mode {
             Some(RocksDBClientMode::Direct) => {
+                let inner = self.inner.as_ref()
+                    .ok_or_else(|| GraphError::StorageError("No database available".to_string()))?;
+                let db = inner.lock().await;
                 let cfs = ["vertices", "edges", "kv_pairs"];
-                let db = self.inner.lock().await;
                 let mut batch = WriteBatch::default();
                 for cf_name in cfs.iter() {
                     let cf = (*db).cf_handle(cf_name)
@@ -392,35 +606,41 @@ impl RocksDBClient {
     pub async fn connect(&mut self) -> GraphResult<()> {
         info!("Connecting to RocksDB");
         println!("===> Connecting to RocksDB");
-        self.is_running = true;
+        let mut is_running = self.is_running.lock().await;
+        *is_running = true; // FIX: Update through mutex
         Ok(())
     }
 
     pub async fn start(&mut self) -> GraphResult<()> {
         info!("Starting RocksDB");
         println!("===> Starting RocksDB");
-        self.is_running = true;
+        let mut is_running = self.is_running.lock().await;
+        *is_running = true; // FIX: Update through mutex
         Ok(())
     }
 
     pub async fn stop(&mut self) -> GraphResult<()> {
         info!("Stopping RocksDB");
         println!("===> Stopping RocksDB");
-        self.is_running = false;
+        let mut is_running = self.is_running.lock().await;
+        *is_running = false; // FIX: Update through mutex
         Ok(())
     }
 
     pub async fn close(&mut self) -> GraphResult<()> {
         info!("Closing RocksDB");
         println!("===> Closing RocksDB");
-        self.is_running = false;
+        let mut is_running = self.is_running.lock().await;
+        *is_running = false; // FIX: Update through mutex
         Ok(())
     }
 
     pub async fn flush(&self) -> GraphResult<()> {
         match &self.mode {
             Some(RocksDBClientMode::Direct) => {
-                let db = self.inner.lock().await;
+                let inner = self.inner.as_ref()
+                    .ok_or_else(|| GraphError::StorageError("No database available".to_string()))?;
+                let db = inner.lock().await;
                 (*db).flush_wal(true)
                     .map_err(|e| GraphError::StorageError(format!("Failed to flush WAL: {}", e)))?;
                 info!("Flushed WAL");
@@ -457,12 +677,10 @@ impl RocksDBClient {
         Ok(QueryResult::Null)
     }
 
-    // Enhanced ZMQ helper methods
     pub async fn ping_daemon(port: u16) -> GraphResult<()> {
         let socket_path = format!("/tmp/graphdb-{}.ipc", port);
         let addr = format!("ipc://{}", socket_path);
 
-        // Check if socket file exists
         if !tokio::fs::metadata(&socket_path).await.is_ok() {
             warn!("IPC socket file {} does not exist for port {}", socket_path, port);
             println!("===> Warning: IPC socket file {} does not exist for port {}", socket_path, port);
@@ -521,34 +739,28 @@ impl RocksDBClient {
             info!("Attempt {}/{} to send ZMQ request to port {} via {}", attempt, max_retries, port, if use_tcp { "TCP" } else { "IPC" });
             println!("===> Attempt {}/{} to send ZMQ request to port {} via {}", attempt, max_retries, port, if use_tcp { "TCP" } else { "IPC" });
 
-            let result = tokio::task::spawn_blocking({
+            let result = spawn_blocking({
                 let addr = addr.to_string();
                 let request_data = request_data.clone();
                 move || -> Result<Value, GraphError> {
                     let context = zmq::Context::new();
                     let socket = context.socket(zmq::REQ)
                         .map_err(|e| GraphError::StorageError(format!("Failed to create ZMQ socket: {}", e)))?;
-
                     socket.set_rcvtimeo(15000)
                         .map_err(|e| GraphError::StorageError(format!("Failed to set receive timeout: {}", e)))?;
                     socket.set_sndtimeo(10000)
                         .map_err(|e| GraphError::StorageError(format!("Failed to set send timeout: {}", e)))?;
                     socket.set_linger(0)
                         .map_err(|e| GraphError::StorageError(format!("Failed to set linger: {}", e)))?;
-
                     socket.connect(&addr)
                         .map_err(|e| GraphError::StorageError(format!("Failed to connect to {}: {}", addr, e)))?;
-
                     socket.send(&request_data, 0)
                         .map_err(|e| GraphError::StorageError(format!("Failed to send request to {}: {}", addr, e)))?;
-
                     let mut msg = zmq::Message::new();
                     socket.recv(&mut msg, 0)
                         .map_err(|e| GraphError::StorageError(format!("Failed to receive response from {}: {}", addr, e)))?;
-
                     let response: Value = serde_json::from_slice(&msg)
                         .map_err(|e| GraphError::StorageError(format!("Failed to deserialize response from {}: {}", addr, e)))?;
-
                     Ok(response)
                 }
             })
@@ -585,7 +797,6 @@ impl RocksDBClient {
         let socket_path = format!("/tmp/graphdb-{}.ipc", port);
         let mut use_tcp = false;
 
-        // Check IPC socket file existence
         if !tokio::fs::metadata(&socket_path).await.is_ok() {
             warn!("IPC socket file {} does not exist for port {}, will try TCP", socket_path, port);
             println!("===> Warning: IPC socket file {} does not exist for port {}, will try TCP", socket_path, port);
@@ -597,7 +808,6 @@ impl RocksDBClient {
             return response;
         }
 
-        // Retry with TCP if IPC failed
         warn!("Retrying ZMQ request to port {} via TCP after IPC failure", port);
         println!("===> Retrying ZMQ request to port {} via TCP after IPC failure", port);
         Self::send_zmq_request_inner(port, request, true).await
@@ -688,7 +898,6 @@ impl RocksDBClient {
     }
 }
 
-// Enhanced trait implementations
 #[async_trait]
 impl StorageEngine for RocksDBClient {
     async fn connect(&self) -> Result<(), GraphError> {
@@ -737,7 +946,7 @@ impl GraphStorageEngine for RocksDBClient {
     }
 
     async fn is_running(&self) -> bool {
-        self.is_running
+        *self.is_running.lock().await // FIX: Lock and dereference to return bool
     }
 
     async fn query(&self, query_string: &str) -> Result<Value, GraphError> {

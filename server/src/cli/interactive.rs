@@ -1,16 +1,3 @@
-// server/src/cli/interactive.rs
-// This file handles the interactive CLI mode, including command parsing
-// and displaying interactive help messages.
-// ADDED: 2025-07-31 - Added parsing and handling for new fields `daemon_port`, `daemon_cluster`, `rest_port`, `rest_cluster`, `storage_port`, `storage_cluster` in CommandType variants (StartRest, StartStorage, StartDaemon, RestartRest, RestartStorage, RestartDaemon) and subcommands (DaemonCliCommand::Start, RestCliCommand::Start, StorageAction::Start) to align with commands.rs (artifact ID 2caecb52-0a6c-46b0-a6b6-42c1b23388a1). Updated patterns and initializers to include these fields, resolving E0027 and E0063 errors at lines 331-333, 601, 643, 675, 757, 864, 943, 1030, 1040, 1055, 1234, 1250, 1274.
-// UPDATED: 2025-07-31 - Fixed E0382 (use of moved value) for `rest_cluster`, `storage_cluster`, `daemon_cluster` by adding `.clone()` in `.or()` calls at lines 331, 337, 344, 635, 697, 749, 851, 978, 1077, 1369, 1394, 1413. Removed redundant `--storage-port` case at line 673 to fix unreachable pattern warning. Removed unused `cmd_type` assignment at line 87 to fix unused variable warning.
-// ADDED: 2025-08-08 - Added parsing and handling for `use storage <engine>` and `use plugin [--enable <bool>]` commands in `parse_command`, mapping to `CommandType::UseStorage` and `CommandType::UsePlugin`. Added handling for `StatusRaft(Option<u16>)` in `parse_command` and `handle_interactive_command`. Ensured `StorageEngineType` is imported.
-// UPDATED: 2025-08-08 - Fixed E0599 and E0308 for `UsePlugin`. In `parse_command`, set `enable` to `unwrap_or(true)` for `CommandType::UsePlugin`. In `handle_interactive_command`, removed redundant `unwrap_or(true)` since `enable` is now a `bool`.
-// UPDATED: 2025-08-08 - Updated `parse_command` to handle `StorageEngineType` variants `sled`, `rocksdb`, `inmemory`, `redis`, `postgresql`, `mysql` in `use storage` command, aligning with updated `StorageEngineType` enum.
-// UPDATED: 2025-08-08 - Fixed E0603 by ensuring `StorageEngineType` is imported from `crate::cli::commands`, which re-exports from `crate::cli::config`.
-// ADDED: 2025-08-09 - Added parsing for `save storage` and `save config`/`save configuration` in `parse_command`, mapping to `CommandType::SaveStorage` and `CommandType::SaveConfig`. Updated `handle_interactive_command` to handle `CommandType::SaveStorage` and `CommandType::SaveConfig` to fix E0004. Updated `use storage` parsing to handle `--permanent` flag, setting `permanent` boolean for `CommandType::UseStorage`.
-// ADDED: 2025-08-31 - Added parsing for `kv`, `exec`, `query`, and `unified` commands in `parse_command`, supporting flagless and flagged arguments (`--operation`, `--key`, `--value` for `kv`; `--command` for `exec`; `--query`, `--language` for `query` and `unified`). Updated `handle_interactive_command` to handle `CommandType::Kv`, `CommandType::Exec`, `CommandType::Query`, and `CommandType::Unified` by calling `handlers::handle_kv_command`, `handle_exec_command`, `handle_query_command`, and `handle_unified_query`. Added `query_engine` to `SharedState` and `run_cli_interactive`.
-// UPDATED: 2025-08-31 - Fixed E0308 by reordering arguments in `handle_kv_command`, `handle_exec_command`, `handle_query_command`, and `handle_unified_query` calls to place `query_engine` first. Fixed E0308 for `listen_port` by removing redundant `Some` wrapping in `parse_command`.
-
 use anyhow::{Result, Context, anyhow};
 use rustyline::error::ReadlineError;
 use rustyline::{DefaultEditor, history::DefaultHistory};
@@ -24,11 +11,12 @@ use clap::CommandFactory;
 use std::collections::HashSet;
 use shlex;
 use log::{info, error, warn, debug};
-use crate::cli::cli::CliArgs;
+use crate::cli::cli::{ CliArgs, get_query_engine_singleton};
+
 use lib::commands::{
     CommandType, DaemonCliCommand, RestCliCommand, StorageAction, StatusArgs, StopArgs,
     ReloadArgs, ReloadAction, StartAction, RestartArgs, RestartAction, HelpArgs, ShowAction,
-    ConfigAction, parse_kv_operation, KvAction, 
+    ConfigAction, parse_kv_operation, KvAction,
 };
 use crate::cli::handlers;
 use crate::cli::help_display::{
@@ -47,7 +35,7 @@ struct SharedState {
     storage_daemon_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
     storage_daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
     storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
-    query_engine: Arc<QueryExecEngine>,
+    query_engine: Arc<TokioMutex<Option<Arc<QueryExecEngine>>>>,
 }
 
 fn levenshtein_distance(s1: &str, s2: &str) -> usize {
@@ -366,33 +354,47 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
 
             match explicit_subcommand.as_deref() {
                 Some("all") => CommandType::StartAll {
-                    port, cluster, daemon_port, daemon_cluster,
-                    listen_port, rest_port, rest_cluster,
-                    storage_port, storage_cluster, storage_config_file,
+                    port, 
+                    cluster, 
+                    daemon_port, 
+                    daemon_cluster,
+                    listen_port, 
+                    rest_port, 
+                    rest_cluster,
+                    storage_port, 
+                    storage_cluster, 
+                    storage_config_file,
                 },
                 Some("daemon") => CommandType::StartDaemon {
-                    port: daemon_port.or(port),
-                    cluster: daemon_cluster.clone().or(cluster),
+                    port: Some(daemon_port.unwrap_or(port.unwrap_or_default())),
+                    cluster: daemon_cluster.clone().or(cluster.clone()),
                     daemon_port,
                     daemon_cluster,
                 },
                 Some("rest") => CommandType::StartRest {
-                    port: rest_port.or(listen_port).or(port),
-                    cluster: rest_cluster.clone().or(cluster),
+                    port: Some(rest_port.unwrap_or(listen_port.unwrap_or(port.unwrap_or_default()))),
+                    cluster: rest_cluster.clone().or(cluster.clone()),
                     rest_port,
                     rest_cluster,
                 },
                 Some("storage") => CommandType::StartStorage {
-                    port: storage_port.or(port),
+                    port: Some(storage_port.unwrap_or(port.unwrap_or_default())),
                     config_file: storage_config_file,
-                    cluster: storage_cluster.clone().or(cluster),
+                    cluster: storage_cluster.clone().or(cluster.clone()),
                     storage_port,
                     storage_cluster,
                 },
                 None => CommandType::StartAll {
-                    port, cluster, daemon_port, daemon_cluster,
-                    listen_port, rest_port, rest_cluster,
-                    storage_port, storage_cluster, storage_config_file,
+                    port, 
+                    cluster, 
+                    daemon_port, 
+                    daemon_cluster,
+                    listen_port, 
+                    rest_port, 
+                    rest_cluster,
+                    storage_port, 
+                    storage_cluster, 
+                    storage_config_file,
                 },
                 _ => CommandType::Unknown,
             }
@@ -578,7 +580,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                 "--daemon-cluster" => {
                                     if i + 1 < remaining_args.len() {
                                         daemon_cluster = Some(remaining_args[i + 1].clone());
-                                        i += 2;
+                                        i += 1;
                                     } else {
                                         eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
                                         i += 1;
@@ -672,7 +674,12 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                 }
                             }
                         }
-                        CommandType::RestartRest { port: rest_port.or(port), cluster: rest_cluster.clone().or(cluster), rest_port, rest_cluster }
+                        CommandType::RestartRest {
+                            port: Some(rest_port.unwrap_or(port.unwrap_or_default())),
+                            cluster: rest_cluster.clone().or(cluster.clone()),
+                            rest_port,
+                            rest_cluster
+                        }
                     },
                     "storage" => {
                         let mut port = None;
@@ -734,7 +741,13 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                 }
                             }
                         }
-                        CommandType::RestartStorage { port: storage_port.or(port), config_file, cluster: storage_cluster.clone().or(cluster), storage_port, storage_cluster }
+                        CommandType::RestartStorage {
+                            port: Some(storage_port.unwrap_or(port.unwrap_or_default())),
+                            config_file,
+                            cluster: storage_cluster.clone().or(cluster.clone()),
+                            storage_port,
+                            storage_cluster
+                        }
                     },
                     "daemon" => {
                         let mut port = None;
@@ -786,7 +799,12 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                 }
                             }
                         }
-                        CommandType::RestartDaemon { port: daemon_port.or(port), cluster: daemon_cluster.clone().or(cluster), daemon_port, daemon_cluster }
+                        CommandType::RestartDaemon {
+                            port: Some(daemon_port.unwrap_or(port.unwrap_or_default())),
+                            cluster: daemon_cluster.clone().or(cluster.clone()),
+                            daemon_port,
+                            daemon_cluster
+                        }
                     },
                     "cluster" => CommandType::RestartCluster,
                     _ => CommandType::Unknown,
@@ -959,7 +977,12 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                         _ => { i += 1; }
                     }
                 }
-                CommandType::Daemon(DaemonCliCommand::Start { port: daemon_port.or(port), cluster: daemon_cluster.clone().or(cluster), daemon_port, daemon_cluster })
+                CommandType::Daemon(DaemonCliCommand::Start {
+                    port: Some(daemon_port.unwrap_or(port.unwrap_or_default())),
+                    cluster: daemon_cluster.clone().or(cluster.clone()),
+                    daemon_port,
+                    daemon_cluster
+                })
             } else if remaining_args.first().map_or(false, |s| s.to_lowercase() == "stop") {
                 let mut port = None;
                 let mut i = 1;
@@ -1085,7 +1108,12 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                 }
 
                 match rest_subcommand.as_str() {
-                    "start" => CommandType::Rest(RestCliCommand::Start { port: rest_port.or(port), cluster: rest_cluster.clone().or(cluster), rest_port, rest_cluster }),
+                    "start" => CommandType::Rest(RestCliCommand::Start {
+                        port: Some(rest_port.unwrap_or(port.unwrap_or_default())),
+                        cluster: rest_cluster.clone().or(cluster.clone()),
+                        rest_port,
+                        rest_cluster
+                    }),
                     "stop" => CommandType::Rest(RestCliCommand::Stop { port } ),
                     "status" => CommandType::Rest(RestCliCommand::Status { port, cluster }),
                     "health" => CommandType::Rest(RestCliCommand::Health),
@@ -1193,7 +1221,13 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                 }
 
                 match storage_subcommand.as_str() {
-                    "start" => CommandType::Storage(StorageAction::Start { port: storage_port.or(port), config_file, cluster: storage_cluster.clone().or(cluster), storage_port, storage_cluster }),
+                    "start" => CommandType::Storage(StorageAction::Start {
+                        port: Some(storage_port.unwrap_or(port.unwrap_or_default())),
+                        config_file,
+                        cluster: storage_cluster.clone().or(cluster.clone()),
+                        storage_port,
+                        storage_cluster
+                    }),
                     "stop" => CommandType::Storage(StorageAction::Stop { port }),
                     "status" => CommandType::Storage(StorageAction::Status { port, cluster }),
                     "health" => CommandType::Storage(StorageAction::Health),
@@ -1492,6 +1526,17 @@ pub async fn handle_interactive_command(
     command: CommandType,
     state: &SharedState,
 ) -> Result<()> {
+    async fn ensure_query_engine(state: &SharedState) -> Result<Arc<QueryExecEngine>> {
+        let mut query_engine_guard = state.query_engine.lock().await;
+        if let Some(engine) = query_engine_guard.as_ref() {
+            Ok(Arc::clone(engine))
+        } else {
+            let engine = get_query_engine_singleton().await?;
+            *query_engine_guard = Some(Arc::clone(&engine));
+            Ok(engine)
+        }
+    }
+
     match command {
         CommandType::Daemon(daemon_cmd) => {
             handlers::handle_daemon_command_interactive(daemon_cmd, state.daemon_handles.clone()).await
@@ -1776,7 +1821,12 @@ pub async fn handle_interactive_command(
         }
         CommandType::RestartRest { port, cluster, rest_port, rest_cluster } => {
             let restart_args = RestartArgs {
-                action: RestartAction::Rest { port: rest_port.or(port), cluster: rest_cluster.clone().or(cluster), rest_port, rest_cluster },
+                action: RestartAction::Rest {
+                    port: Some(rest_port.unwrap_or(port.unwrap_or_default())),
+                    cluster: rest_cluster.clone().or(cluster.clone()),
+                    rest_port,
+                    rest_cluster
+                },
             };
             handlers::handle_restart_command_interactive(
                 restart_args,
@@ -1799,9 +1849,9 @@ pub async fn handle_interactive_command(
         } => {
             let restart_args = RestartArgs {
                 action: RestartAction::Storage {
-                    port: storage_port.or(port),
+                    port: Some(storage_port.unwrap_or(port.unwrap_or_default())),
                     config_file,
-                    cluster: storage_cluster.clone().or(cluster),
+                    cluster: storage_cluster.clone().or(cluster.clone()),
                     storage_port,
                     storage_cluster,
                 },
@@ -1820,7 +1870,12 @@ pub async fn handle_interactive_command(
         }
         CommandType::RestartDaemon { port, cluster, daemon_port, daemon_cluster } => {
             let restart_args = RestartArgs {
-                action: RestartAction::Daemon { port: daemon_port.or(port), cluster: daemon_cluster.clone().or(cluster), daemon_port, daemon_cluster },
+                action: RestartAction::Daemon {
+                    port: Some(daemon_port.unwrap_or(port.unwrap_or_default())),
+                    cluster: daemon_cluster.clone().or(cluster.clone()),
+                    daemon_port,
+                    daemon_cluster
+                },
             };
             handlers::handle_restart_command_interactive(
                 restart_args,
@@ -1867,7 +1922,7 @@ pub async fn handle_interactive_command(
             }
             Ok(())
         }
-        CommandType::SaveStorage => { 
+        CommandType::SaveStorage => {
             handlers::handle_save_storage().await;
             Ok(())
         }
@@ -1879,24 +1934,28 @@ pub async fn handle_interactive_command(
             Ok(())
         }
         CommandType::Kv { action } => {
+            let query_engine = ensure_query_engine(state).await?;
             let (operation, key, value) = match action {
                 KvAction::Get { key } => ("get".to_string(), key, None),
                 KvAction::Set { key, value } => ("set".to_string(), key, Some(value)),
                 KvAction::Delete { key } => ("delete".to_string(), key, None),
             };
-            handlers::handle_kv_command(state.query_engine.clone(), operation, key, value).await?;
+            handlers::handle_kv_command(query_engine, operation, key, value).await?;
             Ok(())
         }
         CommandType::Exec { command } => {
-            handlers::handle_exec_command(state.query_engine.clone(), command).await?;
+            let query_engine = ensure_query_engine(state).await?;
+            handlers::handle_exec_command(query_engine, command).await?;
             Ok(())
         }
         CommandType::Query { query } => {
-            handlers::handle_query_command(state.query_engine.clone(), query).await?;
+            let query_engine = ensure_query_engine(state).await?;
+            handlers::handle_query_command(query_engine, query).await?;
             Ok(())
         }
         CommandType::Unified { query, language } => {
-            handlers::handle_unified_query(state.query_engine.clone(), query, language).await?;
+            let query_engine = ensure_query_engine(state).await?;
+            handlers::handle_unified_query(query_engine, query, language).await?;
             Ok(())
         }
         CommandType::Unknown => {
@@ -1915,7 +1974,6 @@ pub async fn run_cli_interactive(
     storage_daemon_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
     storage_daemon_handle: Arc<TokioMutex<Option<tokio::task::JoinHandle<()>>>>,
     storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
-    query_engine: Arc<QueryExecEngine>,
 ) -> Result<()> {
     let mut rl = DefaultEditor::new()?;
     let history_path = "graphdb_cli_history.txt";
@@ -1931,7 +1989,7 @@ pub async fn run_cli_interactive(
         storage_daemon_shutdown_tx_opt,
         storage_daemon_handle,
         storage_daemon_port_arc,
-        query_engine,
+        query_engine: Arc::new(TokioMutex::new(None)),
     };
 
     loop {

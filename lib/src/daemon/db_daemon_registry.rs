@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::{RwLock, Semaphore, OnceCell};
+use tokio::sync::{RwLock, Semaphore, OnceCell, Mutex as TokioMutex };
 use tokio::time::{Instant, Duration as TokioDuration};
 use bincode::{config, encode_to_vec, decode_from_slice};
 use serde::{Serialize, Deserialize};
@@ -15,13 +15,14 @@ use tokio::fs;
 use std::fs as std_fs;
 use std::io;
 
-use crate::config::StorageConfig;
+use crate::config::{ StorageConfig, RocksDBWithPath };
 use crate::daemon_config::{
     DAEMON_PID_FILE_NAME_PREFIX,
     REST_PID_FILE_NAME_PREFIX,
     STORAGE_PID_FILE_NAME_PREFIX,
 };
 
+pub type RocksDBDaemonInstanceType = TokioMutex<RocksDBWithPath>;
 // Serializable version of DBDaemonMetadata without DB instances
 #[derive(Serialize, Deserialize, Debug, Clone, bincode::Encode, bincode::Decode)]
 pub struct SerializableDBDaemonMetadata {

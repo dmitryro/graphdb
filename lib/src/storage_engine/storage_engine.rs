@@ -66,7 +66,7 @@ use crate::config::{DEFAULT_DATA_DIRECTORY, DEFAULT_LOG_DIRECTORY, LOCK_FILE_PAT
                                  DEFAULT_STORAGE_PORT, StorageConfig, SledConfig, RocksDBConfig, TikvConfig,
                                  RedisConfig, MySQLConfig, PostgreSQLConfig, TypeConfig, QueryPlan, QueryResult,
                                  NodeIdType, StorageConfigInner, SelectedStorageConfig, StorageConfigWrapper, AppResponse, AppRequest,
-                                 SledDbWithPath, RocksDbWithPath, load_storage_config_from_yaml,
+                                 SledDbWithPath, RocksDBWithPath, load_storage_config_from_yaml,
                                  create_default_storage_yaml_config, SledClientMode, SledClient,
                                  load_engine_specific_config};
 use crate::daemon::daemon_management::{ is_storage_daemon_running, is_socket_used_by_cli, is_daemon_running};

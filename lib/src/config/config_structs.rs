@@ -27,6 +27,7 @@ use crate::commands::{Commands, CommandType, StatusArgs, RestartArgs, ReloadArgs
 use crate::daemon_utils::{is_port_in_cluster_range, is_valid_cluster_range, parse_cluster_range};
 pub use crate::storage_engine::storage_engine::{StorageEngineManager, GraphStorageEngine, GLOBAL_STORAGE_ENGINE_MANAGER};
 pub use crate::storage_engine::sled_client::{ZmqSocketWrapper};
+pub use crate::storage_engine::rocksdb_client::{ZmqSocketWrapper as RocksdDBZmqSocketWrapper};
 use models::{Vertex, Edge, Identifier, identifiers::SerializableUuid};
 use models::errors::{GraphError, GraphResult};
 use openraft_memstore::MemStore;
@@ -356,9 +357,10 @@ pub struct SledStorage {
 
 /// Struct to hold rocksdb::DB and its path
 #[derive(Debug)]
-pub struct RocksDbWithPath {
+pub struct RocksDBWithPath {
     pub db: Arc<DB>,
     pub path: PathBuf,
+    pub client: Option<(RocksDBClient, Arc<TokioMutex<RocksdDBZmqSocketWrapper>>)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -402,10 +404,11 @@ pub enum SledClientMode {
 /// RocksDB Client
 #[derive(Debug, Clone)]
 pub struct RocksDBClient {
-    pub inner: Arc<TokioMutex<Arc<DB>>>,
-    pub db_path: PathBuf,
-    pub is_running: bool,
+    pub inner: Option<Arc<TokioMutex<Arc<DB>>>>,
+    pub db_path: Option<PathBuf>,
+    pub is_running: Arc<TokioMutex<bool>>, 
     pub mode: Option<RocksDBClientMode>,
+    pub zmq_socket: Option<Arc<TokioMutex<RocksdDBZmqSocketWrapper>>>,
 }
 
 
@@ -448,7 +451,32 @@ impl Drop for SledClient {
         }
     }
 }
-
+impl Drop for RocksDBClient {
+    fn drop(&mut self) {
+        // Use .take() to safely move the Arc out of the struct for the async task.
+        if let Some(socket_wrapper) = self.zmq_socket.take() {
+            // Determine the socket path based on the client mode
+            let socket_path = format!("/tmp/graphdb-{}.ipc", match self.mode {
+                Some(RocksDBClientMode::ZMQ(port)) => port,
+                _ => DEFAULT_STORAGE_PORT,
+            });
+            let addr = format!("ipc://{}", socket_path);
+            
+            // Spawn a task to disconnect the socket asynchronously.
+            // Note: ZMQ operations are generally synchronous, but we await the TokioMutex lock.
+            tokio::spawn(async move {
+                let mut socket_guard = socket_wrapper.lock().await;
+                
+                if let Err(e) = socket_guard.disconnect(&addr) {
+                    warn!("Failed to disconnect ZMQ socket from {} during drop: {}", addr, e);
+                } else {
+                    // FIX: Changed the message to correctly reference RocksDBClient
+                    info!("Disconnected ZMQ socket from {} during RocksDBClient drop", addr);
+                }
+            });
+        }
+    }
+}
 
 /// RocksDB Raft storage
 #[derive(Clone)]
@@ -466,37 +494,35 @@ pub struct RocksDBRaftStorage {
     pub client: Option<Arc<RocksDBClient>>,
 }
 
-/// RocksDB daemon configuration
-// Fix E0277: Removed #[derive(Debug)] and kept #[derive(Clone)] only.
 #[derive(Clone)]
-pub struct RocksDBDaemon {
+pub struct RocksDBDaemon<'a> {
     pub port: u16,
     pub db_path: PathBuf,
     pub db: Arc<DB>,
-    /// Flag indicating if the daemon's main loop is still running.
+    pub kv_pairs: Arc<BoundColumnFamily<'a>>,
+    pub vertices: Arc<BoundColumnFamily<'a>>,
+    pub edges: Arc<BoundColumnFamily<'a>>,
     pub running: Arc<TokioMutex<bool>>,
-    /// Sender channel used to gracefully signal the main daemon task to shut down.
     pub shutdown_tx: mpsc::Sender<()>,
-    /// The ZeroMQ context used by the daemon for handling network communication.
     pub zmq_context: Arc<ZmqContext>,
-
-    pub zmq_thread: Arc<TokioMutex<Option<std::thread::JoinHandle<()>>>>, 
-    // Fix E0063: Changed feature flag to the consistent `with-openraft-rocksdb`.
-    // Fix E0277: These fields are handled in the manual Debug implementation below.
-   // #[cfg(feature = "with-rocksdb")]
-    //pub raft_storage: Arc<RocksDBRaftStorage>,
-   // #[cfg(feature = "with-rocksdb")]
-    //pub node_id: u64,
+    //pub zmq_thread: Arc<TokioMutex<Option<JoinHandle<Result<(), GraphError>>>>>,
+    pub zmq_thread: Arc<TokioMutex<Option<std::thread::JoinHandle<Result<(), GraphError>>>>>,
+    #[cfg(feature = "with-openraft-rocksdb")]
+    pub raft: Option<Arc<Raft<TypeConfig>>>,
+    #[cfg(feature = "with-openraft-rocksdb")]
+    pub raft_storage: Option<Arc<RocksDBRaftStorage>>,
+    #[cfg(feature = "with-openraft-rocksdb")]
+    pub node_id: u64,
 }
 
 // IMPORTANT: Place this code block near the definition of the RocksDBDaemon struct.
 // You are asserting thread safety, so ensure the underlying C library logic (RocksDB/ZMQ)
 // handles concurrent access correctly when using clones/handles.
-unsafe impl Send for RocksDBDaemon {}
-unsafe impl Sync for RocksDBDaemon {}
+unsafe impl<'a> Send for RocksDBDaemon<'a> {}
+unsafe impl<'a> Sync for RocksDBDaemon<'a> {}
 
 // Manual implementation of Debug to handle non-Debug fields (ZmqContext, mpsc::Sender, RaftStorage).
-impl std::fmt::Debug for RocksDBDaemon {
+impl<'a> std::fmt::Debug for RocksDBDaemon<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut builder = f.debug_struct("RocksDBDaemon");
         
@@ -504,18 +530,15 @@ impl std::fmt::Debug for RocksDBDaemon {
                .field("db_path", &self.db_path)
                // Print the memory address/pointer for Arc<DB> instead of the full database state
                .field("db", &format!("Arc<DB> @ {:?}", Arc::as_ptr(&self.db))); 
-
         // Explicitly omit non-Debug types to satisfy the compiler
         builder.field("running", &"Arc<TokioMutex<bool>> (omitted)");
         builder.field("shutdown_tx", &"mpsc::Sender<()> (omitted)");
         builder.field("zmq_context", &"Arc<ZmqContext> (omitted)");
-
         #[cfg(feature = "with-openraft-rocksdb")]
         {
             builder.field("raft_storage", &"Arc<RocksDBRaftStorage> (omitted)");
             builder.field("node_id", &self.node_id);
         }
-
         builder.finish()
     }
 }
@@ -525,13 +548,14 @@ impl std::fmt::Debug for RocksDBDaemon {
 // You will need to implement your own clone logic if needed, or rely on Arc<T>.
 #[derive(Debug, Default, Clone)]
 pub struct RocksDBDaemonPool {
-  pub daemons: Arc<RwLock<HashMap<u16, Arc<RocksDBDaemon>>>>, 
-  pub registry: Arc<RwLock<HashMap<u16, DaemonMetadata>>>,
-  pub initialized: Arc<RwLock<bool>>,
-  pub load_balancer: Arc<LoadBalancer>,
-  pub use_raft_for_scale: bool, // Changed from use_raft
+    pub daemons: HashMap<u16, Arc<RocksDBDaemon<'static>>>,
+    pub registry: Arc<RwLock<HashMap<u16, DaemonMetadata>>>,
+    pub initialized: Arc<RwLock<bool>>,
+    pub load_balancer: Arc<LoadBalancer>,
+    pub use_raft_for_scale: bool,
+    pub next_port: Arc<TokioMutex<u16>>,
+    pub clients: Arc<TokioMutex<HashMap<u16, Arc<dyn GraphStorageEngine>>>>,
 }
-
 
 /// RocksDB storage configuration
 #[derive(Debug, Clone)]

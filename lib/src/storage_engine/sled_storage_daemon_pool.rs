@@ -3925,7 +3925,7 @@ impl SledDaemonPool {
                         valid_ports.push(port);
                         self.load_balancer.update_node_health(port, true, 0).await;
                         continue;
-                    } else {
+                    } /*else {
                         warn!("Stale storage daemon found on port {}, cleaning up", port);
                         println!("===> WARNING: STALE STORAGE DAEMON FOUND ON PORT {}, CLEANING UP", port);
                         let pid = metadata.pid;
@@ -3991,7 +3991,7 @@ impl SledDaemonPool {
                             println!("===> ERROR: FAILED TO UNREGISTER DAEMON ON PORT {} AFTER {} ATTEMPTS", port, MAX_REGISTRY_ATTEMPTS);
                             return Err(GraphError::StorageError(format!("Failed to unregister daemon on port {} after {} attempts", port, MAX_REGISTRY_ATTEMPTS)));
                         }
-                    }
+                    }*/
                 } else {
                     should_initialize = true;
                 }
