@@ -13,14 +13,20 @@ use tokio::task::JoinError;
 use std::time::SystemTimeError;
 use crate::{identifiers::Identifier, properties::PropertyMap, PropertyValue};
 
-#[derive(Debug, Serialize, Deserialize, Error)]
+#[derive(Debug, Serialize, Deserialize, Error, Clone)] // <--- ADDED CLONE
 pub enum GraphError {
     #[error("IO error: {0}")]
     Io(String),
+    #[error("IO error: {0}")]
+    IoError(String),
     #[error("Storage error: {0}")]
     StorageError(String), // General storage operation error
+    #[error("ZMQ error: {0}")]
+    ZmqError(String), // General ZMQ error
     #[error("Timeout error: {0}")]
     TimeoutError(String),
+    #[error("Daemon start error: {0}")]
+    DaemonStartError(String),
     #[error("Serialization error: {0}")]
     SerializationError(String), // Error during data serialization
     #[error("Deserialization error: {0}")]
@@ -183,7 +189,7 @@ impl From<EncodeError> for GraphError {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Error, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Error, PartialEq, Clone)] // <--- ADDED CLONE
 pub enum ValidationError {
     #[error("invalid value provided")]
     InvalidValue,
@@ -228,3 +234,4 @@ pub type GraphResult<T> = Result<T, GraphError>;
 
 /// A type alias for a `Result` that returns a `ValidationError` on failure.
 pub type ValidationResult<T> = Result<T, ValidationError>;
+

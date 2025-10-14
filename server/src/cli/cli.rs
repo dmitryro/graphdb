@@ -175,15 +175,26 @@ fn start_wrapper(
     handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
     port_arc: Arc<TokioMutex<Option<u16>>>,
 ) -> Pin<Box<dyn Future<Output = Result<(), anyhow::Error>> + Send>> {
-    Box::pin(start_storage_interactive(
-        port,
-        config_path,
-        storage_config,
-        engine_name,
-        shutdown_tx,
-        handle,
-        port_arc,
-    ))
+    Box::pin(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("Failed to create Tokio runtime for start_storage_interactive")?;
+            rt.block_on(start_storage_interactive(
+                port,
+                config_path,
+                storage_config,
+                engine_name,
+                shutdown_tx,
+                handle,
+                port_arc,
+            ))
+        })
+        .await
+        .context("Spawned task for start_storage_interactive panicked")??;
+        Ok(result)
+    })
 }
 
 fn stop_wrapper(
@@ -192,50 +203,51 @@ fn stop_wrapper(
     handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
     port_arc: Arc<TokioMutex<Option<u16>>>,
 ) -> Pin<Box<dyn Future<Output = Result<(), anyhow::Error>> + Send>> {
-    Box::pin(stop_storage_interactive(
-        port,
-        shutdown_tx,
-        handle,
-        port_arc,
-    ))
+    Box::pin(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("Failed to create Tokio runtime for stop_storage_interactive")?;
+            rt.block_on(stop_storage_interactive(
+                port,
+                shutdown_tx,
+                handle,
+                port_arc,
+            ))
+        })
+        .await
+        .context("Spawned task for stop_storage_interactive panicked")??;
+        Ok(result)
+    })
 }
-
 
 /// This function implements the singleton pattern for the QueryExecEngine.
 /// It ensures that the QueryExecEngine is initialized only once, even with concurrent access.
 pub async fn get_query_engine_singleton() -> Result<Arc<QueryExecEngine>> {
-    // Acquire the mutex with a minimal timeout to check if the singleton is already initialized.
     let mutex_timeout = TokioDuration::from_secs(5);
     let mut singleton_guard = timeout(mutex_timeout, QUERY_ENGINE_SINGLETON.lock())
         .await
         .map_err(|_| anyhow!("Failed to acquire query engine singleton mutex after {} seconds", mutex_timeout.as_secs()))?;
 
-    // Check if the singleton is already initialized.
     if let Some(engine) = singleton_guard.as_ref() {
         info!("Query engine singleton already initialized, returning existing instance");
         println!("===> Query engine singleton already initialized, returning existing instance");
-        // The lock is automatically released when `singleton_guard` goes out of scope here.
         return Ok(Arc::clone(engine));
     }
 
-    // Since the singleton is not initialized, we will now do the work.
-    // We must drop the lock here to allow other threads to potentially access the state
-    // and prevent deadlocks during the long initialization process.
     drop(singleton_guard);
 
-    // Perform the initialization of the query engine outside of the lock
     let query_engine = async move {
         info!("Starting query engine singleton initialization...");
         println!("===> Starting query engine singleton initialization...");
 
-        // Initialize storage for query execution with a timeout to prevent hanging.
         info!("Calling initialize_storage_for_query with a timeout...");
         println!("===> Calling initialize_storage_for_query with a timeout...");
         timeout(TokioDuration::from_secs(60), initialize_storage_for_query(start_wrapper, stop_wrapper)).await
             .context("Storage initialization timed out after 60 seconds")?
             .context("Failed to initialize storage for query execution")?;
 
-        // Load storage configuration with a timeout.
         let storage_config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
         info!("Loading storage config from {}", storage_config_path.display());
         println!("===> Loading storage config from {}", storage_config_path.display());
@@ -249,27 +261,21 @@ pub async fn get_query_engine_singleton() -> Result<Arc<QueryExecEngine>> {
             StorageConfig::new_in_memory()
         };
 
-        // Initialize database with a timeout.
         info!("Creating new Database instance...");
         println!("===> Creating new Database instance...");
         let database = timeout(TokioDuration::from_secs(60), Database::new(storage_config)).await
             .context("Database creation timed out after 60 seconds")?
             .map_err(|e| anyhow!("Failed to create Database: {}", e))?;
 
-        // Create query engine
         info!("Creating new QueryExecEngine instance...");
         println!("===> Creating new QueryExecEngine instance...");
         let query_engine = Arc::new(QueryExecEngine::new(Arc::new(database)));
         
-        // Use the turbofish to explicitly state the error type for the Result
         Ok::<Arc<QueryExecEngine>, anyhow::Error>(query_engine)
     }.await?;
 
-    // Now that the engine is initialized, re-acquire the lock to store the result.
-    // This lock is only held for a very short time.
     let mut singleton_guard = QUERY_ENGINE_SINGLETON.lock().await;
 
-    // Store the query engine in the singleton.
     info!("Storing query engine in singleton...");
     println!("===> Storing query engine in singleton...");
     *singleton_guard = Some(Arc::clone(&query_engine));
@@ -280,8 +286,6 @@ pub async fn get_query_engine_singleton() -> Result<Arc<QueryExecEngine>> {
     Ok(query_engine)
 }
 
-
-// Re-usable function to handle all commands.
 pub async fn run_single_command(
     command: Commands,
     daemon_handles: Arc<TokioMutex<HashMap<u16, (JoinHandle<()>, oneshot::Sender<()>)>>>,
@@ -292,6 +296,17 @@ pub async fn run_single_command(
     storage_daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
     storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
 ) -> Result<()> {
+    let is_interactive = matches!(command, Commands::Interactive) || env::var("GRAPHDB_CLI_INTERACTIVE").as_deref() == Ok("1");
+    let mut env_var_set = false;
+    if is_interactive && env::var("GRAPHDB_CLI_INTERACTIVE").is_err() {
+        debug!("Setting GRAPHDB_CLI_INTERACTIVE=1 for command: {:?}", command);
+        println!("===> Set GRAPHDB_CLI_INTERACTIVE=1 for command: {:?}", command);
+        unsafe {
+            env::set_var("GRAPHDB_CLI_INTERACTIVE", "1");
+        }
+        env_var_set = true;
+    }
+
     info!("Running command: {:?}", command);
     println!("===> Running command: {:?}", command);
 
@@ -743,6 +758,15 @@ pub async fn run_single_command(
                 .await?;
         }
     }
+
+    if env_var_set {
+        info!("Removing GRAPHDB_CLI_INTERACTIVE after command execution");
+        println!("===> Removed GRAPHDB_CLI_INTERACTIVE after command execution");
+        unsafe {
+            env::remove_var("GRAPHDB_CLI_INTERACTIVE");
+        }
+    }
+
     info!("Command execution completed successfully");
     println!("===> Command execution completed successfully");
     Ok(())
@@ -787,7 +811,6 @@ pub async fn start_cli() -> Result<()> {
     let storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>> = Arc::new(TokioMutex::new(None));
 
     if let Some(command) = args.command {
-        // Here, we call run_single_command and let it handle its own lazy initialization
         run_single_command(
             command,
             daemon_handles.clone(),
@@ -805,8 +828,6 @@ pub async fn start_cli() -> Result<()> {
     }
 
     if should_enter_interactive_mode {
-        let query_engine = get_query_engine_singleton().await?;
-
         interactive_mod::run_cli_interactive(
             daemon_handles.clone(),
             rest_api_shutdown_tx_opt.clone(),
@@ -815,7 +836,6 @@ pub async fn start_cli() -> Result<()> {
             storage_daemon_shutdown_tx_opt.clone(),
             storage_daemon_handle.clone(),
             storage_daemon_port_arc.clone(),
-            query_engine.clone(),
         ).await?;
     }
 
