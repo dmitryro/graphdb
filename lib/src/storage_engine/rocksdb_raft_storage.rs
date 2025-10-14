@@ -21,13 +21,13 @@ use chrono::Utc;
 
 use crate::config::{
     RocksDBConfig, StorageConfig, TypeConfig, RaftCommand, AppResponse, RocksDBRaftStorage, 
-    RocksDBDaemonPool, DEFAULT_DATA_DIRECTORY, DEFAULT_STORAGE_PORT, RocksDbWithPath,
+    RocksDBDaemonPool, DEFAULT_DATA_DIRECTORY, DEFAULT_STORAGE_PORT, RocksDBWithPath,
     AppRequest,
 };
 use crate::daemon::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
 use models::errors::{GraphError, GraphResult};
 
-pub static ROCKSDB_DB: LazyLock<OnceCell<TokioMutex<RocksDbWithPath>>> = LazyLock::new(|| OnceCell::new());
+pub static ROCKSDB_DB: LazyLock<OnceCell<TokioMutex<RocksDBWithPath>>> = LazyLock::new(|| OnceCell::new());
 pub static ROCKSDB_POOL_MAP: LazyLock<OnceCell<TokioMutex<HashMap<u16, Arc<TokioMutex<RocksDBDaemonPool>>>>>> = LazyLock::new(|| OnceCell::new());
 
 #[async_trait]
@@ -1002,8 +1002,10 @@ impl RocksDBRaftStorage {
         }).await
             .map_err(|_| GraphError::StorageError("Timeout opening RocksDB database".to_string()))??;
 
+
+
         let db_arc = Arc::new(db);
-        ROCKSDB_DB.set(TokioMutex::new(RocksDbWithPath { db: db_arc.clone(), path: db_path.clone() }))
+        ROCKSDB_DB.set(TokioMutex::new(RocksDBWithPath { db: db_arc.clone(), path: db_path.clone(), client: None }))
             .map_err(|_| GraphError::StorageError("Failed to set ROCKSDB_DB singleton".to_string()))?;
 
         {

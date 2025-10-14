@@ -17,6 +17,7 @@ impl LoadBalancer {
             replication_factor,
             health_check_config: HealthCheckConfig::default(),
             healthy_nodes: Arc::new(RwLock::new(VecDeque::new())),
+            next_node: 0,
         }
     }
 
@@ -29,6 +30,7 @@ impl LoadBalancer {
             last_check: SystemTime::now(),
             response_time_ms: 0,
             error_count: 0,
+            request_count: 0, 
         });
         
         node_health.is_healthy = is_healthy;

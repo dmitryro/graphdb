@@ -12,6 +12,7 @@ pub mod daemon_utils;
 pub mod daemon_config;
 pub mod daemon_registry;
 pub mod daemon_registry_lazy;
+pub mod db_daemon_registry;
 
 pub use daemon::*;
 
@@ -32,5 +33,7 @@ pub use daemon_config::*;
 pub use daemon_registry::*;
 
 pub use daemon_registry_lazy::*;
+
+pub use db_daemon_registry::*;
 
 pub use storage_daemon_server::*;
