@@ -210,6 +210,10 @@ impl AsyncRegistryWrapper {
     pub async fn health_check(&self) -> Result<bool> {
         self.registry.inner.health_check().await
     }
+
+    pub async fn find_free_storage_daemon(&self) -> Result<Option<DaemonMetadata>> {
+        self.registry.inner.find_free_storage_daemon().await
+    }
 }
 
 #[derive(Debug)]
@@ -747,6 +751,32 @@ impl NonBlockingDaemonRegistry {
         Ok(true)
     }
 
+    pub async fn find_free_storage_daemon(&self) -> Result<Option<DaemonMetadata>> {
+        self.clean_stale_daemons().await?;
+        
+        let memory = self.memory_store.read().await;
+        let mut free_daemons: Vec<_> = memory
+            .values()
+            .filter(|m| m.service_type == "storage" && !m.zmq_ready)
+            .cloned()
+            .collect();
+        drop(memory);
+        
+        if free_daemons.is_empty() {
+            info!("No free storage daemons found (zmq_ready=false)");
+            return Ok(None);
+        }
+        
+        // Sort by port (smallest first) and return first
+        free_daemons.sort_by_key(|m| m.port);
+        let free_daemon = free_daemons[0].clone();
+        
+        info!("Found free storage daemon on port {} (smallest of {})", 
+              free_daemon.port, free_daemons.len());
+        
+        Ok(Some(free_daemon))
+    }
+
     async fn load_from_fallback(&self) -> Result<Vec<DaemonMetadata>> {
         if !self.config.fallback_file.exists() {
             return Ok(Vec::new());
@@ -845,6 +875,10 @@ impl DaemonRegistryWrapper {
     
     pub async fn find_daemon_by_port(&self, port: u16) -> Result<Option<DaemonMetadata>> {
         self.get().await.find_daemon_by_port(port).await
+    }
+
+    pub async fn find_free_storage_daemon(&self) -> Result<Option<DaemonMetadata>> {
+        self.get().await.find_free_storage_daemon().await
     }
     
     pub async fn remove_daemon_by_type(&self, service_type: &str, port: u16) -> Result<Option<DaemonMetadata>> {
