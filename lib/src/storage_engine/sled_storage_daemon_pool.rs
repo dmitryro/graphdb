@@ -35,6 +35,8 @@ use async_trait::async_trait;
 use base64::engine::general_purpose;
 use base64::Engine;
 use std::fs::{self};
+use lazy_static::lazy_static;
+use std::sync::Mutex as StdMutex;
 
 #[cfg(feature = "with-openraft-sled")]
 use {
@@ -44,6 +46,17 @@ use {
     tokio::io::{AsyncReadExt, AsyncWriteExt},
 };
 
+lazy_static! {
+    static ref SLED_DAEMON_PORT_LOCKS: StdMutex<HashMap<u16, Arc<TokioMutex<()>>>> = 
+        StdMutex::new(HashMap::new());
+}
+
+pub async fn get_sled_daemon_port_lock(port: u16) -> Arc<TokioMutex<()>> {
+    let mut locks = SLED_DAEMON_PORT_LOCKS.lock().unwrap();
+    locks.entry(port)
+        .or_insert_with(|| Arc::new(TokioMutex::new(())))
+        .clone()
+}
 // Constants for waiting for the IPC file to exist
 const MAX_WAIT_ATTEMPTS: u8 = 20; // 10 seconds total wait time (20 * 500ms)
 const WAIT_DELAY_MS: u64 = 500;
@@ -139,7 +152,10 @@ impl SledDaemon {
             GraphError::ConfigurationError("No port specified in SledConfig".to_string())
         })?;
 
-        // Construct the full database path
+        let port_lock = get_sled_daemon_port_lock(port).await;
+        let _guard = port_lock.lock().await;
+        println!("===> ACQUIRED PER-PORT INIT LOCK FOR PORT {}", port);
+
         let db_path = if config.path.ends_with(&port.to_string()) {
             PathBuf::from(config.path.clone())
         } else {
@@ -149,30 +165,25 @@ impl SledDaemon {
         info!("Initializing Sled daemon at {:?}", db_path);
         println!("===> INITIALIZING SLED DAEMON AT {:?}", db_path);
 
-        // Directory check logic
         if !db_path.exists() {
             info!("Creating database directory at {:?}", db_path);
             println!("===> CREATING DATABASE DIRECTORY AT {:?}", db_path);
-            tokio_fs::create_dir_all(&db_path)
-                .await
-                .map_err(|e| {
-                    error!("Failed to create directory at {:?}: {}", db_path, e);
-                    println!("===> ERROR: FAILED TO CREATE DIRECTORY AT {:?}: {}", db_path, e);
-                    GraphError::StorageError(format!("Failed to create directory at {:?}: {}", db_path, e))
-                })?;
+            tokio_fs::create_dir_all(&db_path).await.map_err(|e| {
+                error!("Failed to create directory at {:?}: {}", db_path, e);
+                println!("===> ERROR: FAILED TO CREATE DIRECTORY AT {:?}: {}", db_path, e);
+                GraphError::StorageError(format!("Failed to create directory at {:?}: {}", db_path, e))
+            })?;
         } else if !db_path.is_dir() {
             error!("Path {:?} is not a directory", db_path);
             println!("===> ERROR: PATH {:?} IS NOT A DIRECTORY", db_path);
             return Err(GraphError::StorageError(format!("Path {:?} is not a directory", db_path)));
         }
 
-        let metadata = tokio_fs::metadata(&db_path)
-            .await
-            .map_err(|e| {
-                error!("Failed to access directory metadata at {:?}: {}", db_path, e);
-                println!("===> ERROR: FAILED TO ACCESS DIRECTORY METADATA AT {:?}: {}", db_path, e);
-                GraphError::StorageError(format!("Failed to access directory metadata at {:?}", db_path))
-            })?;
+        let metadata = tokio_fs::metadata(&db_path).await.map_err(|e| {
+            error!("Failed to access directory metadata at {:?}: {}", db_path, e);
+            println!("===> ERROR: FAILED TO ACCESS DIRECTORY METADATA AT {:?}: {}", db_path, e);
+            GraphError::StorageError(format!("Failed to access directory metadata at {:?}", db_path))
+        })?;
         if metadata.permissions().readonly() {
             error!("Directory at {:?} is not writable", db_path);
             println!("===> ERROR: DIRECTORY AT {:?} IS NOT WRITABLE", db_path);
@@ -180,10 +191,45 @@ impl SledDaemon {
         }
 
         let db_registry = GLOBAL_DB_DAEMON_REGISTRY.get_registry().await;
-        
         let existing_db_metadata = db_registry.get_db_daemon_metadata_by_port(port).await?;
 
-        // FIX: Capture the state before moving `existing_db_metadata` into the `if let` block.
+        if let Some(metadata) = &existing_db_metadata {
+            if metadata.data_dir == Some(db_path.clone()) && 
+               metadata.engine_type == Some("sled".to_string()) &&
+               metadata.sled_db_instance.is_some() {
+                info!("Daemon already initialized for port {}", port);
+                println!("===> DAEMON ALREADY INITIALIZED FOR PORT {} (CONCURRENT TASK COMPLETED FIRST)", port);
+                
+                let (_tx, rx) = mpsc::channel(1);
+                if let (Some(db), Some(v), Some(e), Some(kv)) = (
+                    metadata.sled_db_instance.clone(),
+                    metadata.sled_vertices.clone(),
+                    metadata.sled_edges.clone(),
+                    metadata.sled_kv_pairs.clone(),
+                ) {
+                    let running = Arc::new(TokioMutex::new(true));
+                    let daemon = Self {
+                        port,
+                        db_path,
+                        db,
+                        vertices: v,
+                        edges: e,
+                        kv_pairs: kv,
+                        running,
+                        #[cfg(feature = "with-openraft-sled")]
+                        raft_storage: Arc::new(openraft_sled::SledRaftStorage::new(
+                            metadata.sled_db_instance.clone().unwrap()
+                        )),
+                        #[cfg(feature = "with-openraft-sled")]
+                        node_id: port as u64,
+                        #[cfg(feature = "with-openraft-sled")]
+                        raft: None,
+                    };
+                    return Ok((daemon, rx));
+                }
+            }
+        }
+
         let is_new_db_instance = existing_db_metadata.is_none();
 
         let (db_arc, vertices, edges, kv_pairs) = if let Some(mut metadata) = existing_db_metadata {
@@ -197,7 +243,6 @@ impl SledDaemon {
                 println!("===> REUSING EXISTING SLED DB INSTANCE FROM REGISTRY FOR PORT {}", port);
                 (db, v, e, kv)
             } else {
-                // Fallback to opening new if not all components are present
                 warn!("Incomplete Sled DB instance in registry for port {}, opening new", port);
                 println!("===> WARNING: INCOMPLETE SLED DB INSTANCE IN REGISTRY FOR PORT {}, OPENING NEW", port);
                 let cache_capacity = config.cache_capacity.unwrap_or(1024 * 1024 * 1024);
@@ -210,7 +255,6 @@ impl SledDaemon {
             Self::open_sled_db_and_trees(&config, &db_path, cache_capacity, use_compression).await?
         };
 
-        // FIX: Use the flag to determine if registration is needed.
         if is_new_db_instance {
             let db_metadata = DBDaemonMetadata {
                 port,
@@ -237,11 +281,9 @@ impl SledDaemon {
         info!("SLED DB AND TREES SUCCESSFULLY OPENED AT {:?}", db_path);
         println!("===> SLED DB AND TREES SUCCESSFULLY OPENED AT {:?}", db_path);
 
-        // Use mpsc channel for readiness signaling
         let (tx, rx) = mpsc::channel(1);
         let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", port);
 
-        // Clean up stale IPC socket
         let ipc_path = endpoint.strip_prefix("ipc://").unwrap_or(&endpoint);
         if std::path::Path::new(ipc_path).exists() {
             warn!("Stale IPC socket found at {}. Attempting cleanup.", ipc_path);
@@ -255,8 +297,6 @@ impl SledDaemon {
             }
         }
 
-        // Removed unused ZMQ initialization outside the thread
-        
         let running = Arc::new(TokioMutex::new(true));
         let running_clone = running.clone();
         let db_arc_for_thread = db_arc.clone();
@@ -264,6 +304,7 @@ impl SledDaemon {
         let edges_for_thread = edges.clone();
         let kv_pairs_for_thread = kv_pairs.clone();
         let endpoint_clone = endpoint.clone();
+        let db_path_clone = db_path.clone();  // FIXED: Clone db_path for use in thread
         
         let daemon = Self {
             port,
@@ -274,90 +315,33 @@ impl SledDaemon {
             kv_pairs,
             running,
             #[cfg(feature = "with-openraft-sled")]
-            raft_storage: Arc::new(openraft_sled::SledRaftStorage::new(db_arc.clone())),
+            raft_storage: Arc::new(openraft_sled::SledRaftStorage::new(db_arc_for_thread.clone())),
             #[cfg(feature = "with-openraft-sled")]
             node_id: port as u64,
             #[cfg(feature = "with-openraft-sled")]
-            raft: None, // Assuming raft field is initialized to None here
+            raft: None,
         };
 
-        let daemon_clone = daemon.clone();
+        let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
+
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
             rt.block_on(async {
-                // Create ZMQ socket inside the thread
                 let context = ZmqContext::new();
-                let zmq_socket_raw = context
-                    .socket(REP)
-                    .map_err(|e| {
+                let zmq_socket_raw = match context.socket(REP) {
+                    Ok(socket) => socket,
+                    Err(e) => {
                         error!("Failed to create ZMQ socket for port {}: {}", port, e);
                         println!("===> ERROR: FAILED TO CREATE ZMQ SOCKET FOR PORT {}: {}", port, e);
-                        GraphError::StorageError(format!("Failed to create ZMQ socket: {}", e))
-                    })
-                    .expect("Failed to create ZMQ socket");
-
-                // FIX: Use ZmqSocketWrapper::new() to wrap the private field
-                let zmq_socket_wrapper = ZmqSocketWrapper::new(zmq_socket_raw);
-                let zmq_socket_arc = Arc::new(TokioMutex::new(zmq_socket_wrapper));
-
-                // Bind the socket
-                const BIND_RETRIES: usize = 5;
-                for i in 0..BIND_RETRIES {
-                    let endpoint_for_bind = endpoint_clone.clone();
-                    let zmq_socket_lock = zmq_socket_arc.lock().await;
-                    match zmq_socket_lock.socket().bind(&endpoint_for_bind) {
-                         Ok(_) => {
-                            info!("ZMQ socket successfully bound to {}. Signaling readiness.", endpoint_clone);
-                            println!("===> ZMQ SOCKET SUCCESSFULLY BOUND TO {}. SIGNALING READINESS.", endpoint_clone);
-                            drop(zmq_socket_lock); // Release the lock before sending
-                            let _ = tx.send(()).await;
-                            break;
-                        }
-                        Err(e) => {
-                            if i < BIND_RETRIES - 1 {
-                                warn!(
-                                    "Failed to bind ZMQ socket to {} (attempt {}/{}): {}",
-                                    endpoint_clone, i + 1, BIND_RETRIES, e
-                                );
-                                tokio::time::sleep(TokioDuration::from_millis(100 * (i as u64 + 1))).await;
-                            } else {
-                                error!(
-                                    "Failed to bind ZMQ socket to {} after {} attempts: {}",
-                                    endpoint_clone, BIND_RETRIES, e
-                                );
-                                drop(zmq_socket_lock); // Release the lock before sending
-                                let _ = tx.send(()).await; // Signal even on failure to avoid hanging
-                            }
-                        }
+                        let _ = tx.send(()).await;
+                        return;
                     }
-                }
-                
-                // FINAL ZMQ STRUCTURE (Simplified, assuming successful bind for server start)
-                let context = ZmqContext::new();
-                let zmq_socket_raw = context
-                    .socket(REP)
-                    .expect("Failed to create ZMQ socket");
+                };
 
-                let zmq_socket_wrapper = ZmqSocketWrapper::new(zmq_socket_raw);
-                let zmq_socket_arc = Arc::new(TokioMutex::new(zmq_socket_wrapper));
-
-                // Bind the socket outside the wrapper's lock for simplicity, 
-                // but this means the bind logic above must be placed *after* the raw socket creation.
-                // Let's re-structure the thread to follow standard ZMQ practice (create, bind, then run).
-
-                // ZMQ setup logic *must* be here to prevent `E0382` in `new_with_client` (which uses a similar pattern).
-
-                // 1. Create raw socket
-                let context = ZmqContext::new();
-                let zmq_socket_raw = context
-                    .socket(REP)
-                    .expect("Failed to create ZMQ socket for thread");
-                
-                // 2. Bind raw socket (ZMQ bind is synchronous)
+                const BIND_RETRIES: usize = 5;
                 let mut bind_success = false;
                 for i in 0..BIND_RETRIES {
-                    let endpoint_for_bind = endpoint_clone.clone();
-                    match zmq_socket_raw.bind(&endpoint_for_bind) {
+                    match zmq_socket_raw.bind(&endpoint_clone) {
                         Ok(_) => {
                             info!("ZMQ socket successfully bound to {}. Signaling readiness.", endpoint_clone);
                             println!("===> ZMQ SOCKET SUCCESSFULLY BOUND TO {}. SIGNALING READINESS.", endpoint_clone);
@@ -367,49 +351,59 @@ impl SledDaemon {
                         }
                         Err(e) => {
                             if i < BIND_RETRIES - 1 {
-                                warn!(
-                                    "Failed to bind ZMQ socket to {} (attempt {}/{}): {}",
-                                    endpoint_clone, i + 1, BIND_RETRIES, e
-                                );
+                                warn!("Failed to bind ZMQ socket to {} (attempt {}/{}): {}", 
+                                    endpoint_clone, i + 1, BIND_RETRIES, e);
                                 tokio::time::sleep(TokioDuration::from_millis(100 * (i as u64 + 1))).await;
                             } else {
-                                error!(
-                                    "Failed to bind ZMQ socket to {} after {} attempts: {}",
-                                    endpoint_clone, BIND_RETRIES, e
-                                );
-                                let _ = tx.send(()).await; // Signal even on failure to avoid hanging
+                                error!("Failed to bind ZMQ socket to {} after {} attempts: {}", 
+                                    endpoint_clone, BIND_RETRIES, e);
+                                let _ = tx.send(()).await;
                             }
                         }
                     }
                 }
 
                 if !bind_success {
-                    error!("Could not bind ZMQ socket after max retries. Aborting server run.");
+                    error!("Could not bind ZMQ socket after max retries.");
                     return;
                 }
 
-                // 3. Wrap the bound socket using the public constructor
-                // FIX: Instead of wrapping the socket in ZmqSocketWrapper, 
-                // we must directly wrap the raw Socket in Arc<TokioMutex<_>> to match 
-                // the expected type of run_zmq_server_static (Arc<Mutex<Socket>>).
-                let zmq_socket_arc = Arc::new(TokioMutex::new(zmq_socket_raw));
+                // ============================================================
+                // UPDATE DAEMON METADATA: Mark ZMQ as ready (set to true)
+                // ============================================================
+                let daemon_metadata = DaemonMetadata {
+                    service_type: "storage".to_string(),
+                    ip_address: "127.0.0.1".to_string(),
+                    data_dir: Some(db_path_clone.clone()),  // FIXED: Use db_path_clone
+                    config_path: None,
+                    engine_type: Some("sled".to_string()),
+                    last_seen_nanos: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64,
+                    pid: std::process::id(),
+                    port,
+                    zmq_ready: true,  // CRITICAL: Mark ZMQ as ready and operational
+                };
                 
-                // Run the ZMQ server
+                if let Err(e) = daemon_registry.register_daemon(daemon_metadata).await {
+                    warn!("Failed to update daemon metadata with zmq_ready=true: {}", e);
+                } else {
+                    info!("Updated daemon metadata: zmq_ready=true for port {}", port);
+                    println!("===> DAEMON METADATA UPDATED: ZMQ READY FOR PORT {}", port);
+                }
+
+                let zmq_socket_arc = Arc::new(TokioMutex::new(zmq_socket_raw));
                 info!("Starting ZMQ server for endpoint {}", endpoint_clone);
                 println!("===> STARTING ZMQ SERVER FOR ENDPOINT {}", endpoint_clone);
-                let endpoint_for_zmq_call = endpoint_clone.clone();
+                
                 if let Err(e) = Self::run_zmq_server_static(
-                        port,
-                        db_arc_for_thread,
-                        vertices_for_thread,
-                        edges_for_thread,
-                        kv_pairs_for_thread,
-                        running_clone, // Uses the clone created before 'daemon' init
-                        zmq_socket_arc, // Now correctly passes Arc<Mutex<Socket>>
-                        endpoint_for_zmq_call,
-                    )
-                    .await
-                {
+                    port,
+                    db_arc_for_thread,
+                    vertices_for_thread,
+                    edges_for_thread,
+                    kv_pairs_for_thread,
+                    running_clone,
+                    zmq_socket_arc,
+                    endpoint_clone.clone(),
+                ).await {
                     error!("ZMQ server failed for endpoint {}: {}", endpoint_clone, e);
                     println!("===> ERROR: ZMQ SERVER FAILED FOR ENDPOINT {}: {}", endpoint_clone, e);
                 } else {
@@ -617,21 +611,107 @@ impl SledDaemon {
         info!("Registered Sled DB instance in global registry for port {}", port);
         println!("===> REGISTERED SLED DB INSTANCE IN GLOBAL REGISTRY FOR PORT {}", port);
 
+        let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
+        let general_daemon_metadata = DaemonMetadata {
+            service_type: "storage".to_string(),
+            port,
+            pid: std::process::id(),
+            ip_address: "127.0.0.1".to_string(),
+            data_dir: Some(db_path_clone.clone()),
+            config_path: None,
+            engine_type: Some("sled".to_string()),
+            last_seen_nanos: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64,
+            zmq_ready: false,  // ZMQ server not started yet; will be set to true after bind
+        };
+
+        if let Err(e) = daemon_registry.register_daemon(general_daemon_metadata).await {
+            error!("Failed to register daemon in GLOBAL_DAEMON_REGISTRY for port {}: {}", port, e);
+            println!("===> ERROR: FAILED TO REGISTER DAEMON IN GLOBAL_DAEMON_REGISTRY FOR PORT {}: {}", port, e);
+            return Err(GraphError::StorageError(format!("Failed to register daemon in GLOBAL_DAEMON_REGISTRY: {}", e)));
+        }
+
+        info!("Registered daemon for port {} in GLOBAL_DAEMON_REGISTRY with zmq_ready=false", port);
+        println!("===> REGISTERED DAEMON FOR PORT {} IN GLOBAL_DAEMON_REGISTRY WITH zmq_ready=false", port);
+
         // --- ZMQ IPC Binding Logic for new_with_db ---
         let ipc_addr = endpoint.clone();
         println!("===> Time to run ZeroMQ server on IPC: {}", ipc_addr);
 
         let db_clone_for_zmq = Arc::clone(&daemon.db);
         let endpoint_clone = endpoint.clone();
-        // Move the tx into the thread so it gets dropped when the thread/server exits.
-        // Dropping the tx closes the channel, which informs the rx waiting on it.
+        let db_path_for_zmq = db_path_clone.clone();  // Clone for ZMQ thread
         
         std::thread::spawn(move || {
-            let _tx_shutdown = tx; // Own the Sender in the thread's scope
+            let _tx_shutdown = tx;
             let ipc_addr_thread = ipc_addr;
             tokio::runtime::Runtime::new().unwrap().block_on(async move {
                 tokio::time::sleep(TokioDuration::from_millis(100)).await;
                 println!("===> Starting ZMQ server for IPC {}", ipc_addr_thread);
+                
+                // Create ZMQ socket and bind
+                let context = ZmqContext::new();
+                let zmq_socket_raw = match context.socket(REP) {
+                    Ok(socket) => socket,
+                    Err(e) => {
+                        error!("Failed to create ZMQ socket for port {}: {}", port, e);
+                        println!("===> ERROR: FAILED TO CREATE ZMQ SOCKET FOR PORT {}: {}", port, e);
+                        return;
+                    }
+                };
+
+                // Bind socket with retries
+                const BIND_RETRIES: usize = 5;
+                let mut bind_success = false;
+                for i in 0..BIND_RETRIES {
+                    match zmq_socket_raw.bind(&ipc_addr_thread) {
+                        Ok(_) => {
+                            info!("ZMQ socket successfully bound to {}. Signaling readiness.", ipc_addr_thread);
+                            println!("===> ZMQ SOCKET SUCCESSFULLY BOUND TO {}. SIGNALING READINESS.", ipc_addr_thread);
+                            bind_success = true;
+                            break;
+                        }
+                        Err(e) => {
+                            if i < BIND_RETRIES - 1 {
+                                warn!("Failed to bind ZMQ socket to {} (attempt {}/{}): {}", 
+                                    ipc_addr_thread, i + 1, BIND_RETRIES, e);
+                                tokio::time::sleep(TokioDuration::from_millis(100 * (i as u64 + 1))).await;
+                            } else {
+                                error!("Failed to bind ZMQ socket to {} after {} attempts: {}", 
+                                    ipc_addr_thread, BIND_RETRIES, e);
+                            }
+                        }
+                    }
+                }
+
+                if !bind_success {
+                    error!("Could not bind ZMQ socket after max retries.");
+                    return;
+                }
+
+                // ============================================================
+                // UPDATE DAEMON METADATA: Mark ZMQ as ready (set to true)
+                // ============================================================
+                let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
+                let updated_metadata = DaemonMetadata {
+                    service_type: "storage".to_string(),
+                    ip_address: "127.0.0.1".to_string(),
+                    data_dir: Some(db_path_for_zmq.clone()),
+                    config_path: None,
+                    engine_type: Some("sled".to_string()),
+                    last_seen_nanos: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64,
+                    pid: std::process::id(),
+                    port,
+                    zmq_ready: true,  // CRITICAL: Mark ZMQ as ready and operational
+                };
+
+                if let Err(e) = daemon_registry.register_daemon(updated_metadata).await {
+                    warn!("Failed to update daemon metadata with zmq_ready=true for port {}: {}", port, e);
+                } else {
+                    info!("Updated daemon metadata: zmq_ready=true for port {}", port);
+                    println!("===> DAEMON METADATA UPDATED: ZMQ READY FOR PORT {}", port);
+                }
+
+                let zmq_socket_arc = Arc::new(TokioMutex::new(zmq_socket_raw));
                 
                 if let Err(e) = Self::run_zmq_server_static(
                     port,
@@ -640,14 +720,11 @@ impl SledDaemon {
                     edges_clone,
                     kv_pairs_clone,
                     running_clone,
-                    zmq_socket_clone, // Now correctly passes Arc<Mutex<Socket>>
+                    zmq_socket_arc,
                     endpoint_clone,
-                )
-                .await
-                {
+                ).await {
                     eprintln!("===> ERROR: ZeroMQ server failed: {}", e);
                 }
-                // When this block ends, _tx_shutdown is dropped, signaling to rx.
             });
         });
 
@@ -668,7 +745,6 @@ impl SledDaemon {
         }
 
         println!("===> Sled daemon initialization complete for port {}", port);
-        // FIX: Return the daemon and the receiver to match the signature
         Ok((daemon, rx))
     }
 
@@ -849,15 +925,17 @@ impl SledDaemon {
         };
 
         let daemon_registry = crate::daemon::daemon_registry::GLOBAL_DAEMON_REGISTRY.get().await;
-        let daemon_metadata = crate::daemon::daemon_registry::DaemonMetadata {
+        let daemon_metadata = DaemonMetadata {
             service_type: "storage".to_string(),
             ip_address: config.host.clone().unwrap_or("127.0.0.1".to_string()),
             data_dir: Some(db_path_for_metadata), // Use the cloned path
             config_path: None,
             engine_type: Some("sled".to_string()),
             last_seen_nanos: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as i64,
+            zmq_ready: true,
             pid: std::process::id(),
             port,
+
         };
         daemon_registry.register_daemon(daemon_metadata).await
             .map_err(|e| {
@@ -3120,6 +3198,7 @@ impl SledDaemonPool {
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_nanos() as i64)
                 .unwrap_or(0),
+            zmq_ready: false,
         };
 
         let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
@@ -3675,6 +3754,7 @@ impl SledDaemonPool {
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_nanos() as i64)
                 .unwrap_or(0),
+            zmq_ready: false,
         };
 
         timeout(TokioDuration::from_secs(5), daemon_registry.register_daemon(daemon_metadata))
@@ -4109,6 +4189,7 @@ impl SledDaemonPool {
                         .duration_since(UNIX_EPOCH)
                         .map(|d| d.as_nanos() as i64)
                         .unwrap_or(0),
+                    zmq_ready: false,
                 };
 
                 timeout(TokioDuration::from_secs(5), daemon_registry.register_daemon(daemon_metadata))
@@ -4259,6 +4340,7 @@ impl SledDaemonPool {
                                 .duration_since(UNIX_EPOCH)
                                 .map(|d| d.as_nanos() as i64)
                                 .unwrap_or(0),
+                            zmq_ready: false,
                         };
 
                         timeout(TokioDuration::from_secs(5), daemon_registry.register_daemon(daemon_metadata))
@@ -4456,6 +4538,7 @@ impl SledDaemonPool {
             last_seen_nanos: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64,
             pid: std::process::id(),
             port,
+            zmq_ready: false,
         };
         daemon_registry.register_daemon(daemon_metadata).await
             .map_err(|e| {

@@ -7,10 +7,10 @@ storage:
     max_disk_space_gb: 1000
     min_disk_space_gb: 10
     use_raft_for_scale: false
-    storage_engine_type: "sled"
+    storage_engine_type: "rocksdb"
     engine_specific_config:
-      storage_engine_type: "sled"
-      path: "/opt/graphdb/storage_data/sled"
+      storage_engine_type: "rocksdb"
+      path: "/opt/graphdb/storage_data/rocksdb"
       host: "127.0.0.1"
       port: 8052
       username: ""

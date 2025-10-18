@@ -176,6 +176,7 @@ pub async fn check_process_status_by_port(
                 config_path: None,
                 engine_type: None,
                 last_seen_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
+                zmq_ready: false,
             };
             if let Err(e) = tokio::time::timeout(
                 Duration::from_secs(2),
@@ -544,6 +545,7 @@ pub async fn list_and_report_running_daemons() -> Result<(), anyhow::Error> {
                 config_path: None,
                 engine_type: None,
                 last_seen_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
+                zmq_ready: false,
             };
             if let Err(e) = tokio::time::timeout(
                 Duration::from_secs(2),
@@ -581,6 +583,7 @@ pub async fn list_and_report_running_daemons() -> Result<(), anyhow::Error> {
             config_path: None,
             engine_type: None,
             last_seen_nanos: 0,
+            zmq_ready: false,
         }, false));
         let status_str = if status { "Running" } else { "Stopped" };
         println!("{:<15} {:<10} {:<10} {:<20}", daemon.service_type, daemon.port, daemon.pid, status_str);
@@ -728,6 +731,7 @@ pub async fn start_daemon_with_port(p: u16, service_type: &str) -> Result<(), an
         config_path: None,
         engine_type: None,
         last_seen_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
+        zmq_ready: false,
     };
 
     tokio::time::timeout(Duration::from_secs(2), GLOBAL_DAEMON_REGISTRY.register_daemon(details))
@@ -920,6 +924,7 @@ pub async fn start_daemon_process(
                 config_path,
                 engine_type,
                 last_seen_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
+                zmq_ready: false,
             };
 
             GLOBAL_DAEMON_REGISTRY.register_daemon(metadata).await
@@ -997,6 +1002,7 @@ pub async fn start_daemon_with_pid(
         config_path: None,
         engine_type: None,
         last_seen_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
+        zmq_ready: false,
     };
 
     tokio::time::timeout(Duration::from_secs(2), GLOBAL_DAEMON_REGISTRY.register_daemon(metadata))
@@ -1016,6 +1022,7 @@ pub async fn start_daemon_with_pid(
                 config_path: None,
                 engine_type: None,
                 last_seen_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
+                zmq_ready: false,
             };
             tokio::time::timeout(Duration::from_secs(2), GLOBAL_DAEMON_REGISTRY.register_daemon(cluster_metadata))
                 .await
@@ -1282,6 +1289,7 @@ pub async fn get_all_daemon_processes_with_ports() -> Result<HashMap<u16, (u32, 
                             config_path: None,
                             engine_type: None,
                             last_seen_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
+                            zmq_ready: false,
                         };
                         tokio::time::timeout(Duration::from_secs(2), GLOBAL_DAEMON_REGISTRY.register_daemon(new_metadata)).await.ok();
                         Some((l_port, (pid_u32, final_service_type.to_string())))
@@ -1707,6 +1715,7 @@ pub async fn stop_daemon_by_pid_or_scan(
                 config_path: None,
                 engine_type: None,
                 last_seen_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
+                zmq_ready: false,
             };
             tokio::time::timeout(Duration::from_secs(2), GLOBAL_DAEMON_REGISTRY.register_daemon(new_metadata)).await??;
         }

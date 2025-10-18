@@ -546,6 +546,7 @@ pub async fn start_daemon(
                         None
                     },
                     last_seen_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
+                    zmq_ready: false,
                 };
 
                 if let Err(e) = GLOBAL_DAEMON_REGISTRY.register_daemon(metadata).await {
