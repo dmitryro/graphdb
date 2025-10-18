@@ -19,7 +19,8 @@ use lib::config::{StorageEngineType, SledConfig, RocksDBConfig, DEFAULT_STORAGE_
 use lib::storage_engine::storage_engine::{StorageEngine, GraphStorageEngine, AsyncStorageEngineManager, StorageEngineManager, GLOBAL_STORAGE_ENGINE_MANAGER};
 use lib::commands::parse_kv_operation;
 use lib::storage_engine::rocksdb_storage::{ROCKSDB_DB, ROCKSDB_POOL_MAP};
-use lib::config::{StorageConfig, MAX_SHUTDOWN_RETRIES, SHUTDOWN_RETRY_DELAY_MS, load_storage_config_from_yaml, QueryPlan, QueryResult};
+use lib::storage_engine::sled_storage::{ SLED_DB, SLED_POOL_MAP };
+use lib::config::{StorageConfig, MAX_SHUTDOWN_RETRIES, SHUTDOWN_RETRY_DELAY_MS, load_storage_config_from_yaml, QueryPlan, QueryResult, SledDbWithPath};
 use lib::database::Database;
 use crate::cli::handlers_storage::{start_storage_interactive};
 pub use models::errors::{GraphError, GraphResult};
@@ -612,6 +613,21 @@ pub async fn initialize_storage_for_query(
     let cwd = std::env::current_dir().context("Failed to get current working directory")?;
     let config_path = cwd.join(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
 
+    // ====================================================================
+    // EARLY RETURN: If StorageEngineManager already set with correct engine/port
+    // ====================================================================
+    if let Some(manager) = GLOBAL_STORAGE_ENGINE_MANAGER.get() {
+        let engine = manager.get_persistent_engine().await;
+        let engine_type = engine.get_type();
+        if engine_type == config.storage_engine_type.to_string() && 
+           desired_port == config.default_port {
+            info!("StorageEngineManager already initialized with correct engine and port. Reusing immediately.");
+            println!("===> STORAGE ENGINE MANAGER ALREADY INITIALIZED AND READY. REUSING IMMEDIATELY.");
+            let db = Database { storage: engine, config };
+            return Ok(Arc::new(QueryExecEngine::new(Arc::new(db))));
+        }
+    }
+
     let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
     info!("Daemon registry initialized, fetching metadata...");
     println!("===> DAEMON REGISTRY INITIALIZED, FETCHING METADATA...");
@@ -621,29 +637,13 @@ pub async fn initialize_storage_for_query(
     info!("Registry contents: {:?}", all_daemons);
     println!("===> TOTAL DAEMONS FOUND: {}.", storage_daemons.len());
 
-    if let Some(manager) = GLOBAL_STORAGE_ENGINE_MANAGER.get() {
-        debug!("StorageEngineManager is already initialized. Checking engine compatibility...");
-        println!("===> STORAGE ENGINE MANAGER ALREADY INITIALIZED, CHECKING COMPATIBILITY...");
-        let engine = manager.get_persistent_engine().await;
-        let engine_type = engine.get_type();
-        let engine_port = desired_port;
-
-        if engine_type == config.storage_engine_type.to_string() && engine_port == desired_port {
-            info!("Existing StorageEngineManager has compatible engine type {} and port {}. Reusing...", engine_type, desired_port);
-            println!("===> REUSING EXISTING STORAGE ENGINE MANAGER FOR ENGINE TYPE {} AND PORT {}.", engine_type, desired_port);
-            let db = Database { storage: engine, config };
-            return Ok(Arc::new(QueryExecEngine::new(Arc::new(db))));
-        } else {
-            info!("Existing StorageEngineManager has incompatible engine type {} or port {}. Proceeding to check daemons...", engine_type, engine_port);
-            println!("===> INCOMPATIBLE ENGINE TYPE {} OR PORT {}, CHECKING DAEMONS...", engine_type, engine_port);
-        }
-    }
-
     let daemon = storage_daemons.iter().find(|d| d.port == desired_port);
 
     if let Some(daemon) = daemon {
         println!("=====> DAEMON FOUND {:?}", daemon);
         let pid = daemon.pid;
+        
+        // Validate daemon is still running
         if pid == 0 || !check_pid_validity(pid).await || is_port_free(daemon.port).await {
             info!("Daemon on port {} (PID {}) is invalid, unregistering...", daemon.port, pid);
             println!("===> INVALID DAEMON ON PORT {} (PID {}), UNREGISTERING...", daemon.port, pid);
@@ -653,20 +653,19 @@ pub async fn initialize_storage_for_query(
                 Some(engine_str) => match engine_str.parse() {
                     Ok(parsed_type) => parsed_type,
                     Err(_) => {
-                        warn!("Invalid engine type '{}' for daemon on port {}, falling back to config engine type {:?}", engine_str, daemon.port, config.storage_engine_type);
-                        println!("===> WARNING: INVALID ENGINE TYPE '{}' FOR PORT {}, FALLING BACK TO {:?}", engine_str, daemon.port, config.storage_engine_type);
+                        warn!("Invalid engine type '{}' for daemon on port {}", engine_str, daemon.port);
+                        println!("===> WARNING: INVALID ENGINE TYPE '{}' FOR PORT {}", engine_str, daemon.port);
                         config.storage_engine_type.clone()
                     }
                 },
                 None => {
-                    warn!("No engine type specified for daemon on port {}, falling back to config engine type {:?}", daemon.port, config.storage_engine_type);
-                    println!("===> WARNING: NO ENGINE TYPE FOR PORT {}, FALLING BACK TO {:?}", daemon.port, config.storage_engine_type);
+                    warn!("No engine type for daemon on port {}", daemon.port);
+                    println!("===> WARNING: NO ENGINE TYPE FOR PORT {}", daemon.port);
                     config.storage_engine_type.clone()
                 }
             };
             let engine_type_str = daemon_api_storage_engine_type_to_string(&engine_type);
 
-            // Update daemon metadata with correct engine type and data_dir if necessary
             let data_dir = config.engine_specific_config
                 .as_ref()
                 .and_then(|c| c.storage.path.clone())
@@ -681,8 +680,9 @@ pub async fn initialize_storage_for_query(
                 ip_address: daemon.ip_address.clone(),
                 data_dir: if daemon.data_dir != Some(data_dir.clone()) {
                     updated = true;
-                    println!("===> PATH MISMATCH FOR {}: REGISTRY SHOWS {:?}, BUT CONFIG SPECIFIES {:?}", engine_type_str.to_uppercase(), daemon.data_dir, data_dir);
-                    Some(data_dir)
+                    println!("===> PATH MISMATCH FOR {}: REGISTRY SHOWS {:?}, CONFIG SPECIFIES {:?}", 
+                        engine_type_str.to_uppercase(), daemon.data_dir, data_dir);
+                    Some(data_dir.clone())
                 } else {
                     daemon.data_dir.clone()
                 },
@@ -697,64 +697,154 @@ pub async fn initialize_storage_for_query(
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_nanos() as i64)
                     .unwrap_or(0),
+                zmq_ready: daemon.zmq_ready,  // Preserve existing zmq_ready flag
             };
 
             if updated {
-                let data_dir_for_log = updated_metadata.data_dir.clone();
-                daemon_registry.update_daemon_metadata(updated_metadata).await
+                daemon_registry.update_daemon_metadata(updated_metadata.clone()).await
                     .map_err(|e| {
                         error!("Failed to update daemon metadata for port {}: {}", daemon.port, e);
                         println!("===> ERROR: FAILED TO UPDATE DAEMON METADATA FOR PORT {}: {}", daemon.port, e);
-                        anyhow!("Failed to update daemon metadata for port {}: {}", daemon.port, e)
+                        anyhow!("Failed to update daemon metadata: {}", e)
                     })?;
-                info!("Updated daemon metadata on port {} with engine type {:?} and data_dir {:?}", daemon.port, engine_type, data_dir_for_log);
-                println!("===> UPDATED DAEMON REGISTRY DATA_DIR TO {:?}", data_dir_for_log);
+                info!("Updated daemon metadata on port {}", daemon.port);
+                println!("===> UPDATED DAEMON REGISTRY DATA_DIR TO {:?}", updated_metadata.data_dir);
             }
 
-            if engine_type != config.storage_engine_type {
+            // ================================================================
+            // CRITICAL: Check if engine type matches AND ZMQ is ready
+            // ================================================================
+            if engine_type == config.storage_engine_type {
+                info!("Found valid {} daemon on port {} (PID {}). Checking ZMQ readiness...", engine_type_str, daemon.port, pid);
+                println!("===> FOUND VALID {} DAEMON ON PORT {} (PID {}). CHECKING ZMQ READINESS...", engine_type_str.to_uppercase(), daemon.port, pid);
+
+                // ============================================================
+                // If ZMQ is marked ready AND it's a Sled daemon, connect
+                // ============================================================
+                if daemon.zmq_ready && engine_type == StorageEngineType::Sled {
+                    info!("ZMQ marked as ready for port {}. Attempting client connection...", desired_port);
+                    println!("===> ZMQ MARKED AS READY FOR PORT {}. ATTEMPTING CONNECTION...", desired_port);
+                    
+                    match SledClient::connect_zmq_client_with_readiness_check(desired_port).await {
+                        Ok(client_tuple) => {
+                            info!("ZMQ client connected successfully for port {}", desired_port);
+                            println!("===> ZMQ CLIENT CONNECTED SUCCESSFULLY FOR PORT {}", desired_port);
+
+                            // Store client in SLED_DB singleton if not already done
+                            let _sled_db = SLED_DB.get_or_try_init(|| async {
+                                let temp_db = sled::Config::new()
+                                    .temporary(true)
+                                    .open()
+                                    .map_err(|e| anyhow::anyhow!("Failed to create temp Sled DB: {}", e))?;
+                                Ok::<tokio::sync::Mutex<SledDbWithPath>, anyhow::Error>(
+                                    tokio::sync::Mutex::new(SledDbWithPath {
+                                        db: Arc::new(temp_db),
+                                        path: data_dir.clone(),
+                                        client: Some(client_tuple),
+                                    })
+                                )
+                            }).await?;
+
+                            info!("Successfully established ZMQ connection for Sled on port {}", desired_port);
+                            println!("===> SUCCESSFULLY ESTABLISHED ZMQ CONNECTION FOR SLED ON PORT {}", desired_port);
+
+                            // Create StorageEngineManager with existing daemon
+                            let manager = StorageEngineManager::new(
+                                engine_type,
+                                &config_path,
+                                false,
+                                Some(daemon.port),
+                            ).await
+                                .map_err(|e| {
+                                    error!("Failed to initialize StorageEngineManager for port {}: {}", daemon.port, e);
+                                    println!("===> ERROR: FAILED TO INITIALIZE STORAGE ENGINE MANAGER FOR PORT {}: {}", daemon.port, e);
+                                    anyhow!("Failed to initialize StorageEngineManager for port {}: {}", daemon.port, e)
+                                })?;
+                            
+                            let arc_manager = Arc::new(AsyncStorageEngineManager::from_manager(manager));
+                            let arc_manager_clone = arc_manager.clone();
+                            
+                            GLOBAL_STORAGE_ENGINE_MANAGER.set(arc_manager)
+                                .map_err(|_| {
+                                    error!("Failed to set StorageEngineManager for port {}", daemon.port);
+                                    println!("===> ERROR: FAILED TO SET STORAGE ENGINE MANAGER FOR PORT {}", daemon.port);
+                                    anyhow!("Failed to set StorageEngineManager for port {}", daemon.port)
+                                })?;
+                            
+                            let engine = arc_manager_clone.get_persistent_engine().await;
+                            info!("Successfully reused daemon on port {} with engine type {}", daemon.port, engine.get_type());
+                            println!("===> SUCCESSFULLY REUSED DAEMON ON PORT {} WITH ENGINE TYPE {}", daemon.port, engine.get_type());
+                            
+                            let db = Database { storage: engine, config };
+                            return Ok(Arc::new(QueryExecEngine::new(Arc::new(db))));
+                        }
+                        Err(e) => {
+                            warn!("Failed to establish ZMQ connection for port {}: {}. ZMQ may not be ready yet.", desired_port, e);
+                            println!("===> WARNING: FAILED TO CONNECT ZMQ ON PORT {}: {}. WAITING OR STARTING NEW...", desired_port, e);
+                        }
+                    }
+                } else if !daemon.zmq_ready {
+                    info!("ZMQ not yet ready for port {} (marked as not ready). Waiting for daemon initialization...", daemon.port);
+                    println!("===> ZMQ NOT READY YET FOR PORT {}. WAITING...", daemon.port);
+                    
+                    // Wait a bit for ZMQ to become ready
+                    tokio::time::sleep(TokioDuration::from_secs(2)).await;
+                    
+                    // Check again
+                    if let Ok(updated_daemon) = daemon_registry.get_daemon_metadata(daemon.port).await {
+                        if let Some(d) = updated_daemon {
+                            if d.zmq_ready && engine_type == StorageEngineType::Sled {
+                                info!("ZMQ is now ready after waiting. Attempting connection...");
+                                println!("===> ZMQ NOW READY AFTER WAITING. ATTEMPTING CONNECTION...");
+                                
+                                if let Ok(client_tuple) = SledClient::connect_zmq_client_with_readiness_check(desired_port).await {
+                                    let _sled_db = SLED_DB.get_or_try_init(|| async {
+                                        let temp_db = sled::Config::new()
+                                            .temporary(true)
+                                            .open()
+                                            .map_err(|e| anyhow::anyhow!("Failed to create temp Sled DB: {}", e))?;
+                                        Ok::<tokio::sync::Mutex<SledDbWithPath>, anyhow::Error>(
+                                            tokio::sync::Mutex::new(SledDbWithPath {
+                                                db: Arc::new(temp_db),
+                                                path: data_dir.clone(),
+                                                client: Some(client_tuple),
+                                            })
+                                        )
+                                    }).await?;
+
+                                    let manager = StorageEngineManager::new(
+                                        engine_type,
+                                        &config_path,
+                                        false,
+                                        Some(daemon.port),
+                                    ).await?;
+                                    
+                                    let arc_manager = Arc::new(AsyncStorageEngineManager::from_manager(manager));
+                                    let arc_manager_clone = arc_manager.clone();
+                                    
+                                    GLOBAL_STORAGE_ENGINE_MANAGER.set(arc_manager)?;
+                                    
+                                    let engine = arc_manager_clone.get_persistent_engine().await;
+                                    let db = Database { storage: engine, config };
+                                    return Ok(Arc::new(QueryExecEngine::new(Arc::new(db))));
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Engine type mismatch
                 info!(
-                    "Daemon on port {} has engine type {:?}, but we need {:?}. Unregistering and starting new daemon...",
+                    "Daemon on port {} has engine type {:?}, but we need {:?}. Unregistering...",
                     daemon.port, engine_type, config.storage_engine_type
                 );
-                println!("===> ENGINE TYPE MISMATCH ON PORT {}: FOUND {:?}, NEED {:?}", daemon.port, engine_type, config.storage_engine_type);
-                daemon_registry.unregister_daemon(daemon.port).await
-                    .map_err(|e| {
-                        error!("Failed to unregister daemon on port {}: {}", daemon.port, e);
-                        println!("===> ERROR: FAILED TO UNREGISTER DAEMON ON PORT {}: {}", daemon.port, e);
-                        anyhow!("Failed to unregister daemon on port {}: {}", daemon.port, e)
-                    })?;
-            } else {
-                info!("Found valid {} daemon on port {} (PID {}), reusing...", engine_type_str, daemon.port, pid);
-                println!("===> REUSING EXISTING DAEMON ON PORT {} FOR ENGINE TYPE {}.", daemon.port, engine_type_str);
-                let manager = StorageEngineManager::new(
-                    engine_type,
-                    &config_path,
-                    false,
-                    Some(daemon.port),
-                ).await
-                .map_err(|e| {
-                    error!("Failed to initialize StorageEngineManager for port {}: {}", daemon.port, e);
-                    println!("===> ERROR: FAILED TO INITIALIZE STORAGE ENGINE MANAGER FOR PORT {}: {}", daemon.port, e);
-                    anyhow!("Failed to initialize StorageEngineManager for port {}: {}", daemon.port, e)
-                })?;
-                let arc_manager = Arc::new(AsyncStorageEngineManager::from_manager(manager));
-                
-                let arc_manager_clone = arc_manager.clone();
-                GLOBAL_STORAGE_ENGINE_MANAGER
-                    .set(arc_manager)
-                    .map_err(|e| {
-                        error!("Failed to set StorageEngineManager for port {}: {}", daemon.port, e);
-                        println!("===> ERROR: FAILED TO SET STORAGE ENGINE MANAGER FOR PORT {}: {}", daemon.port, e);
-                        anyhow!("Failed to set StorageEngineManager for port {}: {}", daemon.port, e)
-                    })?;
-                let engine = arc_manager_clone.get_persistent_engine().await;
-                let db = Database { storage: engine, config };
-                return Ok(Arc::new(QueryExecEngine::new(Arc::new(db))));
+                println!("===> ENGINE TYPE MISMATCH ON PORT {}: FOUND {:?}, NEED {:?}. UNREGISTERING...", daemon.port, engine_type, config.storage_engine_type);
+                let _ = daemon_registry.unregister_daemon(daemon.port).await;
             }
         }
     }
 
-    // No valid daemon found, start a new one
+    // No valid daemon found or couldn't connect, start a new one
     info!("No valid daemon found on port {}. Starting new daemon...", desired_port);
     println!("===> NO VALID DAEMON FOUND ON PORT {}, STARTING NEW DAEMON...", desired_port);
     start_storage_interactive(

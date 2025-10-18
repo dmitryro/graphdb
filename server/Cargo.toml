@@ -110,5 +110,3 @@ path = "src/lib.rs"
 [features]
 default = []
 #with-rocksdb = ["rocksdb"]
-
-

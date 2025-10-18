@@ -32,6 +32,7 @@ pub struct DaemonMetadata {
     pub config_path: Option<PathBuf>,
     pub engine_type: Option<String>,
     pub last_seen_nanos: i64,
+    pub zmq_ready: bool,  // NEW: Track if ZMQ server is responding
 }
 
 impl DaemonMetadata {

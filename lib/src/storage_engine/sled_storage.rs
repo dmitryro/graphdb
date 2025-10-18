@@ -325,6 +325,7 @@ impl SledStorage {
             config_path: storage_config.config_root_directory.clone().map(PathBuf::from),
             engine_type: Some("sled".to_string()),
             last_seen_nanos: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64,
+            zmq_ready: false,
         };
 
         if let Err(e) = daemon_registry.register_daemon(general_daemon_metadata).await {
@@ -554,6 +555,7 @@ impl SledStorage {
             config_path: storage_config.config_root_directory.clone().map(PathBuf::from),
             engine_type: Some("sled".to_string()),
             last_seen_nanos: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64,
+            zmq_ready: false,
         };
 
         if let Err(e) = daemon_registry.register_daemon(general_daemon_metadata).await {

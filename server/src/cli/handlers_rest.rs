@@ -460,6 +460,7 @@ pub async fn start_rest_api_interactive(
         config_path: Some(config_path),
         engine_type: None,
         last_seen_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
+        zmq_ready: false,
     };
 
     // --- FIX FOR OS ERROR 20 & ROBUST FILE HANDLING ---
