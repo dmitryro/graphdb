@@ -506,6 +506,7 @@ impl<'a> RocksDBDaemon<'a> {
             last_seen_nanos: SystemTime::now()
                 .duration_since(UNIX_EPOCH)?
                 .as_nanos() as i64,
+            zmq_ready: false,
         };
         println!("======> ABOUT TO CRASH IN RocksDBDaemon::new_with_db STEP 7");
         handle_rocksdb_op!(
@@ -3138,6 +3139,7 @@ impl RocksDBDaemonPool {
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_nanos() as i64)
                 .unwrap_or(0),
+            zmq_ready: false,
         };
 
         let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
@@ -3639,6 +3641,7 @@ impl RocksDBDaemonPool {
                         .duration_since(UNIX_EPOCH)
                         .map(|d| d.as_nanos() as i64)
                         .unwrap_or(0),
+                    zmq_ready: false,
                 };
                 daemon_registry.register_daemon(daemon_metadata).await?;
                 
@@ -3674,6 +3677,7 @@ impl RocksDBDaemonPool {
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_nanos() as i64)
                     .unwrap_or(0),
+                zmq_ready: false,
             };
             daemon_registry.register_daemon(daemon_metadata).await?;
 
@@ -4074,6 +4078,7 @@ impl RocksDBDaemonPool {
                         .duration_since(UNIX_EPOCH)
                         .map(|d| d.as_nanos() as i64)
                         .unwrap_or(0),
+                    zmq_ready: false,
                 };
 
                 timeout(TokioDuration::from_secs(5), daemon_registry.register_daemon(daemon_metadata))
@@ -4224,6 +4229,7 @@ impl RocksDBDaemonPool {
                                 .duration_since(UNIX_EPOCH)
                                 .map(|d| d.as_nanos() as i64)
                                 .unwrap_or(0),
+                            zmq_ready: false,
                         };
 
                         timeout(TokioDuration::from_secs(5), daemon_registry.register_daemon(daemon_metadata))

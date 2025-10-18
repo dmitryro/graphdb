@@ -1,7 +1,9 @@
+use anyhow::anyhow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::{RwLock, Semaphore, OnceCell, Mutex as TokioMutex };
+use tokio::task::JoinHandle;
+use tokio::sync::{RwLock, Semaphore, OnceCell, Mutex as TokioMutex};
 use tokio::time::{Instant, Duration as TokioDuration};
 use bincode::{config, encode_to_vec, decode_from_slice};
 use serde::{Serialize, Deserialize};
@@ -9,13 +11,12 @@ use log::{info, warn, error, debug};
 use anyhow::Result;
 use sled::{Db as SledDB, IVec, Config};
 use sysinfo::{Pid, System, ProcessRefreshKind};
-use rocksdb::{DB as RocksDB, ColumnFamily as RocksDBColumnFamily};
+use rocksdb::{DB as RocksDB, BoundColumnFamily as RocksDBColumnFamily};
 use std::os::unix::fs::PermissionsExt;
 use tokio::fs;
 use std::fs as std_fs;
-use std::io;
 
-use crate::config::{ StorageConfig, RocksDBWithPath };
+use crate::config::{StorageConfig, RocksDBWithPath};
 use crate::daemon_config::{
     DAEMON_PID_FILE_NAME_PREFIX,
     REST_PID_FILE_NAME_PREFIX,
@@ -23,6 +24,7 @@ use crate::daemon_config::{
 };
 
 pub type RocksDBDaemonInstanceType = TokioMutex<RocksDBWithPath>;
+
 // Serializable version of DBDaemonMetadata without DB instances
 #[derive(Serialize, Deserialize, Debug, Clone, bincode::Encode, bincode::Decode)]
 pub struct SerializableDBDaemonMetadata {
@@ -35,8 +37,8 @@ pub struct SerializableDBDaemonMetadata {
     pub last_seen_nanos: i64,
 }
 
-impl From<DBDaemonMetadata> for SerializableDBDaemonMetadata {
-    fn from(metadata: DBDaemonMetadata) -> Self {
+impl From<DBDaemonMetadata<'_>> for SerializableDBDaemonMetadata {
+    fn from(metadata: DBDaemonMetadata<'_>) -> Self {
         SerializableDBDaemonMetadata {
             port: metadata.port,
             pid: metadata.pid,
@@ -49,7 +51,7 @@ impl From<DBDaemonMetadata> for SerializableDBDaemonMetadata {
     }
 }
 
-impl From<SerializableDBDaemonMetadata> for DBDaemonMetadata {
+impl From<SerializableDBDaemonMetadata> for DBDaemonMetadata<'_> {
     fn from(ser: SerializableDBDaemonMetadata) -> Self {
         DBDaemonMetadata {
             port: ser.port,
@@ -72,7 +74,7 @@ impl From<SerializableDBDaemonMetadata> for DBDaemonMetadata {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct DBDaemonMetadata {
+pub struct DBDaemonMetadata<'a> {
     pub port: u16,
     pub pid: u32,
     pub ip_address: String,
@@ -91,14 +93,14 @@ pub struct DBDaemonMetadata {
     #[serde(skip)]
     pub sled_kv_pairs: Option<sled::Tree>,
     #[serde(skip)]
-    pub rocksdb_vertices: Option<RocksDBColumnFamily>,
+    pub rocksdb_vertices: Option<RocksDBColumnFamily<'a>>,
     #[serde(skip)]
-    pub rocksdb_edges: Option<RocksDBColumnFamily>,
+    pub rocksdb_edges: Option<RocksDBColumnFamily<'a>>,
     #[serde(skip)]
-    pub rocksdb_kv_pairs: Option<RocksDBColumnFamily>,
+    pub rocksdb_kv_pairs: Option<RocksDBColumnFamily<'a>>,
 }
 
-impl std::fmt::Debug for DBDaemonMetadata {
+impl std::fmt::Debug for DBDaemonMetadata<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DBDaemonMetadata")
             .field("port", &self.port)
@@ -120,7 +122,7 @@ impl std::fmt::Debug for DBDaemonMetadata {
     }
 }
 
-impl Clone for DBDaemonMetadata {
+impl Clone for DBDaemonMetadata<'_> {
     fn clone(&self) -> Self {
         DBDaemonMetadata {
             port: self.port,
@@ -142,8 +144,8 @@ impl Clone for DBDaemonMetadata {
     }
 }
 
-impl DBDaemonMetadata {
-    pub fn merge_non_empty(&mut self, update: &DBDaemonMetadata) {
+impl DBDaemonMetadata<'_> {
+    pub fn merge_non_empty(&mut self, update: &DBDaemonMetadata<'_>) {
         if update.port != 0 {
             self.port = update.port;
         }
@@ -263,15 +265,15 @@ struct RegistryConfig {
     max_concurrent_ops: usize,
 }
 
-pub struct DBDaemonRegistry {
-    memory_store: Arc<RwLock<HashMap<u16, DBDaemonMetadata>>>,
+pub struct DBDaemonRegistry<'a> {
+    memory_store: Arc<RwLock<HashMap<u16, DBDaemonMetadata<'a>>>>,
     storage: Arc<RwLock<Option<ImprovedSledPool>>>,
     config: Arc<RegistryConfig>,
-    background_tasks: Arc<RwLock<Vec<tokio::task::JoinHandle<()>>>>,
+    background_tasks: Arc<RwLock<Vec<JoinHandle<()>>>>,
     stale_threshold_nanos: i64,
 }
 
-impl DBDaemonRegistry {
+impl<'a> DBDaemonRegistry<'a> {
     pub async fn new(storage_config: Arc<StorageConfig>) -> Result<Self> {
         let config = Arc::new(RegistryConfig {
             is_fallback_mode: Self::should_use_fallback_mode(),
@@ -361,20 +363,31 @@ impl DBDaemonRegistry {
 
     async fn schedule_storage_sync(&self) {
         let storage = self.storage.clone();
-        let memory_store = self.memory_store.clone();
+        // CRITICAL: Cast to 'static to break the lifetime tie to 'a
+        let memory_store: Arc<RwLock<HashMap<u16, DBDaemonMetadata<'static>>>> = unsafe {
+            std::mem::transmute(self.memory_store.clone())
+        };
         let fallback_file = self.config.fallback_file.clone();
+        let background_tasks = self.background_tasks.clone();
 
         let task = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(TokioDuration::from_millis(100)).await;
 
                 let memory = memory_store.read().await;
-                let all_metadata: Vec<_> = memory.values().cloned().collect();
+                let all_metadata: Vec<DBDaemonMetadata<'static>> = memory
+                    .values()
+                    .cloned()
+                    .collect();
                 drop(memory);
 
-                let storage_guard = storage.read().await;
-                if let Some(pool) = &*storage_guard {
-                    info!("Performing background storage sync");
+                if all_metadata.is_empty() {
+                    tokio::time::sleep(TokioDuration::from_secs(5)).await;
+                    continue;
+                }
+
+                if let Some(pool) = &*storage.read().await {
+                    info!("Performing background storage sync ({} daemons)", all_metadata.len());
                     for metadata in &all_metadata {
                         let key = metadata.port.to_string().into_bytes();
                         let serializable = SerializableDBDaemonMetadata::from(metadata.clone());
@@ -390,15 +403,57 @@ impl DBDaemonRegistry {
                         }
                     }
                 }
-                drop(storage_guard);
 
-                let _ = Self::save_fallback_file(&fallback_file, &all_metadata).await;
+                let _ = DBDaemonRegistry::save_fallback_file(&fallback_file, &all_metadata).await;
 
                 tokio::time::sleep(TokioDuration::from_secs(5)).await;
             }
         });
 
-        let mut tasks = self.background_tasks.write().await;
+        let mut tasks = background_tasks.write().await;
+        tasks.push(task);
+    }
+
+    async fn cleanup_daemon_background(&self, metadata: DBDaemonMetadata<'_>) {
+        let storage = self.storage.clone();
+        let fallback_file = self.config.fallback_file.clone();
+        // CRITICAL: Cast to 'static to break the lifetime tie to 'a
+        let memory_store: Arc<RwLock<HashMap<u16, DBDaemonMetadata<'static>>>> = unsafe {
+            std::mem::transmute(self.memory_store.clone())
+        };
+        let background_tasks = self.background_tasks.clone();
+        let metadata_static: DBDaemonMetadata<'static> = {
+            let serializable: SerializableDBDaemonMetadata = metadata.into();
+            serializable.into()
+        };
+
+        let task = tokio::spawn(async move {
+            if let Some(pool) = &*storage.read().await {
+                let key = metadata_static.port.to_string().into_bytes();
+                let _ = pool.remove(&key).await;
+            }
+
+            let memory = memory_store.read().await;
+            let all_metadata: Vec<DBDaemonMetadata<'static>> = memory
+                .values()
+                .cloned()
+                .collect();
+            drop(memory);
+
+            let _ = DBDaemonRegistry::save_fallback_file(&fallback_file, &all_metadata).await;
+
+            let pid_files = vec![
+                format!("/tmp/{}{}.pid", DAEMON_PID_FILE_NAME_PREFIX, metadata_static.port),
+                format!("/tmp/{}{}.pid", REST_PID_FILE_NAME_PREFIX, metadata_static.port),
+                format!("/tmp/{}{}.pid", STORAGE_PID_FILE_NAME_PREFIX, metadata_static.port),
+            ];
+
+            for pid_file in pid_files {
+                let _ = fs::remove_file(&pid_file).await;
+            }
+        });
+
+        let mut tasks = background_tasks.write().await;
         tasks.push(task);
     }
 
@@ -425,7 +480,7 @@ impl DBDaemonRegistry {
         let stale_limit = now_nanos - self.stale_threshold_nanos;
 
         let mut memory = self.memory_store.write().await;
-        let storage_guard = self.storage.read().await;
+        let _storage_guard = self.storage.read().await;
 
         let mut ports_to_remove = Vec::new();
 
@@ -456,40 +511,6 @@ impl DBDaemonRegistry {
         Ok(())
     }
 
-    async fn cleanup_daemon_background(&self, metadata: DBDaemonMetadata) {
-        let storage = self.storage.clone();
-        let fallback_file = self.config.fallback_file.clone();
-        let memory_store = self.memory_store.clone();
-
-        let task = tokio::spawn(async move {
-            let storage_guard = storage.read().await;
-            if let Some(pool) = &*storage_guard {
-                let key = metadata.port.to_string().into_bytes();
-                let _ = pool.remove(&key).await;
-            }
-            drop(storage_guard);
-
-            let memory = memory_store.read().await;
-            let all_metadata: Vec<_> = memory.values().cloned().collect();
-            drop(memory);
-
-            let _ = Self::save_fallback_file(&fallback_file, &all_metadata).await;
-
-            let pid_files = vec![
-                format!("/tmp/{}{}.pid", DAEMON_PID_FILE_NAME_PREFIX, metadata.port),
-                format!("/tmp/{}{}.pid", REST_PID_FILE_NAME_PREFIX, metadata.port),
-                format!("/tmp/{}{}.pid", STORAGE_PID_FILE_NAME_PREFIX, metadata.port),
-            ];
-
-            for pid_file in pid_files {
-                let _ = fs::remove_file(&pid_file).await;
-            }
-        });
-
-        let mut tasks = self.background_tasks.write().await;
-        tasks.push(task);
-    }
-
     async fn terminate_process(pid: u32) -> Result<()> {
         tokio::task::spawn_blocking(move || -> Result<()> {
             let mut system = System::new();
@@ -507,29 +528,36 @@ impl DBDaemonRegistry {
         .await?
     }
 
-    pub async fn register_db_daemon(&self, metadata: DBDaemonMetadata) -> Result<()> {
+    pub async fn register_db_daemon(&self, metadata: DBDaemonMetadata<'_>) -> Result<()> {
         let is_valid = self.validate_process_fast(metadata.pid, metadata.port).await?;
         if !is_valid {
-            return Err(anyhow::anyhow!("Process validation failed for PID {}", metadata.pid));
+            return Err(anyhow!("Process validation failed for PID {}", metadata.pid));
         }
 
         self.clean_stale_db_daemons().await?;
 
+        let port = metadata.port;
+        let metadata_static: DBDaemonMetadata<'static> = {
+            let serializable: SerializableDBDaemonMetadata = metadata.into();
+            serializable.into()
+        };
+
         let mut memory = self.memory_store.write().await;
-        memory.remove(&metadata.port); // Clear existing entry
-        memory.insert(metadata.port, metadata.clone());
+        memory.remove(&port);
+        memory.insert(port, metadata_static.clone());
         drop(memory);
 
         let storage = self.storage.clone();
-        let metadata_clone = metadata.clone();
+        let metadata_clone_static = metadata_static.clone();
+        let background_tasks = self.background_tasks.clone();
+        let fallback_file = self.config.fallback_file.clone();
 
         let task = tokio::spawn(async move {
-            let storage_guard = storage.read().await;
-            if let Some(pool) = &*storage_guard {
-                let key = metadata_clone.port.to_string().into_bytes();
-                let serializable = SerializableDBDaemonMetadata::from(metadata_clone);
+            if let Some(pool) = &*storage.read().await {
+                let key = metadata_clone_static.port.to_string().into_bytes();
+                let serializable = SerializableDBDaemonMetadata::from(metadata_clone_static);
                 let encoded = encode_to_vec(&serializable, config::standard())
-                    .map_err(|e| anyhow::anyhow!("Failed to encode metadata for port {}: {}", serializable.port, e))?;
+                    .map_err(|e| anyhow!("Failed to encode metadata for port {}: {}", serializable.port, e))?;
                 if let Err(e) = pool.insert(&key, &encoded).await {
                     warn!("Failed to insert into sled for port {}: {}", serializable.port, e);
                 }
@@ -539,49 +567,67 @@ impl DBDaemonRegistry {
         task.await??;
 
         let memory = self.memory_store.read().await;
-        let all_metadata: Vec<_> = memory.values().cloned().collect();
+        let all_metadata: Vec<DBDaemonMetadata<'static>> = memory
+            .values()
+            .map(|meta| {
+                let serializable: SerializableDBDaemonMetadata = meta.clone().into();
+                serializable.into()
+            })
+            .collect();
         drop(memory);
-        Self::save_fallback_file(&self.config.fallback_file, &all_metadata).await?;
+        Self::save_fallback_file(&fallback_file, &all_metadata).await?;
 
-        info!("Registered DB daemon: {:?} on port {}", metadata.engine_type, metadata.port);
+        info!("Registered DB daemon: {:?} on port {}", metadata_static.engine_type, metadata_static.port);
         Ok(())
     }
 
-    pub async fn update_db_daemon_metadata(&self, update: DBDaemonMetadata) -> Result<Option<DBDaemonMetadata>> {
+    pub async fn update_db_daemon_metadata(&self, update: DBDaemonMetadata<'_>) -> Result<Option<DBDaemonMetadata<'static>>> {
         let port = update.port;
         let mut memory = self.memory_store.write().await;
 
         if let Some(existing_metadata) = memory.get_mut(&port) {
-            let original = existing_metadata.clone();
+            let _original = existing_metadata.clone();
             existing_metadata.merge_non_empty(&update);
-            let updated_metadata = existing_metadata.clone();
+            let updated_metadata_a = existing_metadata.clone();
             drop(memory);
 
+            let updated_metadata_static: DBDaemonMetadata<'static> = {
+                let serializable: SerializableDBDaemonMetadata = updated_metadata_a.into();
+                serializable.into()
+            };
+
             let storage = self.storage.clone();
-            let metadata_clone = updated_metadata.clone();
+            let metadata_clone_static = updated_metadata_static.clone();
+            let background_tasks = self.background_tasks.clone();
+            let fallback_file = self.config.fallback_file.clone();
 
             let task = tokio::spawn(async move {
-                let storage_guard = storage.read().await;
-                if let Some(pool) = &*storage_guard {
-                    let key = metadata_clone.port.to_string().into_bytes();
-                    let serializable = SerializableDBDaemonMetadata::from(metadata_clone);
+                if let Some(pool) = &*storage.read().await {
+                    let key = metadata_clone_static.port.to_string().into_bytes();
+                    let serializable = SerializableDBDaemonMetadata::from(metadata_clone_static);
                     let encoded = encode_to_vec(&serializable, config::standard())
-                        .map_err(|e| anyhow::anyhow!("Failed to encode updated metadata for port {}: {}", serializable.port, e))?;
+                        .map_err(|e| anyhow!("Failed to encode updated metadata for port {}: {}", serializable.port, e))?;
                     if let Err(e) = pool.insert(&key, &encoded).await {
                         warn!("Failed to update sled for port {}: {}", serializable.port, e);
                     }
                 }
                 Ok::<_, anyhow::Error>(())
             });
-            let _ = task.await;
+            task.await?;
 
             let memory = self.memory_store.read().await;
-            let all_metadata: Vec<_> = memory.values().cloned().collect();
+            let all_metadata: Vec<DBDaemonMetadata<'static>> = memory
+                .values()
+                .map(|meta| {
+                    let serializable: SerializableDBDaemonMetadata = meta.clone().into();
+                    serializable.into()
+                })
+                .collect();
             drop(memory);
-            let _ = Self::save_fallback_file(&self.config.fallback_file, &all_metadata).await;
+            Self::save_fallback_file(&fallback_file, &all_metadata).await?;
 
             info!("Updated DB daemon metadata for port {}", port);
-            Ok(Some(updated_metadata))
+            Ok(Some(updated_metadata_static))
         } else {
             drop(memory);
             warn!("Attempted to update non-existent DB daemon on port {}", port);
@@ -589,7 +635,7 @@ impl DBDaemonRegistry {
         }
     }
 
-    pub async fn get_all_db_daemon_metadata(&self) -> Result<Vec<DBDaemonMetadata>> {
+    pub async fn get_all_db_daemon_metadata(&self) -> Result<Vec<DBDaemonMetadata<'static>>> {
         self.clean_stale_db_daemons().await?;
 
         let storage_guard = self.storage.read().await;
@@ -598,10 +644,10 @@ impl DBDaemonRegistry {
             memory.clear();
 
             let all_sled_entries = pool.iter_all().await?;
-            for (key, encoded_value) in all_sled_entries {
+            for (_key, encoded_value) in all_sled_entries {
                 match decode_from_slice::<SerializableDBDaemonMetadata, _>(&encoded_value, config::standard()) {
                     Ok((ser, _)) => {
-                        let metadata = DBDaemonMetadata::from(ser);
+                        let metadata: DBDaemonMetadata<'static> = ser.into();
                         memory.insert(metadata.port, metadata);
                     }
                     Err(e) => {
@@ -613,29 +659,34 @@ impl DBDaemonRegistry {
         }
 
         let memory = self.memory_store.read().await;
-        let all_metadata: Vec<_> = memory.values().cloned().collect();
+        let all_metadata: Vec<DBDaemonMetadata<'static>> = memory
+            .values()
+            .map(|meta| {
+                let serializable: SerializableDBDaemonMetadata = meta.clone().into();
+                serializable.into()
+            })
+            .collect();
         drop(memory);
 
-        let valid_metadata = tokio::spawn(async move {
-            let mut valid = Vec::new();
-            for metadata in all_metadata {
-                if Self::is_pid_running(metadata.pid).await.unwrap_or(false) {
-                    valid.push(metadata);
-                }
+        let mut valid = Vec::new();
+        for metadata in all_metadata {
+            if Self::is_pid_running(metadata.pid).await.unwrap_or(false) {
+                valid.push(metadata);
             }
-            valid
-        })
-        .await?;
+        }
 
-        Ok(valid_metadata)
+        Ok(valid)
     }
 
-    pub async fn get_db_daemon_metadata_by_port(&self, port: u16) -> Result<Option<DBDaemonMetadata>> {
+    pub async fn get_db_daemon_metadata_by_port(&self, port: u16) -> Result<Option<DBDaemonMetadata<'static>>> {
         self.clean_stale_db_daemons().await?;
 
         let memory = self.memory_store.read().await;
         if let Some(metadata) = memory.get(&port) {
-            let metadata_clone = metadata.clone();
+            let metadata_clone: DBDaemonMetadata<'static> = {
+                let serializable: SerializableDBDaemonMetadata = metadata.clone().into();
+                serializable.into()
+            };
             drop(memory);
 
             if Self::is_pid_running(metadata_clone.pid).await.unwrap_or(false) {
@@ -646,21 +697,24 @@ impl DBDaemonRegistry {
         self.discover_db_daemon_from_sled(port).await
     }
 
-    pub async fn get_db_daemon_metadata_by_pid(&self, pid: u32) -> Result<Option<DBDaemonMetadata>> {
+    pub async fn get_db_daemon_metadata_by_pid(&self, pid: u32) -> Result<Option<DBDaemonMetadata<'static>>> {
         self.clean_stale_db_daemons().await?;
 
         let memory = self.memory_store.read().await;
-        let result = memory.values().find(|metadata| metadata.pid == pid).cloned();
+        let result = memory.values().find(|metadata| metadata.pid == pid).map(|meta| {
+            let serializable: SerializableDBDaemonMetadata = meta.clone().into();
+            serializable.into()
+        });
         Ok(result)
     }
 
-    pub async fn get_db_daemon_metadata_by_engine_type(&self, engine_type: &str) -> Result<Vec<DBDaemonMetadata>> {
+    pub async fn get_db_daemon_metadata_by_engine_type(&self, engine_type: &str) -> Result<Vec<DBDaemonMetadata<'static>>> {
         self.clean_stale_db_daemons().await?;
 
         let engine_type_lower = engine_type.to_lowercase();
         let memory = self.memory_store.read().await;
 
-        let results: Vec<DBDaemonMetadata> = memory
+        let results: Vec<DBDaemonMetadata<'static>> = memory
             .values()
             .filter(|metadata| {
                 metadata
@@ -669,13 +723,16 @@ impl DBDaemonRegistry {
                     .map(|et| et.to_lowercase() == engine_type_lower)
                     .unwrap_or(false)
             })
-            .cloned()
+            .map(|meta| {
+                let serializable: SerializableDBDaemonMetadata = meta.clone().into();
+                serializable.into()
+            })
             .collect();
 
         Ok(results)
     }
 
-    async fn discover_db_daemon_from_sled(&self, port: u16) -> Result<Option<DBDaemonMetadata>> {
+    async fn discover_db_daemon_from_sled(&self, port: u16) -> Result<Option<DBDaemonMetadata<'static>>> {
         debug!("Attempting to discover DB daemon from persistent store on port {}", port);
 
         let storage_guard = self.storage.read().await;
@@ -684,7 +741,7 @@ impl DBDaemonRegistry {
             if let Some(encoded_value) = pool.get(&key).await? {
                 match decode_from_slice::<SerializableDBDaemonMetadata, _>(&encoded_value, config::standard()) {
                     Ok((ser, _)) => {
-                        let metadata = DBDaemonMetadata::from(ser);
+                        let metadata: DBDaemonMetadata<'static> = ser.into();
                         if Self::is_pid_running(metadata.pid).await.unwrap_or(false) {
                             let mut memory = self.memory_store.write().await;
                             memory.insert(port, metadata.clone());
@@ -704,15 +761,15 @@ impl DBDaemonRegistry {
         Ok(None)
     }
 
-    pub async fn register_daemon(&self, metadata: DBDaemonMetadata) -> Result<()> {
+    pub async fn register_daemon(&self, metadata: DBDaemonMetadata<'_>) -> Result<()> {
         self.register_db_daemon(metadata).await
     }
 
-    pub async fn update_daemon_metadata(&self, update: DBDaemonMetadata) -> Result<Option<DBDaemonMetadata>> {
+    pub async fn update_daemon_metadata(&self, update: DBDaemonMetadata<'_>) -> Result<Option<DBDaemonMetadata<'static>>> {
         self.update_db_daemon_metadata(update).await
     }
 
-    pub async fn get_daemon_metadata(&self, port: u16) -> Result<Option<DBDaemonMetadata>> {
+    pub async fn get_daemon_metadata(&self, port: u16) -> Result<Option<DBDaemonMetadata<'static>>> {
         self.get_db_daemon_metadata_by_port(port).await
     }
 
@@ -730,7 +787,7 @@ impl DBDaemonRegistry {
         Ok(())
     }
 
-    pub async fn get_all_daemon_metadata(&self) -> Result<Vec<DBDaemonMetadata>> {
+    pub async fn get_all_daemon_metadata(&self) -> Result<Vec<DBDaemonMetadata<'static>>> {
         self.get_all_db_daemon_metadata().await
     }
 
@@ -741,7 +798,13 @@ impl DBDaemonRegistry {
     pub async fn clear_all_daemons(&self) -> Result<()> {
         let metadata_list = {
             let mut memory = self.memory_store.write().await;
-            let list: Vec<_> = memory.values().cloned().collect();
+            let list: Vec<DBDaemonMetadata<'static>> = memory
+                .values()
+                .map(|meta| {
+                    let serializable: SerializableDBDaemonMetadata = meta.clone().into();
+                    serializable.into()
+                })
+                .collect();
             memory.clear();
             list
         };
@@ -752,13 +815,20 @@ impl DBDaemonRegistry {
         Ok(())
     }
 
-    async fn cleanup_all_daemons_background(&self, metadata_list: Vec<DBDaemonMetadata>) {
+    async fn cleanup_all_daemons_background(&self, metadata_list: Vec<DBDaemonMetadata<'_>>) {
         let storage = self.storage.clone();
         let fallback_file = self.config.fallback_file.clone();
+        let background_tasks = self.background_tasks.clone();
+        let metadata_list: Vec<DBDaemonMetadata<'static>> = metadata_list
+            .into_iter()
+            .map(|m| {
+                let serializable: SerializableDBDaemonMetadata = m.into();
+                serializable.into()
+            })
+            .collect();
 
         let task = tokio::spawn(async move {
-            let storage_guard = storage.read().await;
-            if let Some(pool) = &*storage_guard {
+            if let Some(pool) = &*storage.read().await {
                 debug!("Clearing storage backend");
                 match pool.iter_all().await {
                     Ok(entries) => {
@@ -769,7 +839,6 @@ impl DBDaemonRegistry {
                     Err(e) => warn!("Failed to iterate and clear sled database: {}", e),
                 }
             }
-            drop(storage_guard);
 
             for metadata in metadata_list {
                 let pid_files = vec![
@@ -788,15 +857,15 @@ impl DBDaemonRegistry {
             let _ = Self::save_fallback_file(&fallback_file, &[]).await;
         });
 
-        let mut tasks = self.background_tasks.write().await;
+        let mut tasks = background_tasks.write().await;
         tasks.push(task);
     }
 
-    pub async fn find_daemon_by_port(&self, port: u16) -> Result<Option<DBDaemonMetadata>> {
+    pub async fn find_daemon_by_port(&self, port: u16) -> Result<Option<DBDaemonMetadata<'static>>> {
         self.get_db_daemon_metadata_by_port(port).await
     }
 
-    pub async fn remove_daemon_by_type(&self, service_type: &str, port: u16) -> Result<Option<DBDaemonMetadata>> {
+    pub async fn remove_daemon_by_type(&self, service_type: &str, port: u16) -> Result<Option<DBDaemonMetadata<'static>>> {
         let metadata = {
             let mut memory = self.memory_store.write().await;
             if let Some(metadata) = memory.get(&port) {
@@ -820,7 +889,12 @@ impl DBDaemonRegistry {
             info!("Removed {} DB daemon on port {}", service_type, port);
         }
 
-        Ok(metadata)
+        let metadata_static = metadata.map(|m| {
+            let serializable: SerializableDBDaemonMetadata = m.into();
+            serializable.into()
+        });
+
+        Ok(metadata_static)
     }
 
     pub async fn close(&self) -> Result<()> {
@@ -830,7 +904,13 @@ impl DBDaemonRegistry {
         }
 
         let memory = self.memory_store.read().await;
-        let all_metadata: Vec<_> = memory.values().cloned().collect();
+        let all_metadata: Vec<DBDaemonMetadata<'static>> = memory
+            .values()
+            .map(|meta| {
+                let serializable: SerializableDBDaemonMetadata = meta.clone().into();
+                serializable.into()
+            })
+            .collect();
         drop(memory);
 
         Self::save_fallback_file(&self.config.fallback_file, &all_metadata).await?;
@@ -863,17 +943,17 @@ impl DBDaemonRegistry {
         Ok(true)
     }
 
-    async fn load_from_fallback(&self) -> Result<Vec<DBDaemonMetadata>> {
+    async fn load_from_fallback(&self) -> Result<Vec<DBDaemonMetadata<'a>>> {
         if !self.config.fallback_file.exists() {
             return Ok(Vec::new());
         }
 
         let data = fs::read_to_string(&self.config.fallback_file).await?;
-        let metadata_list: Vec<DBDaemonMetadata> = serde_json::from_str(&data)?;
+        let metadata_list: Vec<DBDaemonMetadata<'a>> = serde_json::from_str(&data)?;
         Ok(metadata_list)
     }
 
-    async fn save_fallback_file(file_path: &PathBuf, metadata_list: &[DBDaemonMetadata]) -> Result<()> {
+    async fn save_fallback_file(file_path: &PathBuf, metadata_list: &[DBDaemonMetadata<'_>]) -> Result<()> {
         if let Some(parent) = file_path.parent() {
             fs::create_dir_all(parent).await?;
             let metadata = fs::metadata(parent).await?;
@@ -947,7 +1027,7 @@ impl DBDaemonRegistry {
 }
 
 pub struct DBDaemonRegistryWrapper {
-    cell: OnceCell<Arc<DBDaemonRegistry>>,
+    cell: OnceCell<Arc<DBDaemonRegistry<'static>>>,
 }
 
 impl DBDaemonRegistryWrapper {
@@ -957,7 +1037,7 @@ impl DBDaemonRegistryWrapper {
         }
     }
 
-    pub async fn get_or_init_instance(&self, config: Arc<StorageConfig>) -> Result<Arc<DBDaemonRegistry>> {
+    pub async fn get_or_init_instance(&self, config: Arc<StorageConfig>) -> Result<Arc<DBDaemonRegistry<'static>>> {
         let registry = self
             .cell
             .get_or_init(|| async {
@@ -974,7 +1054,7 @@ impl DBDaemonRegistryWrapper {
         Ok(Arc::clone(registry))
     }
 
-    pub async fn get_registry(&self) -> Arc<DBDaemonRegistry> {
+    pub async fn get_registry(&self) -> Arc<DBDaemonRegistry<'static>> {
         Arc::clone(
             self.cell
                 .get_or_init(|| async {
@@ -992,7 +1072,7 @@ impl DBDaemonRegistryWrapper {
         )
     }
 
-    pub async fn get(&self) -> Arc<DBDaemonRegistry> {
+    pub async fn get(&self) -> Arc<DBDaemonRegistry<'static>> {
         Arc::clone(
             self.cell
                 .get_or_init(|| async {
@@ -1010,52 +1090,64 @@ impl DBDaemonRegistryWrapper {
         )
     }
 
-    pub async fn register_daemon(&self, metadata: DBDaemonMetadata) -> Result<()> {
-        self.get_registry().await.register_daemon(metadata).await
+    pub async fn register_daemon(&self, metadata: DBDaemonMetadata<'_>) -> Result<()> {
+        let registry = self.get_registry().await;
+        registry.register_daemon(metadata).await
     }
 
-    pub async fn update_daemon_metadata(&self, update: DBDaemonMetadata) -> Result<Option<DBDaemonMetadata>> {
-        self.get_registry().await.update_daemon_metadata(update).await
+    pub async fn update_daemon_metadata(&self, update: DBDaemonMetadata<'_>) -> Result<Option<DBDaemonMetadata<'static>>> {
+        let registry = self.get_registry().await;
+        registry.update_daemon_metadata(update).await
     }
 
-    pub async fn get_daemon_metadata(&self, port: u16) -> Result<Option<DBDaemonMetadata>> {
-        self.get_registry().await.get_daemon_metadata(port).await
+    pub async fn get_daemon_metadata(&self, port: u16) -> Result<Option<DBDaemonMetadata<'static>>> {
+        let registry = self.get_registry().await;
+        registry.get_daemon_metadata(port).await
     }
 
     pub async fn unregister_daemon(&self, port: u16) -> Result<()> {
-        self.get_registry().await.unregister_daemon(port).await
+        let registry = self.get_registry().await;
+        registry.unregister_daemon(port).await
     }
 
-    pub async fn get_all_daemon_metadata(&self) -> Result<Vec<DBDaemonMetadata>> {
-        self.get_registry().await.get_all_daemon_metadata().await
+    pub async fn get_all_daemon_metadata(&self) -> Result<Vec<DBDaemonMetadata<'static>>> {
+        let registry = self.get_registry().await;
+        registry.get_all_daemon_metadata().await
     }
 
     pub async fn clear_stale_daemons(&self) -> Result<()> {
-        self.get_registry().await.clear_stale_daemons().await
+        let registry = self.get_registry().await;
+        registry.clear_stale_daemons().await
     }
 
     pub async fn clear_all_daemons(&self) -> Result<()> {
-        self.get_registry().await.clear_all_daemons().await
+        let registry = self.get_registry().await;
+        registry.clear_all_daemons().await
     }
 
-    pub async fn find_daemon_by_port(&self, port: u16) -> Result<Option<DBDaemonMetadata>> {
-        self.get_registry().await.find_daemon_by_port(port).await
+    pub async fn find_daemon_by_port(&self, port: u16) -> Result<Option<DBDaemonMetadata<'static>>> {
+        let registry = self.get_registry().await;
+        registry.find_daemon_by_port(port).await
     }
 
-    pub async fn remove_daemon_by_type(&self, service_type: &str, port: u16) -> Result<Option<DBDaemonMetadata>> {
-        self.get_registry().await.remove_daemon_by_type(service_type, port).await
+    pub async fn remove_daemon_by_type(&self, service_type: &str, port: u16) -> Result<Option<DBDaemonMetadata<'static>>> {
+        let registry = self.get_registry().await;
+        registry.remove_daemon_by_type(service_type, port).await
     }
 
     pub async fn close(&self) -> Result<()> {
-        self.get_registry().await.close().await
+        let registry = self.get_registry().await;
+        registry.close().await
     }
 
     pub async fn health_check(&self) -> Result<bool> {
-        self.get_registry().await.health_check().await
+        let registry = self.get_registry().await;
+        registry.health_check().await
     }
 
     pub async fn debug_database_state(&self) -> Result<String> {
-        self.get_registry().await.debug_database_state().await
+        let registry = self.get_registry().await;
+        registry.debug_database_state().await
     }
 }
 
