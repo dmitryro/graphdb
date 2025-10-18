@@ -53,6 +53,9 @@ pub enum GraphError {
     #[error("Configuration error: {0}")]
     ConfigurationError(String),
 
+    #[error("Storage error: {0}")]
+    StorageError(String),
+
     #[error("GraphQL error: {0}")]
     GraphQLError(String),
 
