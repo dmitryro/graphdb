@@ -30,7 +30,7 @@ use std::process;
 use anyhow::{Result, Context, anyhow};
 use std::io::Error;
 use serde_yaml2 as serde_yaml;
-use serde_json::{Map, Value, from_value};
+use serde_json::{self, Map, Value, from_value};
 use serde::{Deserialize, Serialize, Deserializer};
 use log::{info, debug, warn, error, trace};
 #[cfg(unix)]
@@ -67,7 +67,7 @@ use crate::config::{DEFAULT_DATA_DIRECTORY, DEFAULT_LOG_DIRECTORY, LOCK_FILE_PAT
                                  RedisConfig, MySQLConfig, PostgreSQLConfig, TypeConfig, QueryPlan, QueryResult,
                                  NodeIdType, StorageConfigInner, SelectedStorageConfig, StorageConfigWrapper, AppResponse, AppRequest,
                                  SledDbWithPath, RocksDBWithPath, load_storage_config_from_yaml,
-                                 create_default_storage_yaml_config, SledClientMode, SledClient,
+                                 create_default_storage_yaml_config, SledClientMode, SledClient, TikvStorage,
                                  load_engine_specific_config};
 use crate::daemon::daemon_management::{ is_storage_daemon_running, is_socket_used_by_cli, is_daemon_running};
 use crate::daemon::daemon_utils::{find_pid_by_port, stop_process, parse_cluster_range};
@@ -81,8 +81,6 @@ pub use crate::config::{ StorageEngineType };
 pub use crate::storage_engine::inmemory_storage::InMemoryStorage as InMemoryGraphStorage;
 #[cfg(feature = "with-sled")]
 pub use crate::storage_engine::sled_storage::{SledStorage, SLED_DB};
-#[cfg(feature = "with-tikv")]
-pub use crate::storage_engine::tikv_storage::TikvStorage;
 #[cfg(feature = "redis-datastore")]
 use crate::storage_engine::redis_storage::RedisStorage;
 #[cfg(feature = "postgres-datastore")]
@@ -93,6 +91,9 @@ use crate::storage_engine::mysql_storage::MySQLStorage;
 use crate::storage_engine::hybrid_storage::HybridStorage;
 #[cfg(feature = "with-rocksdb")]
 pub use crate::config::RocksDBStorage;
+#[cfg(feature = "mysql-datastore")]
+pub use crate::storage_engine::mysql_storage::MySQLStorage;
+
 pub static CLEANUP_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 pub static GLOBAL_STORAGE_ENGINE_MANAGER: OnceCell<Arc<AsyncStorageEngineManager>> = OnceCell::const_new();
 
@@ -112,6 +113,9 @@ static MYSQL_SINGLETON: OnceCell<Arc<MySQLStorage>> = OnceCell::const_new();
 // Global lock to prevent concurrent RocksDB initialization
 static ROCKSDB_INIT_LOCK: LazyLock<TokioMutex<()>> = LazyLock::new(|| TokioMutex::new(()));
 
+lazy_static::lazy_static! {
+    static ref MIGRATION_COMPLETE: Arc<TokioMutex<bool>> = Arc::new(TokioMutex::new(false));
+}
 
 const MAX_RETRIES: u32 = 5;
 const RETRY_DELAY_MS: u64 = 500;
@@ -139,6 +143,121 @@ fn get_config_value(config: &StorageConfig, key: &str, default: &str) -> String 
             default.to_string()
         })
 }
+
+///       use connection strings or derive the path from their specific config struct.
+ // Keep this to allow data_dir to be unused by non-local engines
+#[allow(unused_variables)] // Keep this to allow data_dir to be unused by non-local engines
+async fn create_storage_engine_instance(
+    engine_type: &StorageEngineType,
+    data_dir: &Path,
+    engine_config: StorageConfig,
+) -> Result<Box<dyn GraphStorageEngine + Send + Sync>, GraphError> {
+    match engine_type {
+        #[cfg(feature = "with-rocksdb")]
+        StorageEngineType::RocksDB => {
+            let port = engine_config.default_port;
+            let path = PathBuf::from(data_dir).join("rocksdb").join(port.to_string());
+            let rocksdb_config = if let Some(ref engine_specific) = engine_config.engine_specific_config {
+                let config_value = serde_json::to_value(engine_specific)
+                    .map_err(|e| GraphError::ConfigurationError(format!("Failed to serialize map: {}", e)))?;
+                serde_json::from_value(config_value)
+                    .map_err(|e| GraphError::ConfigurationError(format!("Failed to parse RocksDBConfig: {}", e)))?
+            } else {
+                RocksDBConfig {
+                    storage_engine_type: StorageEngineType::RocksDB,
+                    path,
+                    host: Some("127.0.0.1".to_string()),
+                    port: Some(port),
+                    cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
+                    temporary: false,
+                    use_compression: true,
+                    use_raft_for_scale: false,
+                    max_background_jobs: Some(1000),
+                }
+            };
+            let rocksdb_engine = RocksDBStorage::new(&rocksdb_config, &engine_config).await?;
+            Ok(Box::new(rocksdb_engine))
+        }
+        StorageEngineType::InMemory => {
+            let in_memory_engine = InMemoryStorage::new(&engine_config);
+            Ok(Box::new(in_memory_engine))
+        }
+        #[cfg(feature = "with-sled")]
+        StorageEngineType::Sled => {
+            let port = engine_config.default_port;
+            let path = PathBuf::from(data_dir).join("sled").join(port.to_string());
+            let sled_config = if let Some(ref engine_specific) = engine_config.engine_specific_config {
+                let config_value = serde_json::to_value(engine_specific)
+                    .map_err(|e| GraphError::ConfigurationError(format!("Failed to serialize map: {}", e)))?;
+                serde_json::from_value(config_value)
+                    .map_err(|e| GraphError::ConfigurationError(format!("Failed to parse SledConfig: {}", e)))?
+            } else {
+                SledConfig {
+                    storage_engine_type: StorageEngineType::Sled,
+                    path,
+                    host: Some("127.0.0.1".to_string()),
+                    port: Some(port),
+                    cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
+                    temporary: false,
+                    use_compression: true,
+                }
+            };
+            let sled_engine = SledStorage::new(&sled_config, &engine_config).await?;
+            Ok(Box::new(sled_engine))
+        }
+        #[cfg(feature = "mysql-datastore")]
+        StorageEngineType::MySQL => {
+            let connection_string = engine_config.engine_specific_config.as_ref()
+                .and_then(|config| config.storage.connection_string.as_ref())
+                .ok_or_else(|| GraphError::StorageError("MySQL connection string is required".to_string()))?;
+            let mysql_engine = MySQLStorage::new(connection_string)?;
+            Ok(Box::new(mysql_engine))
+        }
+        #[cfg(feature = "postgres-datastore")]
+        StorageEngineType::PostgreSQL => {
+            let connection_string = engine_config.engine_specific_config.as_ref()
+                .and_then(|config| config.storage.connection_string.as_ref())
+                .ok_or_else(|| GraphError::StorageError("PostgreSQL connection string is required".to_string()))?;
+            let pg_engine = PostgresStorage::new(connection_string)?;
+            Ok(Box::new(pg_engine))
+        }
+        #[cfg(feature = "redis-datastore")]
+        StorageEngineType::Redis => {
+            let connection_string = engine_config.engine_specific_config.as_ref()
+                .and_then(|config| config.storage.connection_string.as_ref())
+                .ok_or_else(|| GraphError::StorageError("Redis connection string is required".to_string()))?;
+            let redis_engine = RedisStorage::new(connection_string)?;
+            Ok(Box::new(redis_engine))
+        }
+        #[cfg(feature = "with-tikv")]
+        StorageEngineType::TiKV => {
+            let tikv_config = if let Some(ref engine_specific) = engine_config.engine_specific_config {
+                let config_value = serde_json::to_value(engine_specific)
+                    .map_err(|e| GraphError::ConfigurationError(format!("Failed to serialize map: {}", e)))?;
+                serde_json::from_value(config_value)
+                    .map_err(|e| GraphError::ConfigurationError(format!("Failed to parse TikvConfig: {}", e)))?
+            } else {
+                TikvConfig {
+                    storage_engine_type: StorageEngineType::TiKV,
+                    path: PathBuf::from(data_dir),
+                    host: None,
+                    port: None,
+                    pd_endpoints: engine_config.engine_specific_config.as_ref()
+                        .and_then(|config| config.storage.pd_endpoints.clone()),
+                    username: None,
+                    password: None,
+                }
+            };
+            let tikv_engine = TikvStorage::new(&tikv_config).await?;
+            Ok(Box::new(tikv_engine))
+        }
+        _ => Err(GraphError::ConfigurationError(format!(
+            "Unsupported storage engine type during creation: {:?}",
+            engine_type
+        ))),
+    }
+}
+
 
 impl RaftNetwork<RaftMemStoreTypeConfig> for ExampleNetwork {
     fn append_entries(
@@ -1370,9 +1489,6 @@ impl StorageEngineManager {
         .await
     }
 
-    // Assuming the necessary import for is_daemon_running is already present,
-    // e.g.: use crate::daemon::daemon_management::is_daemon_running;
-    // and use zmq::Context as ZmqContext is present.
     #[cfg(feature = "with-sled")]
     async fn init_sled(config: &StorageConfig) -> Result<Arc<dyn GraphStorageEngine + Send + Sync>, GraphError> {
         info!("Initializing Sled engine: {:?}", config);
@@ -1381,8 +1497,22 @@ impl StorageEngineManager {
         let engine_specific = config.engine_specific_config.as_ref()
             .ok_or_else(|| GraphError::ConfigurationError("Missing engine_specific_config for Sled".to_string()))?;
 
+        // Determine Sled path with fallback logic
         let sled_path = engine_specific.storage.path.clone()
-            .ok_or_else(|| GraphError::ConfigurationError("Missing path for Sled".to_string()))?;
+            .or_else(|| {
+                config.data_directory
+                    .as_ref()
+                    .and_then(|base| {
+                        if config.default_port == 0 {
+                            Some(base.join("sled"))
+                        } else {
+                            Some(base.join("sled").join(config.default_port.to_string()))
+                        }
+                    })
+                    .or_else(|| Some(PathBuf::from(format!("{}/sled", DEFAULT_DATA_DIRECTORY))))
+            })
+            .unwrap_or_else(|| PathBuf::from(format!("{}/sled", DEFAULT_DATA_DIRECTORY)));
+        
         let port = engine_specific.storage.port.unwrap_or(DEFAULT_STORAGE_PORT);
 
         // Force unlock RocksDB to ensure no contention
@@ -1395,6 +1525,7 @@ impl StorageEngineManager {
                 .join(port.to_string());
             if rocksdb_path.exists() {
                 info!("Force unlocking RocksDB database at {:?}", rocksdb_path);
+                println!("===> CHECKING FOR LOCK FILE AT {:?}", rocksdb_path.join("LOCK"));
                 if let Err(e) = RocksDBStorage::force_unlock(&rocksdb_path).await {
                     warn!("Failed to force unlock RocksDB database at {:?}: {}", rocksdb_path, e);
                 } else {
@@ -1411,6 +1542,8 @@ impl StorageEngineManager {
 
         // Check and release Sled locks
         if sled_path.exists() {
+            info!("Checking for lock file at {:?}", sled_path.join("db.lck"));
+            println!("===> CHECKING FOR LOCK FILE AT {:?}", sled_path.join("db.lck"));
             if let Err(e) = SledStorage::force_unlock(&sled_path).await {
                 error!("Failed to unlock Sled database at {:?}: {}", sled_path, e);
                 return Err(GraphError::StorageError(format!("Failed to unlock Sled database at {:?}: {}", sled_path, e)));
@@ -3071,6 +3204,37 @@ impl StorageEngineManager {
         engines
     }    
 
+    async fn copy_data_without_deletion(src: &PathBuf, dst: &PathBuf) -> Result<(), GraphError> {
+        if src.exists() && src != dst {
+            info!("Copying data from {:?} to {:?}", src, dst);
+            println!("===> COPYING DATA FROM {:?} TO {:?}", src, dst);
+            if dst.exists() {
+                // Ensure destination is clean to avoid stale data conflicts
+                if let Err(e) = tokio_fs::remove_dir_all(dst).await {
+                    error!("Failed to clear destination directory {:?}: {}", dst, e);
+                    println!("===> ERROR: FAILED TO CLEAR DESTINATION DIRECTORY {:?}", dst);
+                    return Err(GraphError::StorageError(format!("Failed to clear destination directory {:?}: {}", dst, e)));
+                }
+            }
+            tokio_fs::create_dir_all(dst).await?;
+            let mut entries = tokio_fs::read_dir(src).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let src_path = entry.path();
+                let dst_path = dst.join(src_path.strip_prefix(src).map_err(|e| GraphError::StorageError(e.to_string()))?);
+                if src_path.is_dir() {
+                    tokio_fs::create_dir_all(&dst_path).await?;
+                    // Box the recursive call to handle async recursion
+                    Box::pin(Self::copy_data_without_deletion(&src_path, &dst_path)).await?;
+                } else {
+                    tokio_fs::copy(&src_path, &dst_path).await?;
+                }
+            }
+            info!("Successfully copied data from {:?} to {:?}", src, dst);
+            println!("===> SUCCESSFULLY COPIED DATA FROM {:?}", src);
+        }
+        Ok(())
+    }
+
     pub async fn use_storage(&mut self, new_config: StorageConfig, permanent: bool) -> Result<(), GraphError> {
         info!("=== Starting use_storage for engine: {:?}, permanent: {} ===", new_config.storage_engine_type, permanent);
         trace!("use_storage called with engine_type: {:?}", new_config.storage_engine_type);
@@ -3096,19 +3260,19 @@ impl StorageEngineManager {
             (was_running, Arc::clone(&engine_guard.persistent), (*engine_guard).engine_type)
         };
 
-        // Get paths from config
+        // Get paths from config - IMPORTANT: Use base paths without port suffix for migration
         let old_path = new_config.engine_specific_config
             .as_ref()
             .and_then(|c| c.storage.path.clone())
             .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY));
+        
         let new_path = new_config.engine_specific_config
             .as_ref()
             .and_then(|c| c.storage.path.clone())
             .unwrap_or_else(|| PathBuf::from(format!(
-                "{}/{}/{}",
+                "{}/{}",
                 DEFAULT_DATA_DIRECTORY,
-                new_config.storage_engine_type.to_string().to_lowercase(),
-                new_config.default_port
+                new_config.storage_engine_type.to_string().to_lowercase()
             )));
 
         // Get port
@@ -3116,6 +3280,17 @@ impl StorageEngineManager {
             .as_ref()
             .and_then(|c| c.storage.port)
             .unwrap_or(new_config.default_port);
+
+        // PRESERVE: Save reference to old data directory BEFORE any cleanup
+        let old_engine_data_dir = PathBuf::from(format!(
+            "{}/{}/{}",
+            DEFAULT_DATA_DIRECTORY,
+            old_engine_type.to_string().to_lowercase(),
+            port
+        ));
+        
+        let old_engine_data_exists = old_engine_data_dir.exists();
+        info!("Old engine data directory: {:?}, exists: {}", old_engine_data_dir, old_engine_data_exists);
 
         // Clean up stale ZeroMQ socket file
         let socket_path = format!("/opt/graphdb/graphdb-{}.ipc", port);
@@ -3128,8 +3303,9 @@ impl StorageEngineManager {
         }
 
         // Force unlock both Sled and RocksDB to ensure clean state
-        let sled_path = new_path.join("sled").join(port.to_string());
-        let rocksdb_path = new_path.join("rocksdb").join(port.to_string());
+        let sled_path = PathBuf::from(format!("{}/sled/{}", DEFAULT_DATA_DIRECTORY, port));
+        let rocksdb_path = PathBuf::from(format!("{}/rocksdb/{}", DEFAULT_DATA_DIRECTORY, port));
+        
         #[cfg(feature = "with-sled")]
         {
             if sled_path.exists() {
@@ -3147,6 +3323,7 @@ impl StorageEngineManager {
                 }
             }
         }
+        
         #[cfg(feature = "with-rocksdb")]
         {
             if rocksdb_path.exists() {
@@ -3297,7 +3474,8 @@ impl StorageEngineManager {
             }
         }
 
-        // Engine-specific cleanup
+        // Engine-specific cleanup - ONLY clean if we're SURE we migrated the data
+        // DO NOT DELETE old engine data directories here - let migration handle it
         if !daemon_running && !(old_engine_type == StorageEngineType::Sled && new_config.storage_engine_type == StorageEngineType::Sled && old_path == new_path) {
             match old_engine_type {
                 StorageEngineType::RocksDB => {
@@ -3309,14 +3487,15 @@ impl StorageEngineManager {
                             rocksdb_instance.close().await
                                 .map_err(|e| GraphError::StorageError(format!("Failed to close RocksDB: {}", e)))?;
                         }
-                        if old_path.exists() {
-                            warn!("Cleaning up RocksDB directory at {:?}", old_path);
-                            if let Err(e) = recover_rocksdb(&old_path).await {
+                        if old_engine_data_dir.exists() {
+                            warn!("Cleaning up RocksDB locks at {:?}", old_engine_data_dir);
+                            if let Err(e) = recover_rocksdb(&old_engine_data_dir).await {
                                 warn!("Failed to clean RocksDB locks: {}", e);
                             } else {
-                                info!("Successfully cleaned RocksDB locks at {:?}", old_path);
+                                info!("Successfully cleaned RocksDB locks at {:?}", old_engine_data_dir);
                             }
                         }
+                        // NOTE: Do NOT delete the directory - preserve for potential re-access
                     }
                 }
                 StorageEngineType::Sled => {
@@ -3324,25 +3503,14 @@ impl StorageEngineManager {
                     {
                         let sled_db = SLED_DB.get().ok_or_else(|| GraphError::StorageError("Sled DB not initialized".to_string()))?;
                         let mut sled_db_guard = sled_db.lock().await;
-                        if sled_db_guard.path == old_path {
+                        if sled_db_guard.path == old_engine_data_dir {
                             info!("Closing existing Sled instance before switching");
                             sled_db_guard.db.flush_async().await
                                 .map_err(|e| GraphError::StorageError(format!("Failed to flush Sled DB: {}", e)))?;
                             sled_db_guard.client.take(); // Drop client to close ZMQ socket
-                            SledStorage::release_instance(&old_path).await;
+                            SledStorage::release_instance(&old_engine_data_dir).await;
                         }
-                        if old_path.exists() {
-                            warn!("Cleaning up Sled locks at {:?}", old_path);
-                            let lock_path = old_path.join("db.lck");
-                            if lock_path.exists() {
-                                if let Err(e) = tokio_fs::remove_file(&lock_path).await {
-                                    warn!("Failed to remove Sled lock file at {:?}: {}", lock_path, e);
-                                } else {
-                                    info!("Successfully removed Sled lock file at {:?}", lock_path);
-                                    println!("===> SUCCESSFULLY REMOVED SLED LOCK FILE AT {:?}", lock_path);
-                                }
-                            }
-                        }
+                        // NOTE: Do NOT delete lock files - preserve data
                     }
                 }
                 StorageEngineType::TiKV => {
@@ -3507,6 +3675,107 @@ impl StorageEngineManager {
                         sleep(TokioDuration::from_millis(100)).await;
                     }
                 }
+            }
+        }
+
+        // MIGRATION: Handle data transfer BEFORE initializing new engine
+        let mut migration_complete = false;
+        if old_engine_type != new_config.storage_engine_type {
+            info!("Engine type changed from {:?} to {:?}", old_engine_type, new_config.storage_engine_type);
+            if old_engine_data_exists {
+                info!("Migrating data from {:?} at {:?} to {:?} at {:?}", 
+                    old_engine_type, old_engine_data_dir, 
+                    new_config.storage_engine_type, new_path);
+
+                match create_storage_engine_instance(
+                    &new_config.storage_engine_type,
+                    &new_path,
+                    new_config.clone(),
+                ).await {
+                    Ok(new_engine_box) => {
+                        let new_persistent_arc: Arc<dyn GraphStorageEngine + Send + Sync> = Arc::from(new_engine_box);
+                        match self.migrate_data(&old_persistent_arc, &new_persistent_arc).await {
+                            Ok(_) => {
+                                migration_complete = true;
+                                info!("Data migration completed successfully");
+                                println!("===> DATA MIGRATION COMPLETED SUCCESSFULLY");
+                            }
+                            Err(e) => {
+                                warn!("Data migration failed: {}", e);
+                                println!("===> WARNING: DATA MIGRATION FAILED: {}", e);
+                                // Fallback: Copy directory to preserve data
+                                if let Err(copy_err) = Self::copy_data_without_deletion(&old_engine_data_dir, &new_path).await {
+                                    warn!("Fallback data copy failed: {}", copy_err);
+                                    println!("===> WARNING: FALLBACK DATA COPY FAILED: {}", copy_err);
+                                } else {
+                                    info!("Fallback data copy completed successfully");
+                                    println!("===> FALLBACK DATA COPY COMPLETED SUCCESSFULLY");
+                                    migration_complete = true;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to create new engine instance for migration: {}", e);
+                        println!("===> WARNING: FAILED TO CREATE NEW ENGINE FOR MIGRATION: {}", e);
+                        // Fallback: Copy directory to preserve data
+                        if let Err(copy_err) = Self::copy_data_without_deletion(&old_engine_data_dir, &new_path).await {
+                            warn!("Fallback data copy failed: {}", copy_err);
+                            println!("===> WARNING: FALLBACK DATA COPY FAILED: {}", copy_err);
+                        } else {
+                            info!("Fallback data copy completed successfully");
+                            println!("===> FALLBACK DATA COPY COMPLETED SUCCESSFULLY");
+                            migration_complete = true;
+                        }
+                    }
+                }
+            } else {
+                info!("No old engine data found at {:?}, starting fresh", old_engine_data_dir);
+                println!("===> NO OLD ENGINE DATA FOUND AT {:?}", old_engine_data_dir);
+                // Ensure new directory exists
+                if !new_path.exists() {
+                    tokio_fs::create_dir_all(&new_path).await?;
+                    info!("Created new directory at {:?}", new_path);
+                    println!("===> CREATED NEW DIRECTORY AT {:?}", new_path);
+                }
+            }
+        } else if old_path != new_path {
+            info!("Same engine but different path. Old: {:?}, New: {:?}", old_path, new_path);
+            if old_engine_data_exists {
+                info!("Copying data from {:?} to {:?}", old_engine_data_dir, new_path);
+                match Self::copy_data_without_deletion(&old_engine_data_dir, &new_path).await {
+                    Ok(_) => {
+                        migration_complete = true;
+                        info!("Data copy completed successfully");
+                        println!("===> DATA COPY COMPLETED SUCCESSFULLY");
+                    }
+                    Err(e) => {
+                        warn!("Data copy failed: {}", e);
+                        println!("===> WARNING: DATA COPY FAILED: {}", e);
+                    }
+                }
+            }
+        }
+
+        // Clean up old engine directory only after successful migration
+        if migration_complete && old_engine_type != new_config.storage_engine_type && old_engine_data_dir.exists() {
+            info!("Migration complete, but preserving old engine directory at {:?}", old_engine_data_dir);
+            println!("===> PRESERVING OLD ENGINE DIRECTORY AT {:?}", old_engine_data_dir);
+}
+
+        if !migration_complete && new_path.exists() {
+            info!("Clearing new engine directory at {:?} to ensure fresh state", new_path);
+            if let Err(e) = tokio_fs::remove_dir_all(&new_path).await {
+                warn!("Failed to clear new engine directory at {:?}: {}", new_path, e);
+                println!("===> WARNING: FAILED TO CLEAR NEW ENGINE DIRECTORY AT {:?}: {}", new_path, e);
+            } else {
+                info!("Successfully cleared new engine directory at {:?}", new_path);
+                println!("===> SUCCESSFULLY CLEARED NEW ENGINE DIRECTORY AT {:?}", new_path);
+            }
+            if let Err(e) = tokio_fs::create_dir_all(&new_path).await {
+                error!("Failed to recreate directory at {:?}: {}", new_path, e);
+                println!("===> ERROR: FAILED TO RECREATE DIRECTORY AT {:?}", new_path);
+                return Err(GraphError::StorageError(format!("Failed to recreate directory at {:?}: {}", new_path, e)));
             }
         }
 
@@ -3879,22 +4148,6 @@ impl StorageEngineManager {
             ).await?
         };
 
-        // Migrate or copy data if needed
-        if old_engine_type != new_config.storage_engine_type || old_path != new_path {
-            info!("Handling data transfer from old {:?} (path {:?}) to new {:?} (path {:?})",
-                  old_engine_type, old_path, new_config.storage_engine_type, new_path);
-            if old_engine_type != new_config.storage_engine_type {
-                info!("Migrating data from {} to {}", old_persistent_arc.get_type(), new_persistent.get_type());
-                self.migrate_data(&old_persistent_arc, &new_persistent).await?;
-            } else if let (Some(old_p), Some(new_p)) = (old_path.to_str(), new_path.to_str()) {
-                if old_p != new_p {
-                    info!("Copying data directory for same-engine path change");
-                    copy_dir(&old_path, &new_path).await
-                        .map_err(|e| GraphError::Io(e.to_string()))?;
-                }
-            }
-        }
-
         // Update the engine
         self.engine = Arc::new(TokioMutex::new(HybridStorage {
             inmemory: Arc::new(InMemoryGraphStorage::new(&new_config)),
@@ -3951,6 +4204,26 @@ impl StorageEngineManager {
                 println!("===> ERROR: FAILED TO REGISTER DAEMON ON PORT {} AFTER {} ATTEMPTS", port, MAX_REGISTRY_ATTEMPTS);
                 return Err(GraphError::StorageError(format!("Failed to register daemon on port {} after {} attempts", port, MAX_REGISTRY_ATTEMPTS)));
             }
+        }
+
+        // CLEANUP: Only delete old engine directory AFTER migration and new engine initialization
+        if migration_complete && old_engine_type != new_config.storage_engine_type {
+            info!("Migration complete, cleaning up old engine directory at {:?}", old_engine_data_dir);
+            if old_engine_data_dir.exists() {
+                match tokio_fs::remove_dir_all(&old_engine_data_dir).await {
+                    Ok(_) => {
+                        info!("Successfully removed old engine directory at {:?}", old_engine_data_dir);
+                        println!("===> SUCCESSFULLY REMOVED OLD ENGINE DIRECTORY AT {:?}", old_engine_data_dir);
+                    }
+                    Err(e) => {
+                        warn!("Failed to remove old engine directory at {:?}: {}", old_engine_data_dir, e);
+                        println!("===> WARNING: FAILED TO REMOVE OLD ENGINE DIRECTORY: {}", e);
+                    }
+                }
+            }
+        } else {
+            info!("Preserving old engine directory at {:?} (migration: {}, same engine: {})", 
+                  old_engine_data_dir, migration_complete, old_engine_type == new_config.storage_engine_type);
         }
 
         info!("Successfully switched to storage engine: {:?}", new_config.storage_engine_type);
