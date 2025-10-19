@@ -1882,6 +1882,19 @@ pub async fn handle_use_storage_command(
         }
     };
 
+
+     // Preserve directories for migration
+    let engine_types = vec![StorageEngineType::RocksDB, StorageEngineType::Sled, StorageEngineType::TiKV];
+    let directories_to_preserve: Vec<PathBuf> = engine_types
+        .iter()
+        .filter(|&e| e != &engine)
+        .map(|e| PathBuf::from(format!("/opt/graphdb/storage_data/{}/{}", e.to_string().to_lowercase(), current_config.default_port)))
+        .filter(|p| p.exists())
+        .collect();
+    info!("Preserving directories for potential migration: {:?}", directories_to_preserve);
+    println!("===> PRESERVING DIRECTORIES FOR MIGRATION: {:?}", directories_to_preserve);
+
+/*
     let engine_types = vec![StorageEngineType::RocksDB, StorageEngineType::Sled, StorageEngineType::TiKV];
     for other_engine in engine_types.iter().filter(|&e| e != &engine) {
         let stale_path = PathBuf::from(format!("/opt/graphdb/storage_data/{}/{}", other_engine.to_string().to_lowercase(), current_config.default_port));
@@ -1895,6 +1908,8 @@ pub async fn handle_use_storage_command(
             }
         }
     }
+*/
+
 
     let engine_specific_config = if engine == StorageEngineType::TiKV {
         let tikv_config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_TIKV);

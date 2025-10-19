@@ -32,6 +32,8 @@ use sysinfo::{System, RefreshKind, ProcessRefreshKind, Pid, ProcessesToUpdate};
 use sled::Config;
 
 pub static SLED_DB: LazyLock<OnceCell<TokioMutex<SledDbWithPath>>> = LazyLock::new(|| OnceCell::new());
+
+//pub static SLED_DB: LazyLock<OnceCell<TokioMutex<SledDbWithPath>>> = LazyLock::new(|| OnceCell::new());
 pub static SLED_POOL_MAP: LazyLock<OnceCell<TokioMutex<HashMap<u16, Arc<TokioMutex<SledDaemonPool>>>>>> = LazyLock::new(|| OnceCell::new());
 
 // Static variable to track active Sled database instances
@@ -71,11 +73,11 @@ impl SledStorage {
 
         // 1. Check and clean up stale IPC socket file
         let ipc_path = get_ipc_endpoint(port);
-        // Remove "ipc://" prefix (assuming it's exactly 6 characters long)
-        if std::path::Path::new(&ipc_path[6..]).exists() { 
+        let socket_path = &ipc_path[6..]; // Remove "ipc://" prefix
+        if std::path::Path::new(socket_path).exists() { 
             warn!("Stale IPC socket found at {}. Attempting cleanup.", ipc_path);
             println!("===> WARNING: STALE IPC SOCKET FOUND AT {}. ATTEMPTING CLEANUP.", ipc_path);
-            if let Err(e) = tokio::fs::remove_file(&ipc_path[6..]).await {
+            if let Err(e) = tokio::fs::remove_file(socket_path).await {
                 warn!("Failed to remove stale IPC socket at {}: {}", ipc_path, e);
                 println!("===> WARNING: FAILED TO REMOVE STALE IPC SOCKET AT {}: {}", ipc_path, e);
             } else {
@@ -1372,16 +1374,17 @@ impl Drop for SledStorage {
             // Use get_active_ports and await it
             let ports = pool_guard.get_active_ports().await;
             if let Some(port) = ports.first() {
-                info!("Cleaning up SledStorage for port {}", port);
-                println!("===> CLEANING UP SledStorage FOR PORT {}", port);
+                let port_u16 = *port;
+                info!("Cleaning up SledStorage for port {}", port_u16);
+                println!("===> CLEANING UP SledStorage FOR PORT {}", port_u16);
 
-                // Flush database if initialized
+                // *** SLED_DB SECTION LEFT COMPLETELY UNTOUCHED ***
                 if let Some(sled_db) = SLED_DB.get() {
                     let mut sled_db_guard = match timeout(TokioDuration::from_secs(5), sled_db.lock()).await {
                         Ok(guard) => guard,
                         Err(_) => {
-                            error!("Timeout acquiring SLED_DB lock during Drop for port {}", port);
-                            println!("===> ERROR: TIMEOUT ACQUIRING SLED_DB LOCK DURING DROP FOR PORT {}", port);
+                            error!("Timeout acquiring SLED_DB lock during Drop for port {}", port_u16);
+                            println!("===> ERROR: TIMEOUT ACQUIRING SLED_DB LOCK DURING DROP FOR PORT {}", port_u16);
                             return;
                         }
                     };
@@ -1402,37 +1405,46 @@ impl Drop for SledStorage {
                     // Release instance from SLED_ACTIVE_DATABASES
                     Self::release_instance(&db_path).await;
                 }
+                // *** END SLED_DB SECTION ***
 
                 // Remove from pool map
                 if let Some(pool_map) = SLED_POOL_MAP.get() {
                     let mut pool_map_guard = match timeout(TokioDuration::from_secs(5), pool_map.lock()).await {
                         Ok(guard) => guard,
                         Err(_) => {
-                            error!("Timeout acquiring pool map lock during Drop for port {}", port);
-                            println!("===> ERROR: TIMEOUT ACQUIRING POOL MAP LOCK DURING DROP FOR PORT {}", port);
+                            error!("Timeout acquiring pool map lock during Drop for port {}", port_u16);
+                            println!("===> ERROR: TIMEOUT ACQUIRING POOL MAP LOCK DURING DROP FOR PORT {}", port_u16);
                             return;
                         }
                     };
-                    pool_map_guard.remove(port);
-                    info!("Removed SledDaemonPool for port {} from pool map", port);
-                    println!("===> REMOVED SledDaemonPool FOR PORT {} FROM POOL MAP", port);
+                    pool_map_guard.remove(&port_u16);
+                    info!("Removed SledDaemonPool for port {} from pool map", port_u16);
+                    println!("===> REMOVED SledDaemonPool FOR PORT {} FROM POOL MAP", port_u16);
                 }
 
                 // Clean up daemon metadata from GLOBAL_DB_DAEMON_REGISTRY
                 let daemon_registry = GLOBAL_DB_DAEMON_REGISTRY.get().await;
-                if let Err(e) = daemon_registry.unregister_daemon(*port).await {
-                    error!("Failed to unregister daemon for port {}: {}", port, e);
-                    println!("===> ERROR: FAILED TO UNREGISTER DAEMON FOR PORT {}: {}", port, e);
+                if let Err(e) = daemon_registry.unregister_daemon(port_u16).await {
+                    error!("Failed to unregister daemon for port {}: {}", port_u16, e);
+                    println!("===> ERROR: FAILED TO UNREGISTER DAEMON FOR PORT {}: {}", port_u16, e);
                 } else {
-                    info!("Unregistered daemon for port {}", port);
-                    println!("===> UNREGISTERED DAEMON FOR PORT {}", port);
+                    info!("Unregistered daemon for port {}", port_u16);
+                    println!("===> UNREGISTERED DAEMON FOR PORT {}", port_u16);
                 }
 
-                // Clean up stale daemon resources
-                let db_path = PathBuf::from(DEFAULT_DATA_DIRECTORY).join("sled").join(port.to_string());
-                if let Err(e) = Self::check_and_cleanup_stale_daemon(*port, &db_path).await {
-                    error!("Failed to clean up stale daemon for port {}: {}", port, e);
-                    println!("===> ERROR: FAILED TO CLEAN UP STALE DAEMON FOR PORT {}: {}", port, e);
+                // *** FIXED: Now correctly uses the ACTUAL db_path from SLED_DB ***
+                let db_path = if let Some(sled_db) = SLED_DB.get() {
+                    sled_db.lock().await.path.clone()
+                } else {
+                    PathBuf::from(DEFAULT_DATA_DIRECTORY).join("sled").join(port_u16.to_string())
+                };
+                
+                if let Err(e) = Self::check_and_cleanup_stale_daemon(port_u16, &db_path).await {
+                    error!("Failed to clean up stale daemon for port {}: {}", port_u16, e);
+                    println!("===> ERROR: FAILED TO CLEAN UP STALE DAEMON FOR PORT {}: {}", port_u16, e);
+                } else {
+                    info!("Successfully cleaned up stale daemon for port {}", port_u16);
+                    println!("===> SUCCESSFULLY CLEANED UP STALE DAEMON FOR PORT {}", port_u16);
                 }
             }
 
