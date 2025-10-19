@@ -651,6 +651,11 @@ impl AsyncStorageEngineManager {
         manager.get_persistent_engine()
     }
 
+    pub async fn migrate_storage(&self, from_config: StorageConfig, to_config: StorageConfig) -> Result<(), GraphError> {
+        let mut manager = self.manager.lock().await;
+        manager.migrate_storage(from_config, to_config).await
+    }
+
     pub async fn use_storage(&self, config: StorageConfig, permanent: bool) -> Result<(), GraphError> {
         let mut manager = self.manager.lock().await;
         manager.use_storage(config, permanent).await
@@ -3232,6 +3237,12 @@ impl StorageEngineManager {
             info!("Successfully copied data from {:?} to {:?}", src, dst);
             println!("===> SUCCESSFULLY COPIED DATA FROM {:?}", src);
         }
+        Ok(())
+    }
+
+    pub async fn migrate_storage(&self, from_config: StorageConfig, to_config: StorageConfig) -> Result<(), GraphError> {
+        info!("==> Migrating from {:?} to {:?}", from_config.storage_engine_type, to_config.storage_engine_type);
+        println!("==> Migrating from {:?} to {:?}", from_config.storage_engine_type, to_config.storage_engine_type);
         Ok(())
     }
 

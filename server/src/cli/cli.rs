@@ -21,7 +21,7 @@ use tokio::time::{timeout, Duration as TokioDuration};
 use lib::commands::{
     parse_kv_operation, ConfigAction, DaemonCliCommand, HelpArgs, ReloadAction, RestartAction,
     RestCliCommand, SaveAction, ShowAction, StartAction, StatusAction, StopAction, StorageAction,
-    StatusArgs, StopArgs, ReloadArgs, RestartArgs, UseAction
+    StatusArgs, StopArgs, ReloadArgs, RestartArgs, UseAction, MigrateAction,
 };
 use lib::config::{
     self, load_storage_config_from_yaml, SelectedStorageConfig, StorageConfig,
@@ -77,7 +77,7 @@ pub struct CliArgs {
     pub internal_cluster_range: Option<String>,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Debug, Clone, Subcommand)]
 pub enum Commands {
     Start {
         #[arg(long, value_parser = clap::value_parser!(u16), help = "Port for the daemon. Conflicts with --daemon-port if both specified.")]
@@ -161,6 +161,7 @@ pub enum Commands {
         #[arg(name = "KEY", help = "Key to delete")]
         key: String,
     },
+    Migrate(MigrateAction),
 }
 
 // Use a TokioMutex to manage the singleton instance of the QueryExecEngine.
@@ -756,6 +757,25 @@ pub async fn run_single_command(
             let query_engine = get_query_engine_singleton().await?;
             handlers_mod::handle_kv_command(query_engine, "delete".to_string(), key, None)
                 .await?;
+        }
+        Commands::Migrate(action) => {
+            let from_engine = action.from
+                .or(action.source)
+                .or(action.from_engine_pos)
+                .ok_or_else(|| anyhow!("No source engine specified for 'migrate' command. Usage: migrate --from <engine> --to <engine> or migrate <from_engine> <to_engine>"))?;
+            let to_engine = action.to
+                .or(action.dest)
+                .or(action.to_engine_pos)
+                .ok_or_else(|| anyhow!("No destination engine specified for 'migrate' command. Usage: migrate --from <engine> --to <engine> or migrate <from_engine> <to_engine>"))?;
+            info!("Executing Migrate command: from_engine={:?}, to_engine={:?}", from_engine, to_engine);
+            println!("===> Executing Migrate command: from_engine={:?}, to_engine={:?}", from_engine, to_engine);
+            handlers_mod::handle_migrate_interactive(
+                from_engine,
+                to_engine,
+                storage_daemon_shutdown_tx_opt.clone(),
+                storage_daemon_handle.clone(),
+                storage_daemon_port_arc.clone(),
+            ).await?;
         }
     }
 

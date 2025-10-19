@@ -91,6 +91,7 @@ pub enum CommandType {
     StatusCluster,
     StatusRaft(Option<u16>),
     //ShowStorage,
+
     // Authentication and User Management
     Auth { username: String, password: String },
     Authenticate { username: String, password: String },
@@ -133,6 +134,7 @@ pub enum CommandType {
 
     // Key-Value and Query Commands
     Kv { action: KvAction },
+    Migrate(MigrateAction),
     Exec { command: String },
     Query { query: String },
     Unified { query: String, language: Option<String> },
@@ -284,6 +286,9 @@ pub enum Commands {
         #[clap(subcommand)]
         action: KvAction,
     },
+    /// Migrates one store to another.
+    #[clap(alias = "m")]
+    Migrate(MigrateAction),
 }
 
 #[derive(Subcommand, Debug, PartialEq, Clone)]
@@ -308,6 +313,26 @@ pub enum KvAction {
 }
 
 #[derive(Args, Debug, PartialEq, Clone)]
+pub struct MigrateAction {
+    #[clap(long, short = 'f', group = "from_engine")]
+    pub from: Option<StorageEngineType>,
+    #[clap(long, short = 't', group = "to_engine")]
+    pub to: Option<StorageEngineType>,
+    #[clap(long, group = "source_engine", conflicts_with = "from")]
+    pub source: Option<StorageEngineType>,
+    #[clap(long, group = "dest_engine", conflicts_with = "to")]
+    pub dest: Option<StorageEngineType>,
+    #[clap(value_name = "FROM_ENGINE", value_parser = parse_storage_engine, required_unless_present_any = ["from", "source"])]
+    pub from_engine_pos: Option<StorageEngineType>,
+    #[clap(value_name = "TO_ENGINE", value_parser = parse_storage_engine, required_unless_present_any = ["to", "dest"])]
+    pub to_engine_pos: Option<StorageEngineType>,
+    #[clap(long)]
+    pub port: Option<u16>,
+    #[clap(long)]
+    pub cluster: Option<String>,
+}
+
+#[derive(Args, Debug, PartialEq, Clone)]
 pub struct ShowArgs {
     #[clap(subcommand)]
     pub action: ShowAction,
@@ -322,8 +347,6 @@ pub enum SaveAction {
     Configuration,
 }
 
-
-// A new enum for the Show command's subcommands:
 #[derive(Subcommand, Debug, PartialEq, Clone)]
 pub enum ShowAction {
     /// Show the current storage engine.
@@ -348,7 +371,6 @@ pub enum ConfigAction {
     /// Show main daemon configuration.
     Main,
 }
-
 
 #[derive(Subcommand, Debug, PartialEq, Clone)]
 pub enum StartAction {

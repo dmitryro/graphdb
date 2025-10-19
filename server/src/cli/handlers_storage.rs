@@ -1787,6 +1787,673 @@ async fn ensure_process_terminated(pid: u32) -> Result<()> {
     Err(anyhow!("Failed to terminate process {} after {} attempts", pid, max_attempts))
 }
 
+/// Handles the 'migrate' command for migrating data between storage engines.
+pub async fn handle_migrate_command(
+    from_engine: StorageEngineType,
+    to_engine: StorageEngineType,
+) -> Result<(), anyhow::Error> {
+    let start_time = Instant::now();
+    info!("=== Starting handle_migrate_command from engine: {:?} to engine: {:?}", from_engine, to_engine);
+    println!("===> MIGRATING FROM ENGINE: {:?} TO ENGINE: {:?}", from_engine, to_engine);
+
+    // Load TiKV PD port from storage_config_tikv.yaml if it exists
+    let tikv_pd_port = {
+        let tikv_config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_TIKV);
+        if tikv_config_path.exists() {
+            match std::fs::read_to_string(&tikv_config_path) {
+                Ok(content) => {
+                    match serde_yaml::from_str::<TiKVConfigWrapper>(&content) {
+                        Ok(wrapper) => wrapper.storage.pd_endpoints.and_then(|pd| pd.split(':').last().and_then(|p| p.parse::<u16>().ok())),
+                        Err(e) => {
+                            warn!("Failed to parse TiKV config: {}", e);
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to read TiKV config: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+    debug!("TiKV PD port from config: {:?}", tikv_pd_port);
+
+    // Capture all existing storage daemons
+    let all_existing_storage_daemons = GLOBAL_DAEMON_REGISTRY
+        .get_all_daemon_metadata()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|daemon| daemon.service_type == "storage")
+        .collect::<Vec<DaemonMetadata>>();
+
+    let existing_daemon_ports: Vec<u16> = all_existing_storage_daemons.iter().map(|d| d.port).collect();
+    info!("Captured existing storage daemons on ports: {:?}", existing_daemon_ports);
+
+    println!("===> MIGRATE HANDLER - STEP 1: Loading configuration...");
+    let cwd = std::env::current_dir()
+        .map_err(|e| anyhow!("Failed to get current working directory: {}", e))?;
+
+    let config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
+    let absolute_config_path = cwd.join(&config_path);
+    debug!("Attempting to load storage config from {:?}", absolute_config_path);
+
+    // Load base configuration
+    let mut base_config: StorageConfig = match load_storage_config_from_yaml(Some(absolute_config_path.clone())).await {
+        Ok(config) => {
+            info!("Successfully loaded existing storage config: {:?}", config);
+            println!("===> Configuration loaded successfully.");
+            config
+        },
+        Err(e) => {
+            warn!("Failed to load existing config from {:?}, using default values. Error: {}", absolute_config_path, e);
+            println!("===> Configuration file not found, using default settings.");
+            StorageConfig::default()
+        }
+    };
+    debug!("Initial loaded config: {:?}", base_config);
+    println!(
+        "Loaded storage config: default_port={}, cluster_range={}, data_directory={:?}, storage_engine_type={:?}, engine_specific_config={:?}, log_directory={:?}, max_disk_space_gb={}, min_disk_space_gb={}, use_raft_for_scale={}",
+        base_config.default_port,
+        base_config.cluster_range,
+        base_config.data_directory,
+        base_config.storage_engine_type,
+        base_config.engine_specific_config,
+        base_config.log_directory,
+        base_config.max_disk_space_gb,
+        base_config.min_disk_space_gb,
+        base_config.use_raft_for_scale
+    );
+
+    // Load config root directory
+    println!("===> MIGRATE HANDLER - STEP 2: Loading config root directory...");
+    let config_root_directory = match base_config.config_root_directory.as_ref() {
+        Some(path) => {
+            println!("===> Using config root directory: {:?}", path);
+            path
+        },
+        None => {
+            return Err(anyhow!("'config_root_directory' is missing from the loaded configuration. Check your storage_config.yaml file."));
+        }
+    };
+
+    // Preserve directories for migration
+    let engine_types = vec![StorageEngineType::Sled, StorageEngineType::RocksDB, StorageEngineType::TiKV, StorageEngineType::InMemory, StorageEngineType::Redis, StorageEngineType::PostgreSQL, StorageEngineType::MySQL];
+    let directories_to_preserve: Vec<PathBuf> = engine_types
+        .iter()
+        .filter(|&e| e != &to_engine)
+        .map(|e| PathBuf::from(format!("/opt/graphdb/storage_data/{}/{}", e.to_string().to_lowercase(), base_config.default_port)))
+        .filter(|p| p.exists())
+        .collect();
+    info!("Preserving directories for migration: {:?}", directories_to_preserve);
+    println!("===> PRESERVING DIRECTORIES FOR MIGRATION: {:?}", directories_to_preserve);
+
+    // Load engine-specific config for from_engine
+    println!("===> MIGRATE HANDLER - STEP 3: Loading engine-specific configuration for from_engine...");
+    let from_engine_specific_config = if from_engine == StorageEngineType::TiKV {
+        let tikv_config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_TIKV);
+        if tikv_config_path.exists() {
+            let content = std::fs::read_to_string(&tikv_config_path)
+                .map_err(|e| anyhow!("Failed to read TiKV config file: {}", e))?;
+            debug!("TiKV config content: {}", content);
+            match serde_yaml::from_str::<TiKVConfigWrapper>(&content) {
+                Ok(wrapper) => {
+                    let tikv_config = SelectedStorageConfig {
+                        storage_engine_type: StorageEngineType::TiKV,
+                        storage: StorageConfigInner {
+                            path: wrapper.storage.path,
+                            host: wrapper.storage.host,
+                            port: wrapper.storage.port,
+                            username: wrapper.storage.username,
+                            password: wrapper.storage.password,
+                            pd_endpoints: wrapper.storage.pd_endpoints,
+                            database: wrapper.storage.database,
+                            use_compression: true,
+                            cache_capacity: Some(1024*1024*1024),
+                            temporary: false,
+                            use_raft_for_scale: false,
+                        },
+                    };
+                    info!("Successfully parsed TiKV config: {:?}", tikv_config);
+                    selected_storage_config_to_hashmap(&tikv_config)
+                },
+                Err(e) => {
+                    error!("Failed to parse TiKV config at {:?}: {}. Content: {}", tikv_config_path, e, content);
+                    let mut map = HashMap::new();
+                    map.insert("storage_engine_type".to_string(), Value::String("tikv".to_string()));
+                    map.insert("path".to_string(), Value::String("/opt/graphdb/storage_data/tikv".to_string()));
+                    map.insert("host".to_string(), Value::String("127.0.0.1".to_string()));
+                    map.insert("port".to_string(), Value::Number(2380.into()));
+                    map.insert("username".to_string(), Value::String("tikv".to_string()));
+                    map.insert("password".to_string(), Value::String("tikv".to_string()));
+                    map.insert("pd_endpoints".to_string(), Value::String("127.0.0.1:2379".to_string()));
+                    map
+                }
+            }
+        } else {
+            warn!("TiKV config file not found at {:?}, using default TiKV configuration", tikv_config_path);
+            let mut map = HashMap::new();
+            map.insert("storage_engine_type".to_string(), Value::String("tikv".to_string()));
+            map.insert("path".to_string(), Value::String("/opt/graphdb/storage_data/tikv".to_string()));
+            map.insert("host".to_string(), Value::String("127.0.0.1".to_string()));
+            map.insert("port".to_string(), Value::Number(2380.into()));
+            map.insert("username".to_string(), Value::String("tikv".to_string()));
+            map.insert("password".to_string(), Value::String("tikv".to_string()));
+            map.insert("pd_endpoints".to_string(), Value::String("127.0.0.1:2379".to_string()));
+            map
+        }
+    } else {
+        let config = load_engine_specific_config(from_engine.clone(), config_root_directory)
+            .map_err(|e| anyhow!("Failed to load engine-specific config for from_engine: {}", e))?;
+        let mut map = selected_storage_config_to_hashmap(&config);
+        map.insert("storage_engine_type".to_string(), Value::String(from_engine.to_string().to_lowercase()));
+        map
+    };
+    println!("===> From engine-specific configuration loaded successfully.");
+
+    // Load engine-specific config for to_engine
+    println!("===> MIGRATE HANDLER - STEP 4: Loading engine-specific configuration for to_engine...");
+    let to_engine_specific_config = if to_engine == StorageEngineType::TiKV {
+        let tikv_config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_TIKV);
+        if tikv_config_path.exists() {
+            let content = std::fs::read_to_string(&tikv_config_path)
+                .map_err(|e| anyhow!("Failed to read TiKV config file: {}", e))?;
+            debug!("TiKV config content: {}", content);
+            match serde_yaml::from_str::<TiKVConfigWrapper>(&content) {
+                Ok(wrapper) => {
+                    let tikv_config = SelectedStorageConfig {
+                        storage_engine_type: StorageEngineType::TiKV,
+                        storage: StorageConfigInner {
+                            path: wrapper.storage.path,
+                            host: wrapper.storage.host,
+                            port: wrapper.storage.port,
+                            username: wrapper.storage.username,
+                            password: wrapper.storage.password,
+                            pd_endpoints: wrapper.storage.pd_endpoints,
+                            database: wrapper.storage.database,
+                            use_compression: true,
+                            cache_capacity: Some(1024*1024*1024),
+                            temporary: false,
+                            use_raft_for_scale: false,
+                        },
+                    };
+                    info!("Successfully parsed TiKV config: {:?}", tikv_config);
+                    selected_storage_config_to_hashmap(&tikv_config)
+                },
+                Err(e) => {
+                    error!("Failed to parse TiKV config at {:?}: {}. Content: {}", tikv_config_path, e, content);
+                    let mut map = HashMap::new();
+                    map.insert("storage_engine_type".to_string(), Value::String("tikv".to_string()));
+                    map.insert("path".to_string(), Value::String("/opt/graphdb/storage_data/tikv".to_string()));
+                    map.insert("host".to_string(), Value::String("127.0.0.1".to_string()));
+                    map.insert("port".to_string(), Value::Number(2380.into()));
+                    map.insert("username".to_string(), Value::String("tikv".to_string()));
+                    map.insert("password".to_string(), Value::String("tikv".to_string()));
+                    map.insert("pd_endpoints".to_string(), Value::String("127.0.0.1:2379".to_string()));
+                    map
+                }
+            }
+        } else {
+            warn!("TiKV config file not found at {:?}, using default TiKV configuration", tikv_config_path);
+            let mut map = HashMap::new();
+            map.insert("storage_engine_type".to_string(), Value::String("tikv".to_string()));
+            map.insert("path".to_string(), Value::String("/opt/graphdb/storage_data/tikv".to_string()));
+            map.insert("host".to_string(), Value::String("127.0.0.1".to_string()));
+            map.insert("port".to_string(), Value::Number(2380.into()));
+            map.insert("username".to_string(), Value::String("tikv".to_string()));
+            map.insert("password".to_string(), Value::String("tikv".to_string()));
+            map.insert("pd_endpoints".to_string(), Value::String("127.0.0.1:2379".to_string()));
+            map
+        }
+    } else {
+        let config = load_engine_specific_config(to_engine.clone(), config_root_directory)
+            .map_err(|e| anyhow!("Failed to load engine-specific config for to_engine: {}", e))?;
+        let mut map = selected_storage_config_to_hashmap(&config);
+        map.insert("storage_engine_type".to_string(), Value::String(to_engine.to_string().to_lowercase()));
+        map
+    };
+    println!("===> To engine-specific configuration loaded successfully.");
+
+    // Extract port for from_engine
+    let from_port = from_engine_specific_config.get("port")
+        .and_then(|v| match v {
+            Value::Number(n) => n.as_u64().map(|p| p as u16),
+            Value::String(s) => s.parse::<u16>().ok(),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            if from_engine == StorageEngineType::TiKV {
+                2380 // TiKV default port
+            } else if from_engine == StorageEngineType::RocksDB {
+                base_config.default_port // Use YAML's default_port (8051) for RocksDB
+            } else {
+                8052 // Default for Sled and other non-TiKV engines
+            }
+        });
+
+    // Validate from_port
+    if from_engine != StorageEngineType::TiKV {
+        if let Some(pd_port) = tikv_pd_port {
+            if from_port == pd_port {
+                return Err(anyhow!("Selected from_port {} is reserved for TiKV PD and cannot be used for engine {:?}", from_port, from_engine));
+            }
+        }
+    }
+
+    // Extract port for to_engine
+    let to_port = to_engine_specific_config.get("port")
+        .and_then(|v| match v {
+            Value::Number(n) => n.as_u64().map(|p| p as u16),
+            Value::String(s) => s.parse::<u16>().ok(),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            if to_engine == StorageEngineType::TiKV {
+                2380 // TiKV default port
+            } else if to_engine == StorageEngineType::RocksDB {
+                base_config.default_port // Use YAML's default_port (8051) for RocksDB
+            } else {
+                8052 // Default for Sled and other non-TiKV engines
+            }
+        });
+
+    // Validate to_port
+    if to_engine != StorageEngineType::TiKV {
+        if let Some(pd_port) = tikv_pd_port {
+            if to_port == pd_port {
+                return Err(anyhow!("Selected to_port {} is reserved for TiKV PD and cannot be used for engine {:?}", to_port, to_engine));
+            }
+        }
+    }
+
+    // Construct from_config
+    let from_path = from_engine_specific_config.get("path")
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(format!("/opt/graphdb/storage_data/{}/{}", from_engine.to_string().to_lowercase(), from_port))
+        });
+    let from_host = from_engine_specific_config.get("host")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let from_username = from_engine_specific_config.get("username")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| if from_engine == StorageEngineType::TiKV { "tikv".to_string() } else { "".to_string() });
+    let from_password = from_engine_specific_config.get("password")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| if from_engine == StorageEngineType::TiKV { "tikv".to_string() } else { "".to_string() });
+    let from_pd_endpoints = from_engine_specific_config.get("pd_endpoints")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| if from_engine == StorageEngineType::TiKV { "127.0.0.1:2379".to_string() } else { "".to_string() });
+
+    let from_engine_config = SelectedStorageConfig {
+        storage_engine_type: from_engine.clone(),
+        storage: StorageConfigInner {
+            path: Some(from_path),
+            host: Some(from_host),
+            port: Some(from_port),
+            database: from_engine_specific_config.get("database").and_then(|v| v.as_str()).map(String::from),
+            username: Some(from_username),
+            password: Some(from_password),
+            pd_endpoints: if from_engine == StorageEngineType::TiKV { Some(from_pd_endpoints) } else { None },
+            cache_capacity: Some(1024*1024*1024),
+            use_compression: true,
+            temporary: false,
+            use_raft_for_scale: false,
+        },
+    };
+
+    let mut from_config = base_config.clone();
+    from_config.storage_engine_type = from_engine.clone();
+    from_config.default_port = from_port;
+    from_config.engine_specific_config = Some(from_engine_config.clone());
+
+    // Construct to_config
+    let to_path = to_engine_specific_config.get("path")
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(format!("/opt/graphdb/storage_data/{}/{}", to_engine.to_string().to_lowercase(), to_port))
+        });
+    let to_host = to_engine_specific_config.get("host")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let to_username = to_engine_specific_config.get("username")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| if to_engine == StorageEngineType::TiKV { "tikv".to_string() } else { "".to_string() });
+    let to_password = to_engine_specific_config.get("password")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| if to_engine == StorageEngineType::TiKV { "tikv".to_string() } else { "".to_string() });
+    let to_pd_endpoints = to_engine_specific_config.get("pd_endpoints")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| if to_engine == StorageEngineType::TiKV { "127.0.0.1:2379".to_string() } else { "".to_string() });
+
+    let to_engine_config = SelectedStorageConfig {
+        storage_engine_type: to_engine.clone(),
+        storage: StorageConfigInner {
+            path: Some(to_path),
+            host: Some(to_host),
+            port: Some(to_port),
+            database: to_engine_specific_config.get("database").and_then(|v| v.as_str()).map(String::from),
+            username: Some(to_username),
+            password: Some(to_password),
+            pd_endpoints: if to_engine == StorageEngineType::TiKV { Some(to_pd_endpoints) } else { None },
+            cache_capacity: Some(1024*1024*1024),
+            use_compression: true,
+            temporary: false,
+            use_raft_for_scale: false,
+        },
+    };
+
+    let mut to_config = base_config.clone();
+    to_config.storage_engine_type = to_engine.clone();
+    to_config.default_port = to_port;
+    to_config.engine_specific_config = Some(to_engine_config.clone());
+
+    // Initialize or update StorageEngineManager
+    println!("===> MIGRATE HANDLER - STEP 5: Initializing StorageEngineManager...");
+    let async_manager = if GLOBAL_STORAGE_ENGINE_MANAGER.get().is_none() {
+        debug!("StorageEngineManager not initialized, creating new instance");
+        println!("===> Creating new instance of StorageEngineManager...");
+        let manager = StorageEngineManager::new(
+            to_engine.clone(),
+            &absolute_config_path,
+            false, // Migration does not persist by default
+            Some(to_port),
+        )
+        .await
+        .context("Failed to initialize StorageEngineManager")?;
+        let async_manager = AsyncStorageEngineManager::from_manager(manager);
+        GLOBAL_STORAGE_ENGINE_MANAGER
+            .set(Arc::new(async_manager))
+            .context("Failed to set GLOBAL_STORAGE_ENGINE_MANAGER")?;
+        println!("===> StorageEngineManager initialized successfully.");
+        // Clone the Arc from the global, don't take a reference
+        GLOBAL_STORAGE_ENGINE_MANAGER
+            .get()
+            .ok_or_else(|| GraphError::ConfigurationError("StorageEngineManager not accessible".to_string()))?
+            .clone()  // <-- THIS IS THE KEY FIX: Clone the Arc itself
+    } else {
+        println!("===> Using existing StorageEngineManager...");
+        // Clone the Arc from the global, don't take a reference
+        GLOBAL_STORAGE_ENGINE_MANAGER
+            .get()
+            .ok_or_else(|| GraphError::ConfigurationError("StorageEngineManager not accessible".to_string()))?
+            .clone()  // <-- THIS IS THE KEY FIX: Clone the Arc itself
+    };
+
+    println!("===> MIGRATE HANDLER - STEP 6: Performing migration...");
+    // Now async_manager is Arc<AsyncStorageEngineManager> (owned), not &Arc<...> (reference)
+    // So we can call methods that take &self directly
+    async_manager
+        .migrate_storage(from_config.clone(), to_config.clone())
+        .await
+        .context("Failed to migrate storage engine")?;
+
+    // Stop all running storage daemons
+    println!("===> MIGRATE HANDLER - STEP 7: Stopping existing storage daemons...");
+    let mut successfully_stopped_ports: Vec<u16> = Vec::new();
+    let mut failed_to_stop_ports: Vec<u16> = Vec::new();
+
+    for daemon in all_existing_storage_daemons {
+        let current_engine_str = daemon.engine_type.as_deref().unwrap_or("unknown");
+        let expected_engine_str = daemon_api_storage_engine_type_to_string(&to_engine);
+
+        if current_engine_str == expected_engine_str && daemon.port == to_port {
+            info!("Existing daemon on port {} already uses engine type {}, reusing it.", daemon.port, expected_engine_str);
+            successfully_stopped_ports.push(daemon.port);
+            println!("Skipping shutdown of Storage Daemon on port {} (already using {}).", daemon.port, expected_engine_str);
+            continue;
+        }
+
+        if let Some(pd_port) = tikv_pd_port {
+            if daemon.port == pd_port && current_engine_str == TIKV_DAEMON_ENGINE_TYPE_NAME {
+                info!("Skipping shutdown of TiKV PD daemon on port {}. Considered handled.", daemon.port);
+                successfully_stopped_ports.push(daemon.port);
+                continue;
+            }
+        }
+
+        let socket_path = format!("/opt/graphdb/graphdb-{}.ipc", daemon.port);
+        if tokio::fs::metadata(&socket_path).await.is_ok() {
+            info!("Removing stale ZeroMQ socket file: {}", socket_path);
+            tokio_fs::remove_file(&socket_path)
+                .await
+                .context(format!("Failed to remove stale ZeroMQ socket file {}", socket_path))?;
+        }
+
+        let mut is_daemon_stopped = false;
+        let pid_file_path = PathBuf::from(STORAGE_PID_FILE_DIR).join(format!("{}{}.pid", STORAGE_PID_FILE_NAME_PREFIX, daemon.port));
+        let mut last_pid: Option<u32> = None;
+        if tokio::fs::File::open(&pid_file_path).await.is_ok() {
+            if let Ok(mut file) = tokio::fs::File::open(&pid_file_path).await {
+                let mut contents = String::new();
+                if file.read_to_string(&mut contents).await.is_ok() {
+                    if let Ok(pid) = contents.trim().parse::<u32>() {
+                        last_pid = Some(pid);
+                    }
+                }
+            }
+        }
+
+        for attempt in 0..MAX_SHUTDOWN_RETRIES {
+            debug!("Attempting to stop storage daemon on port {} (Attempt {} of {})", daemon.port, attempt + 1, MAX_SHUTDOWN_RETRIES);
+
+            stop_storage_interactive(
+                Some(daemon.port),
+                Arc::new(TokioMutex::new(None)),
+                Arc::new(TokioMutex::new(None)),
+                Arc::new(TokioMutex::new(None)),
+            ).await.ok();
+
+            if let Some(pid) = last_pid {
+                let pid_nix = nix::unistd::Pid::from_raw(pid as i32);
+                if let Err(e) = kill(pid_nix, Signal::SIGTERM) {
+                    warn!("Failed to send TERM signal to PID {}: {}", pid, e);
+                } else {
+                    info!("Sent SIGTERM to PID {} for Storage Daemon on port {}.", pid, daemon.port);
+                    println!("Sent SIGTERM to PID {} for Storage Daemon on port {}.", pid, daemon.port);
+                }
+            }
+
+            if !is_storage_daemon_running(daemon.port).await {
+                info!("Storage daemon on port {} is confirmed stopped.", daemon.port);
+                is_daemon_stopped = true;
+                if pid_file_path.exists() {
+                    tokio_fs::remove_file(&pid_file_path).await.ok();
+                }
+                break;
+            }
+
+            info!("Storage daemon still running on port {}, retrying stop in {}ms...", daemon.port, SHUTDOWN_RETRY_DELAY_MS);
+            tokio::time::sleep(Duration::from_millis(SHUTDOWN_RETRY_DELAY_MS)).await;
+        }
+
+        if is_daemon_stopped {
+            successfully_stopped_ports.push(daemon.port);
+            println!("===> Daemon on port {} stopped successfully.", daemon.port);
+        } else {
+            error!("Failed to stop existing storage daemon on port {} after {} attempts.", daemon.port, MAX_SHUTDOWN_RETRIES);
+            failed_to_stop_ports.push(daemon.port);
+        }
+    }
+
+    if failed_to_stop_ports.is_empty() {
+        println!("===> All necessary daemons stopped successfully.");
+    } else {
+        warn!("Failed to stop daemons on ports: {:?}", failed_to_stop_ports);
+        println!("===> Failed to stop {} storage daemons.", failed_to_stop_ports.len());
+        for port in &failed_to_stop_ports {
+            println!("     Port {}: Failed to stop daemon.", port);
+        }
+    }
+
+    // Restart storage daemons with to_engine
+    println!("===> MIGRATE HANDLER - STEP 8: Restarting storage daemons...");
+    let mut daemon_ports_to_restart = successfully_stopped_ports.clone();
+    if !daemon_ports_to_restart.contains(&to_port) {
+        daemon_ports_to_restart.push(to_port);
+    }
+    if let Some(pd_port) = tikv_pd_port {
+        daemon_ports_to_restart.retain(|&p| p != pd_port);
+        info!("Excluding TiKV PD port {} from daemon restart list", pd_port);
+    }
+    daemon_ports_to_restart.sort();
+    daemon_ports_to_restart.dedup();
+
+    let mut successful_restarts: Vec<u16> = Vec::new();
+    let mut failed_restarts: Vec<(u16, String)> = Vec::new();
+
+    if daemon_ports_to_restart.is_empty() {
+        info!("No storage daemons to restart, starting single daemon on port {}", to_port);
+        println!("===> No existing storage cluster found, starting single daemon...");
+
+        let mut port_specific_config = to_config.clone();
+        if let Some(ref mut engine_config) = port_specific_config.engine_specific_config {
+            engine_config.storage.port = Some(to_port);
+            engine_config.storage.path = Some(PathBuf::from(format!("/opt/graphdb/storage_data/{}/{}", to_engine.to_string().to_lowercase(), to_port)));
+        }
+
+        let socket_path = format!("/opt/graphdb/graphdb-{}.ipc", to_port);
+        if tokio::fs::metadata(&socket_path).await.is_ok() {
+            info!("Removing stale ZeroMQ socket file: {}", socket_path);
+            tokio_fs::remove_file(&socket_path)
+                .await
+                .context(format!("Failed to remove stale ZeroMQ socket file {}", socket_path))?;
+        }
+
+        start_storage_interactive(
+            Some(to_port),
+            Some(absolute_config_path.clone()),
+            Some(port_specific_config),
+            Some("skip_manager_set".to_string()),
+            Arc::new(TokioMutex::new(None)),
+            Arc::new(TokioMutex::new(None)),
+            Arc::new(TokioMutex::new(None)),
+        ).await.context("Failed to start storage daemon")?;
+
+        successful_restarts.push(to_port);
+        println!("===> ✓ Storage daemon started successfully with {} engine on port {}", 
+                 daemon_api_storage_engine_type_to_string(&to_engine), to_port);
+    } else {
+        info!("Restarting {} storage daemons on ports: {:?}", daemon_ports_to_restart.len(), daemon_ports_to_restart);
+        println!("===> Restarting {} storage daemons with {} engine...", daemon_ports_to_restart.len(), 
+                 daemon_api_storage_engine_type_to_string(&to_engine));
+
+        for (index, port) in daemon_ports_to_restart.iter().enumerate() {
+            println!("===> Restarting storage daemon {} of {} on port {}...", 
+                     index + 1, daemon_ports_to_restart.len(), port);
+
+            let mut port_specific_config = to_config.clone();
+            if let Some(ref mut engine_config) = port_specific_config.engine_specific_config {
+                engine_config.storage.port = Some(*port);
+                engine_config.storage.path = Some(PathBuf::from(format!("/opt/graphdb/storage_data/{}/{}", to_engine.to_string().to_lowercase(), port)));
+            }
+
+            let socket_path = format!("/opt/graphdb/graphdb-{}.ipc", port);
+            if tokio::fs::metadata(&socket_path).await.is_ok() {
+                info!("Removing stale ZeroMQ socket file: {}", socket_path);
+                tokio_fs::remove_file(&socket_path)
+                    .await
+                    .context(format!("Failed to remove stale ZeroMQ socket file {}", socket_path))?;
+            }
+
+            match start_storage_interactive(
+                Some(*port),
+                Some(absolute_config_path.clone()),
+                Some(port_specific_config),
+                Some("skip_manager_set".to_string()),
+                Arc::new(TokioMutex::new(None)),
+                Arc::new(TokioMutex::new(None)),
+                Arc::new(TokioMutex::new(None)),
+            ).await {
+                Ok(()) => {
+                    successful_restarts.push(*port);
+                    println!("===> ✓ Storage daemon on port {} restarted successfully", port);
+                },
+                Err(e) => {
+                    failed_restarts.push((*port, e.to_string()));
+                    error!("Failed to restart storage daemon on port {}: {}", port, e);
+                    println!("===> ✗ Failed to restart storage daemon on port {}: {}", port, e);
+                }
+            }
+
+            if index < daemon_ports_to_restart.len() - 1 {
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+            }
+        }
+
+        if !successful_restarts.is_empty() {
+            info!("Successfully restarted {} storage daemons on ports: {:?}", 
+                 successful_restarts.len(), successful_restarts);
+            println!("===> ✓ Successfully restarted {} storage daemons with {} engine", 
+                     successful_restarts.len(), daemon_api_storage_engine_type_to_string(&to_engine));
+        }
+
+        if !failed_restarts.is_empty() {
+            warn!("Failed to restart {} storage daemons: {:?}", failed_restarts.len(), failed_restarts);
+            println!("===> ✗ Failed to restart {} storage daemons", failed_restarts.len());
+            for (port, error) in &failed_restarts {
+                println!("     Port {}: {}", port, error);
+            }
+
+            if successful_restarts.is_empty() {
+                return Err(anyhow!("Failed to restart all storage daemons with new engine"));
+            } else {
+                warn!("Partial success: {} succeeded, {} failed", successful_restarts.len(), failed_restarts.len());
+            }
+        }
+    }
+
+    // Verify cluster
+    println!("===> MIGRATE HANDLER - STEP 9: Verifying storage daemon cluster status...");
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+
+    let current_storage_daemons = GLOBAL_DAEMON_REGISTRY
+        .get_all_daemon_metadata()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|daemon| daemon.service_type == "storage")
+        .collect::<Vec<DaemonMetadata>>();
+
+    let running_ports: Vec<u16> = current_storage_daemons.iter().map(|d| d.port).collect();
+    let expected_engine_str = daemon_api_storage_engine_type_to_string(&to_engine);
+
+    info!("Storage cluster verification: {} daemons running on ports {:?} with engine type {}", 
+          current_storage_daemons.len(), running_ports, expected_engine_str);
+
+    let correct_engine_count = current_storage_daemons
+        .iter()
+        .filter(|daemon| daemon.engine_type.as_deref() == Some(&expected_engine_str))
+        .count();
+
+    if correct_engine_count == current_storage_daemons.len() {
+        println!("===> ✓ Storage cluster verified: {} daemons running with {} engine on ports {:?}", 
+                 current_storage_daemons.len(), expected_engine_str, running_ports);
+    } else {
+        warn!("Engine type mismatch: {}/{} daemons have correct engine type", 
+              correct_engine_count, current_storage_daemons.len());
+        println!("===> ⚠ Warning: Some daemons may not have correct engine type");
+    }
+
+    info!("Successfully migrated from engine {:?} to {:?}", from_engine, to_engine);
+    println!("Migrated to storage engine {} from {}", daemon_api_storage_engine_type_to_string(&to_engine), daemon_api_storage_engine_type_to_string(&from_engine));
+    info!("=== Completed handle_migrate_command from engine: {:?} to engine: {:?}. Elapsed: {}ms ===", from_engine, to_engine, start_time.elapsed().as_millis());
+
+    Ok(())
+}
 
 /// Handles the 'use storage' command for managing the storage daemon.
 pub async fn handle_use_storage_command(
@@ -1964,7 +2631,7 @@ pub async fn handle_use_storage_command(
             map
         }
     } else {
-        let config = lib::config::load_engine_specific_config(engine.clone(), config_root_directory)
+        let config = load_engine_specific_config(engine.clone(), config_root_directory)
             .map_err(|e| anyhow!("Failed to load engine-specific config: {}", e))?;
         let mut map = selected_storage_config_to_hashmap(&config);
         map.insert("storage_engine_type".to_string(), Value::String(engine.to_string().to_lowercase()));
@@ -2513,6 +3180,23 @@ pub async fn handle_show_storage_command_interactive() -> Result<()> {
         .ok_or_else(|| anyhow!("StorageEngineManager not initialized"))?;
     let engine_type = manager.current_engine_type().await;
     println!("Current Storage Engine (Interactive Mode): {}", daemon_api_storage_engine_type_to_string(&engine_type));
+    Ok(())
+}
+
+/// Handles the interactive 'migrate' command.
+pub async fn handle_migrate_interactive(
+    from_engine: StorageEngineType,
+    to_engine: StorageEngineType,
+    storage_daemon_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
+    storage_daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
+    storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
+) -> Result<()> {
+    handle_migrate_command(from_engine, to_engine).await?;
+    reload_storage_interactive(
+        storage_daemon_shutdown_tx_opt,
+        storage_daemon_handle,
+        storage_daemon_port_arc,
+    ).await?;
     Ok(())
 }
 
