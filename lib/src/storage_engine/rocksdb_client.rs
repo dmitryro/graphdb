@@ -4,12 +4,14 @@ use async_trait::async_trait;
 use std::path::{PathBuf, Path};
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
-use tokio::task::spawn_blocking; // FIX: Added missing import
+use tokio::task::{ self, spawn_blocking }; // FIX: Added missing import
 use rocksdb::{DB, ColumnFamily, Options, DBCompressionType, WriteBatch, WriteOptions};
 use tokio::fs as tokio_fs;
 use models::{Vertex, Edge, Identifier, identifiers::SerializableUuid};
 use models::errors::{GraphError, GraphResult};
 pub use crate::config::{QueryResult, RocksDBClient, RaftCommand, RocksDBClientMode};
+use crate::daemon::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
+use crate::daemon::daemon_management::{ is_pid_running };
 use crate::storage_engine::storage_utils::{serialize_vertex, deserialize_vertex, serialize_edge, deserialize_edge, create_edge_key};
 use crate::storage_engine::{GraphStorageEngine, StorageEngine};
 use crate::config::{QueryPlan};
@@ -19,7 +21,7 @@ use serde_json::{json, Value};
 use tokio::time::Duration as TokioDuration;
 use base64::engine::general_purpose;
 use base64::Engine;
-use zmq::{Context as ZmqContext, Socket as ZmqSocket, Message};
+use zmq::{Context as ZmqContext, Socket as ZmqSocket, Message, REQ, REP};
 
 // Wrapper for ZmqSocket to implement Debug
 pub struct ZmqSocketWrapper(ZmqSocket);
@@ -345,22 +347,95 @@ impl RocksDBClient {
         }, socket_wrapper))
     }
 
-    /// Forcefully unlocks a RocksDB database by removing the LOCK file at the specified path.
     pub async fn force_unlock(db_path: &Path) -> GraphResult<()> {
         let lock_path = db_path.join("LOCK");
         if lock_path.exists() {
-            info!("Removing RocksDB lock file at {:?}", lock_path);
-            println!("===> REMOVING ROCKSDB LOCK FILE AT {:?}", lock_path);
-            tokio_fs::remove_file(&lock_path).await
-                .map_err(|e| {
-                    error!("Failed to remove RocksDB lock file at {:?}: {}", lock_path, e);
-                    println!("===> ERROR: FAILED TO REMOVE ROCKSDB LOCK FILE AT {:?}: {}", lock_path, e);
-                    GraphError::StorageError(format!("Failed to remove RocksDB lock file at {:?}", lock_path))
-                })?;
-            info!("Successfully removed RocksDB lock file at {:?}", lock_path);
-            println!("===> SUCCESSFULLY REMOVED ROCKSDB LOCK FILE AT {:?}", lock_path);
+            let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
+            let current_pid = std::process::id() as u32;
+            let metadatas = daemon_registry.get_all_daemon_metadata().await?;
+            let metadata = metadatas
+                .into_iter()
+                .find(|m| m.data_dir.as_ref() == Some(&db_path.to_path_buf()));
+
+            match metadata {
+                Some(metadata) if metadata.pid == current_pid => {
+                    warn!("Lock file at {:?} held by current process (PID {}). Skipping unlock.", lock_path, current_pid);
+                    println!("===> WARNING: LOCK FILE AT {:?} HELD BY CURRENT PROCESS (PID {}). SKIPPING UNLOCK.", lock_path, current_pid);
+                    return Ok(());
+                }
+                Some(metadata) if is_pid_running(metadata.pid).await => {
+                    warn!("Lock file at {:?} held by active process (PID {}). Skipping unlock.", lock_path, metadata.pid);
+                    println!("===> WARNING: LOCK FILE AT {:?} HELD BY ACTIVE PROCESS (PID {}). SKIPPING UNLOCK.", lock_path, metadata.pid);
+                    return Ok(());
+                }
+                _ => {
+                    info!("Removing stale lock file at {:?}", lock_path);
+                    println!("===> REMOVING STALE LOCK FILE AT {:?}", lock_path);
+                    tokio::fs::remove_file(&lock_path).await.map_err(|e| {
+                        error!("Failed to remove lock file at {:?}: {}", lock_path, e);
+                        println!("===> ERROR: FAILED TO REMOVE LOCK FILE AT {:?}: {}", lock_path, e);
+                        GraphError::StorageError(format!("Failed to remove lock file at {:?}: {}", lock_path, e))
+                    })?;
+                }
+            }
         }
+        info!("No lock file found at {:?}", lock_path);
+        println!("===> NO LOCK FILE FOUND AT {:?}", lock_path);
         Ok(())
+    }
+
+    pub async fn is_zmq_reachable(port: u16) -> GraphResult<bool> {
+        let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", port);
+        task::spawn_blocking(move || {
+            let context = ZmqContext::new();
+            let socket = match context.socket(REQ) {
+                Ok(s) => s,
+                Err(e) => {
+                    debug!("ZMQ ping failed: Failed to create ZMQ socket: {}", e);
+                    return Ok(false);
+                }
+            };
+
+            let _ = socket.set_rcvtimeo(200);
+            let _ = socket.set_sndtimeo(200);
+
+            if let Err(e) = socket.connect(&endpoint) {
+                debug!("ZMQ ping failed: Failed to connect to {}: {}", endpoint, e);
+                return Ok(false);
+            }
+
+            let ping_request = json!({ "command": "ping" }).to_string();
+            if let Err(e) = socket.send(&ping_request, 0) {
+                debug!("ZMQ ping failed: Failed to send request to {}: {}", endpoint, e);
+                return Ok(false);
+            }
+
+            let mut msg = zmq::Message::new();
+            match socket.recv(&mut msg, 0) {
+                Ok(_) => {
+                    let response_str = msg.as_str().unwrap_or("{}");
+                    match serde_json::from_str::<Value>(response_str) {
+                        Ok(response) => {
+                            let is_success = response.get("status").and_then(|s| s.as_str()) == Some("success");
+                            if !is_success {
+                                debug!("ZMQ ping failed: Response status not 'success' from {}", endpoint);
+                            }
+                            Ok(is_success)
+                        }
+                        Err(e) => {
+                            debug!("ZMQ ping failed: Failed to parse JSON response from {}: {}", endpoint, e);
+                            Ok(false)
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!("ZMQ ping failed: Error receiving response from {}: {}", endpoint, e);
+                    Ok(false)
+                }
+            }
+        })
+        .await
+        .map_err(|e| GraphError::ZmqError(format!("ZMQ blocking task failed: {:?}", e)))?
     }
 
     pub async fn apply_raft_entry(&self, data: Vec<u8>) -> GraphResult<()> {

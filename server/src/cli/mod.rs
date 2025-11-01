@@ -111,6 +111,8 @@ pub use handlers_storage::{
     use_storage_engine,
     handle_save_storage,
     reload_storage_interactive,
+    handle_migrate_command,
+    handle_migrate_interactive,
     handle_use_storage_interactive,
     handle_use_storage_command,
     handle_show_storage_command,

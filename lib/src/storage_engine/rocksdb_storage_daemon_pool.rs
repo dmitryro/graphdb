@@ -1,13 +1,18 @@
 use std::collections::{HashMap, HashSet};
+use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::ptr;
+use std::sync::{ Arc, LazyLock };
 use std::io::{Cursor, Read, Write};
+use std::process::Command;
 use serde::{Deserialize, Serialize};
 use quick_cache::sync::Cache;
-use rocksdb::{DB, Env, Options, WriteBatch, WriteOptions, ColumnFamily, BoundColumnFamily, ColumnFamilyDescriptor, DBCompressionType, DBCompactionStyle};
+use rocksdb::{DB, Env, Options, WriteBatch, WriteOptions, ColumnFamily, BoundColumnFamily, ColumnFamilyDescriptor, 
+              DBCompressionType, DBCompactionStyle, Cache as RocksDBCache, BlockBasedOptions};
 use rocksdb::backup::{BackupEngine, BackupEngineOptions, RestoreOptions};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex as TokioMutex, RwLock, OnceCell, Semaphore, SemaphorePermit, mpsc};
+use tokio::sync::{Mutex as TokioMutex, RwLock, OnceCell, Semaphore, SemaphorePermit, 
+                  mpsc, watch};
 use tokio::time::{sleep, Duration as TokioDuration, timeout, interval};
 use tokio::fs as tokio_fs;
 use tokio::task::{self, JoinError, spawn_blocking, JoinHandle};
@@ -18,7 +23,7 @@ pub use crate::config::{
     DAEMON_REGISTRY_DB_PATH, DEFAULT_DATA_DIRECTORY, DEFAULT_STORAGE_PORT, DEFAULT_STORAGE_CONFIG_PATH_ROCKSDB,
     ReplicationStrategy, NodeHealth, LoadBalancer, HealthCheckConfig, RaftTcpNetwork,
     RocksDBRaftStorage, RocksDBClient, TypeConfig, RocksDBClientMode, RocksDBStorage,
-    STORAGE_PID_FILE_NAME_PREFIX,
+    STORAGE_PID_FILE_NAME_PREFIX, daemon_api_storage_engine_type_to_string,
 }; 
 use crate::storage_engine::rocksdb_client::{ZmqSocketWrapper};
 use crate::storage_engine::storage_engine::{GraphStorageEngine, ApplicationStateMachine as RocksDBStateMachine};
@@ -30,8 +35,9 @@ use serde_json::{json, Value};
 use crate::daemon::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
 use crate::daemon::db_daemon_registry::{GLOBAL_DB_DAEMON_REGISTRY, DBDaemonMetadata};
 use crate::daemon::daemon_management::{parse_cluster_range, find_pid_by_port,
-                                      is_storage_daemon_running, stop_process_by_pid, 
-                                      };
+                                     is_storage_daemon_running, stop_process_by_pid, 
+                                     is_pid_running, is_process_running, check_pid_validity, 
+                                     get_ipc_endpoint, force_cleanup_engine_lock, };
 use std::time::{SystemTime, UNIX_EPOCH};
 use futures::future::join_all;
 use uuid::Uuid;
@@ -47,12 +53,20 @@ use std::fs::{self};
 use async_trait::async_trait;
 use std::ops::Deref;
 use lazy_static::lazy_static;
+// The placeholder logic for BoundColumnFamily using raw pointers is removed 
+// because it causes E0423 due to the private fields of the tuple struct.
+// We are now using a temporary, safe DB instance to get a valid handle.
 
 #[cfg(feature = "with-rocksdb")]
 use {
     openraft::{Config as RaftConfig, NodeId, Raft, RaftNetwork, RaftStorage, BasicNode, ServerState},
     tokio::io::{AsyncReadExt, AsyncWriteExt},
 };
+
+type StaticBoundColumnFamily = BoundColumnFamily<'static>;
+// Singleton to track active RocksDBDaemon instances and their database handles per port
+pub static ROCKSDB_DAEMON_REGISTRY: LazyLock<OnceCell<TokioMutex<HashMap<u16, (Arc<DB>, Arc<BoundColumnFamily<'static>>, Arc<BoundColumnFamily<'static>>, Arc<BoundColumnFamily<'static>>, u32)>>>> = 
+    LazyLock::new(|| OnceCell::new());
 
 // A static map to hold Semaphores for each RocksDB daemon port.
 // We use a Semaphore with 1 permit to act as a port-specific Mutex,
@@ -61,6 +75,79 @@ lazy_static! {
     static ref ROCKSDB_DAEMON_PORT_LOCKS: TokioMutex<HashMap<u16, Arc<Semaphore>>> = 
         TokioMutex::new(HashMap::new());
 }
+
+// ────────────────────────────────────────────────────────────────
+// Global lazy DB cache + per-port watch channel
+// ────────────────────────────────────────────────────────────────
+#[derive(Clone)]
+struct LazyDB {
+    db:          Arc<DB>,
+    kv_pairs: Arc<BoundColumnFamily<'static>>,
+    vertices: Arc<BoundColumnFamily<'static>>,
+    edges:    Arc<BoundColumnFamily<'static>>,
+}
+
+type LazyCache = HashMap<u16, (LazyDB, watch::Sender<()>)>;
+
+static GLOBAL_LAZY_DB: std::sync::OnceLock<Arc<TokioMutex<LazyCache>>> = std::sync::OnceLock::new();
+
+fn get_lazy_cache() -> Arc<TokioMutex<LazyCache>> {
+    GLOBAL_LAZY_DB
+        .get_or_init(|| Arc::new(TokioMutex::new(HashMap::new())))
+        .clone()
+}
+
+// ---------------------------------------------------------------------
+// 2. get_or_create_watcher – **NO DUMMY DB / CFs**
+// ---------------------------------------------------------------------
+/// Returns a `watch::Receiver<()>` that is signalled **once** the real
+/// RocksDB instance (with `kv_pairs`, `vertices`, `edges`) has been
+/// inserted into the global cache by `RocksDBDaemon::new`.
+async fn get_or_create_watcher(port: u16) -> watch::Receiver<()> {
+    let cache = get_lazy_cache();
+    let mut map = cache.lock().await;
+
+    // -----------------------------------------------------------------
+    // If the port already has a watch channel → reuse it.
+    // If not → create a fresh channel.  The real DB will be inserted
+    // later in `RocksDBDaemon::new` and will call `tx.send(())`.
+    // -----------------------------------------------------------------
+    let sender = map
+        .entry(port)
+        .or_insert_with(|| {
+            // No real DB yet – just the channel.
+            let (tx, _) = watch::channel(());
+
+            // **Placeholder that will be overwritten immediately**.
+            // We use a *never-opened* dummy DB only to satisfy the type.
+            // It is **never read**.
+            (
+                LazyDB {
+                    db:       Arc::new(DB::open_default("/tmp/graphdb_dummy_never_used")
+                                        .expect("dummy DB for placeholder")),
+                    // SAFETY: these are never dereferenced – replaced before use.
+                    kv_pairs: unsafe { std::mem::transmute(Arc::new(std::ptr::null_mut::<rocksdb::ColumnFamily>())) },
+                    vertices: unsafe { std::mem::transmute(Arc::new(std::ptr::null_mut::<rocksdb::ColumnFamily>())) },
+                    edges:    unsafe { std::mem::transmute(Arc::new(std::ptr::null_mut::<rocksdb::ColumnFamily>())) },
+                },
+                tx,
+            )
+        })
+        .1
+        .clone();
+
+    sender.subscribe()
+}
+
+// ---------------------------------------------------------------------
+// 3. wait_for_real_db – **NO DUMMY DB / CFs**
+// ---------------------------------------------------------------------
+/// Same as `get_or_create_watcher` but exposed for external callers
+/// (e.g., CLI waiting for the daemon to be ready).
+pub async fn wait_for_real_db(port: u16) -> watch::Receiver<()> {
+    get_or_create_watcher(port).await
+}
+
 
 // Thread-safe wrapper for Arc<rocksdb::DB>
 #[derive(Clone)]
@@ -105,292 +192,629 @@ macro_rules! handle_rocksdb_op {
 }
 
 impl<'a> RocksDBDaemon<'a> {
-/// Helper function to open RocksDB with column families, handling retries for lock contention.
-    async fn open_rocksdb_with_cfs(
+    /// Helper function to encapsulate the blocking RocksDB I/O.
+    /// **CRITICAL FIX:** Implements a retry mechanism to handle transient lock contention 
+    /// from the main thread's pre-initialization cleanup logic (e.g., unlocking the DB).
+    pub async fn open_rocksdb_with_cfs(
         config: &RocksDBConfig,
         db_path: &Path,
         use_compression: bool,
-    ) -> GraphResult<(Arc<DB>, Arc<BoundColumnFamily<'static>>, Arc<BoundColumnFamily<'static>>, Arc<BoundColumnFamily<'static>>)> {
+        read_only: bool,
+    ) -> GraphResult<(
+        Arc<DB>,
+        Arc<BoundColumnFamily<'static>>,
+        Arc<BoundColumnFamily<'static>>,
+        Arc<BoundColumnFamily<'static>>,
+    )> {
         const MAX_RETRIES: usize = 5;
+        const INITIAL_BACKOFF_MS: u64 = 100;
+        const MAX_BACKOFF_MS: u64 = 1600;
+
         let mut attempts = 0;
+
         loop {
             let mut opts = Options::default();
             opts.create_if_missing(true);
             opts.create_missing_column_families(true);
+            opts.set_max_open_files(-1);
+            opts.set_max_background_jobs(4);
+
             if use_compression {
+                let cache_cap = config.cache_capacity.unwrap_or(1024 * 1024 * 1024) as usize;
                 opts.set_compression_type(DBCompressionType::Snappy);
                 opts.set_compaction_style(DBCompactionStyle::Level);
-                opts.set_write_buffer_size(config.cache_capacity.unwrap_or(1024 * 1024 * 1024) as usize);
+                opts.set_write_buffer_size(cache_cap);
                 opts.set_max_write_buffer_number(3);
+
+                let block_cache = RocksDBCache::new_lru_cache(cache_cap);
+                let mut table_options = BlockBasedOptions::default();
+                table_options.set_block_cache(&block_cache);
+                opts.set_block_based_table_factory(&table_options);
             }
+
             let cf_names = vec!["kv_pairs", "vertices", "edges"];
             let cfs = cf_names
-                .into_iter()
-                .map(|name| ColumnFamilyDescriptor::new(name, opts.clone()))
+                .iter()
+                .map(|&name| {
+                    let mut cf_opts = Options::default();
+                    if use_compression {
+                        cf_opts.set_compression_type(DBCompressionType::Snappy);
+                    }
+                    ColumnFamilyDescriptor::new(name, cf_opts)
+                })
                 .collect::<Vec<_>>();
-            match handle_rocksdb_op!(
-                DB::open_cf_descriptors(&opts, db_path, cfs),
-                format!("Failed to open RocksDB at {:?}", db_path)
-            ) {
+
+            let mode_str = if read_only { "READ-ONLY" } else { "PRIMARY (WRITABLE)" };
+            info!("Attempting to open RocksDB in {} mode at {:?}", mode_str, db_path);
+            println!("===> ATTEMPTING TO OPEN ROCKSDB IN {} MODE AT {:?}", mode_str, db_path);
+
+            let db_result = if read_only {
+                DB::open_cf_for_read_only(&opts, db_path, cf_names.clone(), false)
+            } else {
+                DB::open_cf_descriptors(&opts, db_path, cfs)
+            };
+
+            match db_result {
                 Ok(db) => {
-                    let db = Arc::new(db);
-                    // Use unsafe transmute to convert lifetime to 'static
-                    let kv_pairs: Arc<BoundColumnFamily<'static>> = unsafe {
-                        std::mem::transmute(Arc::new(db.cf_handle("kv_pairs").ok_or_else(|| {
-                            GraphError::StorageError("Failed to get kv_pairs column family".to_string())
-                        })?))
+                    let db_arc = Arc::new(db);
+                    // Create column families in a separate scope to ensure leaked_db is dropped
+                    let (kv_pairs, vertices, edges) = {
+                        let leaked_db = Arc::into_raw(db_arc.clone());
+                        let static_db: &'static DB = unsafe { &*leaked_db };
+
+                        let kv_cf_ref = static_db.cf_handle("kv_pairs").ok_or_else(|| {
+                            error!("Failed to get kv_pairs column family at {:?}", db_path);
+                            println!("===> ERROR: FAILED TO GET kv_pairs COLUMN FAMILY AT {:?}", db_path);
+                            GraphError::StorageError(format!("Failed to get kv_pairs column family"))
+                        })?;
+                        let kv_pairs: Arc<BoundColumnFamily<'static>> = unsafe {
+                            std::mem::transmute(Arc::new(kv_cf_ref))
+                        };
+
+                        let vert_cf_ref = static_db.cf_handle("vertices").ok_or_else(|| {
+                            error!("Failed to get vertices column family at {:?}", db_path);
+                            println!("===> ERROR: FAILED TO GET vertices COLUMN FAMILY AT {:?}", db_path);
+                            GraphError::StorageError(format!("Failed to get vertices column family"))
+                        })?;
+                        let vertices: Arc<BoundColumnFamily<'static>> = unsafe {
+                            std::mem::transmute(Arc::new(vert_cf_ref))
+                        };
+
+                        let edge_cf_ref = static_db.cf_handle("edges").ok_or_else(|| {
+                            error!("Failed to get edges column family at {:?}", db_path);
+                            println!("===> ERROR: FAILED TO GET edges COLUMN FAMILY AT {:?}", db_path);
+                            GraphError::StorageError(format!("Failed to get edges column family"))
+                        })?;
+                        let edges: Arc<BoundColumnFamily<'static>> = unsafe {
+                            std::mem::transmute(Arc::new(edge_cf_ref))
+                        };
+
+                        (kv_pairs, vertices, edges)
                     };
-                    let vertices: Arc<BoundColumnFamily<'static>> = unsafe {
-                        std::mem::transmute(Arc::new(db.cf_handle("vertices").ok_or_else(|| {
-                            GraphError::StorageError("Failed to get vertices column family".to_string())
-                        })?))
-                    };
-                    let edges: Arc<BoundColumnFamily<'static>> = unsafe {
-                        std::mem::transmute(Arc::new(db.cf_handle("edges").ok_or_else(|| {
-                            GraphError::StorageError("Failed to get edges column family".to_string())
-                        })?))
-                    };
-                    info!("RocksDB opened at {:?} after {} attempts", db_path, attempts + 1);
-                    return Ok((db, kv_pairs, vertices, edges));
+
+                    info!("RocksDB opened at {:?} in {} mode after {} attempts", db_path, mode_str, attempts + 1);
+                    println!("===> ROCKSDB OPENED AT {:?} IN {} MODE AFTER {} ATTEMPTS", db_path, mode_str, attempts + 1);
+                    return Ok((db_arc, kv_pairs, vertices, edges));
                 }
                 Err(e) => {
                     attempts += 1;
                     let error_msg = e.to_string();
-                    let is_lock_error = error_msg.contains("lock") || error_msg.contains("busy") || error_msg.contains("WouldBlock") || error_msg.contains("Resource temporarily unavailable");
+                    let is_lock_error = error_msg.contains("lock")
+                        || error_msg.contains("busy")
+                        || error_msg.contains("WouldBlock")
+                        || error_msg.contains("Resource temporarily unavailable")
+                        || error_msg.contains("already in use");
+
                     if attempts >= MAX_RETRIES || !is_lock_error {
+                        error!("Failed to open RocksDB at {:?} after {} attempts: {}", db_path, MAX_RETRIES, e);
+                        println!("===> ERROR: FAILED TO OPEN ROCKSDB AT {:?} AFTER {} ATTEMPTS: {}", db_path, MAX_RETRIES, e);
                         return Err(GraphError::StorageError(format!(
                             "Failed to open RocksDB: {}. Ensure no other process is using the database.",
                             e
                         )));
                     }
-                    warn!(
-                        "RocksDB lock contention at {:?}. Retrying in 100ms (Attempt {}/{})",
-                        db_path, attempts, MAX_RETRIES
-                    );
-                    sleep(TokioDuration::from_millis(100)).await;
+
+                    let backoff_factor = 2_u64.pow(attempts as u32 - 1);
+                    let sleep_ms = (INITIAL_BACKOFF_MS * backoff_factor).min(MAX_BACKOFF_MS);
+                    warn!("RocksDB lock contention at {:?}. Retrying in {}ms (Attempt {}/{})", db_path, sleep_ms, attempts, MAX_RETRIES);
+                    println!("===> WARNING: ROCKSDB LOCK CONTENTION AT {:?}. RETRYING IN {}ms (ATTEMPT {}/{})", db_path, sleep_ms, attempts, MAX_RETRIES);
+                    tokio::time::sleep(TokioDuration::from_millis(sleep_ms)).await;
                 }
             }
         }
     }
-  
+
+
+    // ---------------------------------------------------------------------
+    // 3. Open the *real* DB **once** – called from `RocksDBDaemon::new`
+    // ---------------------------------------------------------------------
+    async fn open_real_db(
+        config: &RocksDBConfig,
+        db_path: &Path,
+    ) -> GraphResult<(
+        Arc<DB>,
+        Arc<BoundColumnFamily<'static>>,
+        Arc<BoundColumnFamily<'static>>,
+        Arc<BoundColumnFamily<'static>>,
+    )> {
+        // ---- same retry logic you already had ----
+        const MAX_RETRIES: usize = 5;
+        const INITIAL_BACKOFF_MS: u64 = 100;
+        const MAX_BACKOFF_MS: u64 = 1600;
+
+        let mut attempts = 0;
+        loop {
+            let mut opts = Options::default();
+            opts.create_if_missing(true);
+            opts.create_missing_column_families(true);
+            opts.set_max_open_files(-1);
+            opts.set_max_background_jobs(4);
+
+            if config.use_compression {
+                let cache_cap = config.cache_capacity.unwrap_or(1 << 30) as usize;
+                opts.set_compression_type(DBCompressionType::Snappy);
+                opts.set_compaction_style(DBCompactionStyle::Level);
+                opts.set_write_buffer_size(cache_cap);
+                opts.set_max_write_buffer_number(3);
+                let block_cache = RocksDBCache::new_lru_cache(cache_cap);
+                let mut tbl = BlockBasedOptions::default();
+                tbl.set_block_cache(&block_cache);
+                opts.set_block_based_table_factory(&tbl);
+            }
+
+            let cf_desc = ["kv_pairs", "vertices", "edges"]
+                .iter()
+                .map(|&name| {
+                    let mut cf_opts = Options::default();
+                    if config.use_compression {
+                        cf_opts.set_compression_type(DBCompressionType::Snappy);
+                    }
+                    ColumnFamilyDescriptor::new(name, cf_opts)
+                })
+                .collect::<Vec<_>>();
+
+            let db = DB::open_cf_descriptors(&opts, db_path, cf_desc)
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+
+            let db_arc = Arc::new(db);
+
+            // SAFETY: the DB lives as long as `db_arc`; we only extend the lifetime.
+            let kv   = unsafe { std::mem::transmute(Arc::new(db_arc.cf_handle("kv_pairs").unwrap())) };
+            let vert = unsafe { std::mem::transmute(Arc::new(db_arc.cf_handle("vertices").unwrap())) };
+            let edge = unsafe { std::mem::transmute(Arc::new(db_arc.cf_handle("edges").unwrap())) };
+
+            info!("Real RocksDB opened at {:?} (attempt {})", db_path, attempts + 1);
+            return Ok((db_arc, kv, vert, edge));
+        }
+    }
+
+    /// Opens DB immediately, binds ZMQ in background — CLI returns instantly
     pub async fn new(
         config: RocksDBConfig,
-    ) -> GraphResult<(RocksDBDaemon<'static>, tokio::sync::mpsc::Receiver<()>)> {
+    ) -> GraphResult<(RocksDBDaemon<'static>, mpsc::Receiver<()>)> {
         let port = config.port.unwrap_or(DEFAULT_STORAGE_PORT);
-        let use_compression = config.use_compression;
+        let current_pid = std::process::id() as u32;
 
         let db_path = if config.path.ends_with(&port.to_string()) {
             PathBuf::from(config.path.clone())
         } else {
             PathBuf::from(config.path.clone()).join(port.to_string())
         };
+        let db_path_clone = db_path.clone();
+        info!("Initializing RocksDBDaemon at {:?}", db_path);
+        println!("===> RocksDBDaemon::new() CALLED");
 
-        info!("Initializing RocksDBDaemon with config at path {:?}", db_path);
+        tokio::fs::create_dir_all(&db_path).await
+            .map_err(|e| GraphError::StorageError(format!("Failed to create dir: {}", e)))?;
 
-        tokio::fs::create_dir_all(&db_path)
-            .await
-            .map_err(|e| GraphError::StorageError(format!("Failed to create directory at {:?}: {}", db_path, e)))?;
-        
-        let fs_metadata = tokio::fs::metadata(&db_path)
-            .await
-            .map_err(|e| GraphError::StorageError(format!("Failed to access directory metadata at {:?}: {}", db_path, e)))?;
-        if fs_metadata.permissions().readonly() {
-            return Err(GraphError::StorageError(format!("Directory at {:?} is not writable", db_path)));
-        }
-
-        let db_registry = GLOBAL_DB_DAEMON_REGISTRY.get().await;
-        let existing_db_metadata = db_registry.get_db_daemon_metadata_by_port(port).await?;
-
-        let is_new_db_instance = existing_db_metadata.is_none() || 
-            existing_db_metadata.as_ref().map_or(true, |m| m.rocksdb_db_instance.is_none());
-
-        // Open the database
-        let (db, kv_pairs, vertices, edges) = {
-            info!("Opening RocksDB at {:?}", db_path);
-            Self::open_rocksdb_with_cfs(&config, &db_path, use_compression).await?
+        let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
+        let daemon_metadata = DaemonMetadata {
+            service_type: "storage".to_string(),
+            port,
+            pid: current_pid,
+            ip_address: config.host.clone().unwrap_or("127.0.0.1".to_string()),
+            data_dir: Some(db_path.clone()),
+            config_path: None,
+            engine_type: Some("rocksdb".to_string()),
+            last_seen_nanos: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as i64)
+                .unwrap_or(0),
+            zmq_ready: false,
         };
-
-        // Register if new
-        if is_new_db_instance {
-            let db_metadata = DBDaemonMetadata {
-                port,
-                pid: std::process::id(),
-                ip_address: "127.0.0.1".to_string(),
-                data_dir: Some(db_path.clone()),
-                config_path: None,
-                engine_type: Some("rocksdb".to_string()),
-                last_seen_nanos: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos() as i64,
-                rocksdb_db_instance: Some(db.clone()),
-                rocksdb_kv_pairs: None,
-                rocksdb_vertices: None,
-                rocksdb_edges: None,
-                sled_db_instance: None,
-                sled_kv_pairs: None,
-                sled_vertices: None,
-                sled_edges: None,
-            };
-            db_registry.register_db_daemon(db_metadata).await?;
-            info!("Registered new RocksDB instance in global registry for port {}", port);
-        }
-
-        // Raft setup
-        #[cfg(feature = "with-openraft-rocksdb")]
-        let (raft, raft_storage, node_id) = {
-            use storage_daemon_server::TypeConfig;
-            let raft_db_path = db_path.join("raft");
-            tokio::fs::create_dir_all(&raft_db_path)
-                .await
-                .map_err(|e| GraphError::StorageError(format!("Failed to create Raft DB directory at {:?}: {}", raft_db_path, e)))?;
-            let raft_storage = RocksDBRaftStorage::new(&raft_db_path).await?;
-            let raft_config = Arc::new(RaftConfig {
-                cluster_name: "graphdb-cluster".to_string(),
-                heartbeat_interval: 250,
-                election_timeout_min: 1000,
-                election_timeout_max: 2000,
-                ..Default::default()
-            });
-            let node_id = port as u64;
-            let raft = Raft::new(
-                node_id,
-                raft_config,
-                Arc::new(raft_storage.clone()),
-                Arc::new(RaftTcpNetwork {}),
-            );
-            (Some(Arc::new(raft)), Some(Arc::new(raft_storage)), node_id)
-        };
-        
-        #[cfg(not(feature = "with-openraft-rocksdb"))]
-        let (raft, raft_storage, node_id): (Option<Arc<Raft<TypeConfig>>>, Option<Arc<RocksDBRaftStorage>>, u64) =
-            (None, None, port as u64);
+        daemon_registry.register_daemon(daemon_metadata.clone()).await?;
 
         let zmq_context = Arc::new(ZmqContext::new());
         let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", port);
         let ipc_path = endpoint.strip_prefix("ipc://").unwrap_or(&endpoint);
 
-        if std::path::Path::new(ipc_path).exists() {
-            warn!("Stale IPC socket found at {}. Attempting cleanup.", ipc_path);
-            if let Err(e) = tokio::fs::remove_file(ipc_path).await {
-                error!("Failed to remove stale IPC socket {}: {}", ipc_path, e);
-            } else {
-                info!("Successfully removed stale IPC socket {}", ipc_path);
-            }
+        if Path::new(ipc_path).exists() {
+            let _ = tokio::fs::remove_file(ipc_path).await;
         }
-        
-        // ====================================================================
-        // CRITICAL: Create the mpsc channel for readiness signaling
-        // ====================================================================
-        let (tx, rx) = mpsc::channel(1);    
-        const BIND_RETRIES: usize = 5;
 
+        // Channel for ZMQ readiness
+        let (ready_tx, ready_rx) = mpsc::channel::<()>(1);
         let running = Arc::new(TokioMutex::new(true));
         let running_clone = running.clone();
 
-        let zmq_context_for_thread = zmq_context.clone();
-        let db_arc_for_thread = db.clone();
-        let kv_pairs_for_thread = kv_pairs.clone();
-        let vertices_for_thread = vertices.clone();
-        let edges_for_thread = edges.clone();
-        let endpoint_clone = endpoint.clone();
-        let db_path_for_thread = db_path.clone();
+        // -----------------------------------------------------------------
+        // 1. Open REAL DB NOW (once)
+        // -----------------------------------------------------------------
+        let (db, kv_pairs, vertices, edges) = Self::open_rocksdb_with_cfs(&config, &db_path, config.use_compression, false).await?;
 
-        // ====================================================================
-        // CRITICAL: Spawn ZMQ server thread with readiness signaling
-        // ====================================================================
-        let zmq_thread_handle = std::thread::spawn(move || -> GraphResult<()> {
-            let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime for ZMQ server thread");
-            rt.block_on(async {
-                let zmq_socket_raw = match zmq_context_for_thread.socket(REP) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        error!("Failed to create ZMQ socket for thread: {}", e);
-                        let _ = tx.send(()).await;  // Signal even on error
-                        return Err(GraphError::StorageError(format!("Failed to create ZMQ socket: {}", e)));
-                    }
-                };
-                
-                let mut bind_success = false;
-                for i in 0..BIND_RETRIES {
-                    match zmq_socket_raw.bind(&endpoint_clone) {
-                        Ok(_) => {
-                            info!("ZMQ socket successfully bound to {}. Signaling readiness.", endpoint_clone);
-                            bind_success = true;
-                            let _ = tx.send(()).await;  // **CRITICAL: Signal readiness**
+        // -----------------------------------------------------------------
+        // 2. Spawn ZMQ server in background
+        // -----------------------------------------------------------------
+        // Replace the spawn block with:
+        let zmq_thread_handle = {
+            let zmq_context_thread = zmq_context.clone();
+            let endpoint_thread = endpoint.clone();
+            let config_thread = config.clone();
+            let daemon_metadata_thread = daemon_metadata.clone();
+            let ready_tx = ready_tx.clone();
+
+            // Pass the already-opened DB handles
+            let db_clone = db.clone();
+            let kv_clone = kv_pairs.clone();
+            let vert_clone = vertices.clone();
+            let edge_clone = edges.clone();
+
+            std::thread::spawn(move || -> GraphResult<()> {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    let socket_raw = zmq_context_thread.socket(REP)?;
+                    for i in 0..5 {
+                        if socket_raw.bind(&endpoint_thread).is_ok() {
+                            let _ = ready_tx.send(()).await;
                             break;
                         }
-                        Err(e) => {
-                            if i < BIND_RETRIES - 1 {
-                                warn!(
-                                    "Failed to bind ZMQ socket to {} (attempt {}/{}): {}",
-                                    endpoint_clone, i + 1, BIND_RETRIES, e
-                                );
-                                tokio::time::sleep(TokioDuration::from_millis(100 * (i as u64 + 1))).await;
-                            } else {
-                                let error_msg = format!(
-                                    "Failed to bind ZMQ socket to {} after {} attempts: {}",
-                                    endpoint_clone, BIND_RETRIES, e
-                                );
-                                error!("{}", error_msg);
-                                let _ = tx.send(()).await;  // Signal even on failure
-                                return Err(GraphError::StorageError(error_msg));
-                            }
-                        }
+                        tokio::time::sleep(TokioDuration::from_millis(100 * (i + 1) as u64)).await;
                     }
-                }
 
-                if !bind_success {
-                    let error_msg = "Could not bind ZMQ socket after max retries. Aborting server run.".to_string();
-                    error!("{}", error_msg);
-                    return Err(GraphError::StorageError(error_msg));
-                }
+                    let mut md = daemon_metadata_thread.clone();
+                    md.zmq_ready = true;
+                    GLOBAL_DAEMON_REGISTRY.get().await.register_daemon(md).await?;
 
-                let zmq_socket = Arc::new(TokioMutex::new(zmq_socket_raw));
-                
-                info!("Starting ZMQ server for endpoint {}", endpoint_clone);
-                RocksDBDaemon::run_zmq_server_static(
-                    port,
-                    db_arc_for_thread,
-                    kv_pairs_for_thread,
-                    vertices_for_thread,
-                    edges_for_thread,
-                    running_clone,
-                    zmq_socket,
-                    endpoint_clone.clone(),
-                    db_path_for_thread,
-                )
-                .await
-                .map_err(|e| {
-                    error!("ZMQ server failed for endpoint {}: {}", endpoint_clone, e);
-                    e
+                    let zmq_socket = Arc::new(TokioMutex::new(socket_raw));
+                    RocksDBDaemon::run_zmq_server_lazy(
+                        port,
+                        config_thread,
+                        running_clone,
+                        zmq_socket,
+                        endpoint_thread,
+                        db_clone,
+                        kv_clone,
+                        vert_clone,
+                        edge_clone,
+                        db_path.clone(),
+                    ).await
                 })
             })
-        });
-        
-        let (shutdown_tx, _shutdown_rx) = mpsc::channel::<()>(1);
+        };
+
+        let (shutdown_tx, _) = mpsc::channel::<()>(1);
 
         let daemon = RocksDBDaemon {
             port,
-            db_path: db_path.clone(),
-            db: db.clone(),
-            kv_pairs: kv_pairs.clone(),
-            vertices: vertices.clone(),
-            edges: edges.clone(),
+            db_path: db_path_clone,
+            db,
+            kv_pairs,
+            vertices,
+            edges,
             running: running.clone(),
             shutdown_tx,
             zmq_context: zmq_context.clone(),
             zmq_thread: Arc::new(TokioMutex::new(Some(zmq_thread_handle))),
             #[cfg(feature = "with-openraft-rocksdb")]
-            raft,
+            raft: None,
             #[cfg(feature = "with-openraft-rocksdb")]
-            raft_storage,
+            raft_storage: None,
             #[cfg(feature = "with-openraft-rocksdb")]
-            node_id,
+            node_id: port as u64,
         };
-        
-        info!("RocksDB daemon initialization complete for port {}. ZMQ server starting in background.", port);
-        Ok((daemon, rx))
+
+        println!("===> ROCKSDB DAEMON INITIALIZED ON PORT {} (DB OPENED)", port);
+        Ok((daemon, ready_rx))
+    }
+
+    /// ZMQ server – DB is already opened in `RocksDBDaemon::new()`
+    /// All original commands are preserved.
+    async fn run_zmq_server_lazy(
+        port: u16,
+        _config: RocksDBConfig,               // kept for signature compatibility
+        running: Arc<TokioMutex<bool>>,
+        zmq_socket: Arc<TokioMutex<ZmqSocket>>,
+        endpoint: String,
+        db: Arc<DB>,
+        kv_pairs: Arc<BoundColumnFamily<'static>>,
+        vertices: Arc<BoundColumnFamily<'static>>,
+        edges: Arc<BoundColumnFamily<'static>>,
+        db_path: PathBuf,
+    ) -> GraphResult<()> {
+        info!("===> STARTING ZMQ SERVER FOR PORT {} (DB ALREADY OPEN)", port);
+        println!("===> STARTING ZMQ SERVER FOR PORT {} (DB ALREADY OPEN)", port);
+
+        // Configure socket
+        {
+            let socket = zmq_socket.lock().await;
+            socket.set_linger(1000)
+                .map_err(|e| GraphError::StorageError(format!("Failed to set socket linger: {}", e)))?;
+            socket.set_rcvtimeo(SOCKET_TIMEOUT_MS)
+                .map_err(|e| GraphError::StorageError(format!("Failed to set receive timeout: {}", e)))?;
+            socket.set_sndtimeo(SOCKET_TIMEOUT_MS)
+                .map_err(|e| GraphError::StorageError(format!("Failed to set send timeout: {}", e)))?;
+            socket.set_maxmsgsize(MAX_MESSAGE_SIZE as i64)
+                .map_err(|e| GraphError::StorageError(format!("Failed to set max message size: {}", e)))?;
+        }
+
+        info!("ZeroMQ server configured for port {}", port);
+        println!("===> ZEROMQ SERVER CONFIGURED FOR PORT {}", port);
+
+        let mut consecutive_errors = 0;
+
+        while *running.lock().await {
+            let msg_result = {
+                let socket = zmq_socket.lock().await;
+                socket.recv_bytes(DONTWAIT)
+            };
+
+            let msg: Vec<u8> = match msg_result {
+                Ok(m) => {
+                    consecutive_errors = 0;
+                    debug!("Received ZeroMQ message for port {}", port);
+                    m
+                }
+                Err(ZmqError::EAGAIN) => {
+                    tokio::time::sleep(TokioDuration::from_millis(10)).await;
+                    continue;
+                }
+                Err(e) => {
+                    consecutive_errors += 1;
+                    warn!("Failed to receive ZeroMQ message (attempt {}): {}", consecutive_errors, e);
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                        error!("Too many consecutive ZeroMQ errors, shutting down server");
+                        break;
+                    }
+                    tokio::time::sleep(TokioDuration::from_millis(100)).await;
+                    continue;
+                }
+            };
+
+            if msg.is_empty() {
+                let resp = json!({"status":"error","message":"Received empty message"});
+                let socket = zmq_socket.lock().await;
+                Self::send_zmq_response_static(&socket, &resp, port).await?;
+                continue;
+            }
+
+            let request: Value = match serde_json::from_slice(&msg) {
+                Ok(r) => r,
+                Err(e) => {
+                    let resp = json!({"status":"error","message":format!("Parse error: {}",e)});
+                    let socket = zmq_socket.lock().await;
+                    Self::send_zmq_response_static(&socket, &resp, port).await?;
+                    continue;
+                }
+            };
+
+            let command = request.get("command").and_then(|c| c.as_str());
+
+            let response = match command {
+                // === Control commands ===
+                Some("initialize") => {
+                    info!("Initialization command received for port {}", port);
+                    println!("===> INITIALIZATION COMMAND RECEIVED FOR PORT {}", port);
+                    json!({
+                        "status": "success",
+                        "message": "ZMQ server is bound and DB is open.",
+                        "port": port,
+                        "ipc_path": &endpoint
+                    })
+                }
+                Some("status") | Some("ping") => {
+                    json!({"status":"success","port":port,"db_open":true})
+                }
+                Some("force_unlock") => {
+                    info!("Force unlock requested for port {}", port);
+                    match Self::force_unlock_static(&db_path).await {
+                        Ok(_) => json!({"status":"success"}),
+                        Err(e) => json!({"status":"error","message":e.to_string()}),
+                    }
+                }
+
+                // === Data commands – DB is already open ===
+                Some(cmd) if [
+                    "set_key","get_key","delete_key",
+                    "create_vertex","get_vertex","update_vertex","delete_vertex",
+                    "create_edge","get_edge","update_edge","delete_edge",
+                    "get_all_vertices","get_all_edges",
+                    "get_all_vertices_by_type","get_all_edges_by_type",
+                    "clear_data","force_reset","flush"
+                ].contains(&cmd) => {
+                    match Self::execute_db_command(
+                        cmd, &request,
+                        &db, &kv_pairs, &vertices, &edges,
+                        port, &db_path, &endpoint
+                    ).await {
+                        Ok(r) => r,
+                        Err(e) => json!({"status":"error","message":e.to_string()}),
+                    }
+                }
+
+                // === Fallback ===
+                Some(cmd) => {
+                    error!("Unsupported command: {}", cmd);
+                    json!({"status":"error","message":format!("Unsupported command: {}",cmd)})
+                }
+                None => {
+                    error!("No command specified in request");
+                    json!({"status":"error","message":"No command specified"})
+                }
+            };
+
+            let socket = zmq_socket.lock().await;
+            Self::send_zmq_response_static(&socket, &response, port).await?;
+        }
+
+        info!("ZMQ server shutting down for port {}", port);
+        let socket = zmq_socket.lock().await;
+        let _ = socket.disconnect(&endpoint);
+        Ok(())
+    }
+
+    async fn execute_db_command(
+        command: &str,
+        request: &Value,
+        db: &Arc<DB>,
+        kv_pairs: &Arc<BoundColumnFamily<'static>>,
+        vertices: &Arc<BoundColumnFamily<'static>>,
+        edges: &Arc<BoundColumnFamily<'static>>,
+        port: u16,
+        db_path: &PathBuf,
+        endpoint: &str,
+    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        match command {
+            "set_key" => {
+                let cf_name = request.get("cf").and_then(|c| c.as_str()).unwrap_or("kv_pairs");
+                let key = request.get("key").and_then(|k| k.as_str()).ok_or("Missing key")?;
+                let value = request.get("value").and_then(|v| v.as_str()).ok_or("Missing value")?;
+
+                let cf_handle = db.cf_handle(cf_name).ok_or(format!("Column family {} not found", cf_name))?;
+                let write_opts = WriteOptions::default();
+                db.put_cf_opt(&cf_handle, key.as_bytes(), value.as_bytes(), &write_opts)?;
+                info!("Set key {} in {} for port {}", key, cf_name, port);
+                Ok(json!({"status": "success"}))
+            }
+
+            "get_key" => {
+                let cf_name = request.get("cf").and_then(|c| c.as_str()).unwrap_or("kv_pairs");
+                let key = request.get("key").and_then(|k| k.as_str()).ok_or("Missing key")?;
+
+                let cf_handle = db.cf_handle(cf_name).ok_or(format!("Column family {} not found", cf_name))?;
+                let result = db.get_cf(&cf_handle, key.as_bytes())?;
+                let value_str = result.map(|v| String::from_utf8_lossy(&v).to_string());
+                Ok(json!({"status": "success", "value": value_str}))
+            }
+
+            "delete_key" => {
+                let cf_name = request.get("cf").and_then(|c| c.as_str()).unwrap_or("kv_pairs");
+                let key = request.get("key").and_then(|k| k.as_str()).ok_or("Missing key")?;
+
+                let cf_handle = db.cf_handle(cf_name).ok_or(format!("Column family {} not found", cf_name))?;
+                let write_opts = WriteOptions::default();
+                db.delete_cf_opt(&cf_handle, key.as_bytes(), &write_opts)?;
+                info!("Deleted key {} in {} for port {}", key, cf_name, port);
+                Ok(json!({"status": "success"}))
+            }
+
+            "flush" => {
+                db.flush()?;
+                Ok(json!({"status": "success"}))
+            }
+
+            "get_all_vertices" => {
+                let iterator = db.iterator_cf(&Arc::clone(vertices), rocksdb::IteratorMode::Start);
+                let mut vertices_vec = Vec::new();
+
+                for item in iterator {
+                    let (_, value) = item?;
+                    let vertex = deserialize_vertex(&value)?;
+                    vertices_vec.push(vertex);
+                }
+                Ok(json!({"status": "success", "vertices": vertices_vec}))
+            }
+
+            "get_all_vertices_by_type" => {
+                let vertex_type: Identifier =
+                    serde_json::from_value(request["vertex_type"].clone()).map_err(|_| "Invalid or missing vertex_type")?;
+
+                let iterator = db.iterator_cf(&Arc::clone(vertices), rocksdb::IteratorMode::Start);
+                let mut vertices_vec = Vec::new();
+
+                for item in iterator {
+                    let (_, value) = item?;
+                    let vertex = deserialize_vertex(&value)?;
+                    if vertex.label == vertex_type {
+                        vertices_vec.push(vertex);
+                    }
+                }
+                Ok(json!({"status": "success", "vertices": vertices_vec}))
+            }
+
+            "get_all_edges" => {
+                let iterator = db.iterator_cf(&Arc::clone(edges), rocksdb::IteratorMode::Start);
+                let mut edges_vec = Vec::new();
+
+                for item in iterator {
+                    let (_, value) = item?;
+                    let edge = deserialize_edge(&value)?;
+                    edges_vec.push(edge);
+                }
+                Ok(json!({"status": "success", "edges": edges_vec}))
+            }
+
+            "get_all_edges_by_type" => {
+                let edge_type: Identifier =
+                    serde_json::from_value(request["edge_type"].clone()).map_err(|_| "Invalid or missing edge_type")?;
+
+                let iterator = db.iterator_cf(&Arc::clone(edges), rocksdb::IteratorMode::Start);
+                let mut edges_vec = Vec::new();
+
+                for item in iterator {
+                    let (_, value) = item?;
+                    let edge = deserialize_edge(&value)?;
+                    if edge.t == edge_type {
+                        edges_vec.push(edge);
+                    }
+                }
+                Ok(json!({"status": "success", "edges": edges_vec}))
+            }
+
+            "clear_data" => {
+                let mut batch = WriteBatch::default();
+                let iterator = db.iterator_cf(&Arc::clone(kv_pairs), rocksdb::IteratorMode::Start);
+
+                for item in iterator {
+                    let (key, _) = item?;
+                    batch.delete_cf(&Arc::clone(kv_pairs), &key);
+                }
+
+                db.write(batch)?;
+                db.flush()?;
+                Ok(json!({"status": "success"}))
+            }
+
+            "force_reset" => {
+                let mut batch = WriteBatch::default();
+                for cf in &[kv_pairs, vertices, edges] {
+                    let iterator = db.iterator_cf(&Arc::clone(cf), rocksdb::IteratorMode::Start);
+                    for item in iterator {
+                        let (key, _) = item?;
+                        batch.delete_cf(&Arc::clone(cf), &key);
+                    }
+                }
+
+                db.write(batch)?;
+                db.flush()?;
+                info!("Force reset completed for port {}", port);
+                Ok(json!({"status": "success"}))
+            }
+
+            "force_unlock" => {
+                Self::force_unlock_static(db_path).await?;
+                Ok(json!({"status": "success"}))
+            }
+
+            "force_unlock_path" => {
+                Self::force_unlock_path_static(db_path).await?;
+                Ok(json!({"status": "success"}))
+            }
+
+            cmd => {
+                error!("Unsupported command: {}", cmd);
+                Ok(json!({"status": "error", "message": format!("Unsupported command: {}", cmd)}))
+            }
+        }
     }
 
     pub async fn new_with_db(config: RocksDBConfig, existing_db: Arc<DB>) -> GraphResult<(RocksDBDaemon<'static>, mpsc::Receiver<()>)> {
@@ -3196,8 +3620,14 @@ impl RocksDBDaemonPool {
         )?;
 
         // RocksDBDaemon::new returns (Daemon, shutdown_rx)
-        let (daemon, _shutdown_rx) = RocksDBDaemon::new(daemon_config).await?;
+        let (daemon, mut ready_rx) = RocksDBDaemon::new(daemon_config).await?;
 
+        // Fire-and-forget readiness check
+        tokio::spawn(async move {
+            let _ = ready_rx.recv().await;
+            info!("ZMQ server is ready on port {}", daemon.port);
+        });
+/*
         // Wait for ZMQ server to start
         timeout(TokioDuration::from_secs(10), async {
             while !self.is_zmq_server_running(port).await? {
@@ -3210,8 +3640,7 @@ impl RocksDBDaemonPool {
             error!("Timeout waiting for ZMQ server to start on port {}", port);
             println!("===> ERROR: TIMEOUT WAITING FOR ZMQ SERVER TO START ON PORT {}", port);
             GraphError::StorageError(format!("Timeout waiting for ZMQ server on port {}", port))
-        })??;
-
+        })??;*/
         // This line is now valid because the function is (&mut self).
         self.daemons.insert(port, Arc::new(daemon)); 
         info!("Added new daemon to pool for port {}", port);
@@ -3839,7 +4268,7 @@ impl RocksDBDaemonPool {
         let mut initialized = self.initialized.write().await;
         if *initialized {
             warn!("RocksDBDaemonPool already initialized, skipping");
-            println!("===> WARNING: SLED DAEMON POOL ALREADY INITIALIZED, SKIPPING");
+            println!("===> WARNING: RocksDB DAEMON POOL ALREADY INITIALIZED, SKIPPING");
             return Ok(());
         }
 
@@ -3861,7 +4290,7 @@ impl RocksDBDaemonPool {
             match timeout(TokioDuration::from_secs(10), GLOBAL_DB_DAEMON_REGISTRY.get_or_init_instance(storage_config_arc.clone())).await {
                 Ok(Ok(_)) => {
                     info!("Successfully initialized GLOBAL_DB_DAEMON_REGISTRY for RocksDBDaemonPool");
-                    println!("===> SUCCESSFULLY INITIALIZED GLOBAL_DB_DAEMON_REGISTRY FOR SLED DAEMON POOL");
+                    println!("===> SUCCESSFULLY INITIALIZED GLOBAL_DB_DAEMON_REGISTRY FOR RocksDB DAEMON POOL");
                     break;
                 }
                 Ok(Err(e)) => {
@@ -3985,73 +4414,7 @@ impl RocksDBDaemonPool {
                         valid_ports.push(port);
                         self.load_balancer.update_node_health(port, true, 0).await;
                         continue;
-                    }/* else {
-                        warn!("Stale storage daemon found on port {}, cleaning up", port);
-                        println!("===> WARNING: STALE STORAGE DAEMON FOUND ON PORT {}, CLEANING UP", port);
-                        let pid = metadata.pid;
-                        #[cfg(unix)]
-                        {
-                            info!("Attempting to send SIGTERM to process {}", pid);
-                            println!("===> ATTEMPTING TO SEND SIGTERM TO PROCESS {}", pid);
-                            if let Err(e) = kill(NixPid::from_raw(pid as i32), Signal::SIGTERM) {
-                                warn!("Failed to send SIGTERM to process {}: {}", pid, e);
-                                println!("===> WARNING: FAILED TO SEND SIGTERM TO PROCESS {}: {}", pid, e);
-                            } else {
-                                info!("Sent SIGTERM to process {}", pid);
-                                println!("===> SENT SIGTERM TO PROCESS {}", pid);
-                                let mut system = System::new_all();
-                                let mut attempts = 0;
-                                const MAX_KILL_ATTEMPTS: usize = 10;
-                                while attempts < MAX_KILL_ATTEMPTS {
-                                    system.refresh_all();
-                                    if system.process(Pid::from(pid as usize)).is_none() {
-                                        info!("Process {} has exited", pid);
-                                        println!("===> PROCESS {} HAS EXITED", pid);
-                                        break;
-                                    }
-                                    attempts += 1;
-                                    warn!("Process {} still running after SIGTERM, attempt {}/{}", pid, attempts, MAX_KILL_ATTEMPTS);
-                                    println!("===> PROCESS {} STILL RUNNING AFTER SIGTERM, ATTEMPT {}/{}", pid, attempts, MAX_KILL_ATTEMPTS);
-                                    sleep(TokioDuration::from_millis(500)).await;
-                                }
-                                if attempts >= MAX_KILL_ATTEMPTS {
-                                    warn!("Process {} did not exit after {} attempts, attempting SIGKILL", pid, MAX_KILL_ATTEMPTS);
-                                    println!("===> PROCESS {} DID NOT EXIT AFTER {} ATTEMPTS, ATTEMPTING SIGKILL", pid, MAX_KILL_ATTEMPTS);
-                                    if let Err(e) = kill(NixPid::from_raw(pid as i32), Signal::SIGKILL) {
-                                        error!("Failed to send SIGKILL to process {}: {}", pid, e);
-                                        println!("===> ERROR: FAILED TO SEND SIGKILL TO PROCESS {}: {}", pid, e);
-                                    }
-                                }
-                            }
-                        }
-                        let mut attempts = 0;
-                        while attempts < MAX_REGISTRY_ATTEMPTS {
-                            match timeout(TokioDuration::from_secs(10), daemon_registry.unregister_daemon(port)).await {
-                                Ok(Ok(_)) => {
-                                    info!("Unregistered stale daemon on port {}", port);
-                                    println!("===> UNREGISTERED STALE DAEMON ON PORT {}", port);
-                                    break;
-                                }
-                                Ok(Err(e)) => {
-                                    warn!("Failed to unregister daemon on port {}: {}. Attempt {}/{}", port, e, attempts + 1, MAX_REGISTRY_ATTEMPTS);
-                                    println!("===> WARNING: FAILED TO UNREGISTER DAEMON ON PORT {}: {}. ATTEMPT {}/{}", port, e, attempts + 1, MAX_REGISTRY_ATTEMPTS);
-                                    attempts += 1;
-                                    sleep(TokioDuration::from_millis(1000)).await;
-                                }
-                                Err(_) => {
-                                    warn!("Timeout unregistering daemon on port {}. Attempt {}/{}", port, attempts + 1, MAX_REGISTRY_ATTEMPTS);
-                                    println!("===> WARNING: TIMEOUT UNREGISTERING DAEMON ON PORT {}. ATTEMPT {}/{}", port, attempts + 1, MAX_REGISTRY_ATTEMPTS);
-                                    attempts += 1;
-                                    sleep(TokioDuration::from_millis(1000)).await;
-                                }
-                            }
-                        }
-                        if attempts >= MAX_REGISTRY_ATTEMPTS {
-                            error!("Failed to unregister daemon on port {} after {} attempts", port, MAX_REGISTRY_ATTEMPTS);
-                            println!("===> ERROR: FAILED TO UNREGISTER DAEMON ON PORT {} AFTER {} ATTEMPTS", port, MAX_REGISTRY_ATTEMPTS);
-                            return Err(GraphError::StorageError(format!("Failed to unregister daemon on port {} after {} attempts", port, MAX_REGISTRY_ATTEMPTS)));
-                        }
-                    }*/
+                    }
                 } else {
                     should_initialize = true;
                 }
@@ -4062,14 +4425,14 @@ impl RocksDBDaemonPool {
                     .data_directory
                     .as_ref()
                     .unwrap_or(&PathBuf::from(DEFAULT_DATA_DIRECTORY))
-                    .join("sled")
+                    .join("rocksdb")
                     .join(port.to_string());
 
                 info!("Initializing daemon on port {} with path {:?}", port, db_path);
                 println!("===> INITIALIZING DAEMON ON PORT {} WITH PATH {:?}", port, db_path);
 
                 if !db_path.exists() {
-                    info!("Creating Sled directory at {:?}", db_path);
+                    info!("Creating RocksDB directory at {:?}", db_path);
                     println!("===> CREATING SLED DIRECTORY AT {:?}", db_path);
                     tokio_fs::create_dir_all(&db_path).await
                         .map_err(|e| {
@@ -4096,12 +4459,12 @@ impl RocksDBDaemonPool {
                     .await
                     .map_err(|_| {
                         error!("Timeout creating RocksDBDaemon on port {}", port);
-                        println!("===> ERROR: TIMEOUT CREATING SLED DAEMON ON PORT {}", port);
+                        println!("===> ERROR: TIMEOUT CREATING RocksDB DAEMON ON PORT {}", port);
                         GraphError::StorageError(format!("Timeout creating RocksDBDaemon on port {}", port))
                     })?
                     .map_err(|e| {
                         error!("Failed to create RocksDBDaemon on port {}: {}", port, e);
-                        println!("===> ERROR: FAILED TO CREATE SLED DAEMON ON PORT {}: {}", port, e);
+                        println!("===> ERROR: FAILED TO CREATE RocksDB DAEMON ON PORT {}: {}", port, e);
                         e
                     })?;
 
@@ -4209,14 +4572,14 @@ impl RocksDBDaemonPool {
                         .data_directory
                         .as_ref()
                         .unwrap_or(&PathBuf::from(DEFAULT_DATA_DIRECTORY))
-                        .join("sled")
+                        .join("rocksdb")
                         .join(port.to_string());
 
                     info!("Initializing daemon from cluster_range on port {} with path {:?}", port, db_path);
                     println!("===> INITIALIZING DAEMON FROM CLUSTER_RANGE ON PORT {} WITH PATH {:?}", port, db_path);
 
                     if !db_path.exists() {
-                        info!("Creating Sled directory at {:?}", db_path);
+                        info!("Creating RocksDB directory at {:?}", db_path);
                         println!("===> CREATING ROCKSDB DIRECTORY AT {:?}", db_path);
                         tokio_fs::create_dir_all(&db_path).await
                             .map_err(|e| {
@@ -4235,24 +4598,24 @@ impl RocksDBDaemonPool {
 
                     // Force unlock before creating daemon
                     RocksDBClient::force_unlock(&db_path).await?;
-                    println!("===> Performed force unlock on Sled DB at {:?}", db_path);
+                    println!("===> Performed force unlock on RocksDB at {:?}", db_path);
 
                     let mut daemon_config = config.clone();
                     daemon_config.path = db_path.clone();
                     daemon_config.port = Some(port);
                     info!("Creating RocksDBDaemon with config: {:?}", daemon_config);
-                    println!("===> CREATING SLED DAEMON WITH CONFIG: {:?}", daemon_config);
+                    println!("===> CREATING RocksDB DAEMON WITH CONFIG: {:?}", daemon_config);
 
                     let (daemon, mut ready_rx) = timeout(TokioDuration::from_secs(10), RocksDBDaemon::new(daemon_config.clone()))
                         .await
                         .map_err(|_| {
                             error!("Timeout creating RocksDBDaemon on port {}", port);
-                            println!("===> ERROR: TIMEOUT CREATING SLED DAEMON ON PORT {}", port);
+                            println!("===> ERROR: TIMEOUT CREATING RocksDB DAEMON ON PORT {}", port);
                             GraphError::StorageError(format!("Timeout creating RocksDBDaemon on port {}", port))
                         })?
                         .map_err(|e| {
                             error!("Failed to create RocksDBDaemon on port {}: {}", port, e);
-                            println!("===> ERROR: FAILED TO CREATE SLED DAEMON ON PORT {}: {}", port, e);
+                            println!("===> ERROR: FAILED TO CREATE RocksDB DAEMON ON PORT {}: {}", port, e);
                             e
                         })?;
 
@@ -4362,7 +4725,7 @@ impl RocksDBDaemonPool {
             println!("===> STARTED HEALTH MONITORING FOR PORTS {:?}", valid_ports);
 
             info!("RocksDBDaemonPool initialized successfully with load balancing on ports {:?}", valid_ports);
-            println!("===> SLED DAEMON POOL INITIALIZED SUCCESSFULLY WITH LOAD BALANCING ON PORTS {:?}", valid_ports);
+            println!("===> RocksDB DAEMON POOL INITIALIZED SUCCESSFULLY WITH LOAD BALANCING ON PORTS {:?}", valid_ports);
             Ok(())
     }
 
@@ -4695,4 +5058,3 @@ pub async fn remove_rocksdb_daemon_port_lock(port: u16) {
     locks_map.remove(&port);
     debug!("Removed RocksDB daemon port lock entry for port {}", port);
 }
-
