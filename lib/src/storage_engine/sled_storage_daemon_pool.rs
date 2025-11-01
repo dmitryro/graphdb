@@ -362,6 +362,7 @@ impl SledDaemon {
                     pid: std::process::id(),
                     port,
                     zmq_ready: true,
+                    engine_synced: false,
                 };
 
                 if let Err(e) = daemon_registry.register_daemon(daemon_metadata).await {
@@ -603,6 +604,7 @@ impl SledDaemon {
             engine_type: Some("sled".to_string()),
             last_seen_nanos: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64,
             zmq_ready: false,  // ZMQ server not started yet; will be set to true after bind
+            engine_synced: false,
         };
 
         if let Err(e) = daemon_registry.register_daemon(general_daemon_metadata).await {
@@ -683,6 +685,7 @@ impl SledDaemon {
                     pid: std::process::id(),
                     port,
                     zmq_ready: true,  // CRITICAL: Mark ZMQ as ready and operational
+                    engine_synced: false,
                 };
 
                 if let Err(e) = daemon_registry.register_daemon(updated_metadata).await {
@@ -914,6 +917,7 @@ impl SledDaemon {
             engine_type: Some("sled".to_string()),
             last_seen_nanos: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as i64,
             zmq_ready: true,
+            engine_synced: false,
             pid: std::process::id(),
             port,
 
@@ -3174,6 +3178,7 @@ impl SledDaemonPool {
                 .map(|d| d.as_nanos() as i64)
                 .unwrap_or(0),
             zmq_ready: false,
+            engine_synced: false,
         };
 
         let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
@@ -3730,6 +3735,7 @@ impl SledDaemonPool {
                 .map(|d| d.as_nanos() as i64)
                 .unwrap_or(0),
             zmq_ready: false,
+            engine_synced: false,
         };
 
         timeout(TokioDuration::from_secs(5), daemon_registry.register_daemon(daemon_metadata))
@@ -4074,6 +4080,7 @@ impl SledDaemonPool {
                     .map(|d| d.as_nanos() as i64)
                     .unwrap_or(0),
                 zmq_ready: false,
+                engine_synced: false,
             };
 
             timeout(TokioDuration::from_secs(5), daemon_registry.register_daemon(daemon_metadata))
@@ -4270,6 +4277,7 @@ impl SledDaemonPool {
             pid: std::process::id(),
             port,
             zmq_ready: false,
+            engine_synced: false,
         };
         daemon_registry.register_daemon(daemon_metadata).await
             .map_err(|e| {

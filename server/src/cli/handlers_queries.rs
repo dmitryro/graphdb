@@ -698,6 +698,7 @@ pub async fn initialize_storage_for_query(
                     .map(|d| d.as_nanos() as i64)
                     .unwrap_or(0),
                 zmq_ready: daemon.zmq_ready,  // Preserve existing zmq_ready flag
+                engine_synced: daemon.engine_synced,
             };
 
             if updated {

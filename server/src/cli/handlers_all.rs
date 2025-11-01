@@ -588,6 +588,7 @@ pub async fn display_full_status_summary(
                         .map(|d| d.as_nanos() as i64)
                         .unwrap_or(0),
                     zmq_ready: false,
+                    engine_synced: false,
                 };
 
                 if let Err(e) = GLOBAL_DAEMON_REGISTRY.update_daemon_metadata(update_metadata).await {

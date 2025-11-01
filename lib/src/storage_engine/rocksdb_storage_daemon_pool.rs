@@ -421,6 +421,7 @@ impl<'a> RocksDBDaemon<'a> {
                 .map(|d| d.as_nanos() as i64)
                 .unwrap_or(0),
             zmq_ready: false,
+            engine_synced: false,
         };
         daemon_registry.register_daemon(daemon_metadata.clone()).await?;
 
@@ -961,6 +962,7 @@ impl<'a> RocksDBDaemon<'a> {
                 .duration_since(UNIX_EPOCH)?
                 .as_nanos() as i64,
             zmq_ready: false,
+            engine_synced: false,
         };
         handle_rocksdb_op!(
             GLOBAL_DAEMON_REGISTRY.register_daemon(initial_metadata.clone()).await,
@@ -3660,6 +3662,7 @@ impl RocksDBDaemonPool {
                 .map(|d| d.as_nanos() as i64)
                 .unwrap_or(0),
             zmq_ready: false,
+            engine_synced: false,
         };
 
         let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
@@ -4162,6 +4165,7 @@ impl RocksDBDaemonPool {
                         .map(|d| d.as_nanos() as i64)
                         .unwrap_or(0),
                     zmq_ready: false,
+                    engine_synced: false,
                 };
                 daemon_registry.register_daemon(daemon_metadata).await?;
                 
@@ -4198,6 +4202,7 @@ impl RocksDBDaemonPool {
                     .map(|d| d.as_nanos() as i64)
                     .unwrap_or(0),
                 zmq_ready: false,
+                engine_synced: false,
             };
             daemon_registry.register_daemon(daemon_metadata).await?;
 
@@ -4533,6 +4538,7 @@ impl RocksDBDaemonPool {
                         .map(|d| d.as_nanos() as i64)
                         .unwrap_or(0),
                     zmq_ready: false,
+                    engine_synced: false,
                 };
 
                 timeout(TokioDuration::from_secs(5), daemon_registry.register_daemon(daemon_metadata))
@@ -4684,6 +4690,7 @@ impl RocksDBDaemonPool {
                                 .map(|d| d.as_nanos() as i64)
                                 .unwrap_or(0),
                             zmq_ready: false,
+                            engine_synced: false,
                         };
 
                         timeout(TokioDuration::from_secs(5), daemon_registry.register_daemon(daemon_metadata))
