@@ -1492,6 +1492,7 @@ impl StorageEngineManager {
                     config_path: Some(config_path.clone()),
                     engine_type: Some(storage_engine_type.to_string()),
                     zmq_ready: false,
+                    engine_synced: false,
                     last_seen_nanos: SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .map(|d| d.as_nanos() as i64)
@@ -1678,6 +1679,7 @@ impl StorageEngineManager {
                             data_dir: Some(sled_path.clone()),
                             config_path: None,
                             engine_type: Some("Sled".to_string()),
+                            engine_synced: false,
                             zmq_ready: false,
                             last_seen_nanos: SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
@@ -1882,6 +1884,7 @@ impl StorageEngineManager {
                             config_path: config.config_root_directory.clone(),
                             engine_type: Some("RocksDB".to_string()),
                             zmq_ready: false,
+                            engine_synced: false,
                             last_seen_nanos: SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
                                 .map(|d| d.as_nanos() as i64)
@@ -3508,6 +3511,7 @@ impl StorageEngineManager {
                 config_path: Some(self.config_path.clone()),
                 engine_type: Some(new_config.storage_engine_type.to_string()),
                 zmq_ready: false,
+                engine_synced: false,
                 last_seen_nanos: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map_err(|e| GraphError::StorageError(format!("System time error: {}", e)))?
@@ -4311,6 +4315,7 @@ impl StorageEngineManager {
                 config_path: Some(config_path),
                 engine_type: Some(new_config.storage_engine_type.to_string()),
                 zmq_ready: false,
+                engine_synced: false,
                 last_seen_nanos: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map_err(|e| GraphError::StorageError(format!("System time error: {}", e)))?

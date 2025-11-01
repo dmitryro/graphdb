@@ -487,6 +487,7 @@ impl RocksDBStorage {
             config_path: Some(config_dir),
             engine_type: Some("rocksdb".to_string()),
             zmq_ready: false,
+            engine_synced: false,
             last_seen_nanos: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -875,6 +876,7 @@ impl RocksDBStorage {
             engine_type: Some("rocksdb".to_string()),
             last_seen_nanos: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64,
             zmq_ready: false,
+            engine_synced: false,
             pid: std::process::id() as u32,
             port,
         };
@@ -1162,6 +1164,7 @@ impl RocksDBStorage {
             engine_type: Some("rocksdb".to_string()),
             last_seen_nanos: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64,
             zmq_ready: false,
+            engine_synced: false,
             pid: std::process::id() as u32,
             port,
         };
@@ -1505,6 +1508,7 @@ impl RocksDBStorage {
                 config_path: Some(PathBuf::from("./storage_daemon_server")),
                 engine_type: Some("rocksdb".to_string()),
                 zmq_ready: false,
+                engine_synced: false,
                 last_seen_nanos: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
@@ -1665,6 +1669,7 @@ impl RocksDBStorage {
             engine_type: Some("rocksdb".to_string()),
             last_seen_nanos: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64,
             zmq_ready: false,
+            engine_synced: false,
             pid: std::process::id() as u32,
             port,
         };

@@ -235,6 +235,7 @@ async fn sync_daemon_registry_with_manager(
             .map(|d| d.as_nanos() as i64)
             .unwrap_or(0),
         zmq_ready: false,
+        engine_synced: false,
     };
 
     // Check if daemon is already registered
@@ -698,6 +699,7 @@ pub async fn start_storage_interactive(
             .map(|d| d.as_nanos() as i64)
             .unwrap_or(0),
         zmq_ready: false,
+        engine_synced: false,
     };
 
     let pre_register_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
@@ -717,6 +719,7 @@ pub async fn start_storage_interactive(
                 .map(|d| d.as_nanos() as i64)
                 .unwrap_or(0),
             zmq_ready: false,
+            engine_synced: false,
         };
         GLOBAL_DAEMON_REGISTRY.update_daemon_metadata(update_metadata).await?;
         info!("Updated existing daemon metadata on port {}", selected_port);
@@ -1205,6 +1208,7 @@ pub async fn display_storage_daemon_status(
                         .map(|d| d.as_nanos() as i64)
                         .unwrap_or(0),
                     zmq_ready: false,
+                    engine_synced: false,
                 };
 
                 if let Err(e) = GLOBAL_DAEMON_REGISTRY.update_daemon_metadata(update_metadata).await {
