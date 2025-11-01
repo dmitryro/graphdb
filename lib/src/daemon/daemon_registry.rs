@@ -22,7 +22,7 @@ use crate::daemon_config::{
     STORAGE_PID_FILE_NAME_PREFIX,
 };
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Encode, Decode)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Encode, Decode, Default)]
 pub struct DaemonMetadata {
     pub service_type: String,
     pub port: u16,

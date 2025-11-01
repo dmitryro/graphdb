@@ -25,6 +25,8 @@ pub enum GraphError {
     ZmqError(String), // General ZMQ error
     #[error("Timeout error: {0}")]
     TimeoutError(String),
+    #[error("Daemon error: {0}")]
+    DaemonError(String),
     #[error("Daemon start error: {0}")]
     DaemonStartError(String),
     #[error("Serialization error: {0}")]
@@ -41,6 +43,8 @@ pub enum GraphError {
     ConfigurationError(String), // Error with configuration loading or validation
     #[error("Failed to acquire lock: {0}")]
     LockError(String),
+    #[error("System failure: {0}")]
+    SystemError(String),
     #[error("Feature not implemented: {0}")]
     NotImplemented(String),
     #[error("Entity already exists: {0}")]

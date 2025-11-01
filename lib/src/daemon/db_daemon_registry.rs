@@ -11,7 +11,7 @@ use log::{info, warn, error, debug};
 use anyhow::Result;
 use sled::{Db as SledDB, IVec, Config};
 use sysinfo::{Pid, System, ProcessRefreshKind};
-use rocksdb::{DB as RocksDB, BoundColumnFamily as RocksDBColumnFamily};
+use rocksdb::{DB as RocksDB, BoundColumnFamily};
 use std::os::unix::fs::PermissionsExt;
 use tokio::fs;
 use std::fs as std_fs;
@@ -25,8 +25,50 @@ use crate::daemon_config::{
 
 pub type RocksDBDaemonInstanceType = TokioMutex<RocksDBWithPath>;
 
+// --- START: Global RocksDB Handle Registry ---
+// Global registry for open RocksDB instances in the current process.
+// This is necessary to prevent opening the same database multiple times
+// in a multi-threaded or async environment within the same process.
+// PathBuf is the DB path, Arc<RocksDB> is the open handle.
+static GLOBAL_OPEN_DB_HANDLES: OnceCell<RwLock<HashMap<PathBuf, Arc<RocksDB>>>> = OnceCell::const_new();
+
+/// Initializes the global map of open RocksDB handles if it hasn't been already.
+async fn get_open_db_handles() -> &'static RwLock<HashMap<PathBuf, Arc<RocksDB>>> {
+    GLOBAL_OPEN_DB_HANDLES.get_or_init(|| async {
+        RwLock::new(HashMap::new())
+    }).await
+}
+
+/// Attempts to retrieve an existing, open RocksDB handle registered in the current process
+/// by its file path.
+///
+/// This function is used by `RocksDBDaemonPool` when a daemon finds another daemon is
+/// already running but needs the DB handle to connect to the existing database.
+pub async fn get_registered_db_handle(db_path: &Path) -> Result<Option<Arc<RocksDB>>> {
+    let handles = get_open_db_handles().await.read().await;
+    // .cloned() is essential to return a new Arc pointer to the same DB,
+    // allowing the caller to manage its own reference count.
+    Ok(handles.get(db_path).cloned())
+}
+
+/// Registers an opened RocksDB handle for reuse in the current process.
+pub async fn register_db_handle(db_path: PathBuf, db_handle: Arc<RocksDB>) -> Result<()> {
+    let mut handles = get_open_db_handles().await.write().await;
+    handles.insert(db_path, db_handle);
+    Ok(())
+}
+
+/// Removes a registered DB handle from the map. Should be called when a DB is closed.
+pub async fn unregister_db_handle(db_path: &Path) -> Result<()> {
+    let mut handles = get_open_db_handles().await.write().await;
+    handles.remove(db_path);
+    Ok(())
+}
+// --- END: Global RocksDB Handle Registry ---
+
+
 // Serializable version of DBDaemonMetadata without DB instances
-#[derive(Serialize, Deserialize, Debug, Clone, bincode::Encode, bincode::Decode)]
+#[derive(Serialize, Deserialize, Debug, Clone, bincode::Encode, bincode::Decode, Default)]
 pub struct SerializableDBDaemonMetadata {
     pub port: u16,
     pub pid: u32,
@@ -93,11 +135,11 @@ pub struct DBDaemonMetadata<'a> {
     #[serde(skip)]
     pub sled_kv_pairs: Option<sled::Tree>,
     #[serde(skip)]
-    pub rocksdb_vertices: Option<RocksDBColumnFamily<'a>>,
+    pub rocksdb_kv_pairs: Option<Arc<BoundColumnFamily<'a>>>,
     #[serde(skip)]
-    pub rocksdb_edges: Option<RocksDBColumnFamily<'a>>,
+    pub rocksdb_vertices: Option<Arc<BoundColumnFamily<'a>>>,
     #[serde(skip)]
-    pub rocksdb_kv_pairs: Option<RocksDBColumnFamily<'a>>,
+    pub rocksdb_edges: Option<Arc<BoundColumnFamily<'a>>>,
 }
 
 impl std::fmt::Debug for DBDaemonMetadata<'_> {

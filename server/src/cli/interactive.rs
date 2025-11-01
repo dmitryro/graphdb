@@ -16,7 +16,7 @@ use crate::cli::cli::{ CliArgs, get_query_engine_singleton};
 use lib::commands::{
     CommandType, DaemonCliCommand, RestCliCommand, StorageAction, StatusArgs, StopArgs,
     ReloadArgs, ReloadAction, StartAction, RestartArgs, RestartAction, HelpArgs, ShowAction,
-    ConfigAction, parse_kv_operation, KvAction,
+    ConfigAction, parse_kv_operation, parse_storage_engine, KvAction, MigrateAction,
 };
 use crate::cli::handlers;
 use crate::cli::help_display::{
@@ -80,7 +80,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
         "start", "stop", "status", "auth", "authenticate", "register",
         "version", "health", "reload", "restart", "clear", "help", "exit",
         "daemon", "rest", "storage", "use", "quit", "q", "clean", "save", "show",
-        "kv", "exec", "query", "unified", "set", "get", "delete",
+        "kv", "exec", "query", "unified", "set", "get", "delete", "migrate",
     ];
 
     const FUZZY_MATCH_THRESHOLD: usize = 2;
@@ -829,13 +829,13 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
         },
         "use" => {
             if remaining_args.is_empty() {
-                eprintln!("Usage: use [storage <engine> [--permanent]|plugin [--enable <bool>]]");
+                eprintln!("Usage: use [storage <engine> [--permanent] [--migrate]|plugin [--enable <bool>]]");
                 CommandType::Unknown
             } else {
                 match remaining_args[0].to_lowercase().as_str() {
                     "storage" => {
                         if remaining_args.len() < 2 {
-                            eprintln!("Usage: use storage <engine> [--permanent]");
+                            eprintln!("Usage: use storage <engine> [--permanent] [--migrate]");
                             CommandType::Unknown
                         } else {
                             let engine = match remaining_args[1].to_lowercase().as_str() {
@@ -843,6 +843,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                 "rocksdb" | "rocks-db" => StorageEngineType::RocksDB,
                                 "inmemory" | "in-memory" => StorageEngineType::InMemory,
                                 "redis" => StorageEngineType::Redis,
+                                "tikv" => StorageEngineType::TiKV,
                                 "postgres" | "postgresql" | "postgre-sql" => StorageEngineType::PostgreSQL,
                                 "mysql" | "my-sql" => StorageEngineType::MySQL,
                                 _ => {
@@ -855,10 +856,15 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                             };
                             let mut permanent = true; // Default to true as per commands.rs
                             let mut i = 2;
+                            let mut migrate = false;
                             while i < remaining_args.len() {
                                 match remaining_args[i].to_lowercase().as_str() {
                                     "--permanent" => {
                                         permanent = true;
+                                        i += 1;
+                                    }
+                                    "--migrate" => {
+                                        migrate = true;
                                         i += 1;
                                     }
                                     _ => {
@@ -867,7 +873,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                     }
                                 }
                             }
-                            CommandType::UseStorage { engine, permanent }
+                            CommandType::UseStorage { engine, permanent, migrate }
                         }
                     },
                     "plugin" => {
@@ -1496,6 +1502,120 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                 }
             }
         },
+        "migrate" => {
+            if remaining_args.len() < 2 && !remaining_args.iter().any(|arg| arg == "--from" || arg == "--source" || arg == "--to" || arg == "--dest") {
+                eprintln!("Usage: migrate <from_engine> <to_engine> [--port <port>] [--cluster <cluster>] [--from <engine>] [--to <engine>] [--source <engine>] [--dest <engine>]");
+                CommandType::Unknown
+            } else {
+                let mut from_engine_pos = None;
+                let mut to_engine_pos = None;
+                let mut from = None;
+                let mut to = None;
+                let mut source = None;
+                let mut dest = None;
+                let mut port = None;
+                let mut cluster = None;
+                let mut i = 0;
+
+                // Handle positional arguments first
+                if i < remaining_args.len() && !remaining_args[i].starts_with("--") {
+                    from_engine_pos = parse_storage_engine(&remaining_args[i]).ok();
+                    i += 1;
+                }
+                if i < remaining_args.len() && !remaining_args[i].starts_with("--") {
+                    to_engine_pos = parse_storage_engine(&remaining_args[i]).ok();
+                    i += 1;
+                }
+
+                // Parse flagged arguments
+                while i < remaining_args.len() {
+                    match remaining_args[i].to_lowercase().as_str() {
+                        "--from" => {
+                            if i + 1 < remaining_args.len() {
+                                from = parse_storage_engine(&remaining_args[i + 1]).ok();
+                                i += 2;
+                            } else {
+                                eprintln!("Warning: Flag '--from' requires a value.");
+                                return (CommandType::Unknown, parsed_remaining_args);
+                            }
+                        }
+                        "--to" => {
+                            if i + 1 < remaining_args.len() {
+                                to = parse_storage_engine(&remaining_args[i + 1]).ok();
+                                i += 2;
+                            } else {
+                                eprintln!("Warning: Flag '--to' requires a value.");
+                                return (CommandType::Unknown, parsed_remaining_args);
+                            }
+                        }
+                        "--source" => {
+                            if i + 1 < remaining_args.len() {
+                                source = parse_storage_engine(&remaining_args[i + 1]).ok();
+                                i += 2;
+                            } else {
+                                eprintln!("Warning: Flag '--source' requires a value.");
+                                return (CommandType::Unknown, parsed_remaining_args);
+                            }
+                        }
+                        "--dest" => {
+                            if i + 1 < remaining_args.len() {
+                                dest = parse_storage_engine(&remaining_args[i + 1]).ok();
+                                i += 2;
+                            } else {
+                                eprintln!("Warning: Flag '--dest' requires a value.");
+                                return (CommandType::Unknown, parsed_remaining_args);
+                            }
+                        }
+                        "--port" => {
+                            if i + 1 < remaining_args.len() {
+                                port = remaining_args[i + 1].parse::<u16>().ok();
+                                i += 2;
+                            } else {
+                                eprintln!("Warning: Flag '--port' requires a value.");
+                                return (CommandType::Unknown, parsed_remaining_args);
+                            }
+                        }
+                        "--cluster" => {
+                            if i + 1 < remaining_args.len() {
+                                cluster = Some(remaining_args[i + 1].clone());
+                                i += 2;
+                            } else {
+                                eprintln!("Warning: Flag '--cluster' requires a value.");
+                                return (CommandType::Unknown, parsed_remaining_args);
+                            }
+                        }
+                        _ => {
+                            eprintln!("Warning: Unknown argument for 'migrate': {}", remaining_args[i]);
+                            i += 1;
+                        }
+                    }
+                }
+
+                // Resolve from_engine: prioritize from_engine_pos, then from, then source
+                let from_engine = from_engine_pos.or(from).or(source);
+                // Resolve to_engine: prioritize to_engine_pos, then to, then dest
+                let to_engine = to_engine_pos.or(to).or(dest);
+
+                match (from_engine, to_engine) {
+                    (Some(from_engine), Some(to_engine)) => {
+                        CommandType::Migrate(MigrateAction {
+                            from,
+                            to,
+                            source,
+                            dest,
+                            from_engine_pos,
+                            to_engine_pos,
+                            port,
+                            cluster,
+                        })
+                    }
+                    _ => {
+                        eprintln!("Error: Both source and destination engines must be specified.");
+                        CommandType::Unknown
+                    }
+                }
+            }
+        }
         _ => CommandType::Unknown,
     };
 
@@ -1698,10 +1818,11 @@ pub async fn handle_interactive_command(
             handlers::register_user(username, password).await;
             Ok(())
         }
-        CommandType::UseStorage { engine, permanent } => {
+        CommandType::UseStorage { engine, permanent, migrate } => {
             handlers::handle_use_storage_interactive(
                 engine,
                 permanent,
+                migrate,
                 state.storage_daemon_shutdown_tx_opt.clone(),
                 state.storage_daemon_handle.clone(),
                 state.storage_daemon_port_arc.clone(),
@@ -1960,6 +2081,22 @@ pub async fn handle_interactive_command(
         }
         CommandType::Unknown => {
             println!("Unknown command. Type 'help' for a list of commands.");
+            Ok(())
+        }
+        CommandType::Migrate(action) => {
+            let from_engine = action.from_engine_pos.or(action.from).or(action.source).ok_or_else(|| {
+                anyhow::anyhow!("No source engine specified. Use positional argument or --from/--source.")
+            })?;
+            let to_engine = action.to_engine_pos.or(action.to).or(action.dest).ok_or_else(|| {
+                anyhow::anyhow!("No destination engine specified. Use positional argument or --to/--dest.")
+            })?;
+            handlers::handle_migrate_interactive(
+                from_engine,
+                to_engine,
+                state.storage_daemon_shutdown_tx_opt.clone(),
+                state.storage_daemon_handle.clone(),
+                state.storage_daemon_port_arc.clone(),
+            ).await?;
             Ok(())
         }
     }
