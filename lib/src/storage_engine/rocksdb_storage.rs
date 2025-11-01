@@ -155,6 +155,9 @@ impl RocksDBStorage {
         info!("Using RocksDB path {:?}", db_path);
         println!("===> USING ROCKSDB PATH {:?}", db_path);
 
+        // --------------------------------------------------------------------- //
+        // 1. Directory setup & lock cleanup
+        // --------------------------------------------------------------------- //
         let max_retries = 3;
         let mut attempt = 0;
         while attempt < max_retries {
@@ -165,11 +168,25 @@ impl RocksDBStorage {
                     break;
                 }
                 Err(e) => {
-                    error!("Attempt {}/{}: Failed to create database directory at {:?}: {}", attempt + 1, max_retries, db_path, e);
-                    println!("===> ERROR: ATTEMPT {}/{}: FAILED TO CREATE ROCKSDB DIRECTORY AT {:?}", attempt + 1, max_retries, db_path);
+                    error!(
+                        "Attempt {}/{}: Failed to create database directory at {:?}: {}",
+                        attempt + 1,
+                        max_retries,
+                        db_path,
+                        e
+                    );
+                    println!(
+                        "===> ERROR: ATTEMPT {}/{}: FAILED TO CREATE ROCKSDB DIRECTORY AT {:?}",
+                        attempt + 1,
+                        max_retries,
+                        db_path
+                    );
                     attempt += 1;
                     if attempt == max_retries {
-                        return Err(GraphError::StorageError(format!("Failed to create database directory at {:?} after {} attempts: {}", db_path, max_retries, e)));
+                        return Err(GraphError::StorageError(format!(
+                            "Failed to create database directory at {:?} after {} attempts: {}",
+                            db_path, max_retries, e
+                        )));
                     }
                     tokio::time::sleep(TokioDuration::from_millis(100)).await;
                 }
@@ -181,12 +198,18 @@ impl RocksDBStorage {
             .map_err(|e| {
                 error!("Failed to access directory metadata at {:?}: {}", db_path, e);
                 println!("===> ERROR: FAILED TO ACCESS DIRECTORY METADATA AT {:?}", db_path);
-                GraphError::StorageError(format!("Failed to access directory metadata at {:?}: {}", db_path, e))
+                GraphError::StorageError(format!(
+                    "Failed to access directory metadata at {:?}: {}",
+                    db_path, e
+                ))
             })?;
         if metadata.permissions().readonly() {
             error!("Directory at {:?} is not writable", db_path);
             println!("===> ERROR: DIRECTORY AT {:?} IS NOT WRITABLE", db_path);
-            return Err(GraphError::StorageError(format!("Directory at {:?} is not writable", db_path)));
+            return Err(GraphError::StorageError(format!(
+                "Directory at {:?} is not writable",
+                db_path
+            )));
         }
 
         async fn log_directory_contents(path: &Path) {
@@ -201,37 +224,29 @@ impl RocksDBStorage {
         }
         log_directory_contents(&db_path).await;
 
+        // --------------------------------------------------------------------- //
+        // 2. Singleton & registry reuse (no DB open)
+        // --------------------------------------------------------------------- //
         if let Some(rocks_db) = ROCKSDB_DB.get() {
             let rocks_db_guard = rocks_db.lock().await;
-            if rocks_db_guard.path == db_path && rocks_db_guard.db.cf_handle("vertices").is_some() {
-                info!("Reusing existing ROCKSDB_DB singleton for path {:?}", db_path);
-                println!("===> REUSING EXISTING ROCKSDB_DB SINGLETON FOR PATH {:?}", db_path);
+            if rocks_db_guard.path == db_path && rocks_db_guard.client.is_some() {
+                info!("Reusing existing ROCKSDB_DB singleton with ZMQ client for path {:?}", db_path);
+                println!(
+                    "===> REUSING EXISTING ROCKSDB_DB SINGLETON WITH ZMQ CLIENT FOR PATH {:?}",
+                    db_path
+                );
 
                 let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
-                let daemon_metadata_opt = daemon_registry.get_daemon_metadata(port).await.ok().flatten();
-                if let Some(daemon_metadata) = daemon_metadata_opt {
-                    if daemon_metadata.data_dir.as_ref() != Some(&db_path) {
-                        warn!(
-                            "PATH MISMATCH FOR ROCKSDB: REGISTRY SHOWS {:?}, BUT CONFIG SPECIFIES {:?}. Updating registry...",
-                            daemon_metadata.data_dir, db_path
-                        );
-                        println!(
-                            "===> PATH MISMATCH FOR ROCKSDB: REGISTRY SHOWS {:?}, BUT CONFIG SPECIFIES {:?}. UPDATING REGISTRY...",
-                            daemon_metadata.data_dir, db_path
-                        );
-                        daemon_registry.remove_daemon_by_type("storage", port).await?;
-                    }
-                    if is_storage_daemon_running(port).await && check_pid_validity(daemon_metadata.pid).await {
-                        let pool_map = ROCKSDB_POOL_MAP.get_or_init(|| async {
-                            TokioMutex::new(HashMap::new())
-                        }).await;
+                if let Ok(Some(metadata)) = daemon_registry.get_daemon_metadata(port).await {
+                    if is_storage_daemon_running(port).await && check_pid_validity(metadata.pid).await {
+                        let pool_map = ROCKSDB_POOL_MAP
+                            .get_or_init(|| async { TokioMutex::new(HashMap::new()) })
+                            .await;
+
+                        // Acquire lock ONLY to check existence
                         let pool_map_guard = timeout(TokioDuration::from_secs(5), pool_map.lock())
                             .await
-                            .map_err(|_| {
-                                error!("Failed to acquire pool map lock for port {}", port);
-                                println!("===> ERROR: FAILED TO ACQUIRE POOL MAP LOCK FOR PORT {}", port);
-                                GraphError::StorageError("Failed to acquire pool map lock".to_string())
-                            })?;
+                            .map_err(|_| GraphError::StorageError("Failed to acquire pool map lock".into()))?;
 
                         if let Some(existing_pool) = pool_map_guard.get(&port) {
                             info!("Reusing existing RocksDBDaemonPool for port {}", port);
@@ -260,193 +275,236 @@ impl RocksDBStorage {
             e
         })?;
 
-        // Open the database instance. This is required to initialize the ROCKSDB_DB singleton
-        // with the DB object, which is needed for local operations before the ZMQ client is ready.
-        let rocks_db_instance = Arc::new(Self::initialize_database_instance(&db_path, port).await?);
+        // --------------------------------------------------------------------- //
+        // 3. Initialise ROCKSDB_DB singleton (NO real DB open)
+        // --------------------------------------------------------------------- //
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
 
-        // Initialize the ROCKSDB_DB singleton (without the client initially)
-        let rocks_db_singleton = ROCKSDB_DB.get_or_init(|| async {
-            let rocks_db_guard = rocks_db_instance.lock().await;
-            TokioMutex::new(RocksDBWithPath {
-                db: rocks_db_guard.db.clone(),
-                path: rocks_db_guard.path.clone(),
-                client: None, // Client will be set later
+        let rocks_db_singleton = ROCKSDB_DB
+            .get_or_init(|| async {
+                // Fallback to an in-memory DB – the real DB is opened by the daemon.
+                let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+                let cfs = vec!["default"]; // minimal column family list
+                let db = DB::open_cf(&opts, temp_dir.path(), cfs)
+                    .expect("failed to open temporary RocksDB");
+                TokioMutex::new(RocksDBWithPath {
+                    db: Arc::new(db),
+                    path: db_path.clone(),
+                    client: None,
+                })
             })
-        }).await;
+            .await;
 
+        // --------------------------------------------------------------------- //
+        // 4. Pool & daemon-registry setup — SAFE LOCKING
+        // --------------------------------------------------------------------- //
         let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
-        let daemon_metadata_opt = daemon_registry.get_daemon_metadata(port).await.ok().flatten();
-        let pool = if let Some(daemon_metadata) = daemon_metadata_opt {
-            info!("Found existing daemon on port {} with PID {}", port, daemon_metadata.pid);
-            println!("===> FOUND EXISTING DAEMON ON PORT {} WITH PID {}", port, daemon_metadata.pid);
 
-            if !is_storage_daemon_running(port).await || !check_pid_validity(daemon_metadata.pid).await {
-                warn!("Stale daemon found on port {}. Cleaning up...", port);
-                println!("===> STALE DAEMON FOUND ON PORT {}. CLEANING UP", port);
-                Self::force_unlock(&db_path).await?;
-                daemon_registry.remove_daemon_by_type("storage", port).await
-                    .map_err(|e| {
-                        error!("Failed to remove daemon registry entry for port {}: {}", port, e);
-                        println!("===> ERROR: FAILED TO REMOVE DAEMON REGISTRY ENTRY FOR PORT {}: {}", port, e);
-                        GraphError::StorageError(format!("Failed to remove daemon registry entry: {}", e))
-                    })?;
-            } else {
-                let pool_map = ROCKSDB_POOL_MAP.get_or_init(|| async {
-                    TokioMutex::new(HashMap::new())
-                }).await;
-                let pool_map_guard = timeout(TokioDuration::from_secs(5), pool_map.lock())
-                    .await
-                    .map_err(|_| {
-                        error!("Failed to acquire pool map lock for port {}", port);
-                        println!("===> ERROR: FAILED TO ACQUIRE POOL MAP LOCK FOR PORT {}", port);
-                        GraphError::StorageError("Failed to acquire pool map lock".to_string())
-                    })?;
+        // Determine if we need to clean up stale daemon
+        let stale_cleanup_needed = if let Ok(Some(daemon_metadata)) = daemon_registry.get_daemon_metadata(port).await {
+            info!(
+                "Found existing daemon on port {} with PID {}",
+                port, daemon_metadata.pid
+            );
+            println!(
+                "===> FOUND EXISTING DAEMON ON PORT {} WITH PID {}",
+                port, daemon_metadata.pid
+            );
 
-                if let Some(existing_pool) = pool_map_guard.get(&port) {
-                    info!("Reusing existing RocksDBDaemonPool for port {}", port);
-                    println!("===> REUSING EXISTING ROCKSDB DAEMON POOL FOR PORT {}", port);
-                    return Ok(Self {
-                        pool: existing_pool.clone(),
-                        use_raft_for_scale: config.use_raft_for_scale,
-                        #[cfg(feature = "with-openraft-rocksdb")]
-                        raft: None,
-                    });
-                }
-            }
-
-            let new_pool = Arc::new(TokioMutex::new(RocksDBDaemonPool::new()));
-            let pool_map = ROCKSDB_POOL_MAP.get_or_init(|| async {
-                TokioMutex::new(HashMap::new())
-            }).await;
-            let mut pool_map_guard = timeout(TokioDuration::from_secs(5), pool_map.lock())
-                .await
-                .map_err(|_| {
-                    error!("Failed to acquire pool map lock for port {}", port);
-                    println!("===> ERROR: FAILED TO ACQUIRE POOL MAP LOCK FOR PORT {}", port);
-                    GraphError::StorageError("Failed to acquire pool map lock".to_string())
-                })?;
-            pool_map_guard.insert(port, new_pool.clone());
-            new_pool
+            !is_storage_daemon_running(port).await || !check_pid_validity(daemon_metadata.pid).await
         } else {
-            info!("No existing daemon found for port {}. Creating new pool...", port);
-            println!("===> NO EXISTING DAEMON FOUND FOR PORT {}. CREATING NEW POOL", port);
-            Self::force_unlock(&db_path).await?;
-            let pool_map = ROCKSDB_POOL_MAP.get_or_init(|| async {
-                TokioMutex::new(HashMap::new())
-            }).await;
-            let mut pool_map_guard = timeout(TokioDuration::from_secs(5), pool_map.lock())
-                .await
-                .map_err(|_| {
-                    error!("Failed to acquire pool map lock for port {}", port);
-                    println!("===> ERROR: FAILED TO ACQUIRE POOL MAP LOCK FOR PORT {}", port);
-                    GraphError::StorageError("Failed to acquire pool map lock".to_string())
-                })?;
-            let new_pool = Arc::new(TokioMutex::new(RocksDBDaemonPool::new()));
-            pool_map_guard.insert(port, new_pool.clone());
-            new_pool
+            false
         };
 
-        // 1. Initialize RocksDBDaemonPool Cluster (FIX 1)
+        if stale_cleanup_needed {
+            warn!("Stale daemon found on port {}. Cleaning up...", port);
+            println!("===> STALE DAEMON FOUND ON PORT {}. CLEANING UP", port);
+            Self::force_unlock(&db_path).await?;
+            daemon_registry
+                .remove_daemon_by_type("storage", port)
+                .await
+                .map_err(|e| GraphError::StorageError(format!("Failed to remove daemon registry entry: {}", e)))?;
+        }
+
+        // Get or create pool — with minimal lock scope
+        let pool_map = ROCKSDB_POOL_MAP
+            .get_or_init(|| async { TokioMutex::new(HashMap::new()) })
+            .await;
+
+        let pool = {
+            let mut pool_map_guard = timeout(TokioDuration::from_secs(5), pool_map.lock())
+                .await
+                .map_err(|_| GraphError::StorageError("Failed to acquire pool map lock".into()))?;
+
+            if let Some(existing_pool) = pool_map_guard.get(&port).cloned() {
+                info!("Reusing existing RocksDBDaemonPool for port {}", port);
+                println!("===> REUSING EXISTING ROCKSDB DAEMON POOL FOR PORT {}", port);
+                existing_pool
+            } else {
+                info!("Creating new RocksDBDaemonPool for port {}", port);
+                println!("===> CREATING NEW ROCKSDB DAEMON POOL FOR PORT {}", port);
+                let new_pool = Arc::new(TokioMutex::new(RocksDBDaemonPool::new()));
+                pool_map_guard.insert(port, new_pool.clone());
+                new_pool
+            }
+            // ← pool_map_guard dropped here — lock released!
+        };
+
+        // --------------------------------------------------------------------- //
+        // 5. Initialise cluster (spawns daemon & binds ZMQ)
+        // --------------------------------------------------------------------- //
         {
             let mut pool_guard = timeout(TokioDuration::from_secs(10), pool.lock())
                 .await
-                .map_err(|_| {
-                    error!("Failed to acquire pool lock for cluster initialization on port {}", port);
-                    println!("===> ERROR: FAILED TO ACQUIRE POOL LOCK FOR CLUSTER INITIALIZATION ON PORT {}", port);
-                    GraphError::StorageError("Failed to acquire pool lock for initialization".to_string())
-                })?;
-            
-            // CORRECTED: Call initialize_cluster, passing the configs, instead of initialize_with_db.
+                .map_err(|_| GraphError::StorageError("Failed to acquire pool lock for initialization".into()))?;
+
             info!("Initializing cluster with use_raft: {}", config.use_raft_for_scale);
-            println!("===> INITIALIZING CLUSTER WITH USE_RAFT: {}", config.use_raft_for_scale);
-            
-            timeout(TokioDuration::from_secs(30), pool_guard.initialize_cluster(storage_config, config, Some(port)))
-                .await
-                .map_err(|_| {
-                    error!("Timeout initializing RocksDBDaemonPool cluster for port {}", port);
-                    println!("===> ERROR: TIMEOUT INITIALIZING ROCKSDB DAEMON POOL CLUSTER FOR PORT {}", port);
-                    GraphError::StorageError("Timeout initializing RocksDBDaemonPool cluster".to_string())
-                })??;
-            
+            println!(
+                "===> INITIALIZING CLUSTER WITH USE_RAFT: {}",
+                config.use_raft_for_scale
+            );
+
+            timeout(
+                TokioDuration::from_secs(30),
+                pool_guard.initialize_cluster(storage_config, config, Some(port)),
+            )
+            .await
+            .map_err(|_| GraphError::StorageError("Timeout initializing RocksDBDaemonPool cluster".into()))??;
+
             info!("Initialized cluster on port {}", port);
             println!("===> INITIALIZED CLUSTER ON PORT {}", port);
         }
 
-        // 2. Initialize ZMQ client (FIX 2)
+        // --------------------------------------------------------------------- //
+        // 6. Wait for ZMQ readiness
+        // --------------------------------------------------------------------- //
         let client_tuple = {
             const MAX_RETRIES: usize = 20;
             const INITIAL_RETRY_DELAY_MS: u64 = 100;
-            let mut client_tuple_opt: Option<(RocksDBClient, Arc<TokioMutex<ZmqSocketWrapper>>)> = None;
-            
+            let mut client_opt: Option<(RocksDBClient, Arc<TokioMutex<ZmqSocketWrapper>>)> = None;
+
             info!("Waiting for RocksDB ZMQ IPC readiness on port {}...", port);
             println!("===> WAITING FOR ROCKSDB ZMQ IPC READINESS ON PORT {}...", port);
 
             for i in 0..MAX_RETRIES {
                 match RocksDBClient::connect_zmq_client_with_readiness_check(port).await {
-                    Ok(c_tuple) => {
+                    Ok(c) => {
                         info!("RocksDB ZMQ client connected successfully after {} retries.", i);
-                        println!("===> ROCKSDB ZMQ CLIENT CONNECTED SUCCESSFULLY AFTER {} RETRIES", i);
-                        client_tuple_opt = Some(c_tuple);
+                        println!(
+                            "===> ROCKSDB ZMQ CLIENT CONNECTED SUCCESSFULLY AFTER {} RETRIES",
+                            i
+                        );
+                        client_opt = Some(c);
                         break;
                     }
                     Err(e) => {
-                        warn!("Attempt {}/{} to connect RocksDB ZMQ client failed for port {}: {}", i + 1, MAX_RETRIES, port, e);
-                        println!("===> WARNING: ATTEMPT {}/{} TO CONNECT ROCKSDB ZMQ CLIENT FAILED FOR PORT {}: {}", i + 1, MAX_RETRIES, port, e);
+                        warn!(
+                            "Attempt {}/{} to connect RocksDB ZMQ client failed for port {}: {}",
+                            i + 1,
+                            MAX_RETRIES,
+                            port,
+                            e
+                        );
+                        println!(
+                            "===> WARNING: ATTEMPT {}/{} TO CONNECT ROCKSDB ZMQ CLIENT FAILED FOR PORT {}: {}",
+                            i + 1,
+                            MAX_RETRIES,
+                            port,
+                            e
+                        );
                         if i < MAX_RETRIES - 1 {
-                            tokio::time::sleep(TokioDuration::from_millis(INITIAL_RETRY_DELAY_MS * (1 << i))).await;
+                            tokio::time::sleep(TokioDuration::from_millis(
+                                INITIAL_RETRY_DELAY_MS * (1 << i),
+                            ))
+                            .await;
                         } else {
-                            error!("Failed to connect RocksDB ZMQ client after {} retries for port {}: {}", MAX_RETRIES, port, e);
-                            println!("===> ERROR: FAILED TO CONNECT ROCKSDB ZMQ CLIENT AFTER {} RETRIES FOR PORT {}: {}", MAX_RETRIES, port, e);
-                            return Err(GraphError::StorageError(format!("Failed to connect RocksDB ZMQ client after {} retries for port {}: {}", MAX_RETRIES, port, e)));
+                            error!(
+                                "Failed to connect RocksDB ZMQ client after {} retries for port {}: {}",
+                                MAX_RETRIES, port, e
+                            );
+                            println!(
+                                "===> ERROR: FAILED TO CONNECT ROCKSDB ZMQ CLIENT AFTER {} RETRIES FOR PORT {}: {}",
+                                MAX_RETRIES, port, e
+                            );
+                            return Err(GraphError::StorageError(format!(
+                                "Failed to connect ZMQ client after {} retries: {}",
+                                MAX_RETRIES, e
+                            )));
                         }
                     }
                 }
             }
-            client_tuple_opt.ok_or_else(|| {
-                error!("Failed to initialize RocksDB ZMQ client after successful poll");
-                println!("===> ERROR: FAILED TO INITIALIZE ROCKSDB ZMQ CLIENT AFTER SUCCESSFUL POLL");
-                GraphError::StorageError("Failed to initialize RocksDB ZMQ client after successful poll".to_string())
+            client_opt.ok_or_else(|| {
+                error!("Failed to initialise RocksDB ZMQ client after successful poll");
+                println!("===> ERROR: FAILED TO INITIALISE ROCKSDB ZMQ CLIENT AFTER SUCCESSFUL POLL");
+                GraphError::StorageError("Failed to initialise ZMQ client".into())
             })?
         };
-        
-        // 3. Store client tuple in ROCKSDB_DB singleton
-        let mut rocks_db_guard = rocks_db_singleton.lock().await;
-        rocks_db_guard.client = Some(client_tuple);
-        drop(rocks_db_guard);
-        info!("Attached ZMQ client to ROCKSDB_DB singleton for port {}", port);
-        println!("===> ATTACHED ZMQ CLIENT TO ROCKSDB_DB SINGLETON FOR PORT {}", port);
-        
-        let config_dir = PathBuf::from(storage_config.config_root_directory.clone().unwrap_or_default());
+
+        // --------------------------------------------------------------------- //
+        // 7. Attach client to singleton
+        // --------------------------------------------------------------------- //
+        {
+            let mut rocks_db_guard = rocks_db_singleton.lock().await;
+            rocks_db_guard.client = Some(client_tuple);
+            drop(rocks_db_guard);
+            info!("Attached ZMQ client to ROCKSDB_DB singleton for port {}", port);
+            println!(
+                "===> ATTACHED ZMQ CLIENT TO ROCKSDB_DB SINGLETON FOR PORT {}",
+                port
+            );
+        }
+
+        // --------------------------------------------------------------------- //
+        // 8. Register daemon metadata
+        // --------------------------------------------------------------------- //
+        let config_dir = PathBuf::from(
+            storage_config
+                .config_root_directory
+                .clone()
+                .unwrap_or_default(),
+        );
         if !config_dir.exists() {
             fs::create_dir_all(&config_dir)
                 .await
                 .map_err(|e| {
-                    error!("Failed to create config directory at {:?}: {}", config_dir, e);
-                    println!("===> ERROR: FAILED TO CREATE CONFIG DIRECTORY AT {:?}", config_dir);
-                    GraphError::StorageError(format!("Failed to create config directory at {:?}: {}", config_dir, e))
+                    GraphError::StorageError(format!(
+                        "Failed to create config directory at {:?}: {}",
+                        config_dir, e
+                    ))
                 })?;
         }
 
         let daemon_metadata = DaemonMetadata {
             service_type: "storage".to_string(),
-            ip_address: config.host.clone().unwrap_or("127.0.0.1".to_string()),
+            ip_address: config
+                .host
+                .clone()
+                .unwrap_or_else(|| "127.0.0.1".to_string()),
             data_dir: Some(db_path.clone()),
             config_path: Some(config_dir),
             engine_type: Some("rocksdb".to_string()),
             zmq_ready: false,
-            last_seen_nanos: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64,
+            last_seen_nanos: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as i64,
             pid: std::process::id() as u32,
             port,
         };
-        daemon_registry.register_daemon(daemon_metadata).await
-            .map_err(|e| {
-                error!("Failed to register daemon for port {}: {}", port, e);
-                println!("===> ERROR: FAILED TO REGISTER DAEMON FOR PORT {}: {}", port, e);
-                GraphError::StorageError(format!("Failed to register daemon for port {}: {}", port, e))
-            })?;
+        daemon_registry
+            .register_daemon(daemon_metadata)
+            .await
+            .map_err(|e| GraphError::StorageError(format!("Failed to register daemon: {}", e)))?;
+
         info!("Registered daemon for port {}", port);
         println!("===> REGISTERED DAEMON FOR PORT {}", port);
 
+        // --------------------------------------------------------------------- //
+        // 9. Return the storage instance
+        // --------------------------------------------------------------------- //
         let storage = Self {
             pool,
             use_raft_for_scale: config.use_raft_for_scale,
@@ -454,253 +512,15 @@ impl RocksDBStorage {
             raft: None,
         };
 
-        info!("Successfully initialized RocksDBStorage in {}ms", start_time.elapsed().as_millis());
-        println!("===> SUCCESSFULLY INITIALIZED RocksDBStorage IN {}ms", start_time.elapsed().as_millis());
+        info!(
+            "Successfully initialized RocksDBStorage in {}ms",
+            start_time.elapsed().as_millis()
+        );
+        println!(
+            "===> SUCCESSFULLY INITIALIZED RocksDBStorage IN {}ms",
+            start_time.elapsed().as_millis()
+        );
         Ok(storage)
-    }
-
-    pub async fn initialize_database_instance(db_path: &Path, port: u16) -> GraphResult<TokioMutex<RocksDBWithPath>> {
-        info!("Opening new RocksDB database at {:?}", db_path);
-        println!("===> ATTEMPTING TO OPEN ROCKSDB AT {:?}", db_path);
-
-        let mut should_start_daemon = false;
-        if !is_port_free(port).await {
-            if let Some(pid) = find_pid_by_port(port).await {
-                if NonBlockingDaemonRegistry::is_pid_running(pid).await.unwrap_or(false) {
-                    let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
-                    if let Ok(Some(metadata)) = daemon_registry.get_daemon_metadata(port).await {
-                        if metadata.service_type == "storage" && metadata.pid == pid {
-                            info!("Valid storage daemon (PID: {}) already running on port {}. Reusing...", pid, port);
-                            println!("===> VALID STORAGE DAEMON (PID: {}) ALREADY RUNNING ON PORT {}. REUSING...", pid, port);
-                        } else {
-                            info!("Found process (PID: {}) on port {} but not a valid storage daemon. Stopping it...", pid, port);
-                            println!("===> FOUND PROCESS (PID: {}) ON PORT {} BUT NOT A VALID STORAGE DAEMON. STOPPING IT...", pid, port);
-                            stop_process_by_port("Storage Daemon", port)
-                                .await
-                                .map_err(|e| {
-                                    error!("Failed to stop process on port {}: {}", port, e);
-                                    println!("===> ERROR: FAILED TO STOP PROCESS ON PORT {}: {}", port, e);
-                                    GraphError::StorageError(format!("Failed to stop process on port {}: {}", port, e))
-                                })?;
-                            should_start_daemon = true;
-                        }
-                    } else {
-                        info!("Found process (PID: {}) on port {} but no daemon metadata. Stopping it...", pid, port);
-                        println!("===> FOUND PROCESS (PID: {}) ON PORT {} BUT NO DAEMON METADATA. STOPPING IT...", pid, port);
-                        stop_process_by_port("Storage Daemon", port)
-                            .await
-                            .map_err(|e| {
-                                error!("Failed to stop process on port {}: {}", port, e);
-                                println!("===> ERROR: FAILED TO STOP PROCESS ON PORT {}: {}", port, e);
-                                GraphError::StorageError(format!("Failed to stop process on port {}: {}", port, e))
-                            })?;
-                        should_start_daemon = true;
-                    }
-
-                    if should_start_daemon {
-                        let max_attempts = 5;
-                        let mut attempts = 0;
-                        while !is_port_free(port).await && attempts < max_attempts {
-                            debug!("Port {} still in use after stopping PID {}. Waiting... (attempt {}/{})", port, pid, attempts + 1, max_attempts);
-                            println!("===> PORT {} STILL IN USE AFTER STOPPING PID {}. WAITING... (ATTEMPT {}/{})", port, pid, attempts + 1, max_attempts);
-                            sleep(TokioDuration::from_millis(500)).await;
-                            attempts += 1;
-                        }
-                        if attempts >= max_attempts {
-                            error!("Port {} still in use after {} attempts to stop PID {}", port, max_attempts, pid);
-                            println!("===> ERROR: PORT {} STILL IN USE AFTER {} ATTEMPTS TO STOP PID {}", port, max_attempts, pid);
-                            return Err(GraphError::StorageError(
-                                format!("Port {} still in use after {} attempts to stop PID {}", port, max_attempts, pid)
-                            ));
-                        }
-                    }
-                } else {
-                    info!("Stale PID {} found on port {}. Cleaning up...", pid, port);
-                    println!("===> STALE PID {} FOUND ON PORT {}. CLEANING UP...", pid, port);
-                    should_start_daemon = true;
-                }
-            }
-        } else {
-            should_start_daemon = true;
-        }
-
-        let lock_path = db_path.join("LOCK");
-        if lock_path.exists() {
-            warn!("Found lock file at {:?}", lock_path);
-            println!("===> FOUND LOCK FILE AT {:?}", lock_path);
-            force_cleanup_engine_lock(StorageEngineType::RocksDB, &Some(db_path.to_path_buf()))
-                .await
-                .map_err(|e| {
-                    error!("Failed to clean up lock file at {:?}: {}", lock_path, e);
-                    println!("===> ERROR: FAILED TO CLEAN UP LOCK FILE AT {:?}", lock_path);
-                    GraphError::StorageError(format!("Failed to clean up lock file at {:?}: {}", lock_path, e))
-                })?;
-            info!("Successfully cleaned up lock file at {:?}", lock_path);
-            println!("===> SUCCESSFULLY CLEANED UP LOCK FILE AT {:?}", lock_path);
-        }
-
-        let storage_config = crate::config::load_storage_config_from_yaml(None)
-            .await
-            .unwrap_or_else(|_| StorageConfig::default());
-
-        let standard_cf_names = vec!["vertices", "edges", "kv_pairs"];
-        let raft_cf_names = vec!["raft_vote", "raft_membership", "raft_snapshot", "raft_log", "data"];
-
-        let existing_cfs = if db_path.exists() {
-            match DB::list_cf(&Options::default(), db_path) {
-                Ok(cfs) => cfs,
-                Err(e) => {
-                    warn!("Failed to list existing column families at {:?}: {}. Attempting to create new database.", db_path, e);
-                    println!("===> WARNING: FAILED TO LIST COLUMN FAMILIES AT {:?}", db_path);
-                    vec![]
-                }
-            }
-        } else {
-            vec![]
-        };
-
-        let mut cf_names = standard_cf_names.clone();
-        if storage_config.use_raft_for_scale {
-            cf_names.extend(raft_cf_names.clone());
-        }
-        for cf in &existing_cfs {
-            if !cf_names.contains(&cf.as_str()) {
-                warn!("Including existing column family '{}' at {:?} for compatibility.", cf, db_path);
-                println!("===> INCLUDING EXISTING COLUMN FAMILY '{}' AT {:?}", cf, db_path);
-                cf_names.push(cf);
-            }
-        }
-
-        let cfs: Vec<ColumnFamilyDescriptor> = cf_names.iter().map(|name| {
-            let mut cf_opts = Options::default();
-            cf_opts.set_max_write_buffer_number(2);
-            ColumnFamilyDescriptor::new(name.to_string(), cf_opts)
-        }).collect();
-
-        let mut opts = Options::default();
-        opts.create_if_missing(true);
-        opts.create_missing_column_families(true);
-        opts.set_compaction_style(DBCompactionStyle::Level);
-        opts.set_paranoid_checks(false);
-        opts.set_error_if_exists(false);
-        opts.set_max_open_files(storage_config.max_open_files as i32);
-
-        let max_init_attempts = 3;
-        let mut attempts = 0;
-        let db = loop {
-            let cfs: Vec<ColumnFamilyDescriptor> = cf_names.iter().map(|name| {
-                let mut cf_opts = Options::default();
-                cf_opts.set_max_write_buffer_number(2);
-                ColumnFamilyDescriptor::new(*name, cf_opts)
-            }).collect();
-
-            match timeout(TokioDuration::from_secs(5), async {
-                DB::open_cf_descriptors(&opts, db_path, cfs).map_err(|e| {
-                    error!("Failed to open RocksDB at {:?}: {}. Run `graphdb-cli force-reset --port {}` to reset.", db_path, e, port);
-                    println!("===> ERROR: FAILED TO OPEN ROCKSDB AT {:?}: {}. RUN `graphdb-cli force-reset --port {}` TO RESET.", db_path, e, port);
-                    GraphError::StorageError(format!("Failed to open RocksDB database at {:?}: {}. Run `graphdb-cli force-reset --port {}` to reset.", db_path, e, port))
-                })
-            }).await {
-                Ok(Ok(db)) => break db,
-                Ok(Err(e)) => {
-                    attempts += 1;
-                    if attempts >= max_init_attempts {
-                        error!("Failed to open RocksDB at {:?} after {} attempts", db_path, max_init_attempts);
-                        println!("===> ERROR: FAILED TO OPEN ROCKSDB AT {:?} AFTER {} ATTEMPTS", db_path, max_init_attempts);
-                        return Err(e);
-                    }
-                    error!("Failed to open RocksDB at {:?} (attempt {}/{}): {}. Retrying...", db_path, attempts, max_init_attempts, e);
-                    println!("===> ERROR: FAILED TO OPEN ROCKSDB AT {:?} (ATTEMPT {}/{}): {}. RETRYING...", db_path, attempts, max_init_attempts, e);
-                    sleep(TokioDuration::from_millis(1000)).await;
-
-                    if lock_path.exists() {
-                        if let Some(pid) = find_pid_by_port(port).await {
-                            warn!("New process (PID: {}) created lock file at {}. Stopping it...", pid, lock_path.display());
-                            println!("===> NEW PROCESS (PID: {}) CREATED LOCK FILE AT {}. STOPPING IT...", pid, lock_path.display());
-                            stop_process_by_port("Storage Daemon", port)
-                                .await
-                                .map_err(|e| {
-                                    error!("Failed to stop new process on port {}: {}", port, e);
-                                    println!("===> ERROR: FAILED TO STOP NEW PROCESS ON PORT {}: {}", port, e);
-                                    GraphError::StorageError(format!("Failed to stop new process on port {}: {}", port, e))
-                                })?;
-                            force_cleanup_engine_lock(StorageEngineType::RocksDB, &Some(db_path.to_path_buf()))
-                                .await
-                                .map_err(|e| {
-                                    error!("Failed to clean up new lock file at {:?}: {}", lock_path, e);
-                                    println!("===> ERROR: FAILED TO CLEAN UP NEW LOCK FILE AT {:?}", lock_path);
-                                    GraphError::StorageError(format!("Failed to clean up new lock file at {:?}: {}", lock_path, e))
-                                })?;
-                            should_start_daemon = true;
-                        }
-                    }
-                }
-                Err(_) => {
-                    attempts += 1;
-                    if attempts >= max_init_attempts {
-                        error!("Timeout opening RocksDB at {:?} after {} attempts", db_path, max_init_attempts);
-                        println!("===> ERROR: TIMEOUT OPENING ROCKSDB AT {:?} AFTER {} ATTEMPTS", db_path, max_init_attempts);
-                        return Err(GraphError::StorageError(format!("Timeout opening RocksDB at {:?} after {} attempts", db_path, max_init_attempts)));
-                    }
-                    error!("Timeout opening RocksDB at {:?} (attempt {}/{}). Retrying...", db_path, attempts, max_init_attempts);
-                    println!("===> ERROR: TIMEOUT OPENING ROCKSDB AT {:?} (ATTEMPT {}/{}). RETRYING...", db_path, attempts, max_init_attempts);
-                    sleep(TokioDuration::from_millis(1000)).await;
-                }
-            }
-        };
-
-        for cf_name in &standard_cf_names {
-            if db.cf_handle(cf_name).is_none() {
-                error!("Column family {} not opened in database at {:?}", cf_name, db_path);
-                println!("===> ERROR: COLUMN FAMILY {} NOT OPENED IN DATABASE AT {:?}", cf_name, db_path);
-                return Err(GraphError::StorageError(format!("Column family {} not opened in database at {:?}", cf_name, db_path)));
-            }
-        }
-
-        if should_start_daemon {
-            let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
-            let daemon_metadata = DaemonMetadata {
-                service_type: "storage".to_string(),
-                ip_address: "127.0.0.1".to_string(),
-                data_dir: Some(db_path.to_path_buf()),
-                config_path: Some(PathBuf::from("./storage_daemon_server")),
-                engine_type: Some("rocksdb".to_string()),
-                zmq_ready: false,
-                last_seen_nanos: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos() as i64,
-                pid: std::process::id() as u32,
-                port,
-            };
-            daemon_registry.register_daemon(daemon_metadata).await
-                .map_err(|e| {
-                    error!("Failed to register daemon for port {}: {}", port, e);
-                    println!("===> ERROR: FAILED TO REGISTER DAEMON FOR PORT {}: {}", port, e);
-                    GraphError::StorageError(format!("Failed to register daemon for port {}: {}", port, e))
-                })?;
-            info!("Registered new storage daemon for port {}", port);
-            println!("===> REGISTERED NEW STORAGE DAEMON FOR PORT {}", port);
-
-            let pid_file = format!("/tmp/graphdb-storage-{}.pid", port);
-            fs::write(&pid_file, std::process::id().to_string())
-                .await
-                .map_err(|e| {
-                    error!("Failed to write PID file {}: {}", pid_file, e);
-                    println!("===> ERROR: FAILED TO WRITE PID FILE {}: {}", pid_file, e);
-                    GraphError::StorageError(format!("Failed to write PID file {}: {}", pid_file, e))
-                })?;
-            info!("Wrote PID file for storage daemon at {}", pid_file);
-            println!("===> WROTE PID FILE FOR STORAGE DAEMON AT {}", pid_file);
-        }
-
-        info!("Successfully opened RocksDB database at {:?}", db_path);
-        println!("===> SUCCESSFULLY OPENED ROCKSDB DATABASE AT {:?}", db_path);
-        Ok(TokioMutex::new(RocksDBWithPath {
-            db: Arc::new(db),
-            path: db_path.to_path_buf(),
-            client: None,
-        }))
     }
 
     pub async fn new_with_db(config: &RocksDBConfig, storage_config: &StorageConfig, existing_db: Arc<DB>) -> GraphResult<Self> {
@@ -1478,6 +1298,250 @@ impl RocksDBStorage {
         })
     }
 
+    pub async fn initialize_database_instance(db_path: &Path, port: u16) -> GraphResult<TokioMutex<RocksDBWithPath>> {
+        info!("Opening new RocksDB database at {:?}", db_path);
+        println!("===> ATTEMPTING TO OPEN ROCKSDB AT {:?}", db_path);
+
+        let mut should_start_daemon = false;
+        if !is_port_free(port).await {
+            if let Some(pid) = find_pid_by_port(port).await {
+                if NonBlockingDaemonRegistry::is_pid_running(pid).await.unwrap_or(false) {
+                    let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
+                    if let Ok(Some(metadata)) = daemon_registry.get_daemon_metadata(port).await {
+                        if metadata.service_type == "storage" && metadata.pid == pid {
+                            info!("Valid storage daemon (PID: {}) already running on port {}. Reusing...", pid, port);
+                            println!("===> VALID STORAGE DAEMON (PID: {}) ALREADY RUNNING ON PORT {}. REUSING...", pid, port);
+                        } else {
+                            info!("Found process (PID: {}) on port {} but not a valid storage daemon. Stopping it...", pid, port);
+                            println!("===> FOUND PROCESS (PID: {}) ON PORT {} BUT NOT A VALID STORAGE DAEMON. STOPPING IT...", pid, port);
+                            stop_process_by_port("Storage Daemon", port)
+                                .await
+                                .map_err(|e| {
+                                    error!("Failed to stop process on port {}: {}", port, e);
+                                    println!("===> ERROR: FAILED TO STOP PROCESS ON PORT {}: {}", port, e);
+                                    GraphError::StorageError(format!("Failed to stop process on port {}: {}", port, e))
+                                })?;
+                            should_start_daemon = true;
+                        }
+                    } else {
+                        info!("Found process (PID: {}) on port {} but no daemon metadata. Stopping it...", pid, port);
+                        println!("===> FOUND PROCESS (PID: {}) ON PORT {} BUT NO DAEMON METADATA. STOPPING IT...", pid, port);
+                        stop_process_by_port("Storage Daemon", port)
+                            .await
+                            .map_err(|e| {
+                                error!("Failed to stop process on port {}: {}", port, e);
+                                println!("===> ERROR: FAILED TO STOP PROCESS ON PORT {}: {}", port, e);
+                                GraphError::StorageError(format!("Failed to stop process on port {}: {}", port, e))
+                            })?;
+                        should_start_daemon = true;
+                    }
+
+                    if should_start_daemon {
+                        let max_attempts = 5;
+                        let mut attempts = 0;
+                        while !is_port_free(port).await && attempts < max_attempts {
+                            debug!("Port {} still in use after stopping PID {}. Waiting... (attempt {}/{})", port, pid, attempts + 1, max_attempts);
+                            println!("===> PORT {} STILL IN USE AFTER STOPPING PID {}. WAITING... (ATTEMPT {}/{})", port, pid, attempts + 1, max_attempts);
+                            sleep(TokioDuration::from_millis(500)).await;
+                            attempts += 1;
+                        }
+                        if attempts >= max_attempts {
+                            error!("Port {} still in use after {} attempts to stop PID {}", port, max_attempts, pid);
+                            println!("===> ERROR: PORT {} STILL IN USE AFTER {} ATTEMPTS TO STOP PID {}", port, max_attempts, pid);
+                            return Err(GraphError::StorageError(
+                                format!("Port {} still in use after {} attempts to stop PID {}", port, max_attempts, pid)
+                            ));
+                        }
+                    }
+                } else {
+                    info!("Stale PID {} found on port {}. Cleaning up...", pid, port);
+                    println!("===> STALE PID {} FOUND ON PORT {}. CLEANING UP...", pid, port);
+                    should_start_daemon = true;
+                }
+            }
+        } else {
+            should_start_daemon = true;
+        }
+
+        let lock_path = db_path.join("LOCK");
+        if lock_path.exists() {
+            warn!("Found lock file at {:?}", lock_path);
+            println!("===> FOUND LOCK FILE AT {:?}", lock_path);
+            force_cleanup_engine_lock(StorageEngineType::RocksDB, &Some(db_path.to_path_buf()))
+                .await
+                .map_err(|e| {
+                    error!("Failed to clean up lock file at {:?}: {}", lock_path, e);
+                    println!("===> ERROR: FAILED TO CLEAN UP LOCK FILE AT {:?}", lock_path);
+                    GraphError::StorageError(format!("Failed to clean up lock file at {:?}: {}", lock_path, e))
+                })?;
+            info!("Successfully cleaned up lock file at {:?}", lock_path);
+            println!("===> SUCCESSFULLY CLEANED UP LOCK FILE AT {:?}", lock_path);
+        }
+
+        let storage_config = crate::config::load_storage_config_from_yaml(None)
+            .await
+            .unwrap_or_else(|_| StorageConfig::default());
+
+        let standard_cf_names = vec!["vertices", "edges", "kv_pairs"];
+        let raft_cf_names = vec!["raft_vote", "raft_membership", "raft_snapshot", "raft_log", "data"];
+
+        let existing_cfs = if db_path.exists() {
+            match DB::list_cf(&Options::default(), db_path) {
+                Ok(cfs) => cfs,
+                Err(e) => {
+                    warn!("Failed to list existing column families at {:?}: {}. Attempting to create new database.", db_path, e);
+                    println!("===> WARNING: FAILED TO LIST COLUMN FAMILIES AT {:?}", db_path);
+                    vec![]
+                }
+            }
+        } else {
+            vec![]
+        };
+
+        let mut cf_names = standard_cf_names.clone();
+        if storage_config.use_raft_for_scale {
+            cf_names.extend(raft_cf_names.clone());
+        }
+        for cf in &existing_cfs {
+            if !cf_names.contains(&cf.as_str()) {
+                warn!("Including existing column family '{}' at {:?} for compatibility.", cf, db_path);
+                println!("===> INCLUDING EXISTING COLUMN FAMILY '{}' AT {:?}", cf, db_path);
+                cf_names.push(cf);
+            }
+        }
+
+        let cfs: Vec<ColumnFamilyDescriptor> = cf_names.iter().map(|name| {
+            let mut cf_opts = Options::default();
+            cf_opts.set_max_write_buffer_number(2);
+            ColumnFamilyDescriptor::new(name.to_string(), cf_opts)
+        }).collect();
+
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        opts.set_compaction_style(DBCompactionStyle::Level);
+        opts.set_paranoid_checks(false);
+        opts.set_error_if_exists(false);
+        opts.set_max_open_files(storage_config.max_open_files as i32);
+
+        let max_init_attempts = 3;
+        let mut attempts = 0;
+        let db = loop {
+            let cfs: Vec<ColumnFamilyDescriptor> = cf_names.iter().map(|name| {
+                let mut cf_opts = Options::default();
+                cf_opts.set_max_write_buffer_number(2);
+                ColumnFamilyDescriptor::new(*name, cf_opts)
+            }).collect();
+
+            match timeout(TokioDuration::from_secs(5), async {
+                DB::open_cf_descriptors(&opts, db_path, cfs).map_err(|e| {
+                    error!("Failed to open RocksDB at {:?}: {}. Run `graphdb-cli force-reset --port {}` to reset.", db_path, e, port);
+                    println!("===> ERROR: FAILED TO OPEN ROCKSDB AT {:?}: {}. RUN `graphdb-cli force-reset --port {}` TO RESET.", db_path, e, port);
+                    GraphError::StorageError(format!("Failed to open RocksDB database at {:?}: {}. Run `graphdb-cli force-reset --port {}` to reset.", db_path, e, port))
+                })
+            }).await {
+                Ok(Ok(db)) => break db,
+                Ok(Err(e)) => {
+                    attempts += 1;
+                    if attempts >= max_init_attempts {
+                        error!("Failed to open RocksDB at {:?} after {} attempts", db_path, max_init_attempts);
+                        println!("===> ERROR: FAILED TO OPEN ROCKSDB AT {:?} AFTER {} ATTEMPTS", db_path, max_init_attempts);
+                        return Err(e);
+                    }
+                    error!("Failed to open RocksDB at {:?} (attempt {}/{}): {}. Retrying...", db_path, attempts, max_init_attempts, e);
+                    println!("===> ERROR: FAILED TO OPEN ROCKSDB AT {:?} (ATTEMPT {}/{}): {}. RETRYING...", db_path, attempts, max_init_attempts, e);
+                    sleep(TokioDuration::from_millis(1000)).await;
+
+                    if lock_path.exists() {
+                        if let Some(pid) = find_pid_by_port(port).await {
+                            warn!("New process (PID: {}) created lock file at {}. Stopping it...", pid, lock_path.display());
+                            println!("===> NEW PROCESS (PID: {}) CREATED LOCK FILE AT {}. STOPPING IT...", pid, lock_path.display());
+                            stop_process_by_port("Storage Daemon", port)
+                                .await
+                                .map_err(|e| {
+                                    error!("Failed to stop new process on port {}: {}", port, e);
+                                    println!("===> ERROR: FAILED TO STOP NEW PROCESS ON PORT {}: {}", port, e);
+                                    GraphError::StorageError(format!("Failed to stop new process on port {}: {}", port, e))
+                                })?;
+                            force_cleanup_engine_lock(StorageEngineType::RocksDB, &Some(db_path.to_path_buf()))
+                                .await
+                                .map_err(|e| {
+                                    error!("Failed to clean up new lock file at {:?}: {}", lock_path, e);
+                                    println!("===> ERROR: FAILED TO CLEAN UP NEW LOCK FILE AT {:?}", lock_path);
+                                    GraphError::StorageError(format!("Failed to clean up new lock file at {:?}: {}", lock_path, e))
+                                })?;
+                            should_start_daemon = true;
+                        }
+                    }
+                }
+                Err(_) => {
+                    attempts += 1;
+                    if attempts >= max_init_attempts {
+                        error!("Timeout opening RocksDB at {:?} after {} attempts", db_path, max_init_attempts);
+                        println!("===> ERROR: TIMEOUT OPENING ROCKSDB AT {:?} AFTER {} ATTEMPTS", db_path, max_init_attempts);
+                        return Err(GraphError::StorageError(format!("Timeout opening RocksDB at {:?} after {} attempts", db_path, max_init_attempts)));
+                    }
+                    error!("Timeout opening RocksDB at {:?} (attempt {}/{}). Retrying...", db_path, attempts, max_init_attempts);
+                    println!("===> ERROR: TIMEOUT OPENING ROCKSDB AT {:?} (ATTEMPT {}/{}). RETRYING...", db_path, attempts, max_init_attempts);
+                    sleep(TokioDuration::from_millis(1000)).await;
+                }
+            }
+        };
+
+        for cf_name in &standard_cf_names {
+            if db.cf_handle(cf_name).is_none() {
+                error!("Column family {} not opened in database at {:?}", cf_name, db_path);
+                println!("===> ERROR: COLUMN FAMILY {} NOT OPENED IN DATABASE AT {:?}", cf_name, db_path);
+                return Err(GraphError::StorageError(format!("Column family {} not opened in database at {:?}", cf_name, db_path)));
+            }
+        }
+
+        if should_start_daemon {
+            let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
+            let daemon_metadata = DaemonMetadata {
+                service_type: "storage".to_string(),
+                ip_address: "127.0.0.1".to_string(),
+                data_dir: Some(db_path.to_path_buf()),
+                config_path: Some(PathBuf::from("./storage_daemon_server")),
+                engine_type: Some("rocksdb".to_string()),
+                zmq_ready: false,
+                last_seen_nanos: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos() as i64,
+                pid: std::process::id() as u32,
+                port,
+            };
+            daemon_registry.register_daemon(daemon_metadata).await
+                .map_err(|e| {
+                    error!("Failed to register daemon for port {}: {}", port, e);
+                    println!("===> ERROR: FAILED TO REGISTER DAEMON FOR PORT {}: {}", port, e);
+                    GraphError::StorageError(format!("Failed to register daemon for port {}: {}", port, e))
+                })?;
+            info!("Registered new storage daemon for port {}", port);
+            println!("===> REGISTERED NEW STORAGE DAEMON FOR PORT {}", port);
+
+            let pid_file = format!("/tmp/graphdb-storage-{}.pid", port);
+            fs::write(&pid_file, std::process::id().to_string())
+                .await
+                .map_err(|e| {
+                    error!("Failed to write PID file {}: {}", pid_file, e);
+                    println!("===> ERROR: FAILED TO WRITE PID FILE {}: {}", pid_file, e);
+                    GraphError::StorageError(format!("Failed to write PID file {}: {}", pid_file, e))
+                })?;
+            info!("Wrote PID file for storage daemon at {}", pid_file);
+            println!("===> WROTE PID FILE FOR STORAGE DAEMON AT {}", pid_file);
+        }
+
+        info!("Successfully opened RocksDB database at {:?}", db_path);
+        println!("===> SUCCESSFULLY OPENED ROCKSDB DATABASE AT {:?}", db_path);
+        Ok(TokioMutex::new(RocksDBWithPath {
+            db: Arc::new(db),
+            path: db_path.to_path_buf(),
+            client: None,
+        }))
+    }
+    
     async fn initialize_database(
         config: &RocksDBConfig,
         storage_config: &StorageConfig,

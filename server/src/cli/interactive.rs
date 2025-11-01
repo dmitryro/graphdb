@@ -829,13 +829,13 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
         },
         "use" => {
             if remaining_args.is_empty() {
-                eprintln!("Usage: use [storage <engine> [--permanent]|plugin [--enable <bool>]]");
+                eprintln!("Usage: use [storage <engine> [--permanent] [--migrate]|plugin [--enable <bool>]]");
                 CommandType::Unknown
             } else {
                 match remaining_args[0].to_lowercase().as_str() {
                     "storage" => {
                         if remaining_args.len() < 2 {
-                            eprintln!("Usage: use storage <engine> [--permanent]");
+                            eprintln!("Usage: use storage <engine> [--permanent] [--migrate]");
                             CommandType::Unknown
                         } else {
                             let engine = match remaining_args[1].to_lowercase().as_str() {
@@ -843,6 +843,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                 "rocksdb" | "rocks-db" => StorageEngineType::RocksDB,
                                 "inmemory" | "in-memory" => StorageEngineType::InMemory,
                                 "redis" => StorageEngineType::Redis,
+                                "tikv" => StorageEngineType::TiKV,
                                 "postgres" | "postgresql" | "postgre-sql" => StorageEngineType::PostgreSQL,
                                 "mysql" | "my-sql" => StorageEngineType::MySQL,
                                 _ => {
@@ -855,10 +856,15 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                             };
                             let mut permanent = true; // Default to true as per commands.rs
                             let mut i = 2;
+                            let mut migrate = false;
                             while i < remaining_args.len() {
                                 match remaining_args[i].to_lowercase().as_str() {
                                     "--permanent" => {
                                         permanent = true;
+                                        i += 1;
+                                    }
+                                    "--migrate" => {
+                                        migrate = true;
                                         i += 1;
                                     }
                                     _ => {
@@ -867,7 +873,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                     }
                                 }
                             }
-                            CommandType::UseStorage { engine, permanent }
+                            CommandType::UseStorage { engine, permanent, migrate }
                         }
                     },
                     "plugin" => {
@@ -1812,10 +1818,11 @@ pub async fn handle_interactive_command(
             handlers::register_user(username, password).await;
             Ok(())
         }
-        CommandType::UseStorage { engine, permanent } => {
+        CommandType::UseStorage { engine, permanent, migrate } => {
             handlers::handle_use_storage_interactive(
                 engine,
                 permanent,
+                migrate,
                 state.storage_daemon_shutdown_tx_opt.clone(),
                 state.storage_daemon_handle.clone(),
                 state.storage_daemon_port_arc.clone(),

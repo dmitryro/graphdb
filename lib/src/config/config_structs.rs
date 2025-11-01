@@ -513,6 +513,9 @@ pub struct RocksDBDaemon<'a> {
     pub raft_storage: Option<Arc<RocksDBRaftStorage>>,
     #[cfg(feature = "with-openraft-rocksdb")]
     pub node_id: u64,
+        // === INTERNAL LAZY STATE ===
+   // pub _lazy_db_state: Arc<TokioMutex<Option<(Arc<DB>, Arc<BoundColumnFamily<'a>>, Arc<BoundColumnFamily<'a>>, Arc<BoundColumnFamily<'a>>)>>>,
+
 }
 
 // IMPORTANT: Place this code block near the definition of the RocksDBDaemon struct.

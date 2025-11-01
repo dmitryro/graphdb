@@ -67,9 +67,11 @@ impl fmt::Display for StorageEngineType {
 impl CliConfig {
     pub async fn execute(&self, manager: &mut StorageEngineManager) -> Result<(), GraphError> {
         match &self.command {
-            Commands::Use(UseAction::Storage { engine, permanent }) => {
+            Commands::Use(UseAction::Storage { engine, permanent, migrate }) => {
                 let is_permanent = *permanent;
-                info!("Switching to storage engine: {:?}, permanent: {}", engine, is_permanent);
+                let must_migrate = *migrate;
+                info!("Switching to storage engine: {:?}, permanent: {}, migrate: {:?}", engine, 
+                      is_permanent, must_migrate);
                 let available_engines = StorageEngineManager::available_engines();
                 if !available_engines.contains(engine) {
                     return Err(GraphError::InvalidStorageEngine(format!(
@@ -149,7 +151,7 @@ impl CliConfig {
                 }
 
                 // Call use_storage with the storage_config
-                manager.use_storage(storage_config.clone(), is_permanent).await?;
+                manager.use_storage(storage_config.clone(), is_permanent, must_migrate).await?;
 
                 // Save config if permanent
                 if is_permanent {
@@ -232,8 +234,8 @@ impl CliConfig {
                         storage_cluster: storage_cluster.clone(),
                     });
                 }
-                CommandType::UseStorage { engine, permanent } => {
-                    config.command = Commands::Use(UseAction::Storage { engine, permanent });
+                CommandType::UseStorage { engine, permanent, migrate } => {
+                    config.command = Commands::Use(UseAction::Storage { engine, permanent, migrate });
                 }
                 CommandType::SaveStorage => {
                     config.command = Commands::Save(SaveAction::Storage);

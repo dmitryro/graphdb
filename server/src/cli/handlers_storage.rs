@@ -84,6 +84,10 @@ use lib::daemon::daemon_management::{
     check_pid_validity,
     stop_process_by_pid,
     check_daemon_health,
+    cleanup_daemon_registry_stale_entries,
+    get_running_storage_daemons,
+    is_socket_used_by_cli,
+    stop_specific_storage_daemon,
 };
 use lib::query_parser::{parse_query_from_string, QueryType};
 
@@ -118,7 +122,7 @@ impl FileLock {
                 // Attempt to clean up stale lock file if it's older than a threshold
                 if let Ok(metadata) = fs::metadata(&path) {
                     if let Ok(modified) = metadata.modified() {
-                        let age = SystemTime::now().duration_since(modified).unwrap_or(Duration::from_secs(0));
+                        let age = SystemTime::now().duration_since(modified).unwrap_or(TokioDuration::from_secs(0));
                         if age > Duration::from_secs(60) { // Consider lock stale after 60 seconds
                             warn!("Removing stale lock file (age: {:?})", age);
                             if let Err(e) = fs::remove_file(&path) {
@@ -243,7 +247,7 @@ async fn sync_daemon_registry_with_manager(
             info!("Daemon metadata for port {} already correct", port);
         }
     } else {
-        timeout(Duration::from_secs(5), GLOBAL_DAEMON_REGISTRY.register_daemon(daemon_metadata))
+        timeout(TokioDuration::from_secs(5), GLOBAL_DAEMON_REGISTRY.register_daemon(daemon_metadata))
             .await
             .map_err(|_| anyhow!("Timeout registering daemon on port {}", port))??;
         info!("Registered daemon on port {} with path {:?}", port, instance_path);
@@ -396,6 +400,11 @@ pub async fn start_storage_interactive(
         &cli_config.command,
         Commands::Use(UseAction::Storage { permanent: true, .. })
     );
+    let must_migrate =  matches!(
+        &cli_config.command,
+        Commands::Use(UseAction::Storage { migrate: true, .. })
+    );
+
     if is_permanent {
         debug!("--permanent flag detected, setting storage engine to {:?}", storage_config.storage_engine_type);
         info!("Saved storage config with engine {:?}", storage_config.storage_engine_type);
@@ -750,7 +759,7 @@ pub async fn start_storage_interactive(
         if let Some(async_manager) = GLOBAL_STORAGE_ENGINE_MANAGER.get() {
             info!("Existing StorageEngineManager found, updating with new config");
             async_manager
-                .use_storage(manager_config.clone(), is_permanent)
+                .use_storage(manager_config.clone(), is_permanent, must_migrate)
                 .await
                 .context("Failed to update existing StorageEngineManager")?;
             engine_initialized = true;
@@ -935,6 +944,15 @@ pub async fn stop_storage_interactive(
     let mut failed_ports = Vec::new();
 
     for port in target_ports {
+        // Check if CLI is using the IPC socket
+        let socket_path = format!("/tmp/graphdb-{}.ipc", port);
+        if is_socket_used_by_cli(&socket_path).await.unwrap_or(false) {
+            warn!("Port {} is used by CLI process. Skipping shutdown to avoid self-termination.", port);
+            println!("===> WARNING: Port {} is used by CLI. Skipping shutdown.", port);
+            failed_ports.push(format!("Port {} used by CLI", port));
+            continue;
+        }
+
         // Find the daemon for the specified port
         let daemon = daemon_registry
             .get_all_daemon_metadata()
@@ -948,61 +966,56 @@ pub async fn stop_storage_interactive(
             .join("rocksdb")
             .join(port.to_string());
         let lock_path = db_path.join("LOCK");
-        let socket_path = format!("/tmp/graphdb-{}.ipc", port);
 
         match daemon {
-            Some(d) if d.pid != 0 => {
-                // Validate PID before attempting to terminate
+            Some(d) if d.pid != 0 && d.pid != std::process::id() => {
+                // Validate PID and stop daemon
                 if check_pid_validity(d.pid).await {
                     info!("Attempting to stop Storage Daemon on port {} (PID {})...", port, d.pid);
                     println!("===> ATTEMPTING TO STOP STORAGE DAEMON ON PORT {} (PID {})", port, d.pid);
 
-                    // Try SIGTERM first with a longer timeout for graceful shutdown
-                    if let Err(e) = kill(Pid::from_raw(d.pid as i32), Signal::SIGTERM) {
-                        warn!("Failed to send SIGTERM to PID {} for port {}: {}", d.pid, port, e);
-                        println!("===> WARNING: FAILED TO SEND SIGTERM TO PID {} FOR PORT {}", d.pid, port);
+                    if let Err(e) = stop_specific_storage_daemon(port, true).await {
+                        warn!("Failed to stop daemon on port {} (PID {}): {}", port, d.pid, e);
+                        println!("===> WARNING: Failed to stop daemon on port {} (PID {}): {}", port, d.pid, e);
+                        failed_ports.push(format!("Failed to stop daemon on port {}: {}", port, e));
                     } else {
-                        info!("Sent SIGTERM to PID {} for Storage Daemon on port {}.", d.pid, port);
-                        println!("===> SENT SIGTERM TO PID {} FOR STORAGE DAEMON ON PORT {}", d.pid, port);
-                    }
-
-                    // Wait for process to exit (up to 5 seconds with retries)
-                    let max_attempts = 10;
-                    let mut attempts = 0;
-                    while check_pid_validity(d.pid).await && attempts < max_attempts {
-                        sleep(TokioDuration::from_millis(500)).await;
-                        attempts += 1;
-                    }
-
-                    // If process is still running, escalate to SIGKILL
-                    if check_pid_validity(d.pid).await {
-                        warn!("Process (PID {}) on port {} did not exit after SIGTERM. Sending SIGKILL...", d.pid, port);
-                        println!("===> WARNING: PROCESS (PID {}) ON PORT {} DID NOT EXIT AFTER SIGTERM. SENDING SIGKILL...", d.pid, port);
-                        if let Err(e) = kill(Pid::from_raw(d.pid as i32), Signal::SIGKILL) {
-                            warn!("Failed to send SIGKILL to PID {} for port {}: {}", d.pid, port, e);
-                            println!("===> WARNING: FAILED TO SEND SIGKILL TO PID {} FOR PORT {}", d.pid, port);
-                        } else {
-                            info!("Sent SIGKILL to PID {} for Storage Daemon on port {}.", d.pid, port);
-                            println!("===> SENT SIGKILL TO PID {} FOR STORAGE DAEMON ON PORT {}", d.pid, port);
-                            // Wait briefly after SIGKILL
-                            sleep(TokioDuration::from_millis(1000)).await;
-                        }
-                    } else {
-                        info!("Process (PID {}) exited gracefully after SIGTERM.", d.pid);
-                        println!("===> PROCESS (PID {}) EXITED GRACEFULLY AFTER SIGTERM.", d.pid);
+                        info!("Successfully stopped daemon on port {} (PID {}).", port, d.pid);
+                        println!("===> Successfully stopped daemon on port {} (PID {}).", port, d.pid);
                     }
                 } else {
                     warn!("Stale PID {} found for Storage Daemon on port {}. Cleaning up...", d.pid, port);
                     println!("===> STALE PID {} FOUND FOR STORAGE DAEMON ON PORT {}. CLEANING UP...", d.pid, port);
                 }
             }
+            Some(d) if d.pid == std::process::id() => {
+                warn!("PID {} for port {} matches CLI process. Skipping shutdown.", d.pid, port);
+                println!("===> WARNING: PID {} for port {} matches CLI process. Skipping shutdown.", d.pid, port);
+                failed_ports.push(format!("Port {} matches CLI PID", port));
+            }
             Some(_) => {
-                warn!("No valid PID found for Storage Daemon on port {}. Cleaning up registry and lock file...", port);
-                println!("===> NO VALID PID FOUND FOR STORAGE DAEMON ON PORT {}. CLEANING UP REGISTRY AND LOCK FILE...", port);
+                warn!("No valid PID found for Storage Daemon on port {}. Checking for stray processes...", port);
+                println!("===> NO VALID PID FOUND FOR STORAGE DAEMON ON PORT {}. CHECKING FOR STRAY PROCESSES...", port);
             }
             None => {
                 info!("No Storage Daemon found on port {} in registry. Checking for stray processes...", port);
                 println!("===> NO STORAGE DAEMON FOUND ON PORT {} IN REGISTRY. CHECKING FOR STRAY PROCESSES...", port);
+
+                // Check for stray processes
+                if let Some(new_pid) = find_pid_by_port(port).await {
+                    if new_pid != std::process::id() && check_pid_validity(new_pid).await {
+                        info!("Found stray process (PID {}) on port {}. Stopping...", new_pid, port);
+                        println!("===> Found stray process (PID {}) on port {}. Stopping...", new_pid, port);
+                        if let Err(e) = stop_specific_storage_daemon(port, true).await {
+                            warn!("Failed to stop stray process on port {} (PID {}): {}", port, new_pid, e);
+                            println!("===> WARNING: Failed to stop stray process on port {} (PID {}): {}", port, new_pid, e);
+                            failed_ports.push(format!("Failed to stop stray process on port {}: {}", port, e));
+                        }
+                    } else {
+                        warn!("Stray PID {} on port {} is invalid or matches CLI. Skipping.", new_pid, port);
+                        println!("===> WARNING: Stray PID {} on port {} is invalid or matches CLI. Skipping.", new_pid, port);
+                        failed_ports.push(format!("Stray PID {} on port {} is invalid or matches CLI", new_pid, port));
+                    }
+                }
             }
         }
 
@@ -1014,8 +1027,8 @@ pub async fn stop_storage_interactive(
             println!("===> SUCCESSFULLY CLEANED UP LOCK FILE AT {:?}", lock_path);
         }
 
-        // Clean up ZMQ socket file
-        if std::path::Path::new(&socket_path).exists() {
+        // Clean up ZMQ socket file only if not used by CLI
+        if std::path::Path::new(&socket_path).exists() && !is_socket_used_by_cli(&socket_path).await.unwrap_or(false) {
             std::fs::remove_file(&socket_path)
                 .context(format!("Failed to remove ZMQ socket file at {}", socket_path))?;
             info!("Successfully removed ZMQ socket file at {}", socket_path);
@@ -1044,18 +1057,19 @@ pub async fn stop_storage_interactive(
             );
 
             // Check for stray processes and terminate them
-            let system = System::new_with_specifics(RefreshKind::everything().with_processes(ProcessRefreshKind::everything()));
             if let Some(new_pid) = find_pid_by_port(port).await {
-                warn!("Stray process (PID {}) found on port {}. Sending SIGKILL...", new_pid, port);
-                println!("===> STRAY PROCESS (PID {}) FOUND ON PORT {}. SENDING SIGKILL...", new_pid, port);
-                if let Err(e) = kill(Pid::from_raw(new_pid as i32), Signal::SIGKILL) {
-                    warn!("Failed to send SIGKILL to stray PID {} for port {}: {}", new_pid, port, e);
-                    println!("===> WARNING: FAILED TO SEND SIGKILL TO STRAY PID {} FOR PORT {}", new_pid, port);
-                } else {
-                    info!("Sent SIGKILL to stray PID {} for port {}.", new_pid, port);
-                    println!("===> SENT SIGKILL TO STRAY PID {} FOR PORT {}", new_pid, port);
+                if new_pid != std::process::id() && check_pid_validity(new_pid).await {
+                    warn!("Stray process (PID {}) found on port {}. Sending SIGKILL...", new_pid, port);
+                    println!("===> STRAY PROCESS (PID {}) FOUND ON PORT {}. SENDING SIGKILL...", new_pid, port);
+                    if let Err(e) = kill(Pid::from_raw(new_pid as i32), Signal::SIGKILL) {
+                        warn!("Failed to send SIGKILL to stray PID {} for port {}: {}", new_pid, port, e);
+                        println!("===> WARNING: FAILED TO SEND SIGKILL TO STRAY PID {} FOR PORT {}", new_pid, port);
+                    } else {
+                        info!("Sent SIGKILL to stray PID {} for port {}.", new_pid, port);
+                        println!("===> in stop_storage_interactive - SENT SIGKILL TO STRAY PID {} FOR PORT {}", new_pid, port);
+                    }
+                    sleep(TokioDuration::from_millis(1000)).await;
                 }
-                sleep(TokioDuration::from_millis(1000)).await;
             }
 
             sleep(TokioDuration::from_millis(1000)).await;
@@ -1067,9 +1081,8 @@ pub async fn stop_storage_interactive(
             info!("Port {} is now free.", port);
             println!("===> PORT {} IS NOW FREE", port);
         } else {
-            // Get the new PID and process name for detailed error reporting
-            let system = System::new_with_specifics(RefreshKind::everything().with_processes(ProcessRefreshKind::everything()));
             let error_msg = if let Some(new_pid) = find_pid_by_port(port).await {
+                let system = System::new_with_specifics(RefreshKind::everything().with_processes(ProcessRefreshKind::everything()));
                 let process_name = system
                     .process(NixPid::from_u32(new_pid))
                     .map(|p| p.name().to_string_lossy().to_string())
@@ -1090,7 +1103,7 @@ pub async fn stop_storage_interactive(
         if let Some(tx) = shutdown_tx_guard.take() {
             let _ = tx.send(());
             info!("Sent shutdown signal for storage daemon(s).");
-            println!("===> SENT SHUTDOWN SIGNAL FOR STORAGE DAEMON(S)");
+            println!("===> in stop_storage_interactive: SENT SHUTDOWN SIGNAL FOR STORAGE DAEMON(S)");
         }
     }
 
@@ -1562,7 +1575,7 @@ pub async fn stop_storage(
 }
 
 /// Updates the storage engine configuration and applies it via StorageEngineManager.
-pub async fn use_storage_engine(engine_type_str: &str, permanent: bool) -> Result<(), anyhow::Error> {
+pub async fn use_storage_engine(engine_type_str: &str, permanent: bool, migrate: bool) -> Result<(), anyhow::Error> {
     // Map string to StorageEngineType
     let engine_type = match engine_type_str.to_lowercase().as_str() {
         "sled" => StorageEngineType::Sled,
@@ -1612,7 +1625,7 @@ pub async fn use_storage_engine(engine_type_str: &str, permanent: bool) -> Resul
         .get()
         .ok_or_else(|| anyhow!("StorageEngineManager not initialized. Run 'graphdb-cli storage start' to initialize it."))?;
 
-    manager.use_storage(storage_config.clone(), permanent)
+    manager.use_storage(storage_config.clone(), permanent, migrate)
         .await
         .context(format!("Failed to update storage engine to {}", engine_type_str))?;
 
@@ -1751,7 +1764,7 @@ async fn force_cleanup_engine_lock(engine: StorageEngineType, data_directory: &O
                 }
                 // Wait before retrying, with exponential backoff
                 tokio::time::sleep(delay).await;
-                delay = delay.checked_mul(2).unwrap_or(Duration::from_millis(5000)); // Cap the delay
+                delay = delay.checked_mul(2).unwrap_or(TokioDuration::from_millis(5000)); // Cap the delay
                 attempt += 1;
             }
         }
@@ -1777,7 +1790,7 @@ async fn ensure_process_terminated(pid: u32) -> Result<()> {
         if let Some(process) = system.process(NixPid::from(pid as usize)) {
             warn!("Process {} still running, attempting to terminate (attempt {})", pid, attempt);
             process.kill();
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(TokioDuration::from_millis(200)).await;
             attempt += 1;
         } else {
             info!("Process {} is no longer running", pid);
@@ -1795,6 +1808,16 @@ pub async fn handle_migrate_command(
     let start_time = Instant::now();
     info!("=== Starting handle_migrate_command from engine: {:?} to engine: {:?}", from_engine, to_engine);
     println!("===> MIGRATING FROM ENGINE: {:?} TO ENGINE: {:?}", from_engine, to_engine);
+
+    // Clean up stale registry entries
+    cleanup_daemon_registry_stale_entries()
+        .await
+        .context("Failed to clean daemon registry")?;
+    println!("===> Cleaned daemon registry");
+
+    // Debug registry state
+    let initial_registry = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
+    debug!("Initial registry state: {:?}", initial_registry);
 
     // Load TiKV PD port from storage_config_tikv.yaml if it exists
     let tikv_pd_port = {
@@ -1829,20 +1852,40 @@ pub async fn handle_migrate_command(
         .into_iter()
         .filter(|daemon| daemon.service_type == "storage")
         .collect::<Vec<DaemonMetadata>>();
+    debug!("All existing storage daemons: {:?}", all_existing_storage_daemons);
 
-    let existing_daemon_ports: Vec<u16> = all_existing_storage_daemons.iter().map(|d| d.port).collect();
-    info!("Captured existing storage daemons on ports: {:?}", existing_daemon_ports);
+    // Get active ports
+    let active_ports = get_running_storage_daemons()
+        .await
+        .context("Failed to get running storage daemons")?;
+    debug!("Active ports from get_running_storage_daemons: {:?}", active_ports);
+
+    // Filter active storage daemons
+    let storage_daemons: Vec<DaemonMetadata> = all_existing_storage_daemons
+        .into_iter()
+        .filter(|daemon| active_ports.contains(&daemon.port))
+        .collect();
+
+    println!("======> STORAGE DAEMON {:?}", storage_daemons.len());
+    let existing_daemon_ports: Vec<u16> = storage_daemons.iter().map(|d| d.port).collect();
+    info!("Captured active storage daemons on ports: {:?}", existing_daemon_ports);
+    println!("===> Active storage daemons on ports: {:?}", existing_daemon_ports);
+
+    if storage_daemons.is_empty() {
+        warn!("No active storage daemons found for migration. Registry state: {:?}", initial_registry);
+        println!("===> WARNING: No active storage daemons found");
+        return Err(anyhow!("No active storage daemons to migrate"));
+    }
 
     println!("===> MIGRATE HANDLER - STEP 1: Loading configuration...");
     let cwd = std::env::current_dir()
         .map_err(|e| anyhow!("Failed to get current working directory: {}", e))?;
-
     let config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
     let absolute_config_path = cwd.join(&config_path);
     debug!("Attempting to load storage config from {:?}", absolute_config_path);
 
     // Load base configuration
-    let mut base_config: StorageConfig = match load_storage_config_from_yaml(Some(absolute_config_path.clone())).await {
+    let base_config: StorageConfig = match load_storage_config_from_yaml(Some(absolute_config_path.clone())).await {
         Ok(config) => {
             info!("Successfully loaded existing storage config: {:?}", config);
             println!("===> Configuration loaded successfully.");
@@ -2026,15 +2069,14 @@ pub async fn handle_migrate_command(
         })
         .unwrap_or_else(|| {
             if from_engine == StorageEngineType::TiKV {
-                2380 // TiKV default port
+                2380
             } else if from_engine == StorageEngineType::RocksDB {
-                base_config.default_port // Use YAML's default_port (8051) for RocksDB
+                base_config.default_port
             } else {
-                8052 // Default for Sled and other non-TiKV engines
+                8052
             }
         });
 
-    // Validate from_port
     if from_engine != StorageEngineType::TiKV {
         if let Some(pd_port) = tikv_pd_port {
             if from_port == pd_port {
@@ -2052,15 +2094,14 @@ pub async fn handle_migrate_command(
         })
         .unwrap_or_else(|| {
             if to_engine == StorageEngineType::TiKV {
-                2380 // TiKV default port
+                2380
             } else if to_engine == StorageEngineType::RocksDB {
-                base_config.default_port // Use YAML's default_port (8051) for RocksDB
+                base_config.default_port
             } else {
-                8052 // Default for Sled and other non-TiKV engines
+                8052
             }
         });
 
-    // Validate to_port
     if to_engine != StorageEngineType::TiKV {
         if let Some(pd_port) = tikv_pd_port {
             if to_port == pd_port {
@@ -2161,56 +2202,90 @@ pub async fn handle_migrate_command(
     to_config.default_port = to_port;
     to_config.engine_specific_config = Some(to_engine_config.clone());
 
-    // Initialize or update StorageEngineManager
-    println!("===> MIGRATE HANDLER - STEP 5: Initializing StorageEngineManager...");
-    let async_manager = if GLOBAL_STORAGE_ENGINE_MANAGER.get().is_none() {
-        debug!("StorageEngineManager not initialized, creating new instance");
-        println!("===> Creating new instance of StorageEngineManager...");
-        let manager = StorageEngineManager::new(
-            to_engine.clone(),
-            &absolute_config_path,
-            false, // Migration does not persist by default
-            Some(to_port),
-        )
-        .await
-        .context("Failed to initialize StorageEngineManager")?;
-        let async_manager = AsyncStorageEngineManager::from_manager(manager);
-        GLOBAL_STORAGE_ENGINE_MANAGER
-            .set(Arc::new(async_manager))
-            .context("Failed to set GLOBAL_STORAGE_ENGINE_MANAGER")?;
-        println!("===> StorageEngineManager initialized successfully.");
-        // Clone the Arc from the global, don't take a reference
-        GLOBAL_STORAGE_ENGINE_MANAGER
-            .get()
-            .ok_or_else(|| GraphError::ConfigurationError("StorageEngineManager not accessible".to_string()))?
-            .clone()  // <-- THIS IS THE KEY FIX: Clone the Arc itself
-    } else {
-        println!("===> Using existing StorageEngineManager...");
-        // Clone the Arc from the global, don't take a reference
-        GLOBAL_STORAGE_ENGINE_MANAGER
-            .get()
-            .ok_or_else(|| GraphError::ConfigurationError("StorageEngineManager not accessible".to_string()))?
-            .clone()  // <-- THIS IS THE KEY FIX: Clone the Arc itself
-    };
+    // Initialize or update StorageEngineManager for each active daemon
+    println!("===> MIGRATE HANDLER - STEP 5: Initializing StorageEngineManager for {} daemons...", storage_daemons.len());
+    let mut successful_migrations: Vec<u16> = Vec::new();
+    let mut failed_migrations: Vec<(u16, String)> = Vec::new();
 
-    println!("===> MIGRATE HANDLER - STEP 6: Performing migration...");
-    // Now async_manager is Arc<AsyncStorageEngineManager> (owned), not &Arc<...> (reference)
-    // So we can call methods that take &self directly
-    async_manager
-        .migrate_storage(from_config.clone(), to_config.clone())
-        .await
-        .context("Failed to migrate storage engine")?;
+    for daemon in storage_daemons.iter() {
+        let port = daemon.port;
+        info!("Migrating storage daemon on port {}", port);
+        println!("===> Migrating storage daemon on port {}", port);
+
+        // Check if CLI is using the IPC socket
+        let socket_path = format!("/tmp/graphdb-{}.ipc", port);
+        if is_socket_used_by_cli(&socket_path).await.unwrap_or(false) {
+            warn!("Port {} is used by CLI process. Skipping migration to avoid self-termination.", port);
+            println!("===> WARNING: Port {} is used by CLI. Skipping.", port);
+            failed_migrations.push((port, "Port used by CLI".to_string()));
+            continue;
+        }
+
+        // Create port-specific configs
+        let mut port_from_config = from_config.clone();
+        port_from_config.default_port = port;
+        if let Some(ref mut engine_config) = port_from_config.engine_specific_config {
+            engine_config.storage.port = Some(port);
+            engine_config.storage.path = Some(PathBuf::from(format!("/opt/graphdb/storage_data/{}/{}", from_engine.to_string().to_lowercase(), port)));
+        }
+
+        let mut port_to_config = to_config.clone();
+        port_to_config.default_port = port;
+        if let Some(ref mut engine_config) = port_to_config.engine_specific_config {
+            engine_config.storage.port = Some(port);
+            engine_config.storage.path = Some(PathBuf::from(format!("/opt/graphdb/storage_data/{}/{}", to_engine.to_string().to_lowercase(), port)));
+        }
+
+        // Initialize StorageEngineManager
+        let async_manager = if GLOBAL_STORAGE_ENGINE_MANAGER.get().is_none() {
+            debug!("StorageEngineManager not initialized, creating new instance for port {}", port);
+            println!("===> Creating new instance of StorageEngineManager for port {}...", port);
+            let manager = StorageEngineManager::new(
+                to_engine.clone(),
+                &absolute_config_path,
+                false,
+                Some(port),
+            )
+            .await
+            .context(format!("Failed to initialize StorageEngineManager for port {}", port))?;
+            let async_manager = AsyncStorageEngineManager::from_manager(manager);
+            GLOBAL_STORAGE_ENGINE_MANAGER
+                .set(Arc::new(async_manager))
+                .context("Failed to set GLOBAL_STORAGE_ENGINE_MANAGER")?;
+            GLOBAL_STORAGE_ENGINE_MANAGER
+                .get()
+                .ok_or_else(|| GraphError::ConfigurationError("StorageEngineManager not accessible".to_string()))?
+                .clone()
+        } else {
+            println!("===> Using existing StorageEngineManager for port {}...", port);
+            GLOBAL_STORAGE_ENGINE_MANAGER
+                .get()
+                .ok_or_else(|| GraphError::ConfigurationError("StorageEngineManager not accessible".to_string()))?
+                .clone()
+        };
+
+        // Perform migration
+        println!("===> MIGRATE HANDLER - STEP 6: Performing migration for port {}...", port);
+        if let Err(e) = async_manager.migrate_storage(port_from_config.clone(), port_to_config.clone()).await {
+            warn!("Migration failed for port {}: {}", port, e);
+            println!("===> ERROR: Migration failed for port {}: {}", port, e);
+            failed_migrations.push((port, format!("Migration failed: {}", e)));
+            continue;
+        }
+        successful_migrations.push(port);
+        println!("===> Migration completed for port {}", port);
+    }
 
     // Stop all running storage daemons
     println!("===> MIGRATE HANDLER - STEP 7: Stopping existing storage daemons...");
     let mut successfully_stopped_ports: Vec<u16> = Vec::new();
     let mut failed_to_stop_ports: Vec<u16> = Vec::new();
 
-    for daemon in all_existing_storage_daemons {
+    for daemon in storage_daemons.iter() {
         let current_engine_str = daemon.engine_type.as_deref().unwrap_or("unknown");
         let expected_engine_str = daemon_api_storage_engine_type_to_string(&to_engine);
 
-        if current_engine_str == expected_engine_str && daemon.port == to_port {
+        if current_engine_str == expected_engine_str && successful_migrations.contains(&daemon.port) {
             info!("Existing daemon on port {} already uses engine type {}, reusing it.", daemon.port, expected_engine_str);
             successfully_stopped_ports.push(daemon.port);
             println!("Skipping shutdown of Storage Daemon on port {} (already using {}).", daemon.port, expected_engine_str);
@@ -2225,15 +2300,14 @@ pub async fn handle_migrate_command(
             }
         }
 
-        let socket_path = format!("/opt/graphdb/graphdb-{}.ipc", daemon.port);
-        if tokio::fs::metadata(&socket_path).await.is_ok() {
-            info!("Removing stale ZeroMQ socket file: {}", socket_path);
-            tokio_fs::remove_file(&socket_path)
-                .await
-                .context(format!("Failed to remove stale ZeroMQ socket file {}", socket_path))?;
+        let socket_path = format!("/tmp/graphdb-{}.ipc", daemon.port);
+        if is_socket_used_by_cli(&socket_path).await.unwrap_or(false) {
+            warn!("Port {} is used by CLI process. Skipping shutdown to avoid self-termination.", daemon.port);
+            println!("===> WARNING: Port {} is used by CLI. Skipping shutdown.", daemon.port);
+            failed_to_stop_ports.push(daemon.port);
+            continue;
         }
 
-        let mut is_daemon_stopped = false;
         let pid_file_path = PathBuf::from(STORAGE_PID_FILE_DIR).join(format!("{}{}.pid", STORAGE_PID_FILE_NAME_PREFIX, daemon.port));
         let mut last_pid: Option<u32> = None;
         if tokio::fs::File::open(&pid_file_path).await.is_ok() {
@@ -2247,15 +2321,14 @@ pub async fn handle_migrate_command(
             }
         }
 
+        let mut is_daemon_stopped = false;
         for attempt in 0..MAX_SHUTDOWN_RETRIES {
             debug!("Attempting to stop storage daemon on port {} (Attempt {} of {})", daemon.port, attempt + 1, MAX_SHUTDOWN_RETRIES);
 
-            stop_storage_interactive(
-                Some(daemon.port),
-                Arc::new(TokioMutex::new(None)),
-                Arc::new(TokioMutex::new(None)),
-                Arc::new(TokioMutex::new(None)),
-            ).await.ok();
+            if let Err(e) = stop_specific_storage_daemon(daemon.port, true).await {
+                warn!("Failed to stop storage daemon on port {}: {}", daemon.port, e);
+                println!("===> WARNING: Failed to stop daemon on port {}: {}", daemon.port, e);
+            }
 
             if let Some(pid) = last_pid {
                 let pid_nix = nix::unistd::Pid::from_raw(pid as i32);
@@ -2277,7 +2350,7 @@ pub async fn handle_migrate_command(
             }
 
             info!("Storage daemon still running on port {}, retrying stop in {}ms...", daemon.port, SHUTDOWN_RETRY_DELAY_MS);
-            tokio::time::sleep(Duration::from_millis(SHUTDOWN_RETRY_DELAY_MS)).await;
+            tokio::time::sleep(TokioDuration::from_millis(SHUTDOWN_RETRY_DELAY_MS)).await;
         }
 
         if is_daemon_stopped {
@@ -2301,7 +2374,7 @@ pub async fn handle_migrate_command(
 
     // Restart storage daemons with to_engine
     println!("===> MIGRATE HANDLER - STEP 8: Restarting storage daemons...");
-    let mut daemon_ports_to_restart = successfully_stopped_ports.clone();
+    let mut daemon_ports_to_restart = successful_migrations.clone();
     if !daemon_ports_to_restart.contains(&to_port) {
         daemon_ports_to_restart.push(to_port);
     }
@@ -2325,7 +2398,7 @@ pub async fn handle_migrate_command(
             engine_config.storage.path = Some(PathBuf::from(format!("/opt/graphdb/storage_data/{}/{}", to_engine.to_string().to_lowercase(), to_port)));
         }
 
-        let socket_path = format!("/opt/graphdb/graphdb-{}.ipc", to_port);
+        let socket_path = format!("/tmp/graphdb-{}.ipc", to_port);
         if tokio::fs::metadata(&socket_path).await.is_ok() {
             info!("Removing stale ZeroMQ socket file: {}", socket_path);
             tokio_fs::remove_file(&socket_path)
@@ -2361,7 +2434,7 @@ pub async fn handle_migrate_command(
                 engine_config.storage.path = Some(PathBuf::from(format!("/opt/graphdb/storage_data/{}/{}", to_engine.to_string().to_lowercase(), port)));
             }
 
-            let socket_path = format!("/opt/graphdb/graphdb-{}.ipc", port);
+            let socket_path = format!("/tmp/graphdb-{}.ipc", port);
             if tokio::fs::metadata(&socket_path).await.is_ok() {
                 info!("Removing stale ZeroMQ socket file: {}", socket_path);
                 tokio_fs::remove_file(&socket_path)
@@ -2390,7 +2463,7 @@ pub async fn handle_migrate_command(
             }
 
             if index < daemon_ports_to_restart.len() - 1 {
-                tokio::time::sleep(Duration::from_millis(1000)).await;
+                tokio::time::sleep(TokioDuration::from_millis(1000)).await;
             }
         }
 
@@ -2418,7 +2491,7 @@ pub async fn handle_migrate_command(
 
     // Verify cluster
     println!("===> MIGRATE HANDLER - STEP 9: Verifying storage daemon cluster status...");
-    tokio::time::sleep(Duration::from_millis(2000)).await;
+    tokio::time::sleep(TokioDuration::from_millis(2000)).await;
 
     let current_storage_daemons = GLOBAL_DAEMON_REGISTRY
         .get_all_daemon_metadata()
@@ -2448,10 +2521,38 @@ pub async fn handle_migrate_command(
         println!("===> ⚠ Warning: Some daemons may not have correct engine type");
     }
 
-    info!("Successfully migrated from engine {:?} to {:?}", from_engine, to_engine);
-    println!("Migrated to storage engine {} from {}", daemon_api_storage_engine_type_to_string(&to_engine), daemon_api_storage_engine_type_to_string(&from_engine));
-    info!("=== Completed handle_migrate_command from engine: {:?} to engine: {:?}. Elapsed: {}ms ===", from_engine, to_engine, start_time.elapsed().as_millis());
+    if !failed_migrations.is_empty() {
+        warn!("Migration failed for ports: {:?}", failed_migrations);
+        println!("===> ✗ Failed to migrate {} storage daemons", failed_migrations.len());
+        for (port, error) in failed_migrations {
+            println!("     Port {}: {}", port, error);
+        }
+        if successful_migrations.is_empty() {
+            return Err(anyhow!("Failed to migrate all storage daemons"));
+        }
+    } else {
+        println!("===> ✓ Successfully migrated all storage daemons to {}", expected_engine_str);
+    }
 
+    info!("Successfully migrated from engine {:?} to {:?}", from_engine, to_engine);
+    println!("Migration completed in {}ms", start_time.elapsed().as_millis());
+    Ok(())
+}
+
+/// Handles the interactive 'migrate' command.
+pub async fn handle_migrate_interactive(
+    from_engine: StorageEngineType,
+    to_engine: StorageEngineType,
+    storage_daemon_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
+    storage_daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
+    storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
+) -> Result<()> {
+    handle_migrate_command(from_engine, to_engine).await?;
+    reload_storage_interactive(
+        storage_daemon_shutdown_tx_opt,
+        storage_daemon_handle,
+        storage_daemon_port_arc,
+    ).await?;
     Ok(())
 }
 
@@ -2459,6 +2560,7 @@ pub async fn handle_migrate_command(
 pub async fn handle_use_storage_command(
     engine: StorageEngineType,
     permanent: bool,
+    migrate: bool,
 ) -> Result<(), anyhow::Error> {
     let start_time = Instant::now();
     info!("=== Starting handle_use_storage_command for engine: {:?}, permanent: {} ===", engine, permanent);
@@ -2631,7 +2733,7 @@ pub async fn handle_use_storage_command(
             map
         }
     } else {
-        let config = load_engine_specific_config(engine.clone(), config_root_directory)
+        let config = lib::config::load_engine_specific_config(engine.clone(), config_root_directory)
             .map_err(|e| anyhow!("Failed to load engine-specific config: {}", e))?;
         let mut map = selected_storage_config_to_hashmap(&config);
         map.insert("storage_engine_type".to_string(), Value::String(engine.to_string().to_lowercase()));
@@ -2890,7 +2992,7 @@ pub async fn handle_use_storage_command(
             .ok_or_else(|| GraphError::ConfigurationError("StorageEngineManager not accessible".to_string()))?;
         debug!("Calling use_storage on existing StorageEngineManager: config={:?}, permanent={}", new_config, permanent);
         async_manager
-            .use_storage(new_config.clone(), permanent)
+            .use_storage(new_config.clone(), permanent, migrate)
             .await
             .context("Failed to update StorageEngineManager with new engine")?;
         println!("===> StorageEngineManager updated successfully.");
@@ -3055,6 +3157,24 @@ pub async fn handle_use_storage_command(
     Ok(())
 }
 
+/// Handles the interactive 'use storage' command.
+pub async fn handle_use_storage_interactive(
+    engine: StorageEngineType,
+    permanent: bool,
+    migrate: bool,
+    storage_daemon_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
+    storage_daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
+    storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
+) -> Result<()> {
+    handle_use_storage_command(engine.clone(), permanent, migrate).await?;
+    reload_storage_interactive(
+        storage_daemon_shutdown_tx_opt,
+        storage_daemon_handle,
+        storage_daemon_port_arc,
+    ).await?;
+    Ok(())
+}
+
 // Helper function to display configuration
 pub fn display_config(config: &StorageConfig, config_path: &PathBuf) {
     println!("Current Storage Configuration (from {:?}):", config_path);
@@ -3183,39 +3303,6 @@ pub async fn handle_show_storage_command_interactive() -> Result<()> {
     Ok(())
 }
 
-/// Handles the interactive 'migrate' command.
-pub async fn handle_migrate_interactive(
-    from_engine: StorageEngineType,
-    to_engine: StorageEngineType,
-    storage_daemon_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
-    storage_daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
-    storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
-) -> Result<()> {
-    handle_migrate_command(from_engine, to_engine).await?;
-    reload_storage_interactive(
-        storage_daemon_shutdown_tx_opt,
-        storage_daemon_handle,
-        storage_daemon_port_arc,
-    ).await?;
-    Ok(())
-}
-
-/// Handles the interactive 'use storage' command.
-pub async fn handle_use_storage_interactive(
-    engine: StorageEngineType,
-    permanent: bool,
-    storage_daemon_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
-    storage_daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
-    storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
-) -> Result<()> {
-    handle_use_storage_command(engine.clone(), permanent).await?;
-    reload_storage_interactive(
-        storage_daemon_shutdown_tx_opt,
-        storage_daemon_handle,
-        storage_daemon_port_arc,
-    ).await?;
-    Ok(())
-}
 
 /// Handles the "show storage config" command, printing the current configuration.
 pub async fn handle_show_storage_config_command() -> Result<(), anyhow::Error> {
@@ -3316,7 +3403,7 @@ pub async fn ensure_storage_daemon_running(
             return Ok(());
         }
         warn!("StorageEngineManager not initialized on attempt {}. Retrying...", attempt + 1);
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(TokioDuration::from_millis(500)).await;
     }
 
     Err(anyhow!("Failed to initialize StorageEngineManager after {} attempts", max_attempts))

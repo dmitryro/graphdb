@@ -491,8 +491,8 @@ pub async fn run_single_command(
         }
         Commands::Use(action) => {
             match action {
-                UseAction::Storage { engine, permanent } => {
-                    handlers_mod::handle_use_storage_command(engine, permanent).await?;
+                UseAction::Storage { engine, permanent, migrate } => {
+                    handlers_mod::handle_use_storage_command(engine, permanent, migrate).await?;
                 }
                 UseAction::Plugin { enable } => {
                     let mut config = load_cli_config().await?;

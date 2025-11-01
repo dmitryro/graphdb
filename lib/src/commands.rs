@@ -54,7 +54,7 @@ pub enum CommandType {
     Storage(StorageAction),
 
     // Use Commands
-    UseStorage { engine: StorageEngineType, permanent: bool },
+    UseStorage { engine: StorageEngineType, permanent: bool, migrate: bool },
     UsePlugin { enable: bool },
 
     // Save Commands
@@ -782,6 +782,9 @@ pub enum UseAction {
         /// Persist the storage engine choice across sessions.
         #[clap(long, default_value = "false")]
         permanent: bool,
+        /// Persist the storage engine choice across sessions.
+        #[clap(long, default_value = "false")]
+        migrate: bool,
     },
     /// Enable or disable experimental plugins.
     Plugin {
