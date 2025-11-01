@@ -264,6 +264,7 @@ pub async fn start_daemon_instance_interactive(
         engine_type: None,
         last_seen_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
         zmq_ready: false,
+        engine_synced: false,
     };
 
     let mut attempts = 0;

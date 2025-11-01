@@ -328,6 +328,7 @@ impl SledStorage {
             engine_type: Some("sled".to_string()),
             last_seen_nanos: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64,
             zmq_ready: false,
+            engine_synced: false,
         };
 
         if let Err(e) = daemon_registry.register_daemon(general_daemon_metadata).await {
@@ -558,6 +559,7 @@ impl SledStorage {
             engine_type: Some("sled".to_string()),
             last_seen_nanos: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64,
             zmq_ready: false,
+            engine_synced: false,
         };
 
         if let Err(e) = daemon_registry.register_daemon(general_daemon_metadata).await {
