@@ -401,7 +401,7 @@ pub async fn start_storage_interactive(
         &cli_config.command,
         Commands::Use(UseAction::Storage { permanent: true, .. })
     );
-    let must_migrate =  matches!(
+    let must_migrate = matches!(
         &cli_config.command,
         Commands::Use(UseAction::Storage { migrate: true, .. })
     );
@@ -616,20 +616,23 @@ pub async fn start_storage_interactive(
     debug!("daemon_config_string: {}", daemon_config_string);
     println!("==> STARTING STORAGE - STEP 5.3");
 
-    // Start the daemon and ensure it's running before proceeding
+    // === FIXED: START DAEMON WITH CRASH ERROR FILTERING ===
     let max_attempts = 3;
     let retry_interval = TokioDuration::from_millis(1000);
     let mut pid = None;
 
     for attempt in 1..=max_attempts {
         debug!("Attempt {}/{} to start storage daemon on port {}", attempt, max_attempts, selected_port);
-        match start_daemon(
+        
+        let start_result = start_daemon(
             Some(selected_port),
             Some(daemon_config_string.clone()),
             vec![],
             "storage",
             Some(storage_config.clone()),
-        ).await {
+        ).await;
+
+        match start_result {
             Ok(_) => {
                 debug!("start_daemon succeeded on attempt {} for port {}", attempt, selected_port);
                 match find_pid_by_port(selected_port).await {
@@ -651,6 +654,26 @@ pub async fn start_storage_interactive(
                 }
             }
             Err(e) => {
+                // === CRASH FIX: Filter harmless thread::join panic ===
+                let err_msg = e.to_string();
+                if err_msg.contains("thread::join failed") && err_msg.contains("No such process") {
+                    warn!("Ignoring harmless daemon detach error (thread::join failed: No such process) on attempt {}", attempt);
+                    // Still check if daemon is actually running
+                    if let Some(p) = find_pid_by_port(selected_port).await {
+                        if p > 0 && check_pid_validity(p).await {
+                            pid = Some(p);
+                            info!("Storage daemon recovered with PID {} on port {} despite detach error", p, selected_port);
+                            println!("Daemon (PID {}) is listening on {}:{}", p, ip, selected_port);
+                            break;
+                        }
+                    }
+                    if attempt < max_attempts {
+                        info!("Retrying after detach error in {:?}", retry_interval);
+                        tokio::time::sleep(retry_interval).await;
+                        continue;
+                    }
+                }
+
                 error!("Storage daemon start attempt {}/{} failed on port {}: {}", attempt, max_attempts, selected_port, e);
                 if attempt < max_attempts {
                     info!("Retrying storage daemon startup in {:?}", retry_interval);
@@ -664,7 +687,7 @@ pub async fn start_storage_interactive(
 
     let pid = pid.ok_or_else(|| anyhow!("Failed to start storage daemon on port {} after {} attempts", selected_port, max_attempts))?;
 
-    // Register daemon metadata before engine initialization
+    // === REST OF FUNCTION UNCHANGED ===
     println!("==> STARTING STORAGE - STEP 6 (PREPARE PATHS)");
     let engine_type_str = daemon_api_storage_engine_type_to_string(&storage_config.storage_engine_type);
     let engine_path_name = engine_type_str.to_lowercase();
@@ -736,7 +759,6 @@ pub async fn start_storage_interactive(
         println!("===> REGISTERED DAEMON ON PORT {} WITH PATH {:?}", selected_port, instance_path);
     }
 
-    // Verify daemon registration
     let post_register_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
     debug!("Registry state after registering daemon on port {}: {:?}", selected_port, post_register_daemons);
     if !post_register_daemons.iter().any(|d| d.port == selected_port && d.service_type == "storage") {
@@ -745,7 +767,6 @@ pub async fn start_storage_interactive(
         return Err(anyhow!("Daemon on port {} not found in registry after registration", selected_port));
     }
 
-    // Initialize StorageEngineManager after daemon is confirmed running
     println!("==> STARTING STORAGE - STEP 7 (INITIALIZE MANAGER)");
     trace!("Checking if GLOBAL_STORAGE_ENGINE_MANAGER is initialized");
 
@@ -758,7 +779,6 @@ pub async fn start_storage_interactive(
         info!("Attempt {}/{} to initialize StorageEngineManager on port {}", attempt, max_init_attempts, selected_port);
         println!("===> ATTEMPT {}/{} TO INITIALIZE STORAGEENGINEMANAGER ON PORT {}", attempt, max_init_attempts, selected_port);
 
-        // Check if manager is already initialized
         if let Some(async_manager) = GLOBAL_STORAGE_ENGINE_MANAGER.get() {
             info!("Existing StorageEngineManager found, updating with new config");
             async_manager
@@ -807,7 +827,6 @@ pub async fn start_storage_interactive(
     info!("Initialized StorageEngineManager with engine type: {:?} on port {}", storage_config.storage_engine_type, selected_port);
     println!("===> STORAGE ENGINE MANAGER INITIALIZED SUCCESSFULLY FOR PORT {}", selected_port);
 
-    // Perform engine-specific cleanup and verification
     if storage_config.storage_engine_type == StorageEngineType::Sled {
         let selected_config = storage_config.engine_specific_config.clone()
             .unwrap_or_else(|| create_default_selected_storage_config(&StorageEngineType::Sled));
@@ -815,7 +834,6 @@ pub async fn start_storage_interactive(
         info!("Sled path set to {:?}", sled_path);
         println!("===> USING SLED PATH: {:?}", sled_path);
 
-        // Verify Sled database by checking directory existence
         if sled_path.exists() && sled_path.is_dir() {
             info!("Sled database directory exists at {:?}", sled_path);
             println!("===> SLED DATABASE DIRECTORY VERIFIED AT {:?}", sled_path);
@@ -890,7 +908,6 @@ pub async fn start_storage_interactive(
     sync_daemon_registry_with_manager(selected_port, &storage_config, &storage_daemon_shutdown_tx_opt).await?;
     println!("==> STEP 7 COMPLETE: Registry synced with manager paths");
 
-    // Set up shutdown channel and handle
     *storage_daemon_port_arc.lock().await = Some(selected_port);
     let (tx, rx) = oneshot::channel();
     *storage_daemon_shutdown_tx_opt.lock().await = Some(tx);

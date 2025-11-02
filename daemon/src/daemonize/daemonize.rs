@@ -51,6 +51,7 @@ pub struct DaemonizeBuilder {
     host: String,
     port: u16,
     skip_ports: Vec<u16>, // Ports that should NOT be bound by the stub daemon
+    pid_file_path: Option<String>, // Add pid_file_path field
 }
 
 impl DaemonizeBuilder {
@@ -65,6 +66,7 @@ impl DaemonizeBuilder {
             host: "127.0.0.1".into(),
             port: 8080,
             skip_ports: vec![],
+            pid_file_path: None,
         }
     }
 
@@ -110,6 +112,12 @@ impl DaemonizeBuilder {
 
     pub fn skip_ports(mut self, skip_ports: Vec<u16>) -> Self {
         self.skip_ports = skip_ports;
+        self
+    }
+
+        
+    pub fn pid_file_path(mut self, path: &str) -> Self {
+        self.pid_file_path = Some(path.to_string());
         self
     }
 
