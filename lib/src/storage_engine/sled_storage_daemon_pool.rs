@@ -146,8 +146,11 @@ impl SledDaemon {
         }
     }
 
+    // ============================================================================
+    // SledDaemon::new
+    // ============================================================================
     pub async fn new(config: SledConfig) -> GraphResult<(Self, mpsc::Receiver<()>)> {
-        println!("===> SledDaemon new CALLED");
+        println!("===> SledDaemon::new CALLED");
         let port = config.port.ok_or_else(|| {
             error!("No port specified in SledConfig");
             println!("===> ERROR: NO PORT SPECIFIED IN SLED CONFIG");
@@ -164,8 +167,15 @@ impl SledDaemon {
             PathBuf::from(config.path.clone()).join(port.to_string())
         };
 
+        info!("SledDaemon using path: {:?}", db_path);
+        println!("===> SLED DAEMON USING PATH: {:?}", db_path);
+
         if !db_path.exists() {
+            info!("Creating Sled directory at {:?}", db_path);
+            println!("===> CREATING SLED DIRECTORY AT {:?}", db_path);
             tokio_fs::create_dir_all(&db_path).await.map_err(|e| {
+                error!("Failed to create directory at {:?}: {}", db_path, e);
+                println!("===> ERROR: FAILED TO CREATE DIRECTORY AT {:?}: {}", db_path, e);
                 GraphError::StorageError(format!("Failed to create directory: {}", e))
             })?;
         }
@@ -173,7 +183,16 @@ impl SledDaemon {
         // --- CRITICAL: Open DB under lock, reuse if possible ---
         let cache_capacity = config.cache_capacity.unwrap_or(1024 * 1024 * 1024);
         let use_compression = config.use_compression;
-        let (db_arc, vertices, edges, kv_pairs) = Self::open_sled_db_and_trees(&config, &db_path, cache_capacity, use_compression).await?;
+        
+        info!("Opening Sled DB and trees at {:?}", db_path);
+        println!("===> OPENING SLED DB AND TREES AT {:?}", db_path);
+        
+        let (db_arc, vertices, edges, kv_pairs) = Self::open_sled_db_and_trees(
+            &config, 
+            &db_path, 
+            cache_capacity, 
+            use_compression
+        ).await?;
 
         info!("SLED DB AND TREES SUCCESSFULLY OPENED AT {:?}", db_path);
         println!("===> SLED DB AND TREES SUCCESSFULLY OPENED AT {:?}", db_path);
@@ -184,7 +203,11 @@ impl SledDaemon {
         let ipc_path = endpoint.strip_prefix("ipc://").unwrap();
 
         // Clean stale socket BEFORE binding
-        let _ = tokio_fs::remove_file(ipc_path).await;
+        if Path::new(ipc_path).exists() {
+            warn!("Removing stale IPC socket at {}", ipc_path);
+            println!("===> REMOVING STALE IPC SOCKET AT {}", ipc_path);
+            let _ = tokio_fs::remove_file(ipc_path).await;
+        }
 
         let running = Arc::new(TokioMutex::new(true));
         let daemon = Self {
@@ -208,14 +231,25 @@ impl SledDaemon {
         let db_path_clone = db_path.clone();
         let running_clone = running.clone();
 
+        info!("Spawning ZMQ server thread for port {}", port);
+        println!("===> SPAWNING ZMQ SERVER THREAD FOR PORT {}", port);
+
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
             rt.block_on(async {
+                info!("ZMQ thread started for port {}", port);
+                println!("===> ZMQ THREAD STARTED FOR PORT {}", port);
+
                 let context = ZmqContext::new();
                 let zmq_socket_raw = match context.socket(REP) {
-                    Ok(s) => s,
+                    Ok(s) => {
+                        info!("ZMQ socket created successfully");
+                        println!("===> ZMQ SOCKET CREATED SUCCESSFULLY");
+                        s
+                    }
                     Err(e) => {
                         error!("ZMQ socket create failed: {}", e);
+                        println!("===> ERROR: ZMQ SOCKET CREATE FAILED: {}", e);
                         let _ = tx.send(()).await;
                         return;
                     }
@@ -224,27 +258,44 @@ impl SledDaemon {
                 // Bind with retries
                 let mut bound = false;
                 for i in 0..5 {
-                    if zmq_socket_raw.bind(&endpoint_clone).is_ok() {
-                        bound = true;
-                        break;
+                    match zmq_socket_raw.bind(&endpoint_clone) {
+                        Ok(_) => {
+                            bound = true;
+                            info!("ZMQ socket bound successfully on attempt {}", i + 1);
+                            println!("===> ZMQ SOCKET BOUND SUCCESSFULLY ON ATTEMPT {}", i + 1);
+                            break;
+                        }
+                        Err(e) => {
+                            warn!("ZMQ bind attempt {} failed: {}", i + 1, e);
+                            println!("===> WARNING: ZMQ BIND ATTEMPT {} FAILED: {}", i + 1, e);
+                            if i < 4 {
+                                sleep(TokioDuration::from_millis(100 * (i + 1) as u64)).await;
+                            }
+                        }
                     }
-                   sleep(TokioDuration::from_millis(100 * (i + 1) as u64)).await;
                 }
 
-                let _ = tx.send(()).await; // Signal: attempted bind
+                // Signal: attempted bind (whether success or failure)
+                let _ = tx.send(()).await;
+                info!("Sent ZMQ readiness signal");
+                println!("===> SENT ZMQ READINESS SIGNAL");
 
                 if !bound {
                     error!("ZMQ failed to bind after retries");
+                    println!("===> ERROR: ZMQ FAILED TO BIND AFTER RETRIES");
                     return;
                 }
 
-                // Update registry: mark as zmq_ready
+                info!("ZMQ server bound successfully at {}", endpoint_clone);
+                println!("===> ZMQ SERVER BOUND SUCCESSFULLY AT {}", endpoint_clone);
+
+                // Update registry: mark as zmq_ready and engine_synced
                 let metadata = DaemonMetadata {
                     service_type: "storage".to_string(),
                     port,
                     pid: std::process::id(),
                     ip_address: "127.0.0.1".to_string(),
-                    data_dir: Some(db_path_clone),
+                    data_dir: Some(db_path_clone.clone()),
                     config_path: None,
                     engine_type: Some("sled".to_string()),
                     last_seen_nanos: SystemTime::now()
@@ -254,15 +305,32 @@ impl SledDaemon {
                     zmq_ready: true,
                     engine_synced: true,
                 };
-                let _ = daemon_registry.register_daemon(metadata).await;
+                
+                match daemon_registry.register_daemon(metadata).await {
+                    Ok(_) => {
+                        info!("Updated daemon registry: zmq_ready=true, engine_synced=true");
+                        println!("===> UPDATED DAEMON REGISTRY: ZMQ_READY=TRUE, ENGINE_SYNCED=TRUE");
+                    }
+                    Err(e) => {
+                        error!("Failed to update daemon registry: {}", e);
+                        println!("===> ERROR: FAILED TO UPDATE DAEMON REGISTRY: {}", e);
+                    }
+                }
 
                 let zmq_socket = Arc::new(TokioMutex::new(zmq_socket_raw));
+                
+                info!("Starting ZMQ server loop for port {}", port);
+                println!("===> STARTING ZMQ SERVER LOOP FOR PORT {}", port);
+                
                 let _ = Self::run_zmq_server_static(
                     port, db_arc, vertices, edges, kv_pairs, running_clone, zmq_socket, endpoint_clone,
                 ).await;
             });
         });
 
+        info!("SledDaemon created successfully on port {}", port);
+        println!("===> SLED DAEMON CREATED SUCCESSFULLY ON PORT {}", port);
+        
         Ok((daemon, rx))
     }
 
@@ -3691,6 +3759,9 @@ impl SledDaemonPool {
         Ok(client_arc)
     }   
 
+    // ============================================================================
+    // SledDaemonPool::_initialize_cluster_core
+    // ============================================================================
     async fn _initialize_cluster_core(
         &mut self,
         storage_config: &StorageConfig,
@@ -3700,83 +3771,176 @@ impl SledDaemonPool {
         let _guard = get_cluster_init_lock().await.lock().await;
         let mut initialized = self.initialized.write().await;
         if *initialized {
+            info!("SledDaemonPool already initialized");
+            println!("===> SLED DAEMON POOL ALREADY INITIALIZED");
             return Ok(());
         }
-
+        let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
         let port = cli_port.unwrap_or(config.port.unwrap_or(8052));
+        info!("Initializing cluster on port {}", port);
+        println!("===> INITIALIZING CLUSTER ON PORT {}", port);
 
-        // Check if ZMQ is already responsive
-        if self.is_zmq_reachable(port).await.unwrap_or(false) {
-            info!("Daemon already running on port {}", port);
-            self.load_balancer.update_node_health(port, true, 0).await;
-            *initialized = true;
-            return Ok(());
-        }
-
-        // Clean stale IPC
         let ipc_path = format!("/tmp/graphdb-{}.ipc", port);
-        let _ = tokio_fs::remove_file(&ipc_path).await;
-
-        // Build path
-        let engine_dir = "sled";
         let db_path = storage_config
             .data_directory
             .as_ref()
             .unwrap_or(&PathBuf::from("/opt/graphdb/storage_data"))
-            .join(engine_dir)
+            .join("sled")
             .join(port.to_string());
 
+        // Clean stale IPC regardless of daemon state
+        if Path::new(&ipc_path).exists() {
+            warn!("Removing stale IPC socket at {}", ipc_path);
+            println!("===> REMOVING STALE IPC SOCKET AT {}", ipc_path);
+            let _ = tokio_fs::remove_file(&ipc_path).await;
+        }
+
+        info!("Creating new daemon on port {}", port);
+        println!("===> CREATING NEW DAEMON ON PORT {}", port);
+
+        // Create directory if needed
         if !db_path.exists() {
+            info!("Creating Sled directory at {:?}", db_path);
+            println!("===> CREATING SLED DIRECTORY AT {:?}", db_path);
             tokio_fs::create_dir_all(&db_path).await?;
         }
 
+        // Force unlock
         SledClient::force_unlock(&db_path).await?;
+        info!("Force unlocked database at {:?}", db_path);
+        println!("===> FORCE UNLOCKED DATABASE AT {:?}", db_path);
 
+        // Handle data synchronization from canonical/leader port if needed
+        if storage_config.use_raft_for_scale {
+            info!("Raft enabled, checking for data synchronization needs");
+            println!("===> RAFT ENABLED, CHECKING FOR DATA SYNCHRONIZATION NEEDS");
+            
+            // Find canonical port or a synced daemon to copy from
+            let all_daemons = daemon_registry.get_all_daemon_metadata().await?;
+            let synced_daemons: Vec<_> = all_daemons
+                .into_iter()
+                .filter(|m| {
+                    m.service_type == "storage" 
+                    && m.engine_type.as_ref().map(|e| e == "sled").unwrap_or(false)
+                    && m.port != port
+                    && m.engine_synced
+                    && m.data_dir.is_some()
+                })
+                .collect();
+
+            if !synced_daemons.is_empty() {
+                // Check if our directory is empty
+                let is_empty = Self::is_dir_empty(&db_path).await;
+                
+                if is_empty {
+                    // Find the canonical port (default_port) if available, otherwise use first synced daemon
+                    let source_daemon = synced_daemons
+                        .iter()
+                        .find(|d| d.port == storage_config.default_port)
+                        .or_else(|| synced_daemons.first());
+
+                    if let Some(leader) = source_daemon {
+                        if let Some(leader_path) = &leader.data_dir {
+                            info!("Syncing data from leader on port {} at {:?}", leader.port, leader_path);
+                            println!("===> SYNCING DATA FROM LEADER ON PORT {} AT {:?}", leader.port, leader_path);
+                            
+                            // Copy data files only (no locks)
+                            Self::copy_data_files_only(leader_path, &db_path).await?;
+                            
+                            info!("Successfully synced data from leader on port {}", leader.port);
+                            println!("===> SUCCESSFULLY SYNCED DATA FROM LEADER ON PORT {}", leader.port);
+                        }
+                    }
+                } else {
+                    info!("Database directory not empty, skipping sync");
+                    println!("===> DATABASE DIRECTORY NOT EMPTY, SKIPPING SYNC");
+                }
+            } else {
+                info!("No synced leader found, this will be the first node");
+                println!("===> NO SYNCED LEADER FOUND, THIS WILL BE THE FIRST NODE");
+            }
+        }
+
+        // Configure daemon
         let mut daemon_config = config.clone();
-        daemon_config.path = db_path;
+        daemon_config.path = db_path.clone();
         daemon_config.port = Some(port);
 
-        // ✅ This will open DB safely under per-port lock
+        info!("Creating SledDaemon with config: {:?}", daemon_config);
+        println!("===> CREATING SLED DAEMON WITH CONFIG: {:?}", daemon_config);
+
+        // Create daemon - this will open DB safely under per-port lock
         let (daemon, mut ready_rx) = timeout(
             TokioDuration::from_secs(15),
             SledDaemon::new(daemon_config)
-        ).await??;
+        )
+        .await
+        .map_err(|_| {
+            error!("Timeout creating SledDaemon on port {}", port);
+            println!("===> ERROR: TIMEOUT CREATING SLED DAEMON ON PORT {}", port);
+            GraphError::StorageError(format!("Timeout creating SledDaemon on port {}", port))
+        })?
+        .map_err(|e| {
+            error!("Failed to create SledDaemon on port {}: {}", port, e);
+            println!("===> ERROR: FAILED TO CREATE SLED DAEMON ON PORT {}: {}", port, e);
+            e
+        })?;
+
+        info!("Waiting for ZMQ readiness signal on port {}", port);
+        println!("===> WAITING FOR ZMQ READINESS SIGNAL ON PORT {}", port);
 
         // Wait for ZMQ bind attempt
-        timeout(TokioDuration::from_secs(5), ready_rx.recv())
+        timeout(TokioDuration::from_secs(10), ready_rx.recv())
             .await
-            .map_err(|_| GraphError::StorageError("Timeout waiting for ZMQ readiness signal".into()))?
-            .ok_or_else(|| GraphError::StorageError("ZMQ readiness channel closed prematurely".into()))?;
+            .map_err(|_| {
+                error!("Timeout waiting for ZMQ readiness signal on port {}", port);
+                println!("===> ERROR: TIMEOUT WAITING FOR ZMQ READINESS SIGNAL ON PORT {}", port);
+                GraphError::StorageError("Timeout waiting for ZMQ readiness signal".into())
+            })?
+            .ok_or_else(|| {
+                error!("ZMQ readiness channel closed prematurely on port {}", port);
+                println!("===> ERROR: ZMQ READINESS CHANNEL CLOSED PREMATURELY ON PORT {}", port);
+                GraphError::StorageError("ZMQ readiness channel closed prematurely".into())
+            })?;
 
         // Verify IPC file exists
+        let mut ipc_check_attempts = 0;
+        while !Path::new(&ipc_path).exists() && ipc_check_attempts < 10 {
+            warn!("IPC file not found at {}, waiting... (attempt {})", ipc_path, ipc_check_attempts + 1);
+            println!("===> WARNING: IPC FILE NOT FOUND AT {}, WAITING... (ATTEMPT {})", ipc_path, ipc_check_attempts + 1);
+            sleep(TokioDuration::from_millis(500)).await;
+            ipc_check_attempts += 1;
+        }
+
         if !Path::new(&ipc_path).exists() {
+            error!("IPC file not created at {} after {} attempts", ipc_path, ipc_check_attempts);
+            println!("===> ERROR: IPC FILE NOT CREATED AT {} AFTER {} ATTEMPTS", ipc_path, ipc_check_attempts);
             return Err(GraphError::StorageError(format!("IPC file not created: {}", ipc_path)));
         }
 
-        // Optional: ping ZMQ to confirm responsiveness
-        // (Implement `zmq_ping(port)` if needed)
+        info!("IPC file verified at {}", ipc_path);
+        println!("===> IPC FILE VERIFIED AT {}", ipc_path);
 
+        // Note: We don't ping ZMQ here because the server is still initializing.
+        // The ZMQ thread will update the registry with zmq_ready=true once it's fully running.
+        info!("ZMQ server starting, will be marked ready in registry when fully initialized");
+        println!("===> ZMQ SERVER STARTING, WILL BE MARKED READY IN REGISTRY WHEN FULLY INITIALIZED");
+
+        // Store daemon and update load balancer
         self.daemons.insert(port, Arc::new(daemon));
         self.load_balancer.update_node_health(port, true, 0).await;
         *initialized = true;
 
+        info!("SledDaemonPool initialized successfully on port {}", port);
+        println!("===> SLED DAEMON POOL INITIALIZED SUCCESSFULLY ON PORT {}", port);
+
         Ok(())
     }
 
-    /// ---------------------------------------------------------------------------
-    /// Small utilities used above
-    /// ---------------------------------------------------------------------------
-    fn leader_port_is_canonical(leader: &Path, canon_port: u16, cfg: &StorageConfig) -> bool {
-        leader.ends_with(&format!("{}", canon_port))
-            && leader.starts_with(
-                cfg.data_directory
-                    .as_ref()
-                    .unwrap_or(&PathBuf::from("/opt/graphdb/storage_data"))
-                    .join("sled"),
-            )
-    }
-
-    // Helper
+    // ============================================================================
+    // Helper utilities
+    // ============================================================================
+    
     async fn is_dir_empty(path: &Path) -> bool {
         if let Ok(mut dir) = tokio_fs::read_dir(path).await {
             dir.next_entry().await.ok().flatten().is_none()
@@ -3814,7 +3978,10 @@ impl SledDaemonPool {
 
                 // Skip lock files and temp files
                 if file_name_str.contains("LOCK") || file_name_str.contains(".lck") 
-                    || file_name_str.contains(".tmp") || file_name_str.contains(".temp") {
+                    || file_name_str.contains(".tmp") || file_name_str.contains(".temp") 
+                    || file_name_str == "db" { // Skip Sled's lock file
+                    info!("Skipping lock/temp file: {}", file_name_str);
+                    println!("===> SKIPPING LOCK/TEMP FILE: {}", file_name_str);
                     continue;
                 }
 
@@ -3828,6 +3995,7 @@ impl SledDaemonPool {
                 } else {
                     tokio_fs::copy(&source_path, &target_path).await
                         .map_err(|e| GraphError::Io(format!("Failed to copy file: {}", e)))?;
+                    info!("Copied file: {}", file_name_str);
                 }
             }
 
@@ -3835,6 +4003,19 @@ impl SledDaemonPool {
             println!("===> SUCCESSFULLY COPIED DATA TO {:?}", target);
             Ok(())
         })
+    }
+
+    /// ---------------------------------------------------------------------------
+    /// Small utilities used above
+    /// ---------------------------------------------------------------------------
+    fn leader_port_is_canonical(leader: &Path, canon_port: u16, cfg: &StorageConfig) -> bool {
+        leader.ends_with(&format!("{}", canon_port))
+            && leader.starts_with(
+                cfg.data_directory
+                    .as_ref()
+                    .unwrap_or(&PathBuf::from("/opt/graphdb/storage_data"))
+                    .join("sled"),
+            )
     }
 
     /// Start periodic health monitoring

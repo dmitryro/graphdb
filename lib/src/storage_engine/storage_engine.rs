@@ -1297,228 +1297,133 @@ impl StorageEngineManager {
         let engine_path = base_engine_path.join(port.to_string());
         println!("===> in new in storage_engine.rs - STEP 2: ENGINE PATH {:?}", engine_path);
 
-        // Check if a daemon is already running and verify its process
-        let daemon_running = timeout(TokioDuration::from_secs(5), is_storage_daemon_running(port))
-            .await
-            .map_err(|_| GraphError::StorageError(format!("Timeout checking daemon on port {}", port)))?;
-        
-        if daemon_running {
-            debug!("Daemon found running on port {}", port);
-            println!("===> DAEMON FOUND RUNNING ON PORT {}", port);
-            
-            if let Ok(Ok(Some(metadata))) = timeout(TokioDuration::from_secs(2), GLOBAL_DAEMON_REGISTRY.find_daemon_by_port(port)).await {
-                let pid = Pid::from(metadata.pid as usize);
-                
-                let mut system = System::new_with_specifics(RefreshKind::nothing());
-                system.refresh_processes(ProcessesToUpdate::Some(&[pid]), false);
-
-                if system.process(pid).is_some() {
-                    info!("Reusing existing daemon on port {} with PID {}", port, metadata.pid);
-                    println!("===> REUSING EXISTING DAEMON ON PORT {} WITH PID {}", port, metadata.pid);
-
-                    if let Some(ref mut engine_config) = config.engine_specific_config {
-                        engine_config.storage.path = Some(engine_path.clone());
-                        engine_config.storage.port = Some(port);
-                    }
-
-                    let engine = Self::initialize_storage_engine(storage_engine_type, &config).await?;
-
-                    return Self::create_manager(
-                        storage_engine_type,
-                        config,
-                        config_path,
-                        engine,
-                        !use_temp,
-                        Arc::new(TokioMutex::new(HashMap::new())),
-                    ).await;
+        // ✅ STEP 1: Check for VALID, LIVE, SYNCED DAEMON
+        let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
+        let valid_daemon_exists = if let Ok(Some(metadata)) = daemon_registry.get_daemon_metadata(port).await {
+            if metadata.engine_synced && metadata.zmq_ready {
+                if is_pid_running(metadata.pid).await {
+                    info!("Valid, synced daemon already running on port {} (PID {})", port, metadata.pid);
+                    println!("===> VALID, SYNCED DAEMON ALREADY RUNNING ON PORT {} (PID {})", port, metadata.pid);
+                    true
                 } else {
-                    warn!("Daemon on port {} with PID {} is registered but not running, removing stale entry", port, metadata.pid);
-                    println!("===> DAEMON ON PORT {} WITH PID {} IS REGISTERED BUT NOT RUNNING, REMOVING STALE ENTRY", port, metadata.pid);
-
-                    if let Err(e) = timeout(
-                        TokioDuration::from_secs(2),
-                        GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("storage", port),
-                    )
-                    .await
-                    .map_err(|_| GraphError::StorageError("Timeout removing stale daemon entry".to_string()))?
-                    {
-                        warn!("Failed to remove stale daemon entry for port {}: {}", port, e);
-                        println!("===> WARNING: FAILED TO REMOVE STALE DAEMON ENTRY FOR PORT {}: {}", port, e);
-                    }
+                    warn!("Daemon metadata exists but process dead (PID {}), cleaning up", metadata.pid);
+                    let _ = daemon_registry.remove_daemon_by_type("storage", port).await;
+                    false
                 }
             } else {
-                warn!("No daemon metadata found or failed to query registry for port {}", port);
-                println!("===> WARNING: NO DAEMON METADATA FOUND OR FAILED TO QUERY REGISTRY FOR PORT {}", port);
+                debug!("Daemon exists but not synced or ZMQ not ready: zmq_ready={}, engine_synced={}", 
+                       metadata.zmq_ready, metadata.engine_synced);
+                false
             }
         } else {
-            debug!("No daemon running on port {}", port);
-            println!("===> NO DAEMON RUNNING ON PORT {}", port);
+            false
+        };
+
+        // ✅ STEP 2: If valid daemon exists → reuse WITHOUT opening DB
+        if valid_daemon_exists {
+            // Update config to match actual path
+            if let Some(ref mut engine_config) = config.engine_specific_config {
+                engine_config.storage.path = Some(engine_path.clone());
+                engine_config.storage.port = Some(port);
+            }
+
+            // Initialize engine in CLIENT mode (no DB open — uses ZMQ)
+            let engine = Self::initialize_storage_engine(storage_engine_type, &config).await?;
+
+            return Self::create_manager(
+                storage_engine_type,
+                config,
+                config_path,
+                engine,
+                !use_temp,
+                Arc::new(TokioMutex::new(HashMap::new())),
+            ).await;
         }
-        println!("===> in new in storage_engine.rs - STEP 3 ");
 
-        // Check ROCKSDB_DAEMON_REGISTRY for consistency
-        let registry = ROCKSDB_DAEMON_REGISTRY
-            .get_or_init(|| async { TokioMutex::new(HashMap::new()) })
-            .await;
-        let current_pid = std::process::id() as u32;
-        {
-            let registry_lock = registry.lock().await;
-            if let Some((db, kv_pairs, vertices, edges, pid)) = registry_lock.get(&port) {
-                if *pid == current_pid {
-                    info!("Reusing existing RocksDB instance from ROCKSDB_DAEMON_REGISTRY for port {} (PID {})", port, current_pid);
-                    println!("===> REUSING EXISTING ROCKSDB INSTANCE FROM ROCKSDB_DAEMON_REGISTRY FOR PORT {} (PID {})", port, current_pid);
-                    if let Some(ref mut engine_config) = config.engine_specific_config {
-                        engine_config.storage.path = Some(engine_path.clone());
-                        engine_config.storage.port = Some(port);
-                    }
-                    let engine = Self::initialize_storage_engine(storage_engine_type, &config).await?;
+        // ✅ STEP 3: No valid daemon → proceed with cleanup and new init
+        println!("===> NO VALID DAEMON FOUND, PROCEEDING WITH CLEAN INIT");
 
-                    return Self::create_manager(
-                        storage_engine_type,
-                        config,
-                        config_path,
-                        engine,
-                        !use_temp,
-                        Arc::new(TokioMutex::new(HashMap::new())),
-                    ).await;
-                } else if is_pid_running(*pid).await && timeout(TokioDuration::from_secs(5), RocksDBClient::is_zmq_reachable(port))
-                    .await
-                    .unwrap_or(Ok(false))
-                    .unwrap_or(false)
-                {
-                    info!("Active daemon found in ROCKSDB_DAEMON_REGISTRY on port {} (PID {}), reusing", port, pid);
-                    println!("===> ACTIVE DAEMON IN ROCKSDB_DAEMON_REGISTRY ON PORT {} (PID {}), REUSING", port, pid);
-                    if let Some(ref mut engine_config) = config.engine_specific_config {
-                        engine_config.storage.path = Some(engine_path.clone());
-                        engine_config.storage.port = Some(port);
-                    }
-                    let engine = Self::initialize_storage_engine(storage_engine_type, &config).await?;
-
-
-                    return Self::create_manager(
-                        storage_engine_type,
-                        config,
-                        config_path,
-                        engine,
-                        !use_temp,
-                        Arc::new(TokioMutex::new(HashMap::new())),
-                    ).await;
-                } else {
-                    warn!("Stale entry in ROCKSDB_DAEMON_REGISTRY for port {} (PID {}), removing", port, pid);
-                    println!("===> STALE ENTRY IN ROCKSDB_DAEMON_REGISTRY FOR PORT {} (PID {}), REMOVING", port, pid);
-                    drop(registry_lock); // Release lock before async operation
-                    RocksDBClient::force_unlock(&engine_path).await?;
-                }
+        // Clean stale IPC
+        let ipc_path = format!("/tmp/graphdb-{}.ipc", port);
+        if Path::new(&ipc_path).exists() {
+            // Only remove if no live daemon
+            let should_remove = match daemon_registry.get_daemon_metadata(port).await {
+                Ok(Some(meta)) => !is_pid_running(meta.pid).await,
+                _ => true,
+            };
+            if should_remove {
+                warn!("Removing stale IPC socket at {}", ipc_path);
+                let _ = tokio_fs::remove_file(&ipc_path).await;
             }
         }
-        println!("===> in new in storage_engine.rs - STEP 4 ");
 
-        // Safe lock file management
+        // Force unlock
         match storage_engine_type {
             #[cfg(feature = "with-rocksdb")]
             StorageEngineType::RocksDB => {
-                println!("===> new in storage_engine.rs - CHECKING ROCKSDB LOCKS");
                 if engine_path.exists() {
-                    if let Err(e) = RocksDBStorage::force_unlock(&engine_path).await {
-                        error!("Failed to unlock RocksDB at {:?}", engine_path);
-                        println!("===> ERROR: FAILED TO UNLOCK ROCKSDB AT {:?}", engine_path);
-                        return Err(e);
-                    }
-                    info!("Successfully checked/unlocked RocksDB at {:?}", engine_path);
-                    println!("===> SUCCESSFULLY CHECKED/UNLOCKED ROCKSDB AT {:?}", engine_path);
+                    RocksDBClient::force_unlock(&engine_path).await?;
                 } else {
-                    info!("Creating new database directory at {:?}", engine_path);
-                    println!("===> CREATING NEW DATABASE DIRECTORY AT {:?}", engine_path);
-                    fs::create_dir_all(&engine_path)
-                        .await
-                        .map_err(|e| GraphError::StorageError(format!("Failed to create directory at {:?}: {}", engine_path, e)))?;
+                    tokio_fs::create_dir_all(&engine_path).await
+                        .map_err(|e| GraphError::StorageError(format!("Failed to create dir: {}", e)))?;
+                }
+            }
+            #[cfg(feature = "with-sled")]
+            StorageEngineType::Sled => {
+                if engine_path.exists() {
+                    SledClient::force_unlock(&engine_path).await?;
+                } else {
+                    tokio_fs::create_dir_all(&engine_path).await
+                        .map_err(|e| GraphError::StorageError(format!("Failed to create dir: {}", e)))?;
                 }
             }
             _ => {}
         }
-        println!("===> in new in storage_engine.rs - STEP 5 ");
 
-        // Clean up stale registry entry
-        match timeout(TokioDuration::from_secs(2), GLOBAL_DAEMON_REGISTRY.find_daemon_by_port(port)).await {
-            Ok(Ok(Some(metadata))) => {
-                let mut system = System::new_with_specifics(RefreshKind::nothing());
-                let pid = Pid::from(metadata.pid as usize);
-                system.refresh_processes(ProcessesToUpdate::Some(&[pid]), false);
-                if system.process(pid).is_none() {
-                    warn!("Removing stale registry entry for port {} with PID {}", port, metadata.pid);
-                    println!("===> REMOVING STALE REGISTRY ENTRY FOR PORT {} WITH PID {}", port, metadata.pid);
-                    timeout(
-                        TokioDuration::from_secs(2),
-                        GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type("storage", port),
-                    )
-                    .await
-                    .map_err(|_| GraphError::StorageError("Timeout removing stale daemon entry".to_string()))??;
-                }
-            }
-            Ok(Ok(None)) => {
-                debug!("No stale registry entry found for port {}", port);
-                println!("===> NO STALE REGISTRY ENTRY FOUND FOR PORT {}", port);
-            }
-            Ok(Err(e)) => {
-                warn!("Error querying daemon registry for port {}: {}", port, e);
-                println!("===> WARNING: ERROR QUERYING DAEMON REGISTRY FOR PORT {}: {}", port, e);
-            }
-            Err(_) => {
-                warn!("Timeout querying daemon registry for port {}", port);
-                println!("===> WARNING: TIMEOUT QUERYING DAEMON REGISTRY FOR PORT {}", port);
-            }
+        // Ensure registry has correct metadata (do NOT register if exists)
+        if let Ok(Some(mut metadata)) = daemon_registry.get_daemon_metadata(port).await {
+            metadata.data_dir = Some(engine_path.clone());
+            metadata.engine_type = Some(storage_engine_type.to_string());
+            metadata.ip_address = "127.0.0.1".to_string();
+            metadata.pid = std::process::id();
+            metadata.last_seen_nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as i64)
+                .unwrap_or(0);
+            // Do NOT set zmq_ready/engine_synced here — let daemon do it
+            let _ = daemon_registry.update_daemon_metadata(metadata).await;
+        } else {
+            // Only register if truly missing
+            let new_metadata = DaemonMetadata {
+                service_type: "storage".to_string(),
+                port,
+                pid: std::process::id(),
+                ip_address: "127.0.0.1".to_string(),
+                data_dir: Some(engine_path.clone()),
+                config_path: Some(config_path.clone()),
+                engine_type: Some(storage_engine_type.to_string()),
+                zmq_ready: false,
+                engine_synced: false,
+                last_seen_nanos: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as i64)
+                    .unwrap_or(0),
+            };
+            let _ = daemon_registry.register_daemon(new_metadata).await;
         }
-        println!("===> in new in storage_engine.rs - STEP 6 ");
 
-        let metadata = match timeout(TokioDuration::from_secs(2), GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port)).await {
-            Ok(Ok(Some(mut existing))) => {
-                if existing.data_dir != Some(engine_path.clone()) {
-                    warn!("Updating daemon data_dir from {:?} to {:?}", existing.data_dir, engine_path);
-                    println!("===> UPDATING DAEMON DATA_DIR FROM {:?} TO {:?}", existing.data_dir, engine_path);
-                    existing.data_dir = Some(engine_path.clone());
-                    timeout(TokioDuration::from_secs(2), GLOBAL_DAEMON_REGISTRY.update_daemon_metadata(existing.clone()))
-                        .await
-                        .map_err(|_| GraphError::StorageError("Timeout updating daemon metadata".to_string()))??;
-                }
-                existing
-            }
-            _ => {
-                let new_metadata = DaemonMetadata {
-                    service_type: "storage".to_string(),
-                    port,
-                    pid: std::process::id(),
-                    ip_address: "127.0.0.1".to_string(),
-                    data_dir: Some(engine_path.clone()),
-                    config_path: Some(config_path.clone()),
-                    engine_type: Some(storage_engine_type.to_string()),
-                    zmq_ready: false,
-                    engine_synced: false,
-                    last_seen_nanos: SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map(|d| d.as_nanos() as i64)
-                        .unwrap_or(0),
-                };
-                timeout(TokioDuration::from_secs(2), GLOBAL_DAEMON_REGISTRY.register_daemon(new_metadata.clone()))
-                    .await
-                    .map_err(|_| GraphError::StorageError("Timeout registering daemon metadata".to_string()))??;
-                println!("===> REGISTERED NEW DAEMON ENTRY FOR PORT {}", port);
-                new_metadata
-            }
-        };
-        println!("===> in new in storage_engine.rs - STEP 7 ");
-
+        // Update config
         if let Some(ref mut engine_config) = config.engine_specific_config {
             engine_config.storage.path = Some(engine_path.clone());
             engine_config.storage.port = Some(port);
         }
 
         if !use_temp {
-            timeout(TokioDuration::from_secs(5), config.save())
-                .await
-                .map_err(|_| GraphError::ConfigurationError("Timeout saving config".to_string()))??;
+            config.save().await
+                .map_err(|e| GraphError::ConfigurationError(format!("Failed to save config: {}", e)))?;
         }
-        println!("===> in new in storage_engine.rs - STEP 8: BEFORE INITIALIZE_STORAGE_ENGINE");
 
+        // Initialize engine — this will start daemon if needed
         let engine = Self::initialize_storage_engine(storage_engine_type, &config).await?;
 
         Self::create_manager(
