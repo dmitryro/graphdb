@@ -22,7 +22,8 @@ use serde_json::{json, Value};
 use serde::{Deserialize, Serialize};
 use crate::daemon::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
 use crate::daemon::db_daemon_registry::{GLOBAL_DB_DAEMON_REGISTRY, DBDaemonMetadata};
-use crate::daemon::daemon_management::{parse_cluster_range, is_daemon_running,  get_ipc_addr, };
+use crate::daemon::daemon_management::{parse_cluster_range, is_daemon_running,  get_ipc_addr, 
+                                       find_pid_by_port, is_port_free, is_pid_running,}; 
 use std::time::{SystemTime, UNIX_EPOCH};
 use futures::future::join_all;
 use uuid::Uuid;
@@ -145,17 +146,19 @@ impl SledDaemon {
         }
     }
 
+    // ============================================================================
+    // SledDaemon::new
+    // ============================================================================
     pub async fn new(config: SledConfig) -> GraphResult<(Self, mpsc::Receiver<()>)> {
-        println!("===> SledDaemon new CALLED");
+        println!("===> SledDaemon::new CALLED");
         let port = config.port.ok_or_else(|| {
             error!("No port specified in SledConfig");
             println!("===> ERROR: NO PORT SPECIFIED IN SLED CONFIG");
             GraphError::ConfigurationError("No port specified in SledConfig".to_string())
         })?;
 
-        // Acquire per-port init lock — will be held until DB is fully opened
         let port_lock = get_sled_daemon_port_lock(port).await;
-        let _guard = port_lock.lock().await; // 🔒 Held for entire critical section
+        let _guard = port_lock.lock().await;
         println!("===> ACQUIRED PER-PORT INIT LOCK FOR PORT {}", port);
 
         let db_path = if config.path.ends_with(&port.to_string()) {
@@ -164,138 +167,59 @@ impl SledDaemon {
             PathBuf::from(config.path.clone()).join(port.to_string())
         };
 
-        info!("Initializing Sled daemon at {:?}", db_path);
-        println!("===> INITIALIZING SLED DAEMON AT {:?}", db_path);
+        info!("SledDaemon using path: {:?}", db_path);
+        println!("===> SLED DAEMON USING PATH: {:?}", db_path);
 
         if !db_path.exists() {
-            info!("Creating database directory at {:?}", db_path);
-            println!("===> CREATING DATABASE DIRECTORY AT {:?}", db_path);
+            info!("Creating Sled directory at {:?}", db_path);
+            println!("===> CREATING SLED DIRECTORY AT {:?}", db_path);
             tokio_fs::create_dir_all(&db_path).await.map_err(|e| {
                 error!("Failed to create directory at {:?}: {}", db_path, e);
                 println!("===> ERROR: FAILED TO CREATE DIRECTORY AT {:?}: {}", db_path, e);
-                GraphError::StorageError(format!("Failed to create directory at {:?}: {}", db_path, e))
+                GraphError::StorageError(format!("Failed to create directory: {}", e))
             })?;
-        } else if !db_path.is_dir() {
-            error!("Path {:?} is not a directory", db_path);
-            println!("===> ERROR: PATH {:?} IS NOT A DIRECTORY", db_path);
-            return Err(GraphError::StorageError(format!("Path {:?} is not a directory", db_path)));
         }
 
-        let metadata = tokio_fs::metadata(&db_path).await.map_err(|e| {
-            error!("Failed to access directory metadata at {:?}: {}", db_path, e);
-            println!("===> ERROR: FAILED TO ACCESS DIRECTORY METADATA AT {:?}: {}", db_path, e);
-            GraphError::StorageError(format!("Failed to access directory metadata at {:?}", db_path))
-        })?;
-        if metadata.permissions().readonly() {
-            error!("Directory at {:?} is not writable", db_path);
-            println!("===> ERROR: DIRECTORY AT {:?} IS NOT WRITABLE", db_path);
-            return Err(GraphError::StorageError(format!("Directory at {:?} is not writable", db_path)));
-        }
-
-        let db_registry = GLOBAL_DB_DAEMON_REGISTRY.get_registry().await;
-        let existing_db_metadata = db_registry.get_db_daemon_metadata_by_port(port).await?;
-
-        // Determine if we can safely reuse an existing, complete DB instance
-        let (db_arc, vertices, edges, kv_pairs, is_new_db_instance) = 
-            if let Some(ref metadata) = existing_db_metadata {
-                if metadata.data_dir == Some(db_path.clone()) && 
-                   metadata.engine_type == Some("sled".to_string()) &&
-                   metadata.sled_db_instance.is_some() &&
-                   metadata.sled_vertices.is_some() &&
-                   metadata.sled_edges.is_some() &&
-                   metadata.sled_kv_pairs.is_some()
-                {
-                    info!("Reusing complete existing Sled DB instance from registry for port {}", port);
-                    println!("===> REUSING COMPLETE EXISTING SLED DB INSTANCE FROM REGISTRY FOR PORT {}", port);
-                    
-                    let db = metadata.sled_db_instance.clone().unwrap();
-                    let v = metadata.sled_vertices.clone().unwrap();
-                    let e = metadata.sled_edges.clone().unwrap();
-                    let kv = metadata.sled_kv_pairs.clone().unwrap();
-                    (db, v, e, kv, false)
-                } else {
-                    warn!("Incomplete or mismatched Sled DB instance in registry for port {}, opening new", port);
-                    println!("===> WARNING: INCOMPLETE/MISMATCHED SLED DB INSTANCE IN REGISTRY FOR PORT {}, OPENING NEW", port);
-                    let cache_capacity = config.cache_capacity.unwrap_or(1024 * 1024 * 1024);
-                    let use_compression = config.use_compression;
-                    let opened = Self::open_sled_db_and_trees(&config, &db_path, cache_capacity, use_compression).await?;
-                    (opened.0, opened.1, opened.2, opened.3, true)
-                }
-            } else {
-                info!("No existing Sled DB instance found for port {}, opening new", port);
-                println!("===> NO EXISTING SLED DB INSTANCE FOUND FOR PORT {}, OPENING NEW", port);
-                let cache_capacity = config.cache_capacity.unwrap_or(1024 * 1024 * 1024);
-                let use_compression = config.use_compression;
-                let opened = Self::open_sled_db_and_trees(&config, &db_path, cache_capacity, use_compression).await?;
-                (opened.0, opened.1, opened.2, opened.3, true)
-            };
-
-        // Register new instance if needed (still under lock to avoid race)
-        if is_new_db_instance {
-            let db_metadata = DBDaemonMetadata {
-                port,
-                pid: std::process::id(),
-                ip_address: "127.0.0.1".to_string(),
-                data_dir: Some(db_path.clone()),
-                config_path: None,
-                engine_type: Some("sled".to_string()),
-                last_seen_nanos: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos() as i64,
-                sled_db_instance: Some(db_arc.clone()),
-                rocksdb_db_instance: None,
-                sled_vertices: Some(vertices.clone()),
-                sled_edges: Some(edges.clone()),
-                sled_kv_pairs: Some(kv_pairs.clone()),
-                rocksdb_vertices: None,
-                rocksdb_edges: None,
-                rocksdb_kv_pairs: None,
-            };
-            db_registry.register_db_daemon(db_metadata).await?;
-            info!("Registered new Sled DB instance in global registry for port {}", port);
-            println!("===> REGISTERED NEW SLED DB INSTANCE IN GLOBAL REGISTRY FOR PORT {}", port);
-        }
+        // --- CRITICAL: Open DB under lock, reuse if possible ---
+        let cache_capacity = config.cache_capacity.unwrap_or(1024 * 1024 * 1024);
+        let use_compression = config.use_compression;
+        
+        info!("Opening Sled DB and trees at {:?}", db_path);
+        println!("===> OPENING SLED DB AND TREES AT {:?}", db_path);
+        
+        let (db_arc, vertices, edges, kv_pairs) = Self::open_sled_db_and_trees(
+            &config, 
+            &db_path, 
+            cache_capacity, 
+            use_compression
+        ).await?;
 
         info!("SLED DB AND TREES SUCCESSFULLY OPENED AT {:?}", db_path);
         println!("===> SLED DB AND TREES SUCCESSFULLY OPENED AT {:?}", db_path);
 
-        // Proceed to ZMQ setup — DB is now guaranteed open and exclusive
+        // --- ZMQ Setup ---
         let (tx, rx) = mpsc::channel(1);
         let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", port);
-        let ipc_path = endpoint.strip_prefix("ipc://").unwrap_or(&endpoint);
+        let ipc_path = endpoint.strip_prefix("ipc://").unwrap();
 
-        if std::path::Path::new(ipc_path).exists() {
-            warn!("Stale IPC socket found at {}. Attempting cleanup.", ipc_path);
-            println!("===> WARNING: STALE IPC SOCKET FOUND AT {}. ATTEMPTING CLEANUP.", ipc_path);
-            if let Err(e) = tokio_fs::remove_file(ipc_path).await {
-                error!("Failed to remove stale IPC socket {}: {}", ipc_path, e);
-                println!("===> ERROR: FAILED TO REMOVE STALE IPC SOCKET {}: {}", ipc_path, e);
-            } else {
-                info!("Successfully removed stale IPC socket {}", ipc_path);
-                println!("===> SUCCESSFULLY REMOVED STALE IPC SOCKET {}", ipc_path);
-            }
+        // Clean stale socket BEFORE binding
+        if Path::new(ipc_path).exists() {
+            warn!("Removing stale IPC socket at {}", ipc_path);
+            println!("===> REMOVING STALE IPC SOCKET AT {}", ipc_path);
+            let _ = tokio_fs::remove_file(ipc_path).await;
         }
 
         let running = Arc::new(TokioMutex::new(true));
-        let running_clone = running.clone();
-        let db_arc_for_thread = db_arc.clone();
-        let vertices_for_thread = vertices.clone();
-        let edges_for_thread = edges.clone();
-        let kv_pairs_for_thread = kv_pairs.clone();
-        let endpoint_clone = endpoint.clone();
-        let db_path_clone = db_path.clone();
-
         let daemon = Self {
             port,
-            db_path,
-            db: db_arc,
-            vertices,
-            edges,
-            kv_pairs,
-            running,
+            db_path: db_path.clone(),
+            db: db_arc.clone(),
+            vertices: vertices.clone(),
+            edges: edges.clone(),
+            kv_pairs: kv_pairs.clone(),
+            running: running.clone(),
             #[cfg(feature = "with-openraft-sled")]
-            raft_storage: Arc::new(openraft_sled::SledRaftStorage::new(db_arc_for_thread.clone())),
+            raft_storage: Arc::new(openraft_sled::SledRaftStorage::new(db_arc.clone())),
             #[cfg(feature = "with-openraft-sled")]
             node_id: port as u64,
             #[cfg(feature = "with-openraft-sled")]
@@ -303,54 +227,73 @@ impl SledDaemon {
         };
 
         let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
+        let endpoint_clone = endpoint.clone();
+        let db_path_clone = db_path.clone();
+        let running_clone = running.clone();
+
+        info!("Spawning ZMQ server thread for port {}", port);
+        println!("===> SPAWNING ZMQ SERVER THREAD FOR PORT {}", port);
 
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+            let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
             rt.block_on(async {
+                info!("ZMQ thread started for port {}", port);
+                println!("===> ZMQ THREAD STARTED FOR PORT {}", port);
+
                 let context = ZmqContext::new();
                 let zmq_socket_raw = match context.socket(REP) {
-                    Ok(socket) => socket,
+                    Ok(s) => {
+                        info!("ZMQ socket created successfully");
+                        println!("===> ZMQ SOCKET CREATED SUCCESSFULLY");
+                        s
+                    }
                     Err(e) => {
-                        error!("Failed to create ZMQ socket for port {}: {}", port, e);
-                        println!("===> ERROR: FAILED TO CREATE ZMQ SOCKET FOR PORT {}: {}", port, e);
+                        error!("ZMQ socket create failed: {}", e);
+                        println!("===> ERROR: ZMQ SOCKET CREATE FAILED: {}", e);
                         let _ = tx.send(()).await;
                         return;
                     }
                 };
 
-                const BIND_RETRIES: usize = 5;
-                let mut bind_success = false;
-                for i in 0..BIND_RETRIES {
+                // Bind with retries
+                let mut bound = false;
+                for i in 0..5 {
                     match zmq_socket_raw.bind(&endpoint_clone) {
                         Ok(_) => {
-                            info!("ZMQ socket successfully bound to {}. Signaling readiness.", endpoint_clone);
-                            println!("===> ZMQ SOCKET SUCCESSFULLY BOUND TO {}. SIGNALING READINESS.", endpoint_clone);
-                            bind_success = true;
-                            let _ = tx.send(()).await;
+                            bound = true;
+                            info!("ZMQ socket bound successfully on attempt {}", i + 1);
+                            println!("===> ZMQ SOCKET BOUND SUCCESSFULLY ON ATTEMPT {}", i + 1);
                             break;
                         }
                         Err(e) => {
-                            if i < BIND_RETRIES - 1 {
-                                warn!("Failed to bind ZMQ socket to {} (attempt {}/{}): {}", 
-                                    endpoint_clone, i + 1, BIND_RETRIES, e);
-                                tokio::time::sleep(TokioDuration::from_millis(100 * (i as u64 + 1))).await;
-                            } else {
-                                error!("Failed to bind ZMQ socket to {} after {} attempts: {}", 
-                                    endpoint_clone, BIND_RETRIES, e);
-                                let _ = tx.send(()).await;
+                            warn!("ZMQ bind attempt {} failed: {}", i + 1, e);
+                            println!("===> WARNING: ZMQ BIND ATTEMPT {} FAILED: {}", i + 1, e);
+                            if i < 4 {
+                                sleep(TokioDuration::from_millis(100 * (i + 1) as u64)).await;
                             }
                         }
                     }
                 }
 
-                if !bind_success {
-                    error!("Could not bind ZMQ socket after max retries.");
+                // Signal: attempted bind (whether success or failure)
+                let _ = tx.send(()).await;
+                info!("Sent ZMQ readiness signal");
+                println!("===> SENT ZMQ READINESS SIGNAL");
+
+                if !bound {
+                    error!("ZMQ failed to bind after retries");
+                    println!("===> ERROR: ZMQ FAILED TO BIND AFTER RETRIES");
                     return;
                 }
 
-                // Update daemon metadata: mark ZMQ as ready
-                let daemon_metadata = DaemonMetadata {
+                info!("ZMQ server bound successfully at {}", endpoint_clone);
+                println!("===> ZMQ SERVER BOUND SUCCESSFULLY AT {}", endpoint_clone);
+
+                // Update registry: mark as zmq_ready and engine_synced
+                let metadata = DaemonMetadata {
                     service_type: "storage".to_string(),
+                    port,
+                    pid: std::process::id(),
                     ip_address: "127.0.0.1".to_string(),
                     data_dir: Some(db_path_clone.clone()),
                     config_path: None,
@@ -359,44 +302,35 @@ impl SledDaemon {
                         .duration_since(UNIX_EPOCH)
                         .unwrap()
                         .as_nanos() as i64,
-                    pid: std::process::id(),
-                    port,
                     zmq_ready: true,
-                    engine_synced: false,
+                    engine_synced: true,
                 };
-
-                if let Err(e) = daemon_registry.register_daemon(daemon_metadata).await {
-                    warn!("Failed to update daemon metadata with zmq_ready=true: {}", e);
-                } else {
-                    info!("Updated daemon metadata: zmq_ready=true for port {}", port);
-                    println!("===> DAEMON METADATA UPDATED: ZMQ READY FOR PORT {}", port);
+                
+                match daemon_registry.register_daemon(metadata).await {
+                    Ok(_) => {
+                        info!("Updated daemon registry: zmq_ready=true, engine_synced=true");
+                        println!("===> UPDATED DAEMON REGISTRY: ZMQ_READY=TRUE, ENGINE_SYNCED=TRUE");
+                    }
+                    Err(e) => {
+                        error!("Failed to update daemon registry: {}", e);
+                        println!("===> ERROR: FAILED TO UPDATE DAEMON REGISTRY: {}", e);
+                    }
                 }
 
-                let zmq_socket_arc = Arc::new(TokioMutex::new(zmq_socket_raw));
-                info!("Starting ZMQ server for endpoint {}", endpoint_clone);
-                println!("===> STARTING ZMQ SERVER FOR ENDPOINT {}", endpoint_clone);
-
-                if let Err(e) = Self::run_zmq_server_static(
-                    port,
-                    db_arc_for_thread,
-                    vertices_for_thread,
-                    edges_for_thread,
-                    kv_pairs_for_thread,
-                    running_clone,
-                    zmq_socket_arc,
-                    endpoint_clone.clone(),
-                ).await {
-                    error!("ZMQ server failed for endpoint {}: {}", endpoint_clone, e);
-                    println!("===> ERROR: ZMQ SERVER FAILED FOR ENDPOINT {}: {}", endpoint_clone, e);
-                } else {
-                    info!("ZMQ server finished successfully for endpoint {}", endpoint_clone);
-                    println!("===> ZMQ SERVER FINISHED SUCCESSFULLY FOR ENDPOINT {}", endpoint_clone);
-                }
+                let zmq_socket = Arc::new(TokioMutex::new(zmq_socket_raw));
+                
+                info!("Starting ZMQ server loop for port {}", port);
+                println!("===> STARTING ZMQ SERVER LOOP FOR PORT {}", port);
+                
+                let _ = Self::run_zmq_server_static(
+                    port, db_arc, vertices, edges, kv_pairs, running_clone, zmq_socket, endpoint_clone,
+                ).await;
             });
         });
 
-        info!("Sled daemon initialization complete for port {}", port);
-        println!("===> SLED DAEMON INITIALIZATION COMPLETE FOR PORT {}", port);
+        info!("SledDaemon created successfully on port {}", port);
+        println!("===> SLED DAEMON CREATED SUCCESSFULLY ON PORT {}", port);
+        
         Ok((daemon, rx))
     }
 
@@ -3825,303 +3759,263 @@ impl SledDaemonPool {
         Ok(client_arc)
     }   
 
+    // ============================================================================
+    // SledDaemonPool::_initialize_cluster_core
+    // ============================================================================
     async fn _initialize_cluster_core(
         &mut self,
         storage_config: &StorageConfig,
         config: &SledConfig,
         cli_port: Option<u16>,
     ) -> GraphResult<()> {
-        println!("===> IN _initialize_cluster_core");
-        info!("Starting initialization of SledDaemonPool with config: {:?}", storage_config);
-
-        // Acquire global initialization lock to prevent concurrent initialization
         let _guard = get_cluster_init_lock().await.lock().await;
-
         let mut initialized = self.initialized.write().await;
         if *initialized {
-            warn!("SledDaemonPool already initialized, skipping");
-            println!("===> WARNING: SLED DAEMON POOL ALREADY INITIALIZED, SKIPPING");
+            info!("SledDaemonPool already initialized");
+            println!("===> SLED DAEMON POOL ALREADY INITIALIZED");
             return Ok(());
         }
-
-        const DEFAULT_STORAGE_PORT: u16 = 8052;
-
-        let intended_port = cli_port.unwrap_or(config.port.unwrap_or(DEFAULT_STORAGE_PORT));
-        info!("Intended port: {} (cli_port: {:?}, config.port: {:?}, DEFAULT_STORAGE_PORT: {})",
-              intended_port, cli_port, config.port, DEFAULT_STORAGE_PORT);
-        println!("===> INTENDED PORT: {} (cli_port: {:?}, config.port: {:?}, DEFAULT_STORAGE_PORT: {})",
-                 intended_port, cli_port, config.port, DEFAULT_STORAGE_PORT);
-
-        // Initialize GLOBAL_DB_DAEMON_REGISTRY
-        info!("Attempting to initialize GLOBAL_DB_DAEMON_REGISTRY");
-        println!("===> ATTEMPTING TO INITIALIZE GLOBAL_DB_DAEMON_REGISTRY");
-        let storage_config_arc = Arc::new(storage_config.clone());
-        let mut attempts = 0;
-        const MAX_REGISTRY_ATTEMPTS: u32 = 5;
-        while attempts < MAX_REGISTRY_ATTEMPTS {
-            match timeout(TokioDuration::from_secs(10), GLOBAL_DB_DAEMON_REGISTRY.get_or_init_instance(storage_config_arc.clone())).await {
-                Ok(Ok(_)) => {
-                    info!("Successfully initialized GLOBAL_DB_DAEMON_REGISTRY for SledDaemonPool");
-                    println!("===> SUCCESSFULLY INITIALIZED GLOBAL_DB_DAEMON_REGISTRY FOR SLED DAEMON POOL");
-                    break;
-                }
-                Ok(Err(e)) => {
-                    error!("Failed to initialize GLOBAL_DB_DAEMON_REGISTRY: {}", e);
-                    println!("===> ERROR: FAILED TO INITIALIZE GLOBAL_DB_DAEMON_REGISTRY: {}", e);
-                    return Err(GraphError::StorageError(format!("Failed to initialize GLOBAL_DB_DAEMON_REGISTRY: {}", e)));
-                }
-                Err(_) => {
-                    warn!("Timeout initializing GLOBAL_DB_DAEMON_REGISTRY, attempt {}/{}", attempts + 1, MAX_REGISTRY_ATTEMPTS);
-                    println!("===> WARNING: TIMEOUT INITIALIZING GLOBAL_DB_DAEMON_REGISTRY, ATTEMPT {}/{}", attempts + 1, MAX_REGISTRY_ATTEMPTS);
-                    attempts += 1;
-                    sleep(TokioDuration::from_millis(1000)).await;
-                }
-            }
-        }
-        if attempts >= MAX_REGISTRY_ATTEMPTS {
-            error!("Failed to initialize GLOBAL_DB_DAEMON_REGISTRY after {} attempts", MAX_REGISTRY_ATTEMPTS);
-            println!("===> ERROR: FAILED TO INITIALIZE GLOBAL_DB_DAEMON_REGISTRY AFTER {} ATTEMPTS", MAX_REGISTRY_ATTEMPTS);
-            return Err(GraphError::StorageError(format!("Failed to initialize GLOBAL_DB_DAEMON_REGISTRY after {} attempts", MAX_REGISTRY_ATTEMPTS)));
-        }
-
-        // Clean up stale IPC socket for the intended port only
-        let ipc_path = format!("/tmp/graphdb-{}.ipc", intended_port);
-        if Path::new(&ipc_path).exists() {
-            warn!("Stale IPC socket found at {}. Attempting cleanup.", ipc_path);
-            println!("===> WARNING: STALE IPC SOCKET FOUND AT {}. ATTEMPTING CLEANUP.", ipc_path);
-            if let Err(e) = tokio_fs::remove_file(&ipc_path).await {
-                warn!("Failed to remove stale IPC socket at {}: {}", ipc_path, e);
-                println!("===> WARNING: FAILED TO REMOVE STALE IPC SOCKET AT {}: {}", ipc_path, e);
-            } else {
-                info!("Successfully removed stale IPC socket at {}", ipc_path);
-                println!("===> SUCCESSFULLY REMOVED STALE IPC SOCKET AT {}", ipc_path);
-            }
-        }
-
         let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
-        let mut valid_ports: Vec<u16> = Vec::new();
+        let port = cli_port.unwrap_or(config.port.unwrap_or(8052));
+        info!("Initializing cluster on port {}", port);
+        println!("===> INITIALIZING CLUSTER ON PORT {}", port);
 
-        // ✅ FIXED: Only focus on the intended port
-        let port = intended_port;
-        
-        // Check if daemon is already running and responsive
-        let is_running = match timeout(TokioDuration::from_secs(5), self.is_zmq_reachable(port)).await {
-            Ok(inner_result) => match inner_result {
-                Ok(status) => status,
-                Err(e) => {
-                    warn!("Error checking if daemon is running on port {}: {}", port, e);
-                    println!("===> WARNING: ERROR CHECKING IF DAEMON IS RUNNING ON PORT {}: {}", port, e);
-                    false
-                }
-            },
-            Err(e) => {
-                warn!("Timeout checking if daemon is running on port {}: {}", port, e);
-                println!("===> WARNING: TIMEOUT CHECKING IF DAEMON IS RUNNING ON PORT {}: {}", port, e);
-                false
-            }
-        };
+        let ipc_path = format!("/tmp/graphdb-{}.ipc", port);
+        let db_path = storage_config
+            .data_directory
+            .as_ref()
+            .unwrap_or(&PathBuf::from("/opt/graphdb/storage_data"))
+            .join("sled")
+            .join(port.to_string());
 
-        if is_running {
-            // Update existing daemon metadata
-            if let Ok(Some(mut metadata)) = daemon_registry.get_daemon_metadata(port).await {
-                metadata.last_seen_nanos = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as i64)
-                    .unwrap_or(0);
-                let mut update_attempts = 0;
-                while update_attempts < MAX_REGISTRY_ATTEMPTS {
-                    match timeout(TokioDuration::from_secs(5), daemon_registry.register_daemon(metadata.clone())).await {
-                        Ok(Ok(_)) => {
-                            info!("Updated daemon metadata on port {}", port);
-                            println!("===> UPDATED DAEMON METADATA ON PORT {}", port);
-                            break;
-                        }
-                        Ok(Err(e)) => {
-                            warn!("Failed to update daemon metadata on port {}: {}. Attempt {}/{}", port, e, update_attempts + 1, MAX_REGISTRY_ATTEMPTS);
-                            println!("===> WARNING: FAILED TO UPDATE DAEMON METADATA ON PORT {}: {}. ATTEMPT {}/{}", port, e, update_attempts + 1, MAX_REGISTRY_ATTEMPTS);
-                            update_attempts += 1;
-                            sleep(TokioDuration::from_millis(500)).await;
-                        }
-                        Err(_) => {
-                            warn!("Timeout updating daemon metadata on port {}. Attempt {}/{}", port, update_attempts + 1, MAX_REGISTRY_ATTEMPTS);
-                            println!("===> WARNING: TIMEOUT UPDATING DAEMON METADATA ON PORT {}. ATTEMPT {}/{}", port, update_attempts + 1, MAX_REGISTRY_ATTEMPTS);
-                            update_attempts += 1;
-                            sleep(TokioDuration::from_millis(500)).await;
+        // Clean stale IPC regardless of daemon state
+        if Path::new(&ipc_path).exists() {
+            warn!("Removing stale IPC socket at {}", ipc_path);
+            println!("===> REMOVING STALE IPC SOCKET AT {}", ipc_path);
+            let _ = tokio_fs::remove_file(&ipc_path).await;
+        }
+
+        info!("Creating new daemon on port {}", port);
+        println!("===> CREATING NEW DAEMON ON PORT {}", port);
+
+        // Create directory if needed
+        if !db_path.exists() {
+            info!("Creating Sled directory at {:?}", db_path);
+            println!("===> CREATING SLED DIRECTORY AT {:?}", db_path);
+            tokio_fs::create_dir_all(&db_path).await?;
+        }
+
+        // Force unlock
+        SledClient::force_unlock(&db_path).await?;
+        info!("Force unlocked database at {:?}", db_path);
+        println!("===> FORCE UNLOCKED DATABASE AT {:?}", db_path);
+
+        // Handle data synchronization from canonical/leader port if needed
+        if storage_config.use_raft_for_scale {
+            info!("Raft enabled, checking for data synchronization needs");
+            println!("===> RAFT ENABLED, CHECKING FOR DATA SYNCHRONIZATION NEEDS");
+            
+            // Find canonical port or a synced daemon to copy from
+            let all_daemons = daemon_registry.get_all_daemon_metadata().await?;
+            let synced_daemons: Vec<_> = all_daemons
+                .into_iter()
+                .filter(|m| {
+                    m.service_type == "storage" 
+                    && m.engine_type.as_ref().map(|e| e == "sled").unwrap_or(false)
+                    && m.port != port
+                    && m.engine_synced
+                    && m.data_dir.is_some()
+                })
+                .collect();
+
+            if !synced_daemons.is_empty() {
+                // Check if our directory is empty
+                let is_empty = Self::is_dir_empty(&db_path).await;
+                
+                if is_empty {
+                    // Find the canonical port (default_port) if available, otherwise use first synced daemon
+                    let source_daemon = synced_daemons
+                        .iter()
+                        .find(|d| d.port == storage_config.default_port)
+                        .or_else(|| synced_daemons.first());
+
+                    if let Some(leader) = source_daemon {
+                        if let Some(leader_path) = &leader.data_dir {
+                            info!("Syncing data from leader on port {} at {:?}", leader.port, leader_path);
+                            println!("===> SYNCING DATA FROM LEADER ON PORT {} AT {:?}", leader.port, leader_path);
+                            
+                            // Copy data files only (no locks)
+                            Self::copy_data_files_only(leader_path, &db_path).await?;
+                            
+                            info!("Successfully synced data from leader on port {}", leader.port);
+                            println!("===> SUCCESSFULLY SYNCED DATA FROM LEADER ON PORT {}", leader.port);
                         }
                     }
+                } else {
+                    info!("Database directory not empty, skipping sync");
+                    println!("===> DATABASE DIRECTORY NOT EMPTY, SKIPPING SYNC");
                 }
+            } else {
+                info!("No synced leader found, this will be the first node");
+                println!("===> NO SYNCED LEADER FOUND, THIS WILL BE THE FIRST NODE");
             }
-            
-            info!("Active storage daemon found on port {}, adding to load balancer", port);
-            println!("===> ACTIVE STORAGE DAEMON FOUND ON PORT {}, ADDING TO LOAD BALANCER", port);
-            valid_ports.push(port);
-            self.load_balancer.update_node_health(port, true, 0).await;
-        } else {
-            // ✅ CRITICAL: Create daemon for the intended port since none exists
-            info!("No active daemon found on port {}, creating new daemon...", port);
-            println!("===> NO ACTIVE DAEMON FOUND ON PORT {}, CREATING NEW DAEMON...", port);
-            
-            // Engine-aware path creation
-            let engine_dir = daemon_api_storage_engine_type_to_string(&storage_config.storage_engine_type);
-            let db_path = storage_config
-                .data_directory
-                .as_ref()
-                .unwrap_or(&PathBuf::from(DEFAULT_DATA_DIRECTORY))
-                .join(&engine_dir)
-                .join(port.to_string());
+        }
 
-            info!("Initializing daemon on port {} with path {:?} (engine: {})", port, db_path, storage_config.storage_engine_type);
-            println!("===> INITIALIZING DAEMON ON PORT {} WITH PATH {:?} (ENGINE: {})", port, db_path, storage_config.storage_engine_type);
+        // Configure daemon
+        let mut daemon_config = config.clone();
+        daemon_config.path = db_path.clone();
+        daemon_config.port = Some(port);
 
-            if !db_path.exists() {
-                info!("Creating {} directory at {:?}", engine_dir, db_path);
-                println!("===> CREATING {} DIRECTORY AT {:?}", engine_dir.to_uppercase(), db_path);
-                tokio_fs::create_dir_all(&db_path).await
-                    .map_err(|e| {
-                        error!("Failed to create directory at {:?}: {}", db_path, e);
-                        println!("===> ERROR: FAILED TO CREATE DIRECTORY AT {:?}: {}", db_path, e);
-                        GraphError::Io(e.to_string())
-                    })?;
-                tokio_fs::set_permissions(&db_path, fs::Permissions::from_mode(0o700))
-                    .await
-                    .map_err(|e| {
-                        error!("Failed to set permissions on directory at {:?}: {}", db_path, e);
-                        println!("===> ERROR: FAILED TO SET PERMISSIONS ON DIRECTORY AT {:?}: {}", db_path, e);
-                        GraphError::Io(e.to_string())
-                    })?;
-            }
+        info!("Creating SledDaemon with config: {:?}", daemon_config);
+        println!("===> CREATING SLED DAEMON WITH CONFIG: {:?}", daemon_config);
 
-            // Force unlock before creating daemon
-            SledClient::force_unlock(&db_path).await?;
-            println!("===> Performed force unlock on {} DB at {:?}", engine_dir.to_uppercase(), db_path);
+        // Create daemon - this will open DB safely under per-port lock
+        let (daemon, mut ready_rx) = timeout(
+            TokioDuration::from_secs(15),
+            SledDaemon::new(daemon_config)
+        )
+        .await
+        .map_err(|_| {
+            error!("Timeout creating SledDaemon on port {}", port);
+            println!("===> ERROR: TIMEOUT CREATING SLED DAEMON ON PORT {}", port);
+            GraphError::StorageError(format!("Timeout creating SledDaemon on port {}", port))
+        })?
+        .map_err(|e| {
+            error!("Failed to create SledDaemon on port {}: {}", port, e);
+            println!("===> ERROR: FAILED TO CREATE SLED DAEMON ON PORT {}: {}", port, e);
+            e
+        })?;
 
-            let mut daemon_config = config.clone();
-            daemon_config.path = db_path.clone();
-            daemon_config.port = Some(port);
-            info!("Creating SledDaemon with config: {:?}", daemon_config);
-            println!("===> CREATING SLED DAEMON WITH CONFIG: {:?}", daemon_config);
+        info!("Waiting for ZMQ readiness signal on port {}", port);
+        println!("===> WAITING FOR ZMQ READINESS SIGNAL ON PORT {}", port);
 
-            let (daemon, mut ready_rx) = timeout(TokioDuration::from_secs(10), SledDaemon::new(daemon_config.clone()))
-                .await
-                .map_err(|_| {
-                    error!("Timeout creating SledDaemon on port {}", port);
-                    println!("===> ERROR: TIMEOUT CREATING SLED DAEMON ON PORT {}", port);
-                    GraphError::StorageError(format!("Timeout creating SledDaemon on port {}", port))
-                })?
-                .map_err(|e| {
-                    error!("Failed to create SledDaemon on port {}: {}", port, e);
-                    println!("===> ERROR: FAILED TO CREATE SLED DAEMON ON PORT {}: {}", port, e);
-                    e
-                })?;
-
-            info!("Waiting for ZMQ server readiness signal on port {}", port);
-            println!("===> WAITING FOR ZMQ SERVER READINESS SIGNAL ON PORT {}", port);
-            timeout(TokioDuration::from_secs(10), ready_rx.recv())
-                .await
-                .map_err(|_| {
-                    error!("Timeout waiting for ZeroMQ server readiness signal on port {}", port);
-                    println!("===> ERROR: TIMEOUT WAITING FOR ZEROMQ SERVER READINESS SIGNAL ON PORT {}", port);
-                    GraphError::StorageError(format!("Timeout waiting for ZeroMQ server readiness signal on port {}", port))
-                })?
-                .ok_or_else(|| {
-                    error!("ZeroMQ server readiness channel closed for port {}", port);
-                    println!("===> ERROR: ZEROMQ SERVER READINESS CHANNEL CLOSED FOR PORT {}", port);
-                    GraphError::StorageError(format!("ZeroMQ server readiness channel closed for port {}", port))
-                })?;
-
-            let ipc_path = format!("/tmp/graphdb-{}.ipc", port);
-            if !Path::new(&ipc_path).exists() {
-                error!("ZMQ IPC file not created at {} after binding", ipc_path);
-                println!("===> ERROR: ZMQ IPC FILE NOT CREATED AT {} AFTER BINDING", ipc_path);
-                return Err(GraphError::StorageError(format!("ZMQ IPC file not created at {}", ipc_path)));
-            }
-            info!("ZMQ IPC file verified at {}", ipc_path);
-            println!("===> ZMQ IPC FILE VERIFIED AT {}", ipc_path);
-
-            info!("Checking ZMQ server responsiveness on port {}", port);
-            println!("===> CHECKING ZMQ SERVER RESPONSIVENESS ON PORT {}", port);
-            timeout(TokioDuration::from_secs(10), async {
-                let mut attempts = 0;
-                const MAX_ATTEMPTS: usize = 20;
-                sleep(TokioDuration::from_millis(500)).await;
-                while !self.is_zmq_server_running(port).await? {
-                    attempts += 1;
-                    if attempts >= MAX_ATTEMPTS {
-                        error!("ZMQ server failed to start on port {} after {} attempts", port, MAX_ATTEMPTS);
-                        println!("===> ERROR: ZMQ SERVER FAILED TO START ON PORT {} AFTER {} ATTEMPTS", port, MAX_ATTEMPTS);
-                        return Err(GraphError::StorageError(format!("ZMQ server failed to start on port {} after {} attempts", port, MAX_ATTEMPTS)));
-                    }
-                    info!("ZMQ server not ready on port {}, attempt {}/{}", port, attempts, MAX_ATTEMPTS);
-                    println!("===> ZMQ SERVER NOT READY ON PORT {}, ATTEMPT {}/{}", port, attempts, MAX_ATTEMPTS);
-                    sleep(TokioDuration::from_millis(500)).await;
-                }
-                info!("ZMQ server is ready for port {}", port);
-                println!("===> ZEROMQ SERVER IS READY FOR PORT {}", port);
-                Ok(())
-            })
+        // Wait for ZMQ bind attempt
+        timeout(TokioDuration::from_secs(10), ready_rx.recv())
             .await
             .map_err(|_| {
-                error!("Timeout waiting for ZMQ server to start on port {}", port);
-                println!("===> ERROR: TIMEOUT WAITING FOR ZMQ SERVER TO START ON PORT {}", port);
-                GraphError::StorageError(format!("Timeout waiting for ZMQ server on port {}", port))
-            })??;
+                error!("Timeout waiting for ZMQ readiness signal on port {}", port);
+                println!("===> ERROR: TIMEOUT WAITING FOR ZMQ READINESS SIGNAL ON PORT {}", port);
+                GraphError::StorageError("Timeout waiting for ZMQ readiness signal".into())
+            })?
+            .ok_or_else(|| {
+                error!("ZMQ readiness channel closed prematurely on port {}", port);
+                println!("===> ERROR: ZMQ READINESS CHANNEL CLOSED PREMATURELY ON PORT {}", port);
+                GraphError::StorageError("ZMQ readiness channel closed prematurely".into())
+            })?;
 
-            // Register daemon metadata
-            let daemon_metadata = DaemonMetadata {
-                service_type: "storage".to_string(),
-                port,
-                pid: std::process::id(),
-                ip_address: config.host.clone().unwrap_or("127.0.0.1".to_string()),
-                data_dir: Some(db_path.clone()),
-                config_path: storage_config.config_root_directory.clone().map(PathBuf::from),
-                engine_type: Some(engine_dir),
-                last_seen_nanos: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as i64)
-                    .unwrap_or(0),
-                zmq_ready: false,
-                engine_synced: false,
-            };
-
-            timeout(TokioDuration::from_secs(5), daemon_registry.register_daemon(daemon_metadata))
-                .await
-                .map_err(|_| {
-                    error!("Timeout registering daemon on port {}", port);
-                    println!("===> ERROR: TIMEOUT REGISTERING DAEMON ON PORT {}", port);
-                    GraphError::StorageError(format!("Timeout registering daemon on port {}", port))
-                })?
-                .map_err(|e| {
-                    error!("Failed to register daemon on port {}: {}", port, e);
-                    println!("===> ERROR: FAILED TO REGISTER DAEMON ON PORT {}: {}", port, e);
-                    GraphError::StorageError(format!("Failed to register daemon on port {}: {}", port, e))
-                })?;
-
-            self.daemons.insert(port, Arc::new(daemon));
-            valid_ports.push(port);
-            self.load_balancer.update_node_health(port, true, 0).await;
-            info!("Initialized and registered new daemon on port {}", port);
-            println!("===> INITIALIZED AND REGISTERED NEW DAEMON ON PORT {}", port);
+        // Verify IPC file exists
+        let mut ipc_check_attempts = 0;
+        while !Path::new(&ipc_path).exists() && ipc_check_attempts < 10 {
+            warn!("IPC file not found at {}, waiting... (attempt {})", ipc_path, ipc_check_attempts + 1);
+            println!("===> WARNING: IPC FILE NOT FOUND AT {}, WAITING... (ATTEMPT {})", ipc_path, ipc_check_attempts + 1);
+            sleep(TokioDuration::from_millis(500)).await;
+            ipc_check_attempts += 1;
         }
 
-        if valid_ports.is_empty() {
-            error!("No valid ports available for load balancing");
-            println!("===> ERROR: NO VALID PORTS AVAILABLE FOR LOAD BALANCING");
-            return Err(GraphError::StorageError("No valid ports available for load balancing".to_string()));
+        if !Path::new(&ipc_path).exists() {
+            error!("IPC file not created at {} after {} attempts", ipc_path, ipc_check_attempts);
+            println!("===> ERROR: IPC FILE NOT CREATED AT {} AFTER {} ATTEMPTS", ipc_path, ipc_check_attempts);
+            return Err(GraphError::StorageError(format!("IPC file not created: {}", ipc_path)));
         }
 
+        info!("IPC file verified at {}", ipc_path);
+        println!("===> IPC FILE VERIFIED AT {}", ipc_path);
+
+        // Note: We don't ping ZMQ here because the server is still initializing.
+        // The ZMQ thread will update the registry with zmq_ready=true once it's fully running.
+        info!("ZMQ server starting, will be marked ready in registry when fully initialized");
+        println!("===> ZMQ SERVER STARTING, WILL BE MARKED READY IN REGISTRY WHEN FULLY INITIALIZED");
+
+        // Store daemon and update load balancer
+        self.daemons.insert(port, Arc::new(daemon));
+        self.load_balancer.update_node_health(port, true, 0).await;
         *initialized = true;
-        let health_config = HealthCheckConfig {
-            interval: TokioDuration::from_secs(10),
-            connect_timeout: TokioDuration::from_secs(2),
-            response_buffer_size: 1024,
-        };
-        self.start_health_monitoring(health_config).await;
-        info!("Started health monitoring for ports {:?}", valid_ports);
-        println!("===> STARTED HEALTH MONITORING FOR PORTS {:?}", valid_ports);
 
-        info!("SledDaemonPool initialized successfully with load balancing on ports {:?}", valid_ports);
-        println!("===> SLED DAEMON POOL INITIALIZED SUCCESSFULLY WITH LOAD BALANCING ON PORTS {:?}", valid_ports);
+        info!("SledDaemonPool initialized successfully on port {}", port);
+        println!("===> SLED DAEMON POOL INITIALIZED SUCCESSFULLY ON PORT {}", port);
+
         Ok(())
+    }
+
+    // ============================================================================
+    // Helper utilities
+    // ============================================================================
+    
+    async fn is_dir_empty(path: &Path) -> bool {
+        if let Ok(mut dir) = tokio_fs::read_dir(path).await {
+            dir.next_entry().await.ok().flatten().is_none()
+        } else {
+            true
+        }
+    }
+
+    /// Copy data files only (no database opening) to avoid lock contention
+    fn copy_data_files_only<'a>(
+        source: &'a PathBuf, 
+        target: &'a PathBuf
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = GraphResult<()>> + Send + 'a>> {
+        Box::pin(async move {
+            info!("Copying data files from {:?} to {:?}", source, target);
+            println!("===> COPYING DATA FILES FROM {:?} TO {:?}", source, target);
+
+            if !source.exists() {
+                return Err(GraphError::StorageError(format!("Source does not exist: {:?}", source)));
+            }
+
+            tokio_fs::create_dir_all(target).await
+                .map_err(|e| GraphError::Io(format!("Failed to create target: {}", e)))?;
+
+            let mut entries = tokio_fs::read_dir(source).await
+                .map_err(|e| GraphError::Io(format!("Failed to read source: {}", e)))?;
+
+            while let Some(entry) = entries.next_entry().await
+                .map_err(|e| GraphError::Io(format!("Failed to read entry: {}", e)))? {
+                
+                let source_path = entry.path();
+                let file_name = entry.file_name();
+                let file_name_str = file_name.to_string_lossy();
+                let target_path = target.join(&file_name);
+
+                // Skip lock files and temp files
+                if file_name_str.contains("LOCK") || file_name_str.contains(".lck") 
+                    || file_name_str.contains(".tmp") || file_name_str.contains(".temp") 
+                    || file_name_str == "db" { // Skip Sled's lock file
+                    info!("Skipping lock/temp file: {}", file_name_str);
+                    println!("===> SKIPPING LOCK/TEMP FILE: {}", file_name_str);
+                    continue;
+                }
+
+                let metadata = entry.metadata().await
+                    .map_err(|e| GraphError::Io(format!("Failed to get metadata: {}", e)))?;
+
+                if metadata.is_dir() {
+                    tokio_fs::create_dir_all(&target_path).await
+                        .map_err(|e| GraphError::Io(format!("Failed to create dir: {}", e)))?;
+                    Self::copy_data_files_only(&source_path, &target_path).await?;
+                } else {
+                    tokio_fs::copy(&source_path, &target_path).await
+                        .map_err(|e| GraphError::Io(format!("Failed to copy file: {}", e)))?;
+                    info!("Copied file: {}", file_name_str);
+                }
+            }
+
+            info!("Successfully copied data to {:?}", target);
+            println!("===> SUCCESSFULLY COPIED DATA TO {:?}", target);
+            Ok(())
+        })
+    }
+
+    /// ---------------------------------------------------------------------------
+    /// Small utilities used above
+    /// ---------------------------------------------------------------------------
+    fn leader_port_is_canonical(leader: &Path, canon_port: u16, cfg: &StorageConfig) -> bool {
+        leader.ends_with(&format!("{}", canon_port))
+            && leader.starts_with(
+                cfg.data_directory
+                    .as_ref()
+                    .unwrap_or(&PathBuf::from("/opt/graphdb/storage_data"))
+                    .join("sled"),
+            )
     }
 
     /// Start periodic health monitoring
@@ -4959,3 +4853,4 @@ impl RaftNetwork<NodeId, BasicNode> for RaftTcpNetwork {
         }
     }
 }
+

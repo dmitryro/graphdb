@@ -222,7 +222,7 @@ impl RocksDBStorage {
                 println!("===> ERROR: FAILED TO READ DIRECTORY {:?}", path);
             }
         }
-        log_directory_contents(&db_path).await;
+        //log_directory_contents(&db_path).await;
 
         // --------------------------------------------------------------------- //
         // 2. Singleton & registry reuse (no DB open)
@@ -585,7 +585,7 @@ impl RocksDBStorage {
                 println!("===> ERROR: FAILED TO READ DIRECTORY {:?}", path);
             }
         }
-        log_directory_contents(&db_path).await;
+        //log_directory_contents(&db_path).await;
 
         let standard_cf_names = vec!["vertices", "edges", "kv_pairs"];
         let raft_cf_names = vec!["raft_vote", "raft_membership", "raft_snapshot", "raft_log", "data"];
@@ -979,7 +979,7 @@ impl RocksDBStorage {
                 println!("===> ERROR: FAILED TO READ DIRECTORY {:?}", path);
             }
         }
-        log_directory_contents(&db_path).await;
+        //log_directory_contents(&db_path).await;
 
         if let Some(rocks_db) = ROCKSDB_DB.get() {
             let rocks_db_guard = rocks_db.lock().await;
