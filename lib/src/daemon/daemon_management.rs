@@ -104,83 +104,132 @@ pub fn is_valid_cluster_range(range: &str) -> bool {
 }
 
 /// Checks if a process is running on the specified port.
+/// Checks whether a daemon that *should* be bound to `port` is actually alive.
+///
+/// The function:
+///   1. Verifies the port is listening (using `ss -ltnp` – works on Linux/macOS).
+///   2. Looks up the registry entry (if any) and validates its PID.
+///   3. If the PID is dead, removes the stale entry.
+///   4. If no registry entry exists but a process is listening, registers a fresh one.
+///   5. Returns `true` **iff** a live process is bound to the port.
+///
+/// `process_name` is ignored – it was the source of false-negative “Down” reports.
 pub async fn check_process_status_by_port(
-    process_name: &str,
+    _process_name: &str,   // kept for signature compatibility, but unused
     port: u16,
 ) -> bool {
-    // Early return if port is not listening to avoid unnecessary registry checks
+    // --------------------------------------------------------------------- //
+    // 1. Fast path – is anything listening on the port at all?
+    // --------------------------------------------------------------------- //
     if !is_port_listening(port).await {
-        debug!("Port {} is not listening for {}.", port, process_name);
+        debug!("Port {} is not listening – daemon is down.", port);
+        // Clean any stale registry entry that claims this port.
+        let _ = GLOBAL_DAEMON_REGISTRY.unregister_daemon(port).await;
         return false;
     }
-    let metadata = match tokio::time::timeout(
-        Duration::from_secs(2),
+
+    // --------------------------------------------------------------------- //
+    // 2. Do we already have a registry entry for this port?
+    // --------------------------------------------------------------------- //
+    let registry_entry = match timeout(
+        TokioDuration::from_secs(2),
         GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port),
-    ).await {
-        Ok(Ok(Some(meta))) => Some(meta),
-        Ok(Ok(None)) => None,
+    )
+    .await
+    {
+        Ok(Ok(opt)) => opt,
         Ok(Err(e)) => {
-            error!("Failed to get daemon metadata for port {}: {}", port, e);
+            error!("Registry error for port {}: {}", port, e);
             None
         }
         Err(_) => {
-            error!("Timeout accessing daemon metadata for port {}", port);
+            error!("Timeout reading registry for port {}", port);
             None
         }
     };
-    if let Some(meta) = metadata {
-        if check_process_status_by_pid(Pid::from_u32(meta.pid)).await {
-            let updated_metadata = DaemonMetadata {
-                last_seen_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
+
+    // --------------------------------------------------------------------- //
+    // 3. Validate the PID (if we have one)
+    // --------------------------------------------------------------------- //
+    if let Some(meta) = registry_entry {
+        let pid = Pid::from_u32(meta.pid);
+        if check_process_status_by_pid(pid).await {
+            // PID is alive → refresh timestamp
+            let updated = DaemonMetadata {
+                last_seen_nanos: Utc::now()
+                    .timestamp_nanos_opt()
+                    .unwrap_or(0),
                 ..meta
             };
-            if let Err(e) = tokio::time::timeout(
+            let _ = timeout(
                 Duration::from_secs(2),
-                GLOBAL_DAEMON_REGISTRY.register_daemon(updated_metadata),
-            ).await {
-                error!("Failed to update daemon metadata for port {}: {:?}", port, e);
-            }
+                GLOBAL_DAEMON_REGISTRY.update_daemon_metadata(updated),
+            )
+            .await;
             return true;
-        }
-        // Unregister stale entry
-        if let Err(e) = tokio::time::timeout(
-            Duration::from_secs(2),
-            GLOBAL_DAEMON_REGISTRY.unregister_daemon(port),
-        ).await {
-            error!("Failed to unregister daemon for port {}: {:?}", port, e);
+        } else {
+            // Stale PID → remove it
+            warn!(
+                "Stale PID {} for port {} (service_type={}) – removing.",
+                meta.pid, port, meta.service_type
+            );
+            let _ = timeout(
+                Duration::from_secs(2),
+                GLOBAL_DAEMON_REGISTRY.unregister_daemon(port),
+            )
+            .await;
         }
     }
-    // Fallback to system scan if no registry entry
+
+    // --------------------------------------------------------------------- //
+    // 4. No valid registry entry, but the port *is* listening → discover PID
+    // --------------------------------------------------------------------- //
     match find_pid_by_port(port).await {
         Some(pid) => {
-            let service_type = if process_name.contains("Storage") {
-                "storage"
-            } else if process_name.contains("REST") {
-                "rest"
+            // Heuristic: guess service_type from the known port ranges.
+            // This is safe because the CLI always starts components on
+            // well-known ports (main: 9000-range, rest: 8080-range, storage: 8050-range).
+            let service_type = if (9000..=9010).contains(&port) {
+                "main".to_string()
+            } else if (8080..=8090).contains(&port) {
+                "rest".to_string()
             } else {
-                "main"
+                "storage".to_string()
             };
-            let metadata = DaemonMetadata {
-                service_type: service_type.to_string(),
+
+            let fresh = DaemonMetadata {
+                service_type,
                 port,
-                pid, // pid is already u32
+                pid,
                 ip_address: "127.0.0.1".to_string(),
                 data_dir: None,
                 config_path: None,
                 engine_type: None,
-                last_seen_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
+                last_seen_nanos: Utc::now()
+                    .timestamp_nanos_opt()
+                    .unwrap_or(0),
                 zmq_ready: false,
                 engine_synced: false,
             };
-            if let Err(e) = tokio::time::timeout(
+
+            if timeout(
                 Duration::from_secs(2),
-                GLOBAL_DAEMON_REGISTRY.register_daemon(metadata),
-            ).await {
-                error!("Failed to register daemon for port {}: {:?}", port, e);
+                GLOBAL_DAEMON_REGISTRY.register_daemon(fresh),
+            )
+            .await
+            .is_err()
+            {
+                error!("Failed to register discovered daemon on port {}", port);
+            } else {
+                info!("Discovered and registered daemon on port {} (PID {})", port, pid);
             }
             true
         }
-        None => false,
+        None => {
+            // Port is listening but we cannot find a PID (very rare – e.g. kernel socket).
+            // Treat it as *not* our daemon.
+            false
+        }
     }
 }
 

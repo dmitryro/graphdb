@@ -1,11 +1,12 @@
-use std::fs::File;
+// daemon/src/daemonize/daemonize.rs
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::os::unix::io::IntoRawFd;
-use std::path::Path;
-use std::process::exit;
+use std::os::unix::io::{AsRawFd, IntoRawFd};
+use std::path::{Path, PathBuf};
+use std::process::{exit};
 use nix::sys::signal::{self, SigHandler, Signal};
 use nix::sys::stat::{umask, Mode};
-use nix::unistd::{chdir, fork, getpid, setsid, ForkResult};
+use nix::unistd::{chdir, fork, getpid, setsid, Pid, ForkResult};
 use proctitle::set_title;
 use std::fmt::{self, Display, Formatter};
 
@@ -50,7 +51,8 @@ pub struct DaemonizeBuilder {
     pid: Option<u32>,
     host: String,
     port: u16,
-    skip_ports: Vec<u16>, // Ports that should NOT be bound by the stub daemon
+    skip_ports: Vec<u16>,
+    pid_file_path: Option<String>,
 }
 
 impl DaemonizeBuilder {
@@ -65,52 +67,48 @@ impl DaemonizeBuilder {
             host: "127.0.0.1".into(),
             port: 8080,
             skip_ports: vec![],
+            pid_file_path: None,
         }
     }
 
-    pub fn working_directory(mut self, dir: &str) -> Self {
-        self.working_directory = Some(dir.to_string());
-        self
+    pub fn working_directory(self, dir: &str) -> Self {
+        Self { working_directory: Some(dir.to_string()), ..self }
     }
 
-    pub fn umask(mut self, umask: u32) -> Self {
-        self.umask = umask;
-        self
+    pub fn umask(self, umask: u32) -> Self {
+        Self { umask, ..self }
     }
 
-    pub fn process_name(mut self, name: &str) -> Self {
-        self.process_name = Some(name.to_string());
-        self
+    pub fn process_name(self, name: &str) -> Self {
+        Self { process_name: Some(name.to_string()), ..self }
     }
 
-    pub fn stdout(mut self, stdout: File) -> Self {
-        self.stdout = Some(stdout);
-        self
+    pub fn stdout(self, stdout: File) -> Self {
+        Self { stdout: Some(stdout), ..self }
     }
 
-    pub fn stderr(mut self, stderr: File) -> Self {
-        self.stderr = Some(stderr);
-        self
+    pub fn stderr(self, stderr: File) -> Self {
+        Self { stderr: Some(stderr), ..self }
     }
 
-    pub fn pid(mut self, pid: u32) -> Self {
-        self.pid = Some(pid);
-        self
+    pub fn pid(self, pid: u32) -> Self {
+        Self { pid: Some(pid), ..self }
     }
 
-    pub fn host(mut self, host: &str) -> Self {
-        self.host = host.to_string();
-        self
+    pub fn host(self, host: &str) -> Self {
+        Self { host: host.to_string(), ..self }
     }
 
-    pub fn port(mut self, port: u16) -> Self {
-        self.port = port;
-        self
+    pub fn port(self, port: u16) -> Self {
+        Self { port, ..self }
     }
 
-    pub fn skip_ports(mut self, skip_ports: Vec<u16>) -> Self {
-        self.skip_ports = skip_ports;
-        self
+    pub fn skip_ports(self, skip_ports: Vec<u16>) -> Self {
+        Self { skip_ports, ..self }
+    }
+
+    pub fn pid_file_path(self, path: &str) -> Self {
+        Self { pid_file_path: Some(path.to_string()), ..self }
     }
 
     pub fn build(self) -> Result<Daemonize, DaemonizeError> {
@@ -125,19 +123,26 @@ impl DaemonizeBuilder {
             host: self.host,
             port: self.port,
             skip_ports: self.skip_ports,
+            pid_file_path: self.pid_file_path,
         })
     }
 
-    /// Only fork/daemonize, do NOT run the stub TCP server (for REST API).
+    /// Only fork/daemonize, do NOT run the stub TCP server.
     /// Returns 0 in the child, PID in the parent.
-    pub fn fork_only(&mut self) -> Result<u32, DaemonizeError> {
-        // If this port is in the skip list, do not bind or fork!
+    pub fn fork_only(&self) -> Result<u32, DaemonizeError> {
         if self.skip_ports.contains(&self.port) {
             eprintln!(
                 "[INFO] Not binding daemon stub on reserved port {}. This port is reserved for another service.",
                 self.port
             );
             return Ok(0);
+        }
+
+        // Ensure PID directory exists
+        if let Some(ref path) = self.pid_file_path {
+            if let Some(parent) = Path::new(path).parent() {
+                fs::create_dir_all(parent).map_err(DaemonizeError::Io)?;
+            }
         }
 
         match unsafe { fork() } {
@@ -150,7 +155,7 @@ impl DaemonizeBuilder {
                         if let Some(ref dir) = self.working_directory {
                             chdir(Path::new(dir)).map_err(DaemonizeError::Nix)?;
                         }
-                        umask(Mode::from_bits_truncate(self.umask as u16));
+                        umask(Mode::from_bits_truncate(self.umask as u16)); // Fixed: u32 → u16
 
                         if let Some(ref process_name) = self.process_name {
                             set_title(process_name);
@@ -164,16 +169,24 @@ impl DaemonizeBuilder {
                                 .map_err(DaemonizeError::Nix)?;
                         }
 
-                        // Redirect std descriptors if needed
+                        // Redirect std descriptors
                         let dev_null = File::options().read(true).write(true).open("/dev/null")?;
-                        let _stdout_fd = self.stdout.as_ref().unwrap_or(&dev_null).try_clone()?.into_raw_fd();
-                        let _stderr_fd = self.stderr.as_ref().unwrap_or(&dev_null).try_clone()?.into_raw_fd();
+                        let stdout_fd = self.stdout.as_ref().unwrap_or(&dev_null).try_clone()?.into_raw_fd();
+                        let stderr_fd = self.stderr.as_ref().unwrap_or(&dev_null).try_clone()?.into_raw_fd();
+
+                        nix::unistd::dup2(stdout_fd, 1).ok();
+                        nix::unistd::dup2(stderr_fd, 2).ok();
+                        nix::unistd::dup2(dev_null.as_raw_fd(), 0).ok();
+
+                        // Write PID file
+                        if let Some(ref path) = self.pid_file_path {
+                            let pid = getpid().as_raw() as u32;
+                            fs::write(path, pid.to_string()).map_err(DaemonizeError::Io)?;
+                        }
 
                         Ok(0)
                     }
-                    Ok(ForkResult::Parent { .. }) => {
-                        exit(0);
-                    }
+                    Ok(ForkResult::Parent { .. }) => exit(0),
                     Err(e) => Err(DaemonizeError::Nix(e)),
                 }
             }
@@ -193,12 +206,12 @@ pub struct Daemonize {
     host: String,
     port: u16,
     skip_ports: Vec<u16>,
+    pid_file_path: Option<String>,
 }
 
 impl Daemonize {
     /// Start a stub daemon (normal mode, not for REST API)
-    pub fn start(&mut self) -> Result<u32, DaemonizeError> {
-        // If this port is in the skip list, don't bind/fork!
+    pub fn start(&self) -> Result<u32, DaemonizeError> {
         if self.skip_ports.contains(&self.port) {
             eprintln!(
                 "[INFO] Not binding daemon stub on reserved port {}. This port is reserved for another service.",
@@ -207,9 +220,15 @@ impl Daemonize {
             return Ok(0);
         }
 
+        // Ensure PID directory exists
+        if let Some(ref path) = self.pid_file_path {
+            if let Some(parent) = Path::new(path).parent() {
+                fs::create_dir_all(parent).map_err(DaemonizeError::Io)?;
+            }
+        }
+
         match unsafe { fork() } {
             Ok(ForkResult::Child) => {
-                // 1st child process
                 setsid().map_err(DaemonizeError::Nix)?;
 
                 match unsafe { fork() } {
@@ -218,14 +237,18 @@ impl Daemonize {
                         if let Some(ref dir) = self.working_directory {
                             chdir(Path::new(dir)).map_err(DaemonizeError::Nix)?;
                         }
-                        umask(Mode::from_bits_truncate(self.umask as u16));
+                        umask(Mode::from_bits_truncate(self.umask as u16)); // Fixed: u32 → u16
 
                         // Redirect standard file descriptors
                         let dev_null = File::options().read(true).write(true).open("/dev/null")?;
-                        let _stdout_fd = self.stdout.as_ref().unwrap_or(&dev_null).try_clone()?.into_raw_fd();
-                        let _stderr_fd = self.stderr.as_ref().unwrap_or(&dev_null).try_clone()?.into_raw_fd();
+                        let stdout_fd = self.stdout.as_ref().unwrap_or(&dev_null).try_clone()?.into_raw_fd();
+                        let stderr_fd = self.stderr.as_ref().unwrap_or(&dev_null).try_clone()?.into_raw_fd();
 
-                        // Set process title if provided
+                        nix::unistd::dup2(stdout_fd, 1).ok();
+                        nix::unistd::dup2(stderr_fd, 2).ok();
+                        nix::unistd::dup2(dev_null.as_raw_fd(), 0).ok();
+
+                        // Set process title
                         if let Some(ref process_name) = self.process_name {
                             set_title(process_name);
                         }
@@ -238,17 +261,23 @@ impl Daemonize {
                                 .map_err(DaemonizeError::Nix)?;
                         }
 
-                        // Bind TCP stub (for non-REST API ports)
+                        // Write PID file
+                        let current_pid = getpid().as_raw() as u32;
+                        if let Some(ref path) = self.pid_file_path {
+                            fs::write(path, current_pid.to_string()).map_err(DaemonizeError::Io)?;
+                        }
+
+                        // Bind TCP stub
                         let address = format!("{}:{}", self.host, self.port);
-                        eprintln!("DEBUG: Daemon process '{}' binding to {} (PID {})", self.process_name.as_deref().unwrap_or("unknown"), address, getpid());
+                        eprintln!(
+                            "DEBUG: Daemon process '{}' binding to {} (PID {})",
+                            self.process_name.as_deref().unwrap_or("unknown"),
+                            address,
+                            current_pid
+                        );
+
                         match std::net::TcpListener::bind(&address) {
                             Ok(listener) => {
-                                let current_pid = getpid().as_raw() as u32;
-                                if let Some(ref process_name) = self.process_name {
-                                    let pid_file_path = format!("/tmp/{}.pid", process_name);
-                                    std::fs::write(&pid_file_path, current_pid.to_string())
-                                        .map_err(DaemonizeError::Io)?;
-                                }
                                 println!("Daemon (PID {}) is listening on {}", current_pid, address);
                                 for stream in listener.incoming() {
                                     if let Ok(mut stream) = stream {
@@ -262,17 +291,12 @@ impl Daemonize {
                                 Err(DaemonizeError::Io(e))
                             }
                         }
-                    },
-                    Ok(ForkResult::Parent { child: _ }) => {
-                        exit(0);
-                    },
+                    }
+                    Ok(ForkResult::Parent { child: _ }) => exit(0),
                     Err(e) => Err(DaemonizeError::Nix(e)),
                 }
-            },
-            Ok(ForkResult::Parent { child }) => {
-                self.pid = Some(child.as_raw() as u32);
-                Ok(self.pid.unwrap())
-            },
+            }
+            Ok(ForkResult::Parent { child }) => Ok(child.as_raw() as u32),
             Err(e) => Err(DaemonizeError::Nix(e)),
         }
     }
@@ -282,7 +306,7 @@ impl Daemonize {
     }
 }
 
-// Signal handler function
+// Signal handler
 extern "C" fn handle_signal(_sig: i32) {
     eprintln!("Daemon received SIGTERM, exiting gracefully...");
     exit(0);
