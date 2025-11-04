@@ -657,54 +657,356 @@ impl<'a> RocksDBDaemon<'a> {
         Ok((daemon, ready_rx))
     }
 
-    /// Pull the latest SST files from any other live follower.
-    // FIX: Changed my_path to accept &PathBuf to match copy_data_files_only signature.
-    async fn pre_synchronize(my_port: u16, my_path: &PathBuf) -> GraphResult<()> {
-        let canonical = {
-            let map = CANONICAL_DB_MAP.read().await;
-            map.iter()
-                .find_map(|(dir, ports)| ports.contains(&my_port).then(|| dir.clone()))
+    /// Initializes a RocksDB daemon using an **already-opened** `rocksdb::DB`.
+    /// The DB must contain the three column families: `"kv_pairs"`, `"vertices"`, `"edges"`.
+    /// WAL replay is performed using the **same DB + CF handles** that the daemon will use.
+    pub async fn new_with_db(
+        config: RocksDBConfig,
+        existing_db: Arc<DB>,
+    ) -> GraphResult<(RocksDBDaemon<'static>, mpsc::Receiver<()>)> {
+        info!("RocksDBDaemon::new_with_db called – using supplied DB");
+
+        // --------------------------------------------------------------
+        // 1. Port selection
+        // --------------------------------------------------------------
+        let config_port = config.port.unwrap_or(DEFAULT_STORAGE_PORT);
+        let global_registry = GLOBAL_DAEMON_REGISTRY.get().await;
+        let free_daemon_metadata = global_registry.find_free_storage_daemon().await?;
+
+        let port: u16 = if let Some(metadata) = free_daemon_metadata {
+            info!("Reusing uninitialized storage daemon port {} (registry).", metadata.port);
+            metadata.port
+        } else {
+            info!("Using config port {}.", config_port);
+            config_port
         };
 
-        let Some(canonical) = canonical else { return Ok(()); };
+        // --------------------------------------------------------------
+        // 2. Derive per-port path
+        // --------------------------------------------------------------
+        let base_db_path = PathBuf::from(config.path.clone());
+        let db_path = base_db_path.join(port.to_string());
+        info!("RocksDBDaemon using port {} at path {:?}", port, db_path);
 
-        let src_port = RocksDBDaemonPool::followers_of(&canonical).await
-            .into_iter()
-            .find(|&p| p != my_port);
-
-        let Some(src) = src_port else { return Ok(()); };
-
-        let src_path = canonical.join(src.to_string());
-        info!("pre_synchronize: pulling from port {} to {}", src, my_port);
-        // This call is now correct since my_path is &PathBuf
-        RocksDBDaemonPool::copy_data_files_only(&src_path, my_path).await
-    }
-
-    /// Push our new SST files to **every** other follower.
-    // FIX: Changed my_path to accept &PathBuf to match copy_data_files_only signature.
-    async fn post_synchronize(my_port: u16, my_path: &PathBuf) -> GraphResult<()> {
-        let canonical = {
-            let map = CANONICAL_DB_MAP.read().await;
-            map.iter()
-                .find_map(|(dir, ports)| ports.contains(&my_port).then(|| dir.clone()))
-        };
-
-        let Some(canonical) = canonical else { return Ok(()); };
-
-        let targets = RocksDBDaemonPool::followers_of(&canonical).await
-            .into_iter()
-            .filter(|&p| p != my_port)
-            .collect::<Vec<_>>();
-
-        for tgt in targets {
-            let tgt_path = canonical.join(tgt.to_string());
-            info!("post_synchronize: pushing to port {}", tgt);
-            // This call is now correct since my_path is &PathBuf
-            RocksDBDaemonPool::copy_data_files_only(my_path, &tgt_path).await?;
+        // --------------------------------------------------------------
+        // 3. Clean stale lock
+        // --------------------------------------------------------------
+        let lock_path = db_path.join("LOCK");
+        if lock_path.exists() {
+            if let Ok(Some(metadata)) = GLOBAL_DAEMON_REGISTRY.find_daemon_by_port(port).await {
+                let system = System::new_with_specifics(
+                    RefreshKind::nothing().with_processes(ProcessRefreshKind::everything()),
+                );
+                if system.process(Pid::from_u32(metadata.pid)).is_none() {
+                    info!("Removing stale lock file at {:?}", lock_path);
+                    handle_rocksdb_op!(
+                        tokio::fs::remove_file(&lock_path).await,
+                        format!("Failed to remove stale lock file at {:?}", lock_path)
+                    )?;
+                }
+            }
         }
-        Ok(())
+
+        // --------------------------------------------------------------
+        // 4. Extract column-family handles from the **same** DB
+        // --------------------------------------------------------------
+        let kv_pairs: Arc<BoundColumnFamily<'static>> = unsafe {
+            std::mem::transmute(Arc::new(
+                existing_db
+                    .cf_handle("kv_pairs")
+                    .ok_or_else(|| GraphError::StorageError("CF kv_pairs missing".into()))?,
+            ))
+        };
+        let vertices: Arc<BoundColumnFamily<'static>> = unsafe {
+            std::mem::transmute(Arc::new(
+                existing_db
+                    .cf_handle("vertices")
+                    .ok_or_else(|| GraphError::StorageError("CF vertices missing".into()))?,
+            ))
+        };
+        let edges: Arc<BoundColumnFamily<'static>> = unsafe {
+            std::mem::transmute(Arc::new(
+                existing_db
+                    .cf_handle("edges")
+                    .ok_or_else(|| GraphError::StorageError("CF edges missing".into()))?,
+            ))
+        };
+
+        // --------------------------------------------------------------
+        // 5. **WAL REPLAY** – using correct signature
+        // --------------------------------------------------------------
+        let offset_file = db_path.join(format!("{}.offset", port));
+        let start_offset = if offset_file.exists() {
+            tokio_fs::read_to_string(&offset_file)
+                .await
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        // Pass both DB and the **tuple of CF handles**
+        replay_wal_from(
+            &existing_db,
+            &(kv_pairs.clone(), vertices.clone(), edges.clone()),
+            start_offset,
+        )
+        .await?;
+
+        // --------------------------------------------------------------
+        // 6. Raft (unchanged)
+        // --------------------------------------------------------------
+        let node_id = port as u64;
+        #[cfg(feature = "with-openraft-rocksdb")]
+        let (raft, raft_storage) = {
+            let raft_db_path = db_path.join("raft");
+            handle_rocksdb_op!(
+                tokio::fs::create_dir_all(&raft_db_path).await,
+                format!("Failed to create Raft DB directory at {:?}", raft_db_path)
+            )?;
+            let raft_storage = RocksDBRaftStorage::new(&raft_db_path).await?;
+            let raft_config = Arc::new(RaftConfig {
+                cluster_name: "graphdb-cluster".to_string(),
+                heartbeat_interval: 250,
+                election_timeout_min: 1000,
+                election_timeout_max: 2000,
+                ..Default::default()
+            });
+            let raft = Raft::new(
+                node_id,
+                raft_config,
+                Arc::new(raft_storage.clone()),
+                Arc::new(RaftTcpNetwork {}),
+            );
+            (Some(Arc::new(raft)), Some(Arc::new(raft_storage)))
+        };
+        #[cfg(not(feature = "with-openraft-rocksdb"))]
+        let (raft, raft_storage): (Option<Arc<Raft<TypeConfig>>>, Option<Arc<RocksDBRaftStorage>>) =
+            (None, None);
+
+        // --------------------------------------------------------------
+        // 7. ZMQ readiness + stale socket cleanup
+        // --------------------------------------------------------------
+        let (ready_tx, mut ready_rx) = mpsc::channel::<()>(1);
+        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
+        let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", port);
+        let ipc_path = endpoint.strip_prefix("ipc://").unwrap_or(&endpoint);
+
+        if Path::new(ipc_path).exists() {
+            warn!("Stale IPC socket at {}. Removing.", ipc_path);
+            let _ = tokio::fs::remove_file(ipc_path).await;
+        }
+
+        let running = Arc::new(TokioMutex::new(true));
+
+        // --------------------------------------------------------------
+        // 8. Build daemon struct
+        // --------------------------------------------------------------
+        let daemon = RocksDBDaemon {
+            port,
+            db_path: db_path.clone(),
+            db: existing_db.clone(),
+            kv_pairs: kv_pairs.clone(),
+            vertices: vertices.clone(),
+            edges: edges.clone(),
+            running: running.clone(),
+            shutdown_tx: shutdown_tx.clone(),
+            zmq_context: Arc::new(ZmqContext::new()),
+            zmq_thread: Arc::new(TokioMutex::new(None)),
+            #[cfg(feature = "with-openraft-rocksdb")]
+            raft,
+            #[cfg(feature = "with-openraft-rocksdb")]
+            raft_storage,
+            #[cfg(feature = "with-openraft-rocksdb")]
+            node_id,
+        };
+
+        // --------------------------------------------------------------
+        // 9. Register daemon (zmq_ready = false)
+        // --------------------------------------------------------------
+        let initial_metadata = DaemonMetadata {
+            port,
+            service_type: "storage".to_string(),
+            ip_address: "127.0.0.1".to_string(),
+            config_path: Some(db_path.clone()),
+            data_dir: Some(db_path.clone()),
+            engine_type: Some(StorageEngineType::RocksDB.to_string()),
+            pid: std::process::id() as u32,
+            last_seen_nanos: SystemTime::now()
+                .duration_since(UNIX_EPOCH)?
+                .as_nanos() as i64,
+            zmq_ready: false,
+            engine_synced: true,
+        };
+        GLOBAL_DAEMON_REGISTRY
+            .register_daemon(initial_metadata.clone())
+            .await
+            .map_err(|e| GraphError::StorageError(format!("Failed to register daemon on port {}: {}", port, e)))?;
+
+        // --------------------------------------------------------------
+        // 10. Spawn ZMQ thread
+        // --------------------------------------------------------------
+        let zmq_context_thread = daemon.zmq_context.clone();
+        let endpoint_thread = endpoint.clone();
+        let config_thread = config.clone();
+        let ready_tx_thread = ready_tx.clone();
+        let db_path_thread = db_path.clone();
+        let db_clone = existing_db.clone();
+        let kv_clone = kv_pairs.clone();
+        let vert_clone = vertices.clone();
+        let edge_clone = edges.clone();
+        let running_clone = running.clone();
+
+        let zmq_thread_handle = std::thread::spawn(move || -> GraphResult<()> {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                let socket_raw = zmq_context_thread.socket(REP).map_err(|e| {
+                    GraphError::StorageError(format!("Failed to create ZMQ REP socket: {}", e))
+                })?;
+
+                let mut bound = false;
+                for i in 0..5 {
+                    match socket_raw.bind(&endpoint_thread) {
+                        Ok(()) => {
+                            bound = true;
+                            let _ = ready_tx_thread.send(()).await;
+                            info!("ZMQ bound on attempt {}", i + 1);
+                            break;
+                        }
+                        Err(e) => {
+                            warn!("ZMQ bind attempt {} failed: {}", i + 1, e);
+                            if i < 4 {
+                                tokio::time::sleep(TokioDuration::from_millis(100 * (i + 1) as u64)).await;
+                            }
+                        }
+                    }
+                }
+                if !bound {
+                    return Err(GraphError::StorageError("ZMQ failed to bind after retries".into()));
+                }
+
+                let metadata = DaemonMetadata {
+                    zmq_ready: true,
+                    ..initial_metadata
+                };
+                let _ = GLOBAL_DAEMON_REGISTRY.get().await.update_daemon_metadata(metadata).await;
+
+                let zmq_socket = Arc::new(TokioMutex::new(socket_raw));
+
+                RocksDBDaemon::run_zmq_server_lazy(
+                    port,
+                    config_thread,
+                    running_clone,
+                    zmq_socket,
+                    endpoint_thread,
+                    db_clone,
+                    kv_clone,
+                    vert_clone,
+                    edge_clone,
+                    db_path_thread,
+                )
+                .await
+            })
+        });
+
+        *daemon.zmq_thread.lock().await = Some(zmq_thread_handle);
+
+        // --------------------------------------------------------------
+        // 11. Wait for ZMQ readiness
+        // --------------------------------------------------------------
+        info!("Waiting for ZMQ readiness on port {}...", port);
+        ready_rx
+            .recv()
+            .await
+            .ok_or_else(|| GraphError::StorageError(format!("ZMQ failed to signal readiness on port {}", port)))?;
+
+        info!("RocksDB daemon fully initialized on port {}", port);
+        Ok((daemon, shutdown_rx))
     }
-/// ZMQ server – DB is already opened in `RocksDBDaemon::new()`
+
+    /* -------------------------------------------------------------
+        new_with_client
+        ------------------------------------------------------------- */
+    pub async fn new_with_client(config: RocksDBConfig) -> GraphResult<Self> {
+        let port = config.port.ok_or_else(|| {
+            error!("No port specified in RocksDBConfig");
+            println!("===> ERROR: NO PORT SPECIFIED IN ROCKSDB CONFIG");
+            GraphError::ConfigurationError("No port specified in RocksDBConfig".to_string())
+        })?;
+
+        let db_path = if config.path.ends_with(&port.to_string()) {
+            PathBuf::from(config.path.clone())
+        } else {
+            PathBuf::from(config.path.clone()).join(port.to_string())
+        };
+
+        info!("Initializing RocksDBDaemon in client mode (read-only) for port {}", port);
+        println!("===> INITIALIZING ROCKSDB DAEMON IN CLIENT MODE (READ-ONLY) FOR PORT {}", port);
+
+        // Verify a daemon is actually running on this port
+        if !is_storage_daemon_running(port).await {
+            error!("No running daemon found on port {}", port);
+            println!("===> ERROR: NO RUNNING DAEMON FOUND ON PORT {}", port);
+            return Err(GraphError::StorageError(format!("No running daemon found on port {}", port)));
+        }
+
+        // Open the database in read-only mode
+        let mut opts = Options::default();
+        opts.create_if_missing(false);
+        opts.create_missing_column_families(false);
+        let db = Arc::new(handle_rocksdb_op!(
+            DB::open_for_read_only(&opts, &db_path, false),
+            format!("Failed to open RocksDB in read-only mode at {}", db_path.display())
+        )?);
+
+        // Get column family handles (simplified - single pass)
+        let kv_pairs: Arc<BoundColumnFamily<'static>> = unsafe {
+            std::mem::transmute(Arc::new(db.cf_handle("kv_pairs").ok_or_else(|| {
+                GraphError::StorageError("Column family kv_pairs not found".to_string())
+            })?))
+        };
+        let vertices: Arc<BoundColumnFamily<'static>> = unsafe {
+            std::mem::transmute(Arc::new(db.cf_handle("vertices").ok_or_else(|| {
+                GraphError::StorageError("Column family vertices not found".to_string())
+            })?))
+        };
+        let edges: Arc<BoundColumnFamily<'static>> = unsafe {
+            std::mem::transmute(Arc::new(db.cf_handle("edges").ok_or_else(|| {
+                GraphError::StorageError("Column family edges not found".to_string())
+            })?))
+        };
+
+        let zmq_context = Arc::new(ZmqContext::new());
+        let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
+
+        let node_id = port as u64;
+        
+        let daemon = Self {
+            port,
+            db_path,
+            db,
+            kv_pairs,
+            vertices,
+            edges,
+            running: Arc::new(TokioMutex::new(true)),
+            shutdown_tx,
+            zmq_context,
+            zmq_thread: Arc::new(TokioMutex::new(None)), // No thread in client mode
+            #[cfg(feature = "with-openraft-rocksdb")]
+            raft: None,
+            #[cfg(feature = "with-openraft-rocksdb")]
+            raft_storage: None,
+            #[cfg(feature = "with-openraft-rocksdb")]
+            node_id,
+        };
+
+        info!("RocksDBDaemon initialized in client mode (read-only) for port {}", port);
+        println!("===> ROCKSDB DAEMON INITIALIZATION COMPLETE FOR PORT {} IN CLIENT MODE", port);
+        Ok(daemon)
+    }
+
+    /// ZMQ server – DB is already opened in `RocksDBDaemon::new()`
     /// All original commands are preserved.
     async fn run_zmq_server_lazy(
         port: u16,
@@ -1080,382 +1382,6 @@ impl<'a> RocksDBDaemon<'a> {
                 Ok(json!({"status": "error", "message": format!("Unsupported command: {}", cmd)}))
             }
         }
-    }
-
-    pub async fn new_with_db(config: RocksDBConfig, existing_db: Arc<DB>) -> GraphResult<(RocksDBDaemon<'static>, mpsc::Receiver<()>)> {
-        info!("Initializing RocksDB daemon with existing DB at {:?}", config.path);
-
-        // --- 1. PORT SELECTION LOGIC ---
-        const BIND_RETRIES: usize = 5;
-        
-        let config_port = config.port.unwrap_or(DEFAULT_STORAGE_PORT);
-        let global_registry = GLOBAL_DAEMON_REGISTRY.get().await;
-        
-        let free_daemon_metadata = global_registry.find_free_storage_daemon().await?;
-        
-        let port: u16 = if let Some(metadata) = free_daemon_metadata {
-            info!("Priority 1: Reused uninitialized storage daemon port {} found via registry search.", metadata.port);
-            metadata.port
-        } else {
-            info!("Priority 2/3: No reusable port found. Using config port {}.", config_port);
-            config_port
-        };
-
-        // --- 2. DERIVE DB PATH ---
-        let base_db_path = PathBuf::from(config.path.clone());
-        let db_path = base_db_path.join(port.to_string());
-        
-        info!("RocksDBDaemon using port {} at path {:?}", port, db_path);
-
-        // --- 3. CLEANUP STALE LOCKS ---
-        let lock_path = db_path.join("LOCK");
-        if lock_path.exists() {
-            let system = System::new_with_specifics(RefreshKind::nothing().with_processes(ProcessRefreshKind::everything()));
-            if let Ok(Some(metadata)) = GLOBAL_DAEMON_REGISTRY.find_daemon_by_port(port).await {
-                if system.process(Pid::from_u32(metadata.pid)).is_none() {
-                    info!("Removing stale lock file at {:?}", lock_path);
-                    handle_rocksdb_op!(
-                        tokio::fs::remove_file(&lock_path).await,
-                        format!("Failed to remove stale lock file at {:?}", lock_path)
-                    )?;
-                }
-            }
-        }
-        
-        // --- 4. COLUMN FAMILY HANDLES ---
-        let kv_pairs: Arc<BoundColumnFamily<'static>> = unsafe {
-            std::mem::transmute(Arc::new(existing_db.cf_handle("kv_pairs").ok_or_else(|| {
-                GraphError::StorageError("Column family kv_pairs not found".to_string())
-            })?))
-        };
-        let vertices: Arc<BoundColumnFamily<'static>> = unsafe {
-            std::mem::transmute(Arc::new(existing_db.cf_handle("vertices").ok_or_else(|| {
-                GraphError::StorageError("Column family vertices not found".to_string())
-            })?))
-        };
-        let edges: Arc<BoundColumnFamily<'static>> = unsafe {
-            std::mem::transmute(Arc::new(existing_db.cf_handle("edges").ok_or_else(|| {
-                GraphError::StorageError("Column family edges not found".to_string())
-            })?))
-        };
-
-        // --- 5. RAFT INITIALIZATION ---
-        let node_id = port as u64;
-
-        #[cfg(feature = "with-openraft-rocksdb")]
-        let (raft, raft_storage) = {
-            let raft_db_path = db_path.join("raft");
-            handle_rocksdb_op!(
-                tokio::fs::create_dir_all(&raft_db_path).await,
-                format!("Failed to create Raft DB directory at {:?}", raft_db_path)
-            )?;
-            let raft_storage = RocksDBRaftStorage::new(&raft_db_path).await?;
-            let raft_config = Arc::new(RaftConfig {
-                cluster_name: "graphdb-cluster".to_string(),
-                heartbeat_interval: 250,
-                election_timeout_min: 1000,
-                election_timeout_max: 2000,
-                ..Default::default()
-            });
-            let raft = Raft::new(
-                node_id,
-                raft_config,
-                Arc::new(raft_storage.clone()),
-                Arc::new(RaftTcpNetwork {}),
-            );
-            (Some(Arc::new(raft)), Some(Arc::new(raft_storage)))
-        };
-        
-        #[cfg(not(feature = "with-openraft-rocksdb"))]
-        let (raft, raft_storage): (Option<Arc<Raft<TypeConfig>>>, Option<Arc<RocksDBRaftStorage>>) =
-            (None, None);
-
-        let zmq_context = Arc::new(ZmqContext::new());
-        
-        // --- 6. CHANNEL SETUP ---
-        // ====================================================================
-        // CRITICAL: Separate channels for readiness signaling and shutdown
-        // ====================================================================
-        let (tx_readiness, mut rx_readiness) = mpsc::channel(1); 
-        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
-
-        let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", port);
-        let ipc_path = endpoint.strip_prefix("ipc://").unwrap_or(&endpoint);
-        
-        if std::path::Path::new(ipc_path).exists() {
-            warn!("Stale IPC socket found at {}. Attempting cleanup.", ipc_path);
-            if let Err(e) = tokio::fs::remove_file(ipc_path).await {
-                error!("Failed to remove stale IPC socket {}: {}", ipc_path, e);
-            } else {
-                info!("Successfully removed stale IPC socket {}", ipc_path);
-            }
-        }
-        
-        let running = Arc::new(TokioMutex::new(true));
-        
-        // --- 7. INITIALIZE DAEMON STRUCT ---
-        let daemon: RocksDBDaemon<'static> = RocksDBDaemon {
-            port,
-            db_path: db_path.clone(),
-            db: existing_db.clone(),
-            kv_pairs: kv_pairs.clone(),
-            vertices: vertices.clone(),
-            edges: edges.clone(),
-            running: running.clone(),
-            shutdown_tx: shutdown_tx.clone(),
-            zmq_context: zmq_context.clone(),
-            zmq_thread: Arc::new(TokioMutex::new(None)),
-            #[cfg(feature = "with-openraft-rocksdb")]
-            raft,
-            #[cfg(feature = "with-openraft-rocksdb")]
-            raft_storage,
-            #[cfg(feature = "with-openraft-rocksdb")]
-            node_id,
-        };
-
-        // --- 8. INITIAL DAEMON REGISTRY UPDATE (zmq_ready: false) ---
-        let initial_metadata = DaemonMetadata {
-            port,
-            service_type: "storage".to_string(),
-            ip_address: "127.0.0.1".to_string(),
-            config_path: Some(db_path.clone()),
-            data_dir: Some(db_path.clone()),
-            engine_type: Some(StorageEngineType::RocksDB.to_string()),
-            pid: std::process::id() as u32,
-            last_seen_nanos: SystemTime::now()
-                .duration_since(UNIX_EPOCH)?
-                .as_nanos() as i64,
-            zmq_ready: false,
-            engine_synced: false,
-        };
-        handle_rocksdb_op!(
-            GLOBAL_DAEMON_REGISTRY.register_daemon(initial_metadata.clone()).await,
-            format!("Failed to register daemon for port {}", port)
-        )?;
-
-        // --- 9. SPAWN ZMQ THREAD ---
-        let running_clone = running.clone();
-        let zmq_context_clone = zmq_context.clone();
-        let db_clone = existing_db.clone();
-        let kv_pairs_clone = kv_pairs.clone();
-        let vertices_clone = vertices.clone();
-        let edges_clone = edges.clone();
-        let db_path_clone = db_path.clone();
-        let endpoint_clone = endpoint.clone();
-
-        info!("About to start ZMQ server thread for port {}", port);
-        let zmq_thread_handle = std::thread::spawn(move || -> GraphResult<()> {
-            let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime for ZMQ server thread");
-            rt.block_on(async {
-                // Socket creation
-                let zmq_socket_raw = match zmq_context_clone.socket(zmq::REP) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        error!("Failed to create ZMQ socket for thread: {}", e);
-                        let _ = tx_readiness.send(()).await; 
-                        return Err(GraphError::StorageError(format!("Failed to create ZMQ socket: {}", e)));
-                    }
-                };
-                
-                // Binding logic with retries
-                let mut bind_success = false;
-                for i in 0..BIND_RETRIES {
-                    match zmq_socket_raw.bind(&endpoint_clone) {
-                        Ok(_) => {
-                            info!("ZMQ socket successfully bound to {}. Signaling readiness.", endpoint_clone);
-                            bind_success = true;
-                            let _ = tx_readiness.send(()).await;  // ====== CRITICAL: Signal readiness
-                            break;
-                        }
-                        Err(e) => {
-                            if i < BIND_RETRIES - 1 {
-                                warn!(
-                                    "Failed to bind ZMQ socket to {} (attempt {}/{}): {}",
-                                    endpoint_clone, i + 1, BIND_RETRIES, e
-                                );
-                                tokio::time::sleep(TokioDuration::from_millis(100 * (i as u64 + 1))).await;
-                            } else {
-                                let error_msg = format!(
-                                    "Failed to bind ZMQ socket to {} after {} attempts: {}",
-                                    endpoint_clone, BIND_RETRIES, e
-                                );
-                                error!("{}", error_msg);
-                                let _ = tx_readiness.send(()).await; 
-                                return Err(GraphError::StorageError(error_msg));
-                            }
-                        }
-                    }
-                }
-
-                if !bind_success {
-                    let error_msg = "Could not bind ZMQ socket after max retries. Aborting server run.".to_string();
-                    error!("{}", error_msg);
-                    return Err(GraphError::StorageError(error_msg)); 
-                }
-
-                let zmq_socket = Arc::new(TokioMutex::new(zmq_socket_raw));
-                
-                // Run server
-                let endpoint_for_server = endpoint_clone.clone();
-                RocksDBDaemon::run_zmq_server_static(
-                    port,
-                    db_clone,
-                    kv_pairs_clone,
-                    vertices_clone,
-                    edges_clone,
-                    running_clone,
-                    zmq_socket,
-                    endpoint_for_server,
-                    db_path_clone,
-                )
-                .await
-                .map_err(|e| {
-                    error!("ZMQ server failed for endpoint {}: {}", endpoint_clone, e); 
-                    e
-                })
-            })
-        });
-
-        *daemon.zmq_thread.lock().await = Some(zmq_thread_handle);
-
-        // --- 10. WAIT FOR ZMQ READINESS AND FINAL REGISTRY UPDATE ---
-        // ====================================================================
-        // CRITICAL: Wait for ZMQ thread to signal readiness, then update registry
-        // ====================================================================
-        info!("Waiting for ZMQ server readiness signal on port {}...", port);
-        
-        rx_readiness.recv().await.ok_or_else(|| {
-            GraphError::StorageError(format!("ZMQ server failed to start or signal readiness on port {}", port))
-        })?;
-        
-        info!("ZMQ server ready signal received on port {}. Updating global daemon registry.", port);
-
-        // Update DaemonMetadata: set zmq_ready to true
-        let updated_metadata = DaemonMetadata {
-            zmq_ready: true, 
-            ..initial_metadata 
-        };
-
-        global_registry.register_daemon(updated_metadata).await?;
-        info!("Daemon metadata updated: zmq_ready=true for port {}.", port);
-
-        // --- 11. SIGNAL HANDLING ---
-        #[cfg(unix)]
-        {
-            let daemon_for_signal = daemon.clone();
-            let shutdown_tx = daemon.shutdown_tx.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-                let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("Failed to register SIGTERM handler");
-                sigterm.recv().await;
-                info!("Received SIGTERM in RocksDB daemon on port {}", port);
-                let should_shutdown = {
-                    let mut running = daemon_for_signal.running.lock().await;
-                    if *running {
-                        *running = false;
-                        let _ = shutdown_tx.send(()).await;
-                        true
-                    } else {
-                        false
-                    }
-                };
-                if should_shutdown {
-                    if let Err(e) = daemon_for_signal.shutdown().await {
-                        error!("Failed to shutdown RocksDB daemon on port {}: {}", port, e);
-                    } else {
-                        info!("RocksDB daemon shutdown complete on port {}", port);
-                    }
-                } else {
-                    info!("Ignoring SIGTERM as daemon on port {} is not fully initialized", port);
-                }
-            });
-        }
-
-        info!("RocksDB daemon initialization complete for port {}", port);
-        Ok((daemon, shutdown_rx))
-    }
-
-
-    /* -------------------------------------------------------------
-        new_with_client
-        ------------------------------------------------------------- */
-    pub async fn new_with_client(config: RocksDBConfig) -> GraphResult<Self> {
-        let port = config.port.ok_or_else(|| {
-            error!("No port specified in RocksDBConfig");
-            println!("===> ERROR: NO PORT SPECIFIED IN ROCKSDB CONFIG");
-            GraphError::ConfigurationError("No port specified in RocksDBConfig".to_string())
-        })?;
-
-        let db_path = if config.path.ends_with(&port.to_string()) {
-            PathBuf::from(config.path.clone())
-        } else {
-            PathBuf::from(config.path.clone()).join(port.to_string())
-        };
-
-        info!("Initializing RocksDBDaemon in client mode (read-only) for port {}", port);
-        println!("===> INITIALIZING ROCKSDB DAEMON IN CLIENT MODE (READ-ONLY) FOR PORT {}", port);
-
-        // Verify a daemon is actually running on this port
-        if !is_storage_daemon_running(port).await {
-            error!("No running daemon found on port {}", port);
-            println!("===> ERROR: NO RUNNING DAEMON FOUND ON PORT {}", port);
-            return Err(GraphError::StorageError(format!("No running daemon found on port {}", port)));
-        }
-
-        // Open the database in read-only mode
-        let mut opts = Options::default();
-        opts.create_if_missing(false);
-        opts.create_missing_column_families(false);
-        let db = Arc::new(handle_rocksdb_op!(
-            DB::open_for_read_only(&opts, &db_path, false),
-            format!("Failed to open RocksDB in read-only mode at {}", db_path.display())
-        )?);
-
-        // Get column family handles (simplified - single pass)
-        let kv_pairs: Arc<BoundColumnFamily<'static>> = unsafe {
-            std::mem::transmute(Arc::new(db.cf_handle("kv_pairs").ok_or_else(|| {
-                GraphError::StorageError("Column family kv_pairs not found".to_string())
-            })?))
-        };
-        let vertices: Arc<BoundColumnFamily<'static>> = unsafe {
-            std::mem::transmute(Arc::new(db.cf_handle("vertices").ok_or_else(|| {
-                GraphError::StorageError("Column family vertices not found".to_string())
-            })?))
-        };
-        let edges: Arc<BoundColumnFamily<'static>> = unsafe {
-            std::mem::transmute(Arc::new(db.cf_handle("edges").ok_or_else(|| {
-                GraphError::StorageError("Column family edges not found".to_string())
-            })?))
-        };
-
-        let zmq_context = Arc::new(ZmqContext::new());
-        let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
-
-        let node_id = port as u64;
-        
-        let daemon = Self {
-            port,
-            db_path,
-            db,
-            kv_pairs,
-            vertices,
-            edges,
-            running: Arc::new(TokioMutex::new(true)),
-            shutdown_tx,
-            zmq_context,
-            zmq_thread: Arc::new(TokioMutex::new(None)), // No thread in client mode
-            #[cfg(feature = "with-openraft-rocksdb")]
-            raft: None,
-            #[cfg(feature = "with-openraft-rocksdb")]
-            raft_storage: None,
-            #[cfg(feature = "with-openraft-rocksdb")]
-            node_id,
-        };
-
-        info!("RocksDBDaemon initialized in client mode (read-only) for port {}", port);
-        println!("===> ROCKSDB DAEMON INITIALIZATION COMPLETE FOR PORT {} IN CLIENT MODE", port);
-        Ok(daemon)
     }
 
     /// Static method to send a ZMQ response.
@@ -2705,6 +2631,54 @@ impl<'a> RocksDBDaemon<'a> {
                 }
             }
         }
+    }
+
+    /// Pull the latest SST files from any other live follower.
+    // FIX: Changed my_path to accept &PathBuf to match copy_data_files_only signature.
+    async fn pre_synchronize(my_port: u16, my_path: &PathBuf) -> GraphResult<()> {
+        let canonical = {
+            let map = CANONICAL_DB_MAP.read().await;
+            map.iter()
+                .find_map(|(dir, ports)| ports.contains(&my_port).then(|| dir.clone()))
+        };
+
+        let Some(canonical) = canonical else { return Ok(()); };
+
+        let src_port = RocksDBDaemonPool::followers_of(&canonical).await
+            .into_iter()
+            .find(|&p| p != my_port);
+
+        let Some(src) = src_port else { return Ok(()); };
+
+        let src_path = canonical.join(src.to_string());
+        info!("pre_synchronize: pulling from port {} to {}", src, my_port);
+        // This call is now correct since my_path is &PathBuf
+        RocksDBDaemonPool::copy_data_files_only(&src_path, my_path).await
+    }
+
+    /// Push our new SST files to **every** other follower.
+    // FIX: Changed my_path to accept &PathBuf to match copy_data_files_only signature.
+    async fn post_synchronize(my_port: u16, my_path: &PathBuf) -> GraphResult<()> {
+        let canonical = {
+            let map = CANONICAL_DB_MAP.read().await;
+            map.iter()
+                .find_map(|(dir, ports)| ports.contains(&my_port).then(|| dir.clone()))
+        };
+
+        let Some(canonical) = canonical else { return Ok(()); };
+
+        let targets = RocksDBDaemonPool::followers_of(&canonical).await
+            .into_iter()
+            .filter(|&p| p != my_port)
+            .collect::<Vec<_>>();
+
+        for tgt in targets {
+            let tgt_path = canonical.join(tgt.to_string());
+            info!("post_synchronize: pushing to port {}", tgt);
+            // This call is now correct since my_path is &PathBuf
+            RocksDBDaemonPool::copy_data_files_only(my_path, &tgt_path).await?;
+        }
+        Ok(())
     }
 
     async fn insert_static(
