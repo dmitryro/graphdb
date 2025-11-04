@@ -97,12 +97,15 @@ struct LazyDB {
     edges:    Arc<BoundColumnFamily<'static>>,
 }
 
-// Assuming necessary imports for Path, PathBuf, Lazy, tokio_fs, etc. are present.
 // ---------------------------------------------------------------------------
 // Shared WAL – one file, many readers, one writer (leader)
 // ---------------------------------------------------------------------------
 static SHARED_WAL_DIR: Lazy<PathBuf> = Lazy::new(|| {
-    PathBuf::from("/opt/graphdb/storage_data/rocksdb/shared_wal")
+    PathBuf::from(format!(
+        "{}/{}/shared_wal",
+        DEFAULT_DATA_DIRECTORY,
+        StorageEngineType::RocksDB.to_string().to_lowercase()
+    ))
 });
 
 /// **CORRECT**: Full path to the WAL **file**
