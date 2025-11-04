@@ -12,6 +12,22 @@ use crate::errors::{ValidationError, ValidationResult};
 #[serde(transparent)]
 pub struct SerializableUuid(pub Uuid);
 
+
+
+impl SerializableUuid {
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+impl FromStr for SerializableUuid {
+    type Err = uuid::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Uuid::from_str(s).map(SerializableUuid)
+    }
+}
+
 impl fmt::Display for SerializableUuid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)

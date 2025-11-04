@@ -207,7 +207,9 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
 
     info!("Starting ZMQ KV operation: {} for key: {}", operation, key);
 
-    // Retrieve daemon metadata
+    // -----------------------------------------------------------------
+    // 1. Pick the daemon (unchanged)
+    // -----------------------------------------------------------------
     let registry = GLOBAL_DAEMON_REGISTRY.get().await;
     let daemons = registry
         .get_all_daemon_metadata()
@@ -219,10 +221,11 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
 
     if daemons.is_empty() {
         error!("No running Sled daemon found");
-        return Err(anyhow!("No running Sled daemon found. Please start a daemon with 'storage start'"));
+        return Err(anyhow!(
+            "No running Sled daemon found. Please start a daemon with 'storage start'"
+        ));
     }
 
-    // Select the daemon with the highest port
     let daemon = daemons.iter().max_by_key(|m| m.port).unwrap_or(daemons.first().unwrap());
     info!("Selected Sled daemon on port: {}", daemon.port);
     println!("===> Selected daemon on port: {}", daemon.port);
@@ -230,15 +233,20 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
     let socket_path = format!("/tmp/graphdb-{}.ipc", daemon.port);
     let addr = format!("ipc://{}", socket_path);
 
-    // Check if socket file exists
     if !tokio::fs::metadata(&socket_path).await.is_ok() {
-        error!("IPC socket file {} does not exist. Daemon may not be running properly on port {}.", socket_path, daemon.port);
-        return Err(anyhow!("IPC socket file {} does not exist. Daemon may not be running properly on port {}.", socket_path, daemon.port));
+        error!(
+            "IPC socket file {} does not exist. Daemon may not be running properly on port {}.",
+            socket_path, daemon.port
+        );
+        return Err(anyhow!(
+            "IPC socket file {} does not exist. Daemon may not be running properly on port {}.",
+            socket_path, daemon.port
+        ));
     }
 
-    debug!("Connecting to Sled daemon at: {}", addr);
-
-    // Prepare the ZeroMQ request
+    // -----------------------------------------------------------------
+    // 2. Build the request (unchanged – we still send Base64)
+    // -----------------------------------------------------------------
     let request = match operation {
         "set" => {
             let value = value.as_ref().ok_or_else(|| {
@@ -247,20 +255,20 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
             })?;
             json!({
                 "command": "set_key",
-                "key": base64::engine::general_purpose::STANDARD.encode(&key),
+                "key":   base64::engine::general_purpose::STANDARD.encode(&key),
                 "value": base64::engine::general_purpose::STANDARD.encode(&value),
-                "cf": "kv_pairs"
+                "cf":    "kv_pairs"
             })
         }
         "get" => json!({
             "command": "get_key",
-            "key": base64::engine::general_purpose::STANDARD.encode(&key),
-            "cf": "kv_pairs"
+            "key":   base64::engine::general_purpose::STANDARD.encode(&key),
+            "cf":    "kv_pairs"
         }),
         "delete" => json!({
             "command": "delete_key",
-            "key": base64::engine::general_purpose::STANDARD.encode(&key),
-            "cf": "kv_pairs"
+            "key":   base64::engine::general_purpose::STANDARD.encode(&key),
+            "cf":    "kv_pairs"
         }),
         "flush" => json!({ "command": "flush" }),
         _ => {
@@ -269,24 +277,21 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
         }
     };
 
-    debug!("Sending request: {:?}", request);
     let request_data = serde_json::to_vec(&request)
-        .map_err(|e| {
-            error!("Failed to serialize request: {}", e);
-            anyhow!("Failed to serialize request: {}", e)
-        })?;
+        .map_err(|e| anyhow!("Failed to serialize request: {}", e))?;
 
+    // -----------------------------------------------------------------
+    // 3. Send the request with retries (unchanged)
+    // -----------------------------------------------------------------
     let mut last_error: Option<anyhow::Error> = None;
     for attempt in 1..=MAX_RETRIES {
-        debug!("Attempt {}/{} to send ZMQ request", attempt, MAX_RETRIES);
-
         let response_result = timeout(
             TokioDuration::from_secs(CONNECT_TIMEOUT_SECS + REQUEST_TIMEOUT_SECS + RECEIVE_TIMEOUT_SECS),
             tokio::task::spawn_blocking({
                 let addr = addr.clone();
                 let request_data = request_data.clone();
                 move || do_zmq_request(&addr, &request_data)
-            })
+            }),
         )
         .await;
 
@@ -298,13 +303,21 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
                         info!("Operation successful");
                         match operation {
                             "get" => {
-                                if let Some(response_value) = response_value.get("value") {
-                                    let display_value = if response_value.is_null() {
-                                        "not found".to_string()
+                                if let Some(encoded) = response_value.get("value") {
+                                    if encoded.is_null() {
+                                        println!("Key '{}': not found", key);
                                     } else {
-                                        response_value.as_str().unwrap_or("<non-string value>").to_string()
-                                    };
-                                    println!("Key '{}': {}", key, display_value);
+                                        // ---- FIXED PART ----
+                                        let b64 = encoded
+                                            .as_str()
+                                            .ok_or_else(|| anyhow!("'value' field is not a string"))?;
+                                        let decoded = base64::engine::general_purpose::STANDARD
+                                            .decode(b64)
+                                            .map_err(|e| anyhow!("Base64 decode error: {}", e))?;
+                                        let display = String::from_utf8_lossy(&decoded);
+                                        println!("Key '{}': {}", key, display);
+                                        // --------------------
+                                    }
                                 } else {
                                     println!("Key '{}': no value in response", key);
                                 }
@@ -316,8 +329,11 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
                                 println!("Deleted key '{}' successfully", key);
                             }
                             "flush" => {
-                                if let Some(bytes_flushed) = response_value.get("bytes_flushed").and_then(|b| b.as_u64()) {
-                                    println!("Flushed database successfully: {} bytes", bytes_flushed);
+                                if let Some(bytes) = response_value
+                                    .get("bytes_flushed")
+                                    .and_then(|b| b.as_u64())
+                                {
+                                    println!("Flushed database successfully: {} bytes", bytes);
                                 } else {
                                     println!("Flushed database successfully");
                                 }
@@ -327,22 +343,31 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
                         return Ok(());
                     }
                     Some("error") => {
-                        let message = response_value
+                        let msg = response_value
                             .get("message")
                             .and_then(|m| m.as_str())
                             .unwrap_or("Unknown error");
-                        error!("Daemon error: {}", message);
-                        last_error = Some(anyhow!("Daemon error: {}", message));
+                        error!("Daemon error: {}", msg);
+                        last_error = Some(anyhow!("Daemon error: {}", msg));
                     }
                     _ => {
                         error!("Invalid response: {:?}", response_value);
-                        last_error = Some(anyhow!("Invalid response from {}: {:?}", addr, response_value));
+                        last_error = Some(anyhow!(
+                            "Invalid response from {}: {:?}",
+                            addr,
+                            response_value
+                        ));
                     }
                 }
             }
             Ok(Err(e)) => {
                 last_error = Some(anyhow!("Operation failed: {}", e));
-                warn!("Attempt {}/{} failed: {}", attempt, MAX_RETRIES, last_error.as_ref().unwrap());
+                warn!(
+                    "Attempt {}/{} failed: {}",
+                    attempt,
+                    MAX_RETRIES,
+                    last_error.as_ref().unwrap()
+                );
             }
             Err(_) => {
                 last_error = Some(anyhow!(
@@ -361,7 +386,10 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
     }
 
     Err(last_error.unwrap_or_else(|| {
-        anyhow!("Failed to complete ZMQ operation after {} attempts", MAX_RETRIES)
+        anyhow!(
+            "Failed to complete ZMQ operation after {} attempts",
+            MAX_RETRIES
+        )
     }))
 }
 
