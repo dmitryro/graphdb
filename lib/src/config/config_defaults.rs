@@ -1,4 +1,6 @@
 use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use serde_json::Value;
 pub use crate::config::config_constants::*;
 pub use crate::config::config_structs::{StorageConfigInner, SelectedStorageConfig, StorageConfig};
 pub use crate::config::config_helpers::{load_rest_config, load_storage_config_from_yaml, load_daemon_config};
@@ -104,4 +106,17 @@ pub fn get_default_rest_port() -> u16 {
     load_rest_config(None)
         .map(|cfg| cfg.default_port)
         .unwrap_or(DEFAULT_REST_API_PORT)
+}
+
+/// Helper – default TiKV map when the yaml file is missing or malformed
+pub fn default_tikv_map() -> HashMap<String, Value> {
+    let mut map = HashMap::new();
+    map.insert("storage_engine_type".to_string(), Value::String("tikv".to_string()));
+    map.insert("path".to_string(), Value::String("/opt/graphdb/storage_data/tikv".to_string()));
+    map.insert("host".to_string(), Value::String("127.0.0.1".to_string()));
+    map.insert("port".to_string(), Value::Number(2380.into()));
+    map.insert("username".to_string(), Value::String("tikv".to_string()));
+    map.insert("password".to_string(), Value::String("tikv".to_string()));
+    map.insert("pd_endpoints".to_string(), Value::String("127.0.0.1:2379".to_string()));
+    map
 }

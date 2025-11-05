@@ -233,6 +233,11 @@ pub async fn check_process_status_by_port(
     }
 }
 
+pub async fn is_zmq_ipc_in_use(port: u16) -> bool {
+    let path = format!("/tmp/graphdb-{}.ipc", port);
+    tokio::fs::metadata(&path).await.is_ok()
+}
+
 /// Stops a process running on the specified port.
 /// This version is robust against race conditions where the process
 /// is killed but a subsequent check fails, and avoids thread joins.
@@ -2715,3 +2720,173 @@ pub fn extract_port(ipc_endpoint: &str) -> GraphResult<u16> {
     })
 }
 
+pub async fn stop_storage_daemon_by_port(port: u16) -> Result<(), anyhow::Error> {
+    let registry = GLOBAL_DAEMON_REGISTRY.get().await;
+    
+    if let Ok(Some(metadata)) = registry.get_daemon_metadata(port).await {
+        if metadata.pid > 0 {
+            // Try graceful shutdown first
+            if let Err(e) = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(metadata.pid as i32),
+                nix::sys::signal::Signal::SIGTERM,
+            ) {
+                warn!("Failed to send SIGTERM to PID {}: {}", metadata.pid, e);
+                
+                // Force kill if graceful fails
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(metadata.pid as i32),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+            
+            // Wait for process to die
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            
+            // Clean up IPC socket
+            let socket_path = format!("/tmp/graphdb-{}.ipc", port);
+            let _ = tokio::fs::remove_file(&socket_path).await;
+            
+            // Remove from registry
+            registry.unregister_daemon(port).await?;
+            
+            info!("Stopped daemon on port {} (PID {})", port, metadata.pid);
+        }
+    }
+    
+    Ok(())
+}
+
+/// Verify IPC socket exists for a daemon, and attempt recovery if missing
+pub async fn verify_and_recover_ipc(port: u16) -> Result<(), anyhow::Error> {
+    let ipc_path = format!("/tmp/graphdb-{}.ipc", port);
+    
+    // Check if IPC socket exists
+    if tokio::fs::metadata(&ipc_path).await.is_ok() {
+        info!("IPC socket verified at {}", ipc_path);
+        return Ok(());
+    }
+    
+    warn!("IPC socket missing at {} - attempting recovery", ipc_path);
+    
+    // Check if daemon is registered
+    let registry = GLOBAL_DAEMON_REGISTRY.get().await;
+    let metadata = registry.get_daemon_metadata(port).await?;
+    
+    if let Some(daemon_meta) = metadata {
+        if !check_pid_validity(daemon_meta.pid).await {
+            return Err(anyhow!(
+                "Daemon on port {} (PID {}) is not running - cannot recover IPC",
+                port, daemon_meta.pid
+            ));
+        }
+        
+        let engine = daemon_meta.engine_type.as_deref().unwrap_or("unknown");
+        
+        warn!(
+            "Daemon on port {} exists (PID {}, engine {}) but IPC socket is missing",
+            port, daemon_meta.pid, engine
+        );
+        
+        // For missing IPC, we MUST restart the daemon
+        // because IPC is created during daemon initialization
+        return Err(anyhow!(
+            "IPC socket missing for running daemon on port {} - daemon restart required",
+            port
+        ));
+    } else {
+        return Err(anyhow!("No daemon registered on port {}", port));
+    }
+}
+
+/// Check if IPC socket exists and is accessible
+pub async fn check_ipc_socket_exists(port: u16) -> bool {
+    let ipc_path = format!("/tmp/graphdb-{}.ipc", port);
+    tokio::fs::metadata(&ipc_path).await.is_ok()
+}
+
+/// Find a daemon with a working IPC socket, or create one
+pub async fn get_or_create_daemon_with_ipc(
+    engine: StorageEngineType,
+    config: &StorageConfig,
+) -> Result<u16, anyhow::Error> {
+    let registry = GLOBAL_DAEMON_REGISTRY.get().await;
+    let all_daemons = registry.get_all_daemon_metadata().await?;
+    
+    let engine_str = daemon_api_storage_engine_type_to_string(&engine);
+    
+    // Find daemons of the right engine
+    let mut matching_daemons: Vec<_> = all_daemons
+        .into_iter()
+        .filter(|d| {
+            d.service_type == "storage" 
+                && d.engine_type.as_deref() == Some(&engine_str)
+                && d.pid > 0
+        })
+        .collect();
+    
+    // Sort by port (prefer higher ports = more recent)
+    matching_daemons.sort_by_key(|d| std::cmp::Reverse(d.port));
+    
+    // Try to find one with working IPC
+    for daemon in &matching_daemons {
+        if check_pid_validity(daemon.pid).await {
+            if check_ipc_socket_exists(daemon.port).await {
+                info!("Found healthy daemon with IPC on port {}", daemon.port);
+                return Ok(daemon.port);
+            } else {
+                warn!(
+                    "Daemon on port {} exists but IPC socket missing - will skip",
+                    daemon.port
+                );
+            }
+        }
+    }
+    
+    // No daemon with IPC found - need to start one
+    warn!("No healthy daemon with IPC found for engine {} - need to start one", engine_str);
+    
+    // Find a free port
+    let cluster_ports = parse_cluster_range(&config.cluster_range)?;
+    let mut free_port: Option<u16> = None;
+    
+    for &port in &cluster_ports {
+        if !check_process_status_by_port("Storage Daemon", port).await {
+            free_port = Some(port);
+            break;
+        }
+    }
+    
+    let port = free_port.ok_or_else(|| {
+        anyhow!("No free port available in cluster range {}", config.cluster_range)
+    })?;
+    
+    Err(anyhow!(
+        "No daemon with working IPC found - caller must start daemon on port {}",
+        port
+    ))
+}
+
+pub fn check_pid_validity_sync(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::kill;
+        use nix::unistd::Pid;
+
+        // Send signal 0 (null signal) to check if PID exists
+        match kill(Pid::from_raw(pid as i32), None) {
+            Ok(_) => true,   // PID exists
+            Err(_) => false, // PID does not exist (or no permission, but we assume it's dead)
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        // On non-Unix (e.g., Windows), fallback to assuming valid
+        // (In production, you'd use platform-specific process checks)
+        true
+    }
+}

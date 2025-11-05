@@ -26,7 +26,8 @@ use serde::{Deserialize, Serialize};
 use crate::daemon::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
 use crate::daemon::db_daemon_registry::{GLOBAL_DB_DAEMON_REGISTRY, DBDaemonMetadata};
 use crate::daemon::daemon_management::{parse_cluster_range, is_daemon_running,  get_ipc_addr, 
-                                       find_pid_by_port, is_port_free, is_pid_running,}; 
+                                       find_pid_by_port, is_port_free, is_pid_running,
+                                       check_process_status_by_port,}; 
 use std::time::{SystemTime, UNIX_EPOCH};
 use futures::future::join_all;
 use uuid::Uuid;
@@ -332,10 +333,8 @@ impl SledDaemon {
         let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", port);
         let ipc_path = endpoint.strip_prefix("ipc://").unwrap();
 
-        if Path::new(ipc_path).exists() {
-            warn!("Removing stale IPC socket at {}", ipc_path);
-            let _ = tokio_fs::remove_file(ipc_path).await;
-        }
+        // ALWAYS remove stale IPC
+        let _ = tokio_fs::remove_file(ipc_path).await;
 
         let running = Arc::new(TokioMutex::new(true));
         let daemon = Self {
@@ -376,6 +375,10 @@ impl SledDaemon {
                     }
                 };
 
+                // Force remove and retry binding
+                let _ = tokio_fs::remove_file(endpoint_clone.strip_prefix("ipc://").unwrap()).await;
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
                 let mut bound = false;
                 for i in 0..5 {
                     if zmq_socket_raw.bind(&endpoint_clone).is_ok() {
@@ -383,13 +386,14 @@ impl SledDaemon {
                         let _ = tx.send(()).await;
                         break;
                     }
-                    tokio::time::sleep(TokioDuration::from_millis(100 * (i + 1) as u64)).await;
+                    tokio::time::sleep(TokioDuration::from_millis(200 * (i + 1) as u64)).await;
                 }
                 if !bound {
+                    error!("Failed to bind ZMQ socket after retries");
                     return;
                 }
 
-                // Update daemon metadata (don't register - that's done elsewhere)
+                // Update daemon metadata
                 let update_metadata = DaemonMetadata {
                     service_type: "storage".to_string(),
                     port,
@@ -402,7 +406,6 @@ impl SledDaemon {
                     zmq_ready: true,
                     engine_synced: true,
                 };
-                // Only update if daemon already exists, don't fail if it doesn't
                 let _ = daemon_registry.update_daemon_metadata(update_metadata).await;
 
                 let zmq_socket = Arc::new(TokioMutex::new(zmq_socket_raw));
@@ -455,9 +458,8 @@ impl SledDaemon {
         let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", port);
         let ipc_path = endpoint.strip_prefix("ipc://").unwrap();
 
-        if Path::new(ipc_path).exists() {
-            let _ = tokio::fs::remove_file(ipc_path).await;
-        }
+        // ALWAYS remove stale IPC
+        let _ = tokio::fs::remove_file(ipc_path).await;
 
         let running = Arc::new(TokioMutex::new(true));
         
@@ -505,6 +507,10 @@ impl SledDaemon {
                     }
                 };
 
+                // Force remove and retry binding
+                let _ = tokio::fs::remove_file(endpoint_clone.strip_prefix("ipc://").unwrap()).await;
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
                 let mut bound = false;
                 for i in 0..5 {
                     if zmq_socket_raw.bind(&endpoint_clone).is_ok() {
@@ -512,13 +518,13 @@ impl SledDaemon {
                         let _ = tx.send(()).await;
                         break;
                     }
-                    tokio::time::sleep(TokioDuration::from_millis(100 * (i + 1) as u64)).await;
+                    tokio::time::sleep(TokioDuration::from_millis(200 * (i + 1) as u64)).await;
                 }
                 if !bound {
                     return;
                 }
 
-                // Update daemon metadata (don't register - that's done elsewhere)
+                // Update daemon metadata
                 let update_metadata = DaemonMetadata {
                     service_type: "storage".to_string(),
                     port,
@@ -531,7 +537,6 @@ impl SledDaemon {
                     zmq_ready: true,
                     engine_synced: true,
                 };
-                // Only update if daemon already exists, don't fail if it doesn't
                 let _ = daemon_registry.update_daemon_metadata(update_metadata).await;
 
                 let zmq_socket = Arc::new(TokioMutex::new(zmq_socket_raw));
@@ -1014,7 +1019,32 @@ impl SledDaemon {
                         Err(e) => json!({"status":"error","message":e.to_string()}),
                     }
                 }
-
+                Some("force_ipc_init") => {
+                    info!("Received force_ipc_init command for port {}", port);
+                    println!("===> FORCING IPC INITIALIZATION FOR PORT {}", port);
+                    
+                    // Verify IPC socket file exists
+                    let ipc_path = format!("/tmp/graphdb-{}.ipc", port);
+                    match tokio::fs::metadata(&ipc_path).await {
+                        Ok(_) => {
+                            json!({
+                                "status": "success",
+                                "message": "IPC socket already exists",
+                                "ipc_path": &ipc_path
+                            })
+                        }
+                        Err(_) => {
+                            // IPC missing - this shouldn't happen in normal flow
+                            // but we can at least report it
+                            error!("IPC socket missing at {} even though ZMQ server is running", ipc_path);
+                            json!({
+                                "status": "error",
+                                "message": "IPC socket missing - server restart required",
+                                "ipc_path": &ipc_path
+                            })
+                        }
+                    }
+                }
                 // ── READ-ONLY COMMANDS ─────────────────────────────────────
                 Some(cmd) if [
                     "get_key",
@@ -4076,27 +4106,58 @@ impl SledDaemonPool {
         info!("Canonical port: {}", port);
         println!("===> CANONICAL PORT: {}", port);
 
-        // ---------- 1. REACHABILITY CHECK ----------
-        let ipc_path = format!("/tmp/graphdb-{}.ipc", port);
+        // ---------- 0. Check if daemon already exists in this pool ----------
+        if self.daemons.contains_key(&port) {
+            info!("Daemon already exists in pool for port {}", port);
+            println!("===> DAEMON ALREADY EXISTS IN POOL FOR PORT {}", port);
+            self.load_balancer.update_node_health(port, true, 0).await;
+            *initialized = true;
+            return Ok(());
+        }
+
+        // ---------- 1. Check for existing live daemon ----------
+        // DO NOT return early — we must ensure ZMQ IPC is created
+        let mut live_daemon_found = false;
+        if let Ok(Some(metadata)) = daemon_registry.get_daemon_metadata(port).await {
+            if is_pid_running(metadata.pid).await {
+                info!("Daemon already running on port {} (PID {}), but will ensure ZMQ IPC is ready", port, metadata.pid);
+                println!("===> DAEMON ALREADY RUNNING ON PORT {} (PID {}), ENSURING ZMQ IPC", port, metadata.pid);
+                live_daemon_found = true;
+            } else {
+                warn!("Found stale daemon registration for port {} (PID {} not running)", port, metadata.pid);
+                println!("===> WARNING: FOUND STALE DAEMON REGISTRATION FOR PORT {} (PID {} NOT RUNNING)", port, metadata.pid);
+            }
+        }
         
-        // Check if daemon is already running and reachable
-        if Path::new(&ipc_path).exists() {
-            if let Ok(Some(metadata)) = daemon_registry.get_daemon_metadata(port).await {
-                if is_pid_running(metadata.pid).await {
-                    info!("Daemon already running on port {}", port);
-                    println!("===> DAEMON ALREADY RUNNING ON PORT {}", port);
-                    self.load_balancer.update_node_health(port, true, 0).await;
-                    *initialized = true;
-                    return Ok(());
+        // Also check if ANY process is listening on this port
+        if !live_daemon_found && check_process_status_by_port("Storage Daemon", port).await {
+            warn!("Process already listening on port {}, but not yet in registry. Will wait then proceed.", port);
+            println!("===> WARNING: PROCESS ALREADY LISTENING ON PORT {}, WILL WAIT THEN PROCEED", port);
+            
+            // Wait up to 5 seconds for registration
+            for attempt in 0..10 {
+                tokio::time::sleep(TokioDuration::from_millis(500)).await;
+                if let Ok(Some(metadata)) = daemon_registry.get_daemon_metadata(port).await {
+                    if is_pid_running(metadata.pid).await {
+                        info!("Daemon registered itself on port {} after {} attempts", port, attempt + 1);
+                        println!("===> DAEMON REGISTERED ON PORT {} AFTER {} ATTEMPTS", port, attempt + 1);
+                        live_daemon_found = true;
+                        break;
+                    }
                 }
             }
-            // Stale IPC socket - remove it
+        }
+
+        let ipc_path = format!("/tmp/graphdb-{}.ipc", port);
+        
+        // Always clean up stale IPC socket
+        if Path::new(&ipc_path).exists() {
             warn!("Removing stale IPC socket at {}", ipc_path);
-            println!("===> WARNING: STALE IPC SOCKET FOUND AT {}. REMOVING.", ipc_path);
+            println!("===> REMOVING STALE IPC SOCKET AT {}", ipc_path);
             let _ = tokio_fs::remove_file(&ipc_path).await;
         }
 
-        // ---------- 2. PER-PORT PATH ----------
+        // ---------- 2. Per-port path ----------
         let db_path = storage_config
             .data_directory
             .as_ref()
@@ -4107,28 +4168,25 @@ impl SledDaemonPool {
         info!("Using Sled path: {:?}", db_path);
         println!("===> USING SLED PATH: {:?}", db_path);
 
-        // ---------- 3. CREATE DIR ----------
+        // ---------- 3. Create dir ----------
         if !db_path.exists() {
             info!("Creating Sled directory at {:?}", db_path);
             println!("===> CREATING SLED DIRECTORY AT {:?}", db_path);
-            tokio_fs::create_dir_all(&db_path).await
-                .map_err(|e| GraphError::Io(e.to_string()))?;
+            tokio_fs::create_dir_all(&db_path).await.map_err(|e| GraphError::Io(e.to_string()))?;
         }
 
-        // ---------- 4. FORCE UNLOCK ----------
+        // ---------- 4. Force unlock ----------
         SledClient::force_unlock(&db_path).await?;
         info!("Force unlocked database at {:?}", db_path);
         println!("===> FORCE UNLOCKED DATABASE AT {:?}", db_path);
 
-        // ---------- 5. WAL LEADER ELECTION ----------
+        // ---------- 5. WAL setup ----------
         let canonical_path = storage_config
             .data_directory
             .as_ref()
             .unwrap_or(&PathBuf::from("/opt/graphdb/storage_data"))
             .join("sled");
         let is_leader = become_wal_leader(&canonical_path).await?;
-
-        // ---------- 6. WAL REPLAY ----------
         let offset_file = canonical_path.join(format!("{}.offset", port));
         let start_offset = match tokio_fs::read_to_string(&offset_file).await {
             Ok(s) => s.trim().parse::<u64>().unwrap_or(0),
@@ -4136,7 +4194,7 @@ impl SledDaemonPool {
             Err(e) => return Err(GraphError::Io(e.to_string())),
         };
 
-        // ---------- 7. CREATE DAEMON ----------
+        // ---------- 6. Create new daemon ----------
         let mut daemon_config = config.clone();
         daemon_config.path = db_path.clone();
         daemon_config.port = Some(port);
@@ -4160,7 +4218,7 @@ impl SledDaemonPool {
             e
         })?;
 
-        // ---------- 8. WAIT FOR ZMQ ----------
+        // ---------- 7. Wait for ZMQ ----------
         info!("Waiting for ZMQ readiness signal on port {}", port);
         println!("===> WAITING FOR ZMQ READINESS SIGNAL ON PORT {}", port);
 
@@ -4177,12 +4235,12 @@ impl SledDaemonPool {
                 GraphError::StorageError("ZMQ readiness channel closed prematurely".into())
             })?;
 
-        // ---------- 9. VERIFY IPC ----------
+        // ---------- 8. Verify IPC ----------
         let mut ipc_check_attempts = 0;
         while !Path::new(&ipc_path).exists() && ipc_check_attempts < 10 {
             warn!("IPC file not found at {}, waiting... (attempt {})", ipc_path, ipc_check_attempts + 1);
             println!("===> WARNING: IPC FILE NOT FOUND AT {}, WAITING... (ATTEMPT {})", ipc_path, ipc_check_attempts + 1);
-            sleep(TokioDuration::from_millis(500)).await;
+            tokio::time::sleep(TokioDuration::from_millis(500)).await;
             ipc_check_attempts += 1;
         }
 
@@ -4195,7 +4253,7 @@ impl SledDaemonPool {
         info!("IPC file verified at {}", ipc_path);
         println!("===> ZMQ IPC FILE VERIFIED AT {}", ipc_path);
 
-        // ---------- 10. REGISTER ----------
+        // ---------- 9. Register/Update ----------
         let daemon_metadata = DaemonMetadata {
             service_type: "storage".to_string(),
             port,
@@ -4212,18 +4270,26 @@ impl SledDaemonPool {
             engine_synced: true,
         };
 
-        // Update offset file if leader
         if is_leader {
             let _ = tokio_fs::write(offset_file, start_offset.to_string().as_bytes()).await;
         }
 
-        daemon_registry.register_daemon(daemon_metadata).await
-            .map_err(|e| GraphError::StorageError(format!("Failed to register daemon on port {}: {}", port, e)))?;
+        match daemon_registry.register_daemon(daemon_metadata.clone()).await {
+            Ok(_) => {
+                info!("Successfully registered daemon on port {}", port);
+                println!("===> SUCCESSFULLY REGISTERED DAEMON ON PORT {}", port);
+            }
+            Err(e) => {
+                warn!("Failed to register daemon (may already exist), attempting update: {}", e);
+                println!("===> WARNING: FAILED TO REGISTER DAEMON, ATTEMPTING UPDATE: {}", e);
+                daemon_registry.update_daemon_metadata(daemon_metadata).await
+                    .map_err(|e2| GraphError::StorageError(format!("Failed to update daemon metadata on port {}: {}", port, e2)))?;
+                info!("Successfully updated daemon metadata on port {}", port);
+                println!("===> SUCCESSFULLY UPDATED DAEMON METADATA ON PORT {}", port);
+            }
+        }
 
-        info!("Successfully registered daemon on port {}", port);
-        println!("===> SUCCESSFULLY REGISTERED DAEMON ON PORT {}", port);
-
-        // ---------- 11. STORE ----------
+        // ---------- 10. Store ----------
         self.daemons.insert(port, Arc::new(daemon));
         self.load_balancer.update_node_health(port, true, 0).await;
         *initialized = true;
