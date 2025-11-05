@@ -88,201 +88,21 @@ impl SledStorage {
 
         Ok(())
     }
-pub async fn new(config: &SledConfig, storage_config: &StorageConfig) -> Result<SledStorage, GraphError> {
+
+    pub async fn new(
+        config: &SledConfig,
+        storage_config: &StorageConfig,
+    ) -> Result<SledStorage, GraphError> {
         let start_time = Instant::now();
         info!("Initializing SledStorage with config at {:?}", config.path);
         println!("===> INITIALIZING SLED STORAGE WITH PORT {:?}", config.port);
 
         let port = config.port.unwrap_or(DEFAULT_STORAGE_PORT);
         let ipc_endpoint = get_ipc_endpoint(port);
-
         let default_data_dir = PathBuf::from(DEFAULT_DATA_DIRECTORY);
         let base_data_dir = storage_config.data_directory.as_ref().unwrap_or(&default_data_dir);
         let db_path = base_data_dir.join("sled").join(port.to_string());
-        info!("Using Sled path (for identification only) {:?}", db_path);
-        println!("===> USING SLED PATH (FOR IDENTIFICATION ONLY) {:?}", db_path);
-        info!("Calculated ZMQ IPC endpoint: {}", ipc_endpoint);
-        println!("===> CALCULATED ZMQ IPC ENDPOINT: {}", ipc_endpoint);
 
-        #[cfg(not(feature = "compression"))]
-        if config.use_compression {
-            error!("Compression is enabled in config but Sled was compiled without compression feature");
-            println!("===> ERROR: COMPRESSION ENABLED BUT SLED COMPILED WITHOUT COMPRESSION FEATURE");
-            return Err(GraphError::StorageError(
-                "Sled compression feature is not enabled in this build.".to_string()
-            ));
-        }
-
-        // 1. Check GLOBAL_DAEMON_REGISTRY for existing daemon
-        let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
-        let mut existing_meta = None;
-
-        if let Some(meta) = daemon_registry.get_daemon_metadata(port).await? {
-            if meta.data_dir == Some(db_path.clone()) && meta.engine_type == Some("sled".to_string()) {
-                existing_meta = Some(meta);
-            }
-        }
-
-        if let Some(_meta) = existing_meta {
-            info!("Found existing Sled daemon on port {} with path {:?}", port, db_path);
-            println!("===> FOUND EXISTING SLED DAEMON ON PORT {} WITH PATH {:?}", port, db_path);
-            let pool_map = SLED_POOL_MAP.get_or_init(|| async {
-                TokioMutex::new(HashMap::new())
-            }).await;
-            let pool_map_guard = timeout(TokioDuration::from_secs(5), pool_map.lock()).await
-                .map_err(|_| {
-                    error!("Timeout acquiring pool map lock for port {}", port);
-                    println!("===> ERROR: TIMEOUT ACQUIRING POOL MAP LOCK FOR PORT {}", port);
-                    GraphError::StorageError("Timeout acquiring pool map lock".to_string())
-                })?;
-            if let Some(existing_pool) = pool_map_guard.get(&port) {
-                info!("Reusing existing SledDaemonPool for port {}", port);
-                println!("===> REUSING EXISTING SLED DAEMON POOL FOR PORT {}", port);
-                return Ok(SledStorage { pool: existing_pool.clone() });
-            }
-        }
-
-        // 2. Clean up stale daemon
-        Self::check_and_cleanup_stale_daemon(port, &db_path).await?;
-
-        // 3. Acquire or create the SledDaemonPool instance
-        let pool = {
-            let pool_map = SLED_POOL_MAP.get_or_init(|| async {
-                TokioMutex::new(HashMap::new())
-            }).await;
-            let mut pool_map_guard = timeout(TokioDuration::from_secs(5), pool_map.lock()).await
-                .map_err(|_| {
-                    error!("Failed to acquire pool map lock for port {}", port);
-                    println!("===> ERROR: FAILED TO ACQUIRE POOL MAP LOCK FOR PORT {}", port);
-                    GraphError::StorageError("Failed to acquire pool map lock".to_string())
-                })?;
-            if let Some(existing_pool) = pool_map_guard.get(&port) {
-                info!("Reusing existing SledDaemonPool for port {}", port);
-                println!("===> REUSING EXISTING SLED DAEMON POOL FOR PORT {}", port);
-                existing_pool.clone()
-            } else {
-                let new_pool = Arc::new(TokioMutex::new(SledDaemonPool::new()));
-                info!("Created new SledDaemonPool for port {}", port);
-                println!("===> CREATED NEW SLED DAEMON POOL FOR PORT {}", port);
-                pool_map_guard.insert(port, new_pool.clone());
-                new_pool
-            }
-        };
-
-        // 4. Initialize SledDaemonPool Cluster
-        {
-            let mut pool_guard = timeout(TokioDuration::from_secs(10), pool.lock()).await
-                .map_err(|_| {
-                    error!("Failed to acquire pool lock for initialization on port {}", port);
-                    println!("===> ERROR: FAILED TO ACQUIRE POOL LOCK FOR INITIALIZATION ON PORT {}", port);
-                    GraphError::StorageError("Failed to acquire pool lock for initialization".to_string())
-                })?;
-            info!("Initializing cluster with use_raft_for_scale: {}", storage_config.use_raft_for_scale);
-            println!("===> INITIALIZING CLUSTER WITH USE_RAFT_FOR_SCALE: {}", storage_config.use_raft_for_scale);
-            pool_guard.initialize_cluster(storage_config, config, Some(port)).await?;
-            info!("Initialized cluster on port {}", port);
-            println!("===> INITIALIZED CLUSTER ON PORT {}", port);
-        }
-
-        // 5. Initialize SLED_DB singleton with a temporary database
-        let sled_db_instance = SLED_DB.get_or_try_init(|| async {
-            info!("Initializing SLED_DB singleton for ZMQ client at port {}", port);
-            println!("===> INITIALIZING SLED_DB SINGLETON FOR ZMQ CLIENT AT PORT {}", port);
-            let temp_db = sled::Config::new()
-                .temporary(true)
-                .open()
-                .map_err(|e| GraphError::StorageError(e.to_string()))?;
-            Ok::<TokioMutex<SledDbWithPath>, GraphError>(TokioMutex::new(SledDbWithPath {
-                db: Arc::new(temp_db),
-                path: db_path.clone(),
-                client: None,
-            }))
-        }).await?;
-
-        // 6. Initialize ZMQ client
-        let client_tuple = {
-            const MAX_RETRIES: usize = 20;
-            const INITIAL_RETRY_DELAY_MS: u64 = 100;
-            let mut client_tuple_opt: Option<(SledClient, Arc<TokioMutex<ZmqSocketWrapper>>)> = None;
-            info!("Waiting for ZMQ IPC readiness at {}...", ipc_endpoint);
-            println!("===> WAITING FOR ZMQ IPC READINESS AT {}...", ipc_endpoint);
-
-            for i in 0..MAX_RETRIES {
-                match SledClient::connect_zmq_client_with_readiness_check(port).await {
-                    Ok(c_tuple) => {
-                        info!("ZMQ client connected successfully after {} retries.", i);
-                        println!("===> ZMQ CLIENT CONNECTED SUCCESSFULLY AFTER {} RETRIES", i);
-                        client_tuple_opt = Some(c_tuple);
-                        break;
-                    }
-                    Err(e) => {
-                        warn!("Attempt {}/{} to connect ZMQ client failed for endpoint {}: {}", i + 1, MAX_RETRIES, ipc_endpoint, e);
-                        println!("===> WARNING: ATTEMPT {}/{} TO CONNECT ZMQ CLIENT FAILED FOR ENDPOINT {}: {}", i + 1, MAX_RETRIES, ipc_endpoint, e);
-                        if i < MAX_RETRIES - 1 {
-                            sleep(TokioDuration::from_millis(INITIAL_RETRY_DELAY_MS * (1 << i))).await;
-                        } else {
-                            error!("Failed to connect ZMQ client after {} retries at {}: {}", MAX_RETRIES, ipc_endpoint, e);
-                            println!("===> ERROR: FAILED TO CONNECT ZMQ CLIENT AFTER {} RETRIES AT {}: {}", MAX_RETRIES, ipc_endpoint, e);
-                            return Err(GraphError::StorageError(format!("Failed to connect ZMQ client after {} retries at {}: {}", MAX_RETRIES, ipc_endpoint, e)));
-                        }
-                    }
-                }
-            }
-            client_tuple_opt.ok_or_else(|| {
-                error!("Failed to initialize ZMQ client after successful poll");
-                println!("===> ERROR: FAILED TO INITIALIZE ZMQ CLIENT AFTER SUCCESSFUL POLL");
-                GraphError::StorageError("Failed to initialize ZMQ client after successful poll".to_string())
-            })?
-        };
-
-        // 7. Store client tuple in SLED_DB singleton
-        let mut sled_db_guard = sled_db_instance.lock().await;
-        sled_db_guard.client = Some(client_tuple);
-        drop(sled_db_guard);
-
-        // 8. Register daemon in GLOBAL_DAEMON_REGISTRY only
-        let general_daemon_metadata = DaemonMetadata {
-            service_type: "storage".to_string(),
-            port,
-            pid: std::process::id(),
-            ip_address: config.host.clone().unwrap_or("127.0.0.1".to_string()),
-            data_dir: Some(db_path.clone()),
-            config_path: storage_config.config_root_directory.clone().map(PathBuf::from),
-            engine_type: Some("sled".to_string()),
-            last_seen_nanos: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64,
-            zmq_ready: true,
-            engine_synced: true,
-        };
-
-        if let Err(e) = daemon_registry.register_daemon(general_daemon_metadata).await {
-            error!("Failed to register daemon in GLOBAL_DAEMON_REGISTRY for port {}: {}", port, e);
-            println!("===> ERROR: FAILED TO REGISTER DAEMON IN GLOBAL_DAEMON_REGISTRY FOR PORT {}: {}", port, e);
-            return Err(GraphError::StorageError(format!("Failed to register daemon in GLOBAL_DAEMON_REGISTRY: {}", e)));
-        }
-
-        info!("Registered daemon for port {} in GLOBAL_DAEMON_REGISTRY", port);
-        println!("===> REGISTERED DAEMON FOR PORT {} IN GLOBAL_DAEMON_REGISTRY", port);
-        info!("Successfully initialized SledStorage in {}ms", start_time.elapsed().as_millis());
-        println!("===> SUCCESSFULLY INITIALIZED SledStorage IN {}ms", start_time.elapsed().as_millis());
-
-        Ok(SledStorage { pool })
-    }
-    
-    pub async fn new_with_db(
-        config: &SledConfig,
-        storage_config: &StorageConfig,
-        existing_db: Arc<sled::Db>,
-    ) -> Result<SledStorage, GraphError> {
-        let start_time = Instant::now();
-        info!("Initializing SledStorage with existing database at {:?}", config.path);
-        println!("===> INITIALIZING SLED STORAGE WITH EXISTING DB WITH PORT {:?}", config.port);
-
-        let port = config.port.unwrap_or(DEFAULT_STORAGE_PORT);
-        let ipc_endpoint = get_ipc_endpoint(port);
-
-        let default_data_dir = PathBuf::from(DEFAULT_DATA_DIRECTORY);
-        let base_data_dir = storage_config.data_directory.as_ref().unwrap_or(&default_data_dir);
-        let db_path = base_data_dir.join("sled").join(port.to_string());
         info!("Using Sled path (for identification only) {:?}", db_path);
         println!("===> USING SLED PATH (FOR IDENTIFICATION ONLY) {:?}", db_path);
         info!("Calculated ZMQ IPC endpoint: {}", ipc_endpoint);
@@ -297,25 +117,22 @@ pub async fn new(config: &SledConfig, storage_config: &StorageConfig) -> Result<
             ));
         }
 
-        // === 1. Check GLOBAL_DAEMON_REGISTRY only ===
+        // === 1. Check GLOBAL_DAEMON_REGISTRY for existing healthy daemon ===
         let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
-        let existing_meta = daemon_registry.get_daemon_metadata(port).await?;
+        if let Some(meta) = daemon_registry.get_daemon_metadata(port).await? {
+            if meta.data_dir == Some(db_path.clone())
+                && meta.engine_type == Some("sled".to_string())
+                && meta.pid > 0
+                && check_pid_validity(meta.pid).await
+                && meta.zmq_ready
+            {
+                info!("Reusing healthy Sled daemon from registry: PID {} on port {}", meta.pid, port);
+                println!("===> REUSING HEALTHY SLED DAEMON FROM REGISTRY: PID {} ON PORT {}", meta.pid, port);
 
-        if let Some(meta) = existing_meta {
-            if meta.data_dir == Some(db_path.clone()) && meta.engine_type == Some("sled".to_string()) {
-                info!("Found existing Sled daemon on port {} with path {:?}", port, db_path);
-                println!("===> FOUND EXISTING SLED DAEMON ON PORT {} WITH PATH {:?}", port, db_path);
-
-                let pool_map = SLED_POOL_MAP.get_or_init(|| async {
-                    TokioMutex::new(HashMap::new())
-                }).await;
-
+                // Reuse existing pool
+                let pool_map = SLED_POOL_MAP.get_or_init(|| async { TokioMutex::new(HashMap::new()) }).await;
                 let pool_map_guard = timeout(TokioDuration::from_secs(5), pool_map.lock()).await
-                    .map_err(|_| {
-                        error!("Timeout acquiring pool map lock for port {}", port);
-                        println!("===> ERROR: TIMEOUT ACQUIRING POOL MAP LOCK FOR PORT {}", port);
-                        GraphError::StorageError("Timeout acquiring pool map lock".to_string())
-                    })?;
+                    .map_err(|_| GraphError::StorageError("Timeout acquiring pool map lock".to_string()))?;
 
                 if let Some(existing_pool) = pool_map_guard.get(&port) {
                     info!("Reusing existing SledDaemonPool for port {}", port);
@@ -325,21 +142,14 @@ pub async fn new(config: &SledConfig, storage_config: &StorageConfig) -> Result<
             }
         }
 
-        // === 2. Clean up stale daemon ===
+        // === 2. Clean up stale daemon (only if not healthy) ===
         Self::check_and_cleanup_stale_daemon(port, &db_path).await?;
 
         // === 3. Acquire or create SledDaemonPool ===
         let pool = {
-            let pool_map = SLED_POOL_MAP.get_or_init(|| async {
-                TokioMutex::new(HashMap::new())
-            }).await;
-
+            let pool_map = SLED_POOL_MAP.get_or_init(|| async { TokioMutex::new(HashMap::new()) }).await;
             let mut pool_map_guard = timeout(TokioDuration::from_secs(5), pool_map.lock()).await
-                .map_err(|_| {
-                    error!("Failed to acquire pool map lock for port {}", port);
-                    println!("===> ERROR: FAILED TO ACQUIRE POOL MAP LOCK FOR PORT {}", port);
-                    GraphError::StorageError("Failed to acquire pool map lock".to_string())
-                })?;
+                .map_err(|_| GraphError::StorageError("Failed to acquire pool map lock".to_string()))?;
 
             if let Some(existing_pool) = pool_map_guard.get(&port) {
                 info!("Reusing existing SledDaemonPool for port {}", port);
@@ -354,53 +164,28 @@ pub async fn new(config: &SledConfig, storage_config: &StorageConfig) -> Result<
             }
         };
 
-        // === 4. Initialize cluster with existing DB ===
+        // === 4. Initialize cluster ===
         {
             let mut pool_guard = timeout(TokioDuration::from_secs(10), pool.lock()).await
-                .map_err(|_| {
-                    error!("Failed to acquire pool lock for initialization on port {}", port);
-                    println!("===> ERROR: FAILED TO ACQUIRE POOL LOCK FOR INITIALIZATION ON PORT {}", port);
-                    GraphError::StorageError("Failed to acquire pool lock for initialization".to_string())
-                })?;
+                .map_err(|_| GraphError::StorageError("Failed to acquire pool lock".to_string()))?;
 
             info!("Initializing cluster with use_raft_for_scale: {}", storage_config.use_raft_for_scale);
             println!("===> INITIALIZING CLUSTER WITH USE_RAFT_FOR_SCALE: {}", storage_config.use_raft_for_scale);
-
-            pool_guard
-                .initialize_cluster_with_db(storage_config, config, Some(port), existing_db.clone())
-                .await?;
-
-            info!("Initialized cluster on port {} with existing DB", port);
-            println!("===> INITIALIZED CLUSTER ON PORT {} WITH EXISTING DB", port);
+            pool_guard.initialize_cluster(storage_config, config, Some(port)).await?;
+            info!("Initialized cluster on port {}", port);
+            println!("===> INITIALIZED CLUSTER ON PORT {}", port);
         }
 
-        // === 5. Initialize SLED_DB singleton ===
+        // === 5. Initialize SLED_DB singleton (temp) ===
         let sled_db_instance = SLED_DB.get_or_try_init(|| async {
-            info!("Storing provided Sled database in singleton at {:?}", db_path);
-            println!("===> STORING PROVIDED SLED DB IN SINGLETON AT {:?}", db_path);
-
-            let vertices = existing_db.open_tree("vertices").map_err(|e| GraphError::StorageError(e.to_string()))?;
-            let edges = existing_db.open_tree("edges").map_err(|e| GraphError::StorageError(e.to_string()))?;
-            let kv_pairs = existing_db.open_tree("kv_pairs").map_err(|e| GraphError::StorageError(e.to_string()))?;
-
-            let kv_count = existing_db.iter().count();
-            info!(
-                "Opened database at {:?} with {} kv_pairs, {} vertices, {} edges",
-                db_path,
-                kv_count,
-                vertices.iter().count(),
-                edges.iter().count()
-            );
-            println!(
-                "===> OPENED DATABASE AT {:?} WITH {} KV_PAIRS, {} VERTICES, {} EDGES",
-                db_path,
-                kv_count,
-                vertices.iter().count(),
-                edges.iter().count()
-            );
-
+            info!("Initializing SLED_DB singleton for ZMQ client at port {}", port);
+            println!("===> INITIALIZING SLED_DB SINGLETON FOR ZMQ CLIENT AT PORT {}", port);
+            let temp_db = sled::Config::new()
+                .temporary(true)
+                .open()
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
             Ok::<TokioMutex<SledDbWithPath>, GraphError>(TokioMutex::new(SledDbWithPath {
-                db: existing_db.clone(),
+                db: Arc::new(temp_db),
                 path: db_path.clone(),
                 client: None,
             }))
@@ -424,96 +209,162 @@ pub async fn new(config: &SledConfig, storage_config: &StorageConfig) -> Result<
                         break;
                     }
                     Err(e) => {
-                        warn!(
-                            "Attempt {}/{} to connect ZMQ client failed for endpoint {}: {}",
-                            i + 1,
-                            MAX_RETRIES,
-                            ipc_endpoint,
-                            e
-                        );
-                        println!(
-                            "===> WARNING: ATTEMPT {}/{} TO CONNECT ZMQ CLIENT FAILED FOR ENDPOINT {}: {}",
-                            i + 1,
-                            MAX_RETRIES,
-                            ipc_endpoint,
-                            e
-                        );
+                        warn!("Attempt {}/{} to connect ZMQ client failed: {}", i + 1, MAX_RETRIES, e);
+                        println!("===> WARNING: ATTEMPT {}/{} TO CONNECT ZMQ CLIENT FAILED: {}", i + 1, MAX_RETRIES, e);
                         if i < MAX_RETRIES - 1 {
                             sleep(TokioDuration::from_millis(INITIAL_RETRY_DELAY_MS * (1 << i))).await;
-                        } else {
-                            error!(
-                                "Failed to connect ZMQ client after {} retries at {}: {}",
-                                MAX_RETRIES, ipc_endpoint, e
-                            );
-                            println!(
-                                "===> ERROR: FAILED TO CONNECT ZMQ CLIENT AFTER {} RETRIES AT {}: {}",
-                                MAX_RETRIES, ipc_endpoint, e
-                            );
-                            return Err(GraphError::StorageError(format!(
-                                "Failed to connect ZMQ client after {} retries at {}: {}",
-                                MAX_RETRIES, ipc_endpoint, e
-                            )));
                         }
                     }
                 }
             }
 
             client_tuple_opt.ok_or_else(|| {
-                error!("Failed to initialize ZMQ client after successful poll");
-                println!("===> ERROR: FAILED TO INITIALIZE ZMQ CLIENT AFTER SUCCESSFUL POLL");
-                GraphError::StorageError("Failed to initialize ZMQ client after successful poll".to_string())
+                error!("Failed to connect ZMQ client after {} retries", MAX_RETRIES);
+                GraphError::StorageError("Failed to connect ZMQ client".to_string())
             })?
         };
 
-        // === 7. Store client in SLED_DB singleton ===
+        // === 7. Store client in singleton ===
         {
             let mut sled_db_guard = sled_db_instance.lock().await;
             sled_db_guard.client = Some(client_tuple);
         }
 
-        // === 8. Register in GLOBAL_DAEMON_REGISTRY only ===
-        let general_daemon_metadata = DaemonMetadata {
-            service_type: "storage".to_string(),
-            port,
-            pid: std::process::id(),
-            ip_address: config.host.clone().unwrap_or("127.0.0.1".to_string()),
-            data_dir: Some(db_path.clone()),
-            config_path: storage_config.config_root_directory.clone().map(PathBuf::from),
-            engine_type: Some("sled".to_string()),
-            last_seen_nanos: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos() as i64,
-            zmq_ready: false,
-            engine_synced: false,
-        };
+        // === 8. DO NOT REGISTER DAEMON HERE — CLI already did it ===
+        info!("Successfully initialized SledStorage in {}ms", start_time.elapsed().as_millis());
+        println!("===> SUCCESSFULLY INITIALIZED SledStorage IN {}ms", start_time.elapsed().as_millis());
 
-        if let Err(e) = daemon_registry.register_daemon(general_daemon_metadata).await {
-            error!("Failed to register daemon in GLOBAL_DAEMON_REGISTRY for port {}: {}", port, e);
-            println!(
-                "===> ERROR: FAILED TO REGISTER DAEMON IN GLOBAL_DAEMON_REGISTRY FOR PORT {}: {}",
-                port, e
-            );
-            return Err(GraphError::StorageError(format!(
-                "Failed to register daemon in GLOBAL_DAEMON_REGISTRY: {}",
-                e
-            )));
+        Ok(SledStorage { pool })
+    }
+
+    pub async fn new_with_db(
+        config: &SledConfig,
+        storage_config: &StorageConfig,
+        existing_db: Arc<sled::Db>,
+    ) -> Result<SledStorage, GraphError> {
+        let start_time = Instant::now();
+        info!("Initializing SledStorage with existing database at {:?}", config.path);
+        println!("===> INITIALIZING SLED STORAGE WITH EXISTING DB WITH PORT {:?}", config.port);
+
+        let port = config.port.unwrap_or(DEFAULT_STORAGE_PORT);
+        let ipc_endpoint = get_ipc_endpoint(port);
+        let default_data_dir = PathBuf::from(DEFAULT_DATA_DIRECTORY);
+        let base_data_dir = storage_config.data_directory.as_ref().unwrap_or(&default_data_dir);
+        let db_path = base_data_dir.join("sled").join(port.to_string());
+
+        info!("Using Sled path (for identification only) {:?}", db_path);
+        println!("===> USING SLED PATH (FOR IDENTIFICATION ONLY) {:?}", db_path);
+        info!("Calculated ZMQ IPC endpoint: {}", ipc_endpoint);
+        println!("===> CALCULATED ZMQ IPC ENDPOINT: {}", ipc_endpoint);
+
+        #[cfg(not(feature = "compression"))]
+        if config.use_compression {
+            return Err(GraphError::StorageError(
+                "Sled compression feature is not enabled in this build.".to_string(),
+            ));
         }
 
-        info!("Successfully registered daemon for port {} in GLOBAL_DAEMON_REGISTRY", port);
-        println!(
-            "===> SUCCESSFULLY REGISTERED DAEMON FOR PORT {} IN GLOBAL_DAEMON_REGISTRY",
-            port
-        );
+        // === 1. Reuse healthy daemon from registry ===
+        let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
+        if let Some(meta) = daemon_registry.get_daemon_metadata(port).await? {
+            if meta.data_dir == Some(db_path.clone())
+                && meta.engine_type == Some("sled".to_string())
+                && meta.pid > 0
+                && check_pid_validity(meta.pid).await
+                && meta.zmq_ready
+            {
+                info!("Reusing healthy Sled daemon from registry: PID {} on port {}", meta.pid, port);
+                println!("===> REUSING HEALTHY SLED DAEMON FROM REGISTRY: PID {} ON PORT {}", meta.pid, port);
 
-        info!(
-            "Successfully initialized SledStorage with existing DB in {}ms",
-            start_time.elapsed().as_millis()
-        );
-        println!(
-            "===> SUCCESSFULLY INITIALIZED SledStorage WITH EXISTING DB IN {}ms",
-            start_time.elapsed().as_millis()
-        );
+                let pool_map = SLED_POOL_MAP.get_or_init(|| async { TokioMutex::new(HashMap::new()) }).await;
+                let pool_map_guard = timeout(TokioDuration::from_secs(5), pool_map.lock()).await
+                    .map_err(|_| GraphError::StorageError("Timeout acquiring pool map lock".to_string()))?;
+
+                if let Some(existing_pool) = pool_map_guard.get(&port) {
+                    return Ok(SledStorage { pool: existing_pool.clone() });
+                }
+            }
+        }
+
+        // === 2. Clean up stale ===
+        Self::check_and_cleanup_stale_daemon(port, &db_path).await?;
+
+        // === 3. Create or get pool ===
+        let pool = {
+            let pool_map = SLED_POOL_MAP.get_or_init(|| async { TokioMutex::new(HashMap::new()) }).await;
+            let mut pool_map_guard = timeout(TokioDuration::from_secs(5), pool_map.lock()).await
+                .map_err(|_| GraphError::StorageError("Failed to acquire pool map lock".to_string()))?;
+
+            if let Some(existing_pool) = pool_map_guard.get(&port) {
+                existing_pool.clone()
+            } else {
+                let new_pool = Arc::new(TokioMutex::new(SledDaemonPool::new()));
+                pool_map_guard.insert(port, new_pool.clone());
+                new_pool
+            }
+        };
+
+        // === 4. Initialize cluster with existing DB ===
+        {
+            let mut pool_guard = timeout(TokioDuration::from_secs(10), pool.lock()).await
+                .map_err(|_| GraphError::StorageError("Failed to acquire pool lock".to_string()))?;
+
+            pool_guard
+                .initialize_cluster_with_db(storage_config, config, Some(port), existing_db.clone())
+                .await?;
+        }
+
+        // === 5. Store in singleton ===
+        let sled_db_instance = SLED_DB.get_or_try_init(|| async {
+            let vertices = existing_db.open_tree("vertices").map_err(|e| GraphError::StorageError(e.to_string()))?;
+            let edges = existing_db.open_tree("edges").map_err(|e| GraphError::StorageError(e.to_string()))?;
+            let kv_pairs = existing_db.open_tree("kv_pairs").map_err(|e| GraphError::StorageError(e.to_string()))?;
+            let kv_count = existing_db.iter().count();
+            info!(
+                "Opened database at {:?} with {} kv_pairs, {} vertices, {} edges",
+                db_path, kv_count, vertices.iter().count(), edges.iter().count()
+            );
+            println!(
+                "===> OPENED DATABASE AT {:?} WITH {} KV_PAIRS, {} VERTICES, {} EDGES",
+                db_path, kv_count, vertices.iter().count(), edges.iter().count()
+            );
+            Ok::<TokioMutex<SledDbWithPath>, GraphError>(TokioMutex::new(SledDbWithPath {
+                db: existing_db.clone(),
+                path: db_path.clone(),
+                client: None,
+            }))
+        }).await?;
+
+        // === 6. ZMQ client ===
+        let client_tuple = {
+            const MAX_RETRIES: usize = 20;
+            let mut client_tuple_opt: Option<(SledClient, Arc<TokioMutex<ZmqSocketWrapper>>)> = None;
+            for i in 0..MAX_RETRIES {
+                match SledClient::connect_zmq_client_with_readiness_check(port).await {
+                    Ok(c_tuple) => {
+                        client_tuple_opt = Some(c_tuple);
+                        break;
+                    }
+                    Err(e) => {
+                        if i == MAX_RETRIES - 1 {
+                            return Err(GraphError::StorageError(format!("ZMQ connect failed: {}", e)));
+                        }
+                        sleep(TokioDuration::from_millis(100 * (1 << i))).await;
+                    }
+                }
+            }
+            client_tuple_opt.unwrap()
+        };
+
+        // === 7. Store client ===
+        {
+            let mut guard = sled_db_instance.lock().await;
+            guard.client = Some(client_tuple);
+        }
+
+        // === 8. NO REGISTRATION HERE ===
+        info!("Successfully initialized SledStorage with existing DB in {}ms", start_time.elapsed().as_millis());
+        println!("===> SUCCESSFULLY INITIALIZED SledStorage WITH EXISTING DB IN {}ms", start_time.elapsed().as_millis());
 
         Ok(SledStorage { pool })
     }
