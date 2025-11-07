@@ -1,4 +1,4 @@
-// server/src/cli/interactive.rs
+interactive.rs : // server/src/cli/interactive.rs
 use anyhow::{Result, Context, anyhow};
 use rustyline::error::ReadlineError;
 use rustyline::{DefaultEditor, history::DefaultHistory};
@@ -26,7 +26,6 @@ use crate::cli::help_display::{
 use crate::cli::handlers_utils::{parse_show_command};
 pub use lib::config::{StorageEngineType};
 use lib::query_exec_engine::query_exec_engine::QueryExecEngine;
-
 struct SharedState {
     daemon_handles: Arc<TokioMutex<HashMap<u16, (JoinHandle<()>, oneshot::Sender<()>)>>>,
     rest_api_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
@@ -37,8 +36,6 @@ struct SharedState {
     storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
     query_engine: Arc<TokioMutex<Option<Arc<QueryExecEngine>>>>,
 }
-
-// === Levenshtein distance for fuzzy matching ===
 fn levenshtein_distance(s1: &str, s2: &str) -> usize {
     let s1_chars: Vec<char> = s1.chars().collect();
     let s2_chars: Vec<char> = s2.chars().collect();
@@ -47,8 +44,12 @@ fn levenshtein_distance(s1: &str, s2: &str) -> usize {
     if m == 0 { return n; }
     if n == 0 { return m; }
     let mut dp = vec![vec![0; n + 1]; m + 1];
-    for i in 0..=m { dp[i][0] = i; }
-    for j in 0..=n { dp[0][j] = j; }
+    for i in 0..=m {
+        dp[i][0] = i;
+    }
+    for j in 0..=n {
+        dp[0][j] = j;
+    }
     for i in 1..=m {
         for j in 1..=n {
             let cost = if s1_chars[i - 1] == s2_chars[j - 1] { 0 } else { 1 };
@@ -59,96 +60,22 @@ fn levenshtein_distance(s1: &str, s2: &str) -> usize {
     }
     dp[m][n]
 }
-
-// === Helper: Strip surrounding double quotes ===
-fn strip_surrounding_quotes(s: &str) -> String {
-    let trimmed = s.trim();
-    if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
-        trimmed[1..trimmed.len() - 1].to_owned()
-    } else {
-        trimmed.to_owned()
-    }
-}
-
-// === RAW QUERY AUTO-DETECTION (SQL / Cypher / GraphQL) ===
-fn detect_raw_query_language(line: &str) -> Option<(&'static str, String)> {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let upper = trimmed.to_ascii_uppercase();
-
-    // ---- SQL ----
-    if upper.starts_with("SELECT ")
-        || upper.starts_with("INSERT ")
-        || upper.starts_with("UPDATE ")
-        || upper.starts_with("DELETE ")
-        || upper.starts_with("WITH ")
-        || upper.starts_with("CREATE ")
-        || upper.starts_with("DROP ")
-        || upper.starts_with("ALTER ")
-    {
-        return Some(("sql", trimmed.to_string()));
-    }
-
-    // ---- Cypher ----
-    let lower = trimmed.to_ascii_lowercase();
-    if lower.starts_with("match ")
-        || lower.starts_with("create ")
-        || lower.starts_with("merge ")
-        || lower.starts_with("return ")
-        || lower.starts_with("optional match ")
-        || lower.starts_with("detach delete ")
-        || lower.starts_with("remove ")
-        || lower.starts_with("set ")
-    {
-        return Some(("cypher", trimmed.to_string()));
-    }
-
-    // ---- GraphQL ----
-    if trimmed.starts_with('{')
-        || lower.starts_with("query ")
-        || lower.starts_with("mutation ")
-    {
-        return Some(("graphql", trimmed.to_string()));
-    }
-
-    None
-}
-
-// === Main command parser (raw queries are detected BEFORE parsing) ===
 pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
     if parts.is_empty() {
         return (CommandType::Unknown, Vec::new());
     }
-
-    // Join back the parts – we need the original line for raw-query detection
-    let full_line = parts.join(" ");
-
-    // ---- RAW QUERY SHORT-CIRCUIT ----
-    if let Some((lang, query)) = detect_raw_query_language(&full_line) {
-        return (
-            CommandType::Query {
-                query,
-                language: Some(lang.to_string()),
-            },
-            Vec::new(),
-        );
-    }
-
-    // Normal CLI command parsing
     let command_str = parts[0].to_lowercase();
-    let remaining_args = parts[1..].to_vec();
-
+    let remaining_args: Vec<String> = parts[1..].to_vec();
     let top_level_commands = vec![
-        "start", "stop", "status", "auth", "authenticate", "register", "version", "health",
-        "reload", "restart", "clear", "help", "exit", "daemon", "rest", "storage", "use",
-        "quit", "q", "clean", "save", "show", "kv", "query", "exec", "migrate",
+        "start", "stop", "status", "auth", "authenticate", "register",
+        "version", "health", "reload", "restart", "clear", "help", "exit",
+        "daemon", "rest", "storage", "use", "quit", "q", "clean", "save", "show",
+        "kv", "query", "migrate",
     ];
     const FUZZY_MATCH_THRESHOLD: usize = 2;
-
-    let cmd_type = match command_str.as_str() {
+    let cmd_type;
+    let parsed_remaining_args = remaining_args.clone();
+    cmd_type = match command_str.as_str() {
         "exit" | "quit" | "q" => CommandType::Exit,
         "clear" | "clean" => CommandType::Clear,
         "version" => CommandType::Version,
@@ -304,7 +231,9 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                         explicit_subcommand = Some(remaining_args[0].to_lowercase());
                         current_subcommand_index = 1;
                     }
-                    _ => { current_subcommand_index = 0; }
+                    _ => {
+                        current_subcommand_index = 0;
+                    }
                 }
             }
             let mut i = current_subcommand_index;
@@ -408,28 +337,47 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
             }
             match explicit_subcommand.as_deref() {
                 Some("all") => CommandType::StartAll {
-                    port, cluster, daemon_port, daemon_cluster, listen_port,
-                    rest_port, rest_cluster, storage_port, storage_cluster, storage_config_file,
+                    port,
+                    cluster,
+                    daemon_port,
+                    daemon_cluster,
+                    listen_port,
+                    rest_port,
+                    rest_cluster,
+                    storage_port,
+                    storage_cluster,
+                    storage_config_file,
                 },
                 Some("daemon") => CommandType::StartDaemon {
                     port: Some(daemon_port.unwrap_or(port.unwrap_or_default())),
                     cluster: daemon_cluster.clone().or(cluster.clone()),
-                    daemon_port, daemon_cluster,
+                    daemon_port,
+                    daemon_cluster,
                 },
                 Some("rest") => CommandType::StartRest {
                     port: Some(rest_port.unwrap_or(listen_port.unwrap_or(port.unwrap_or_default()))),
                     cluster: rest_cluster.clone().or(cluster.clone()),
-                    rest_port, rest_cluster,
+                    rest_port,
+                    rest_cluster,
                 },
                 Some("storage") => CommandType::StartStorage {
                     port: Some(storage_port.unwrap_or(port.unwrap_or_default())),
                     config_file: storage_config_file,
                     cluster: storage_cluster.clone().or(cluster.clone()),
-                    storage_port, storage_cluster,
+                    storage_port,
+                    storage_cluster,
                 },
                 None => CommandType::StartAll {
-                    port, cluster, daemon_port, daemon_cluster, listen_port,
-                    rest_port, rest_cluster, storage_port, storage_cluster, storage_config_file,
+                    port,
+                    cluster,
+                    daemon_port,
+                    daemon_cluster,
+                    listen_port,
+                    rest_port,
+                    rest_cluster,
+                    storage_port,
+                    storage_cluster,
+                    storage_config_file,
                 },
                 _ => CommandType::Unknown,
             }
@@ -506,7 +454,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
         },
         "reload" => {
             if remaining_args.is_empty() {
-                eprintln!("Usage: reload [all|rest|storage|daemon|cluster] [--port ]");
+                eprintln!("Usage: reload [all|rest|storage|daemon|cluster] [--port <port>]");
                 CommandType::Unknown
             } else {
                 match remaining_args[0].to_lowercase().as_str() {
@@ -614,7 +562,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                 "--daemon-cluster" => {
                                     if i + 1 < remaining_args.len() {
                                         daemon_cluster = Some(remaining_args[i + 1].clone());
-                                        i += 2;
+                                        i += 1;
                                     } else {
                                         eprintln!("Warning: Flag '{}' requires a value.", remaining_args[i]);
                                         i += 1;
@@ -711,7 +659,8 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                         CommandType::RestartRest {
                             port: Some(rest_port.unwrap_or(port.unwrap_or_default())),
                             cluster: rest_cluster.clone().or(cluster.clone()),
-                            rest_port, rest_cluster
+                            rest_port,
+                            rest_cluster
                         }
                     },
                     "storage" => {
@@ -846,10 +795,15 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
         },
         "auth" | "authenticate" => {
             if remaining_args.len() >= 2 {
-                CommandType::Authenticate {
-                    username: remaining_args[0].clone(),
-                    password: remaining_args[1].clone()
-                }
+                CommandType::Authenticate { username: remaining_args[0].clone(), password: remaining_args[1].clone() }
+            } else {
+                eprintln!("Usage: auth/authenticate <username> <password>");
+                CommandType::Unknown
+            }
+        },
+        "auth" | "authenticate" => {
+            if remaining_args.len() >= 2 {
+                CommandType::Authenticate { username: remaining_args[0].clone(), password: remaining_args[1].clone() }
             } else {
                 eprintln!("Usage: auth/authenticate <username> <password>");
                 CommandType::Unknown
@@ -857,10 +811,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
         },
         "register" => {
             if remaining_args.len() >= 2 {
-                CommandType::RegisterUser {
-                    username: remaining_args[0].clone(),
-                    password: remaining_args[1].clone()
-                }
+                CommandType::RegisterUser { username: remaining_args[0].clone(), password: remaining_args[1].clone() }
             } else {
                 eprintln!("Usage: register <username> <password>");
                 CommandType::Unknown
@@ -868,7 +819,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
         },
         "use" => {
             if remaining_args.is_empty() {
-                eprintln!("Usage: use [storage [--permanent] [--migrate]|plugin [--enable <bool>]]");
+                eprintln!("Usage: use [storage <engine> [--permanent] [--migrate]|plugin [--enable <bool>]]");
                 CommandType::Unknown
             } else {
                 match remaining_args[0].to_lowercase().as_str() {
@@ -890,7 +841,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                         "Unknown storage engine: {}. Supported: sled, rocksdb, rocks-db, inmemory, in-memory, redis, postgres, postgresql, postgre-sql, mysql, my-sql",
                                         remaining_args[1]
                                     );
-                                    return (CommandType::Unknown, remaining_args.clone());
+                                    return (CommandType::Unknown, parsed_remaining_args);
                                 }
                             };
                             let mut permanent = false;
@@ -898,8 +849,14 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                             let mut i = 2;
                             while i < remaining_args.len() {
                                 match remaining_args[i].to_lowercase().as_str() {
-                                    "--permanent" => { permanent = true; i += 1; }
-                                    "--migrate" => { migrate = true; i += 1; }
+                                    "--permanent" => {
+                                        permanent = true;
+                                        i += 1;
+                                    }
+                                    "--migrate" => {
+                                        migrate = true;
+                                        i += 1;
+                                    }
                                     _ => {
                                         eprintln!("Warning: Unknown argument for 'use storage': {}", remaining_args[i]);
                                         i += 1;
@@ -916,7 +873,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                             match remaining_args[i].to_lowercase().as_str() {
                                 "--enable" => {
                                     if i + 1 < remaining_args.len() {
-                                        enable = remaining_args[i + 1].parse::<bool>().ok();
+                                        enable = Some(remaining_args[i + 1].parse::<bool>().ok().unwrap_or_default());
                                         i += 2;
                                     } else {
                                         eprintln!("Warning: Flag '--enable' requires a boolean value.");
@@ -1066,13 +1023,12 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                     }
                 }
                 CommandType::Daemon(DaemonCliCommand::Status { port, cluster })
-            } else {
-                CommandType::Unknown
             }
+            else { CommandType::Unknown }
         },
         "rest" => {
             if remaining_args.is_empty() {
-                eprintln!("Usage: rest <subcommand>");
+                eprintln!("Usage: rest <start|stop|status|health|version|register-user|authenticate|graph-query|storage-query>");
                 CommandType::Unknown
             } else {
                 let rest_subcommand = remaining_args[0].to_lowercase();
@@ -1150,7 +1106,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                         rest_port,
                         rest_cluster
                     }),
-                    "stop" => CommandType::Rest(RestCliCommand::Stop { port }),
+                    "stop" => CommandType::Rest(RestCliCommand::Stop { port } ),
                     "status" => CommandType::Rest(RestCliCommand::Status { port, cluster }),
                     "health" => CommandType::Rest(RestCliCommand::Health),
                     "version" => CommandType::Rest(RestCliCommand::Version),
@@ -1174,7 +1130,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                         if let Some(q) = query_string {
                             CommandType::Rest(RestCliCommand::GraphQuery { query_string: q, persist })
                         } else {
-                            eprintln!("Usage: rest graph-query <query> [--persist]");
+                            eprintln!("Usage: rest graph-query <query_string> [--persist]");
                             CommandType::Unknown
                         }
                     }
@@ -1194,7 +1150,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
         },
         "storage" => {
             if remaining_args.is_empty() {
-                eprintln!("Usage: storage <subcommand>");
+                eprintln!("Usage: storage <start|stop|status|health|version|storage-query>");
                 CommandType::Unknown
             } else {
                 let storage_subcommand = remaining_args[0].to_lowercase();
@@ -1290,7 +1246,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                             i += 2;
                         } else {
                             eprintln!("Warning: Flag '--key' requires a value.");
-                            return (CommandType::Unknown, remaining_args.clone());
+                            return (CommandType::Unknown, parsed_remaining_args);
                         }
                     }
                     "--value" => {
@@ -1299,7 +1255,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                             i += 2;
                         } else {
                             eprintln!("Warning: Flag '--value' requires a value.");
-                            return (CommandType::Unknown, remaining_args.clone());
+                            return (CommandType::Unknown, parsed_remaining_args);
                         }
                     }
                     _ => {
@@ -1312,11 +1268,11 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                 i += 1;
                             } else {
                                 eprintln!("Warning: Unrecognized argument: {}", remaining_args[i]);
-                                return (CommandType::Unknown, remaining_args.clone());
+                                return (CommandType::Unknown, parsed_remaining_args);
                             }
                         } else {
                             eprintln!("Warning: Unrecognized argument: {}", remaining_args[i]);
-                            return (CommandType::Unknown, remaining_args.clone());
+                            return (CommandType::Unknown, parsed_remaining_args);
                         }
                     }
                 }
@@ -1328,7 +1284,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                             if let Some(key) = key {
                                 CommandType::Kv { action: KvAction::Get { key } }
                             } else {
-                                eprintln!("Usage: kv get [--key <key>]");
+                                eprintln!("Usage: kv get [--key] <key>");
                                 CommandType::Unknown
                             }
                         }
@@ -1336,7 +1292,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                             if let (Some(key), Some(value)) = (key, value) {
                                 CommandType::Kv { action: KvAction::Set { key, value } }
                             } else {
-                                eprintln!("Usage: kv set [--key <key>] [--value <value>]");
+                                eprintln!("Usage: kv set [--key] <key> [--value] <value>");
                                 CommandType::Unknown
                             }
                         }
@@ -1344,7 +1300,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                             if let Some(key) = key {
                                 CommandType::Kv { action: KvAction::Delete { key } }
                             } else {
-                                eprintln!("Usage: kv delete [--key <key>]");
+                                eprintln!("Usage: kv delete [--key] <key>");
                                 CommandType::Unknown
                             }
                         }
@@ -1359,19 +1315,14 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                     }
                 },
                 None => {
-                    eprintln!("Usage: kv [get|set|delete] [--key <key>] [--value <value>]");
+                    eprintln!("Usage: kv [get|set|delete] [--key] <key> [--value <value>]");
                     CommandType::Unknown
                 }
             }
         },
         "set" => {
             if remaining_args.len() >= 2 {
-                CommandType::Kv {
-                    action: KvAction::Set {
-                        key: remaining_args[0].clone(),
-                        value: remaining_args[1].clone()
-                    }
-                }
+                CommandType::Kv { action: KvAction::Set { key: remaining_args[0].clone(), value: remaining_args[1].clone() } }
             } else {
                 eprintln!("Usage: set <key> <value>");
                 CommandType::Unknown
@@ -1379,11 +1330,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
         },
         "get" => {
             if remaining_args.len() >= 1 {
-                CommandType::Kv {
-                    action: KvAction::Get {
-                        key: remaining_args[0].clone()
-                    }
-                }
+                CommandType::Kv { action: KvAction::Get { key: remaining_args[0].clone() } }
             } else {
                 eprintln!("Usage: get <key>");
                 CommandType::Unknown
@@ -1391,42 +1338,32 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
         },
         "delete" => {
             if remaining_args.len() >= 1 {
-                CommandType::Kv {
-                    action: KvAction::Delete {
-                        key: remaining_args[0].clone()
-                    }
-                }
+                CommandType::Kv { action: KvAction::Delete { key: remaining_args[0].clone() } }
             } else {
                 eprintln!("Usage: delete <key>");
                 CommandType::Unknown
             }
         },
-        // === query / exec with quote stripping ===
         "query" | "exec" => {
             if remaining_args.is_empty() {
-                eprintln!(
-                    "Usage: {} <query> | {} \"<query>\" | {} --query <query> [--language <lang>]",
-                    command_str, command_str, command_str
-                );
+                eprintln!("Usage: {} <query> or {} --query <query> [--language <lang>]", command_str, command_str);
                 CommandType::Unknown
             } else {
-                let mut query: Option<String> = None;
-                let mut language: Option<String> = None;
+                let mut query = None;
+                let mut language = None;
                 let mut i = 0;
-                // 1. Positional argument (may be quoted)
-                if i < remaining_args.len() && !remaining_args[i].starts_with('-') {
-                    query = Some(strip_surrounding_quotes(&remaining_args[i]));
+                if !remaining_args[0].starts_with('-') {
+                    query = Some(remaining_args[0].clone());
                     i = remaining_args.len();
                 }
-                // 2. Flag parsing
                 while i < remaining_args.len() {
                     match remaining_args[i].to_lowercase().as_str() {
                         "--query" => {
                             if i + 1 < remaining_args.len() {
-                                query = Some(strip_surrounding_quotes(&remaining_args[i + 1]));
+                                query = Some(remaining_args[i + 1].clone());
                                 i += 2;
                             } else {
-                                eprintln!("Warning: '--query' requires a value.");
+                                eprintln!("Warning: Flag '--query' requires a value.");
                                 i += 1;
                             }
                         }
@@ -1435,7 +1372,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                 language = Some(remaining_args[i + 1].clone());
                                 i += 2;
                             } else {
-                                eprintln!("Warning: '--language' requires a value.");
+                                eprintln!("Warning: Flag '--language' requires a value.");
                                 i += 1;
                             }
                         }
@@ -1455,11 +1392,11 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
         },
         "migrate" => {
             if remaining_args.len() < 2 && !remaining_args.iter().any(|arg| arg == "--from" || arg == "--source" || arg == "--to" || arg == "--dest") {
-                eprintln!("Usage: migrate [--port <port>] [--cluster <cluster>] [--from <engine>] [--to <engine>] [--source <engine>] [--dest <engine>]");
+                eprintln!("Usage: migrate <from_engine> <to_engine> [--port <port>] [--cluster <cluster>] [--from <engine>] [--to <engine>] [--source <engine>] [--dest <engine>]");
                 CommandType::Unknown
             } else {
-                let mut from_engine = None;
-                let mut to_engine = None;
+                let mut from_engine_pos = None;
+                let mut to_engine_pos = None;
                 let mut from = None;
                 let mut to = None;
                 let mut source = None;
@@ -1468,11 +1405,11 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                 let mut cluster = None;
                 let mut i = 0;
                 if i < remaining_args.len() && !remaining_args[i].starts_with("--") {
-                    from_engine = parse_storage_engine(&remaining_args[i]).ok();
+                    from_engine_pos = parse_storage_engine(&remaining_args[i]).ok();
                     i += 1;
                 }
                 if i < remaining_args.len() && !remaining_args[i].starts_with("--") {
-                    to_engine = parse_storage_engine(&remaining_args[i]).ok();
+                    to_engine_pos = parse_storage_engine(&remaining_args[i]).ok();
                     i += 1;
                 }
                 while i < remaining_args.len() {
@@ -1483,7 +1420,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                 i += 2;
                             } else {
                                 eprintln!("Warning: Flag '--from' requires a value.");
-                                return (CommandType::Unknown, remaining_args.clone());
+                                return (CommandType::Unknown, parsed_remaining_args);
                             }
                         }
                         "--to" => {
@@ -1492,7 +1429,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                 i += 2;
                             } else {
                                 eprintln!("Warning: Flag '--to' requires a value.");
-                                return (CommandType::Unknown, remaining_args.clone());
+                                return (CommandType::Unknown, parsed_remaining_args);
                             }
                         }
                         "--source" => {
@@ -1501,7 +1438,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                 i += 2;
                             } else {
                                 eprintln!("Warning: Flag '--source' requires a value.");
-                                return (CommandType::Unknown, remaining_args.clone());
+                                return (CommandType::Unknown, parsed_remaining_args);
                             }
                         }
                         "--dest" => {
@@ -1510,7 +1447,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                 i += 2;
                             } else {
                                 eprintln!("Warning: Flag '--dest' requires a value.");
-                                return (CommandType::Unknown, remaining_args.clone());
+                                return (CommandType::Unknown, parsed_remaining_args);
                             }
                         }
                         "--port" => {
@@ -1519,7 +1456,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                 i += 2;
                             } else {
                                 eprintln!("Warning: Flag '--port' requires a value.");
-                                return (CommandType::Unknown, remaining_args.clone());
+                                return (CommandType::Unknown, parsed_remaining_args);
                             }
                         }
                         "--cluster" => {
@@ -1528,7 +1465,7 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                                 i += 2;
                             } else {
                                 eprintln!("Warning: Flag '--cluster' requires a value.");
-                                return (CommandType::Unknown, remaining_args.clone());
+                                return (CommandType::Unknown, parsed_remaining_args);
                             }
                         }
                         _ => {
@@ -1537,18 +1474,21 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                         }
                     }
                 }
-                let from_engine_final = from_engine.or(from).or(source);
-                let to_engine_final = to_engine.or(to).or(dest);
                 CommandType::Migrate(MigrateAction {
-                    from, to, source, dest, from_engine_pos: from_engine_final, to_engine_pos: to_engine_final, port, cluster,
+                    from,
+                    to,
+                    source,
+                    dest,
+                    from_engine_pos,
+                    to_engine_pos,
+                    port,
+                    cluster,
                 })
             }
         }
         _ => CommandType::Unknown,
     };
-
-    // === Fuzzy suggestion ===
-    if cmd_type == CommandType::Unknown && !parts.is_empty() {
+    if cmd_type == CommandType::Unknown {
         let mut best_match: Option<String> = None;
         let mut min_distance = usize::MAX;
         for cmd in &top_level_commands {
@@ -1558,109 +1498,29 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                 best_match = Some(cmd.to_string());
             }
         }
-        if min_distance <= FUZZY_MATCH_THRESHOLD {
+        if min_distance <= FUZZY_MATCH_THRESHOLD && best_match.is_some() {
             if let Some(suggestion) = best_match {
                 eprintln!("Unknown command '{}'. Did you mean '{}'?", command_str, suggestion);
             }
         }
     }
-    (cmd_type, remaining_args)
+    (cmd_type, parsed_remaining_args)
 }
-
-// === Command handler ===
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_interactive_command(
     command: CommandType,
     state: &SharedState,
 ) -> Result<()> {
     async fn ensure_query_engine(state: &SharedState) -> Result<Arc<QueryExecEngine>> {
-        let mut guard = state.query_engine.lock().await;
-        if let Some(engine) = guard.as_ref() {
+        let mut query_engine_guard = state.query_engine.lock().await;
+        if let Some(engine) = query_engine_guard.as_ref() {
             Ok(Arc::clone(engine))
         } else {
             let engine = get_query_engine_singleton().await?;
-            *guard = Some(Arc::clone(&engine));
+            *query_engine_guard = Some(Arc::clone(&engine));
             Ok(engine)
         }
     }
-
-    // === Query execution (raw or via query/exec) ===
-    if let CommandType::Query { query, language } = command {
-        let query_engine = ensure_query_engine(state).await?;
-        let lang = language.as_deref().unwrap_or("").to_ascii_lowercase();
-        let trimmed = query.trim();
-
-        let detected_lang = if lang == "cypher"
-            || trimmed.to_ascii_lowercase().starts_with("match ")
-            || trimmed.to_ascii_lowercase().starts_with("create ")
-            || trimmed.to_ascii_lowercase().starts_with("merge ")
-        {
-            "cypher"
-        } else if lang == "sql"
-            || trimmed.to_ascii_uppercase().starts_with("SELECT ")
-            || trimmed.to_ascii_uppercase().starts_with("INSERT ")
-            || trimmed.to_ascii_uppercase().starts_with("UPDATE ")
-            || trimmed.to_ascii_uppercase().starts_with("DELETE ")
-        {
-            "sql"
-        } else if lang == "graphql"
-            || trimmed.starts_with('{')
-            || trimmed.to_ascii_lowercase().starts_with("query ")
-            || trimmed.to_ascii_lowercase().starts_with("mutation ")
-        {
-            "graphql"
-        } else {
-            // Final fallback
-            if trimmed.to_ascii_lowercase().starts_with("match ")
-                || trimmed.to_ascii_lowercase().starts_with("create ")
-                || trimmed.to_ascii_lowercase().starts_with("merge ")
-            {
-                "cypher"
-            } else if trimmed.to_ascii_uppercase().starts_with("SELECT ")
-                || trimmed.to_ascii_uppercase().starts_with("INSERT ")
-                || trimmed.to_ascii_uppercase().starts_with("UPDATE ")
-                || trimmed.to_ascii_uppercase().starts_with("DELETE ")
-            {
-                "sql"
-            } else if trimmed.starts_with('{')
-                || trimmed.to_ascii_lowercase().starts_with("query ")
-                || trimmed.to_ascii_lowercase().starts_with("mutation ")
-            {
-                "graphql"
-            } else {
-                eprintln!("Warning: Could not detect query language. Use --language cypher|sql|graphql");
-                return Ok(());
-            }
-        };
-
-        match detected_lang {
-            "cypher" => {
-                println!("[Cypher] {}", trimmed);
-                match query_engine.execute_cypher(trimmed).await {
-                    Ok(res) => println!("{}", res),
-                    Err(e) => eprintln!("Cypher Error: {}", e),
-                }
-            }
-            "sql" => {
-                println!("[SQL] {}", trimmed);
-                match query_engine.execute_sql(trimmed).await {
-                    Ok(res) => println!("{}", res),
-                    Err(e) => eprintln!("SQL Error: {}", e),
-                }
-            }
-            "graphql" => {
-                println!("[GraphQL]\n{}", trimmed);
-                match query_engine.execute_graphql(trimmed).await {
-                    Ok(res) => println!("{}", res),
-                    Err(e) => eprintln!("GraphQL Error: {}", e),
-                }
-            }
-            _ => unreachable!(),
-        }
-        return Ok(());
-    }
-
-    // === All other CLI commands (unchanged) ===
     match command {
         CommandType::Daemon(daemon_cmd) => {
             handlers::handle_daemon_command_interactive(daemon_cmd, state.daemon_handles.clone()).await
@@ -1700,9 +1560,15 @@ pub async fn handle_interactive_command(
                 state.rest_api_shutdown_tx_opt.clone(),
                 state.rest_api_port_arc.clone(),
                 state.rest_api_handle.clone(),
-            ).await
+            )
+            .await
         }
-        CommandType::StartStorage { port, config_file, cluster, .. } => {
+        CommandType::StartStorage {
+            port,
+            config_file,
+            cluster,
+            ..
+        } => {
             handlers::start_storage_interactive(
                 port,
                 config_file,
@@ -1711,19 +1577,32 @@ pub async fn handle_interactive_command(
                 state.storage_daemon_shutdown_tx_opt.clone(),
                 state.storage_daemon_handle.clone(),
                 state.storage_daemon_port_arc.clone(),
-            ).await
+            )
+            .await
         }
         CommandType::StartDaemon { port, cluster, .. } => {
             handlers::start_daemon_instance_interactive(port, cluster, state.daemon_handles.clone()).await
         }
         CommandType::StartAll {
-            port, cluster, daemon_port, daemon_cluster, listen_port,
-            rest_port, rest_cluster, storage_port, storage_cluster, storage_config_file,
+            port,
+            cluster,
+            daemon_port,
+            daemon_cluster,
+            listen_port,
+            rest_port,
+            rest_cluster,
+            storage_port,
+            storage_cluster,
+            storage_config_file,
         } => {
             handlers::handle_start_all_interactive(
-                daemon_port.or(port), daemon_cluster.or(cluster),
-                rest_port.or(listen_port), rest_cluster,
-                storage_port, storage_cluster, storage_config_file,
+                daemon_port.or(port),
+                daemon_cluster.or(cluster),
+                rest_port.or(listen_port),
+                rest_cluster,
+                storage_port,
+                storage_cluster,
+                storage_config_file,
                 state.daemon_handles.clone(),
                 state.rest_api_shutdown_tx_opt.clone(),
                 state.rest_api_port_arc.clone(),
@@ -1731,7 +1610,8 @@ pub async fn handle_interactive_command(
                 state.storage_daemon_shutdown_tx_opt.clone(),
                 state.storage_daemon_handle.clone(),
                 state.storage_daemon_port_arc.clone(),
-            ).await
+            )
+            .await
         }
         CommandType::StopAll => {
             handlers::stop_all_interactive(
@@ -1742,7 +1622,8 @@ pub async fn handle_interactive_command(
                 state.storage_daemon_shutdown_tx_opt.clone(),
                 state.storage_daemon_handle.clone(),
                 state.storage_daemon_port_arc.clone(),
-            ).await
+            )
+            .await
         }
         CommandType::StopRest(port) => {
             handlers::stop_rest_api_interactive(
@@ -1750,7 +1631,8 @@ pub async fn handle_interactive_command(
                 state.rest_api_shutdown_tx_opt.clone(),
                 state.rest_api_port_arc.clone(),
                 state.rest_api_handle.clone(),
-            ).await
+            )
+            .await
         }
         CommandType::StopDaemon(port) => {
             handlers::stop_daemon_instance_interactive(port, state.daemon_handles.clone()).await
@@ -1761,13 +1643,15 @@ pub async fn handle_interactive_command(
                 state.storage_daemon_shutdown_tx_opt.clone(),
                 state.storage_daemon_handle.clone(),
                 state.storage_daemon_port_arc.clone(),
-            ).await
+            )
+            .await
         }
         CommandType::StatusSummary => {
             handlers::display_full_status_summary(
                 state.rest_api_port_arc.clone(),
                 state.storage_daemon_port_arc.clone(),
-            ).await;
+            )
+            .await;
             Ok(())
         }
         CommandType::StatusDaemon(port) => {
@@ -1815,14 +1699,26 @@ pub async fn handle_interactive_command(
         }
         CommandType::Show(action) => {
             match action {
-                ShowAction::Storage => { handlers::handle_show_storage_command().await?; }
-                ShowAction::Plugins => { handlers::handle_show_plugins_command().await?; }
+                ShowAction::Storage => {
+                    handlers::handle_show_storage_command().await?;
+                }
+                ShowAction::Plugins => {
+                    handlers::handle_show_plugins_command().await?;
+                }
                 ShowAction::Config { config_type } => {
                     match config_type {
-                        ConfigAction::All => { handlers::handle_show_all_config_command().await?; }
-                        ConfigAction::Rest => { handlers::handle_show_rest_config_command().await?; }
-                        ConfigAction::Storage => { handlers::handle_show_storage_config_command().await?; }
-                        ConfigAction::Main => { handlers::handle_show_main_config_command().await?; }
+                        ConfigAction::All => {
+                             handlers::handle_show_all_config_command().await?;
+                        }
+                        ConfigAction::Rest => {
+                             handlers::handle_show_rest_config_command().await?;
+                        }
+                        ConfigAction::Storage => {
+                             handlers::handle_show_storage_config_command().await?;
+                        }
+                        ConfigAction::Main => {
+                             handlers::handle_show_main_config_command().await?;
+                        }
                     }
                 }
             }
@@ -1845,21 +1741,24 @@ pub async fn handle_interactive_command(
                 state.storage_daemon_shutdown_tx_opt.clone(),
                 state.storage_daemon_handle.clone(),
                 state.storage_daemon_port_arc.clone(),
-            ).await
+            )
+            .await
         }
         CommandType::ReloadRest => {
             handlers::reload_rest_interactive(
                 state.rest_api_shutdown_tx_opt.clone(),
                 state.rest_api_port_arc.clone(),
                 state.rest_api_handle.clone(),
-            ).await
+            )
+            .await
         }
         CommandType::ReloadStorage => {
             handlers::reload_storage_interactive(
                 state.storage_daemon_shutdown_tx_opt.clone(),
                 state.storage_daemon_handle.clone(),
                 state.storage_daemon_port_arc.clone(),
-            ).await
+            )
+            .await
         }
         CommandType::ReloadDaemon(port) => {
             handlers::reload_daemon_interactive(port).await
@@ -1868,13 +1767,29 @@ pub async fn handle_interactive_command(
             handlers::reload_cluster_interactive().await
         }
         CommandType::RestartAll {
-            port, cluster, listen_port, storage_port, storage_config_file,
-            daemon_cluster, daemon_port, rest_cluster, rest_port, storage_cluster,
+            port,
+            cluster,
+            listen_port,
+            storage_port,
+            storage_config_file,
+            daemon_cluster,
+            daemon_port,
+            rest_cluster,
+            rest_port,
+            storage_cluster,
         } => {
             let restart_args = RestartArgs {
                 action: RestartAction::All {
-                    port, cluster, listen_port, storage_port, storage_config_file,
-                    daemon_cluster, daemon_port, rest_cluster, rest_port, storage_cluster,
+                    port,
+                    cluster,
+                    listen_port,
+                    storage_port,
+                    storage_config_file,
+                    daemon_cluster,
+                    daemon_port,
+                    rest_cluster,
+                    rest_port,
+                    storage_cluster,
                 },
             };
             handlers::handle_restart_command_interactive(
@@ -1886,7 +1801,8 @@ pub async fn handle_interactive_command(
                 state.storage_daemon_shutdown_tx_opt.clone(),
                 state.storage_daemon_handle.clone(),
                 state.storage_daemon_port_arc.clone(),
-            ).await
+            )
+            .await
         }
         CommandType::RestartRest { port, cluster, rest_port, rest_cluster } => {
             let restart_args = RestartArgs {
@@ -1906,9 +1822,16 @@ pub async fn handle_interactive_command(
                 state.storage_daemon_shutdown_tx_opt.clone(),
                 state.storage_daemon_handle.clone(),
                 state.storage_daemon_port_arc.clone(),
-            ).await
+            )
+            .await
         }
-        CommandType::RestartStorage { port, config_file, cluster, storage_port, storage_cluster } => {
+        CommandType::RestartStorage {
+            port,
+            config_file,
+            cluster,
+            storage_port,
+            storage_cluster,
+        } => {
             let restart_args = RestartArgs {
                 action: RestartAction::Storage {
                     port: Some(storage_port.unwrap_or(port.unwrap_or_default())),
@@ -1927,7 +1850,8 @@ pub async fn handle_interactive_command(
                 state.storage_daemon_shutdown_tx_opt.clone(),
                 state.storage_daemon_handle.clone(),
                 state.storage_daemon_port_arc.clone(),
-            ).await
+            )
+            .await
         }
         CommandType::RestartDaemon { port, cluster, daemon_port, daemon_cluster } => {
             let restart_args = RestartArgs {
@@ -1947,7 +1871,8 @@ pub async fn handle_interactive_command(
                 state.storage_daemon_shutdown_tx_opt.clone(),
                 state.storage_daemon_handle.clone(),
                 state.storage_daemon_port_arc.clone(),
-            ).await
+            )
+            .await
         }
         CommandType::RestartCluster => {
             let restart_args = RestartArgs {
@@ -1962,7 +1887,8 @@ pub async fn handle_interactive_command(
                 state.storage_daemon_shutdown_tx_opt.clone(),
                 state.storage_daemon_handle.clone(),
                 state.storage_daemon_port_arc.clone(),
-            ).await
+            )
+            .await
         }
         CommandType::Clear => {
             handlers::clear_terminal_screen().await?;
@@ -2004,76 +1930,7 @@ pub async fn handle_interactive_command(
         }
         CommandType::Query { query, language } => {
             let query_engine = ensure_query_engine(state).await?;
-            // === Language Detection ===
-            let lang = language.as_deref().unwrap_or("").to_ascii_lowercase();
-            let trimmed = query.trim_start();
-            let detected_lang = if lang == "cypher"
-                || trimmed.starts_with("MATCH ")
-                || trimmed.starts_with("CREATE ")
-                || trimmed.starts_with("MERGE ")
-            {
-                "cypher"
-            } else if lang == "sql"
-                || trimmed.to_ascii_uppercase().starts_with("SELECT ")
-                || trimmed.to_ascii_uppercase().starts_with("INSERT ")
-            {
-                "sql"
-            } else if lang == "graphql"
-                || trimmed.starts_with('{')
-                || trimmed.starts_with("query ")
-                || trimmed.starts_with("mutation ")
-            {
-                "graphql"
-            } else {
-                // Auto-detect fallback
-                if trimmed.to_ascii_lowercase().starts_with("match ")
-                    || trimmed.to_ascii_lowercase().starts_with("create ")
-                    || trimmed.to_ascii_lowercase().starts_with("merge ")
-                {
-                    "cypher"
-                } else if trimmed
-                    .to_ascii_uppercase()
-                    .starts_with("SELECT ")
-                    || trimmed.to_ascii_uppercase().starts_with("INSERT ")
-                    || trimmed.to_ascii_uppercase().starts_with("UPDATE ")
-                    || trimmed.to_ascii_uppercase().starts_with("DELETE ")
-                {
-                    "sql"
-                } else if trimmed.starts_with('{')
-                    || trimmed.starts_with("query ")
-                    || trimmed.starts_with("mutation ")
-                {
-                    "graphql"
-                } else {
-                    eprintln!("Warning: Could not detect query language. Use --language cypher|sql|graphql");
-                    return Ok(());
-                }
-            };
-            // === Execution ===
-            match detected_lang {
-                "cypher" => {
-                    println!("[Cypher] {}", query);
-                    match query_engine.execute_cypher(&query).await {
-                        Ok(res) => println!("{}", res),
-                        Err(e) => eprintln!("Cypher Error: {}", e),
-                    }
-                }
-                "sql" => {
-                    println!("[SQL] {}", query);
-                    match query_engine.execute_sql(&query).await {
-                        Ok(res) => println!("{}", res),
-                        Err(e) => eprintln!("SQL Error: {}", e),
-                    }
-                }
-                "graphql" => {
-                    println!("[GraphQL]\n{}", query);
-                    match query_engine.execute_graphql(&query).await {
-                        Ok(res) => println!("{}", res),
-                        Err(e) => eprintln!("GraphQL Error: {}", e),
-                    }
-                }
-                _ => unreachable!(),
-            }
+            handlers::handle_unified_query(query_engine, query, language).await?;
             Ok(())
         }
         CommandType::Unknown => {
@@ -2098,22 +1955,20 @@ pub async fn handle_interactive_command(
         }
     }
 }
-
 #[allow(clippy::too_many_arguments)]
 pub async fn run_cli_interactive(
-    daemon_handles: Arc<TokioMutex<HashMap<u16, (JoinHandle<()>, oneshot::Sender<()>)>>>,
+    daemon_handles: Arc<TokioMutex<HashMap<u16, (tokio::task::JoinHandle<()>, oneshot::Sender<()>)>>>,
     rest_api_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
     rest_api_port_arc: Arc<TokioMutex<Option<u16>>>,
-    rest_api_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
+    rest_api_handle: Arc<TokioMutex<Option<tokio::task::JoinHandle<()>>>>,
     storage_daemon_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
-    storage_daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>>,
+    storage_daemon_handle: Arc<TokioMutex<Option<tokio::task::JoinHandle<()>>>>,
     storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>>,
 ) -> Result<()> {
     let mut rl = DefaultEditor::new()?;
     let history_path = "graphdb_cli_history.txt";
     let _ = rl.load_history(history_path);
     handlers::print_welcome_screen();
-
     let state = SharedState {
         daemon_handles,
         rest_api_shutdown_tx_opt,
@@ -2124,7 +1979,6 @@ pub async fn run_cli_interactive(
         storage_daemon_port_arc,
         query_engine: Arc::new(TokioMutex::new(None)),
     };
-
     loop {
         let readline = rl.readline("GraphDB> ");
         match readline {
@@ -2134,20 +1988,6 @@ pub async fn run_cli_interactive(
                     continue;
                 }
                 rl.add_history_entry(line_trim).ok();
-
-                // === RAW QUERY DETECTION (before shlex) ===
-                if let Some((language, query)) = detect_raw_query_language(line_trim) {
-                    let cmd = CommandType::Query {
-                        query,                       // String
-                        language: Some(language.into()), // &str → String
-                    };
-                    if let Err(e) = handle_interactive_command(cmd, &state).await {
-                        eprintln!("Query error: {}", e);
-                    }
-                    continue;
-                }
-
-                // === NORMAL COMMAND PATH ===
                 let args = match shlex::split(line_trim) {
                     Some(a) => a,
                     None => {
@@ -2158,36 +1998,31 @@ pub async fn run_cli_interactive(
                 if args.is_empty() {
                     continue;
                 }
-
                 let (command, _parsed_args) = parse_command(&args);
                 debug!("Parsed command: {:?}", command);
-
                 if command == CommandType::Exit {
                     handle_interactive_command(command, &state).await?;
                     break;
                 }
-
                 if let Err(e) = handle_interactive_command(command, &state).await {
-                    eprintln!("Error: {}", e);
-                    debug!("Full error: {:#}", e);
+                    eprintln!("Error executing command: {:?}", e);
+                    debug!("Detailed error: {:#}", e);
+                    continue;
                 }
             }
-
             Err(ReadlineError::Interrupted) => {
-                println!("Ctrl-C received. Type 'exit' to quit.");
+                println!("Ctrl-C received. Type 'exit' to quit or Ctrl-D to terminate.");
             }
             Err(ReadlineError::Eof) => {
-                println!("Ctrl-D received. Goodbye!");
+                println!("Ctrl-D received. Exiting GraphDB CLI. Goodbye!");
                 break;
             }
             Err(err) => {
-                eprintln!("Readline error: {:?}", err);
+                eprintln!("Error reading line: {:?}", err);
                 break;
             }
         }
     }
-
-    rl.save_history(&history_path)
-        .context("Failed to save history")?;
+    rl.save_history(&history_path).context("Failed to save history")?;
     Ok(())
 }

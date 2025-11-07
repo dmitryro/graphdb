@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand, CommandFactory};
+use clap::{Parser, CommandFactory};
 use anyhow::{Result, Context, anyhow};
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -16,7 +16,7 @@ use lib::daemon::storage_daemon_server::{StorageSettings, StorageSettingsWrapper
 use log::{info, debug, warn, error};
 use models::errors::GraphError;
 use tokio::time::{timeout, Duration as TokioDuration};
-
+use std::future::Future;
 // Import modules
 use lib::commands::{
     parse_kv_operation, ConfigAction, DaemonCliCommand, HelpArgs, ReloadAction, RestartAction,
@@ -39,26 +39,132 @@ use crate::cli::handlers_storage::{ start_storage_interactive, stop_storage_inte
 use crate::cli::handlers_utils::{ parse_storage_engine, handle_internal_daemon_run };
 use crate::cli::help_display as help_display_mod;
 use crate::cli::interactive as interactive_mod;
-use crate::cli::handlers_queries::initialize_storage_for_query;
+use crate::cli::handlers_queries::{
+    initialize_storage_for_query,
+    handle_cypher_query,
+    handle_sql_query,
+    handle_graphql_query,
+};
 use lib::database::Database;
 use lib::query_parser::config::KeyValueStore;
 use lib::query_parser::{parse_query_from_string, QueryType};
 use lib::query_exec_engine::QueryExecEngine;
 use lib::storage_engine::storage_engine::{StorageEngineManager, AsyncStorageEngineManager, GLOBAL_STORAGE_ENGINE_MANAGER};
 
-// GraphDB Command Line Interface
+/// Detect query language from query content (auto-detection)
+fn detect_query_language(query: &str) -> &'static str {
+    let trimmed = query.trim_start();
+    if trimmed.is_empty() {
+        return "unknown";
+    }
+
+    let prefix: String = trimmed.chars().take(15).collect::<String>().to_uppercase();
+
+    // SQL
+    if prefix.starts_with("SELECT")
+        || prefix.starts_with("INSERT")
+        || prefix.starts_with("UPDATE")
+        || prefix.starts_with("DELETE")
+        || prefix.starts_with("WITH")
+        || prefix.starts_with("CREATE TABLE")
+        || prefix.starts_with("ALTER TABLE")
+    {
+        return "sql";
+    }
+
+    // Cypher
+    if prefix.starts_with("MATCH")
+        || prefix.starts_with("CREATE")
+        || prefix.starts_with("MERGE")
+        || prefix.starts_with("RETURN")
+        || prefix.starts_with("OPTIONAL MATCH")
+        || prefix.starts_with("UNWIND")
+        || prefix.starts_with("CALL")
+    {
+        return "cypher";
+    }
+
+    // GraphQL
+    if trimmed.starts_with('{') 
+        || trimmed.contains("\"query\"") 
+        || trimmed.contains("\"mutation\"")
+        || trimmed.contains("query ") 
+        || trimmed.contains("mutation ")
+    {
+        return "graphql";
+    }
+
+    "unknown"
+}
+
+/// Sanitize only Cypher queries — preserve SQL and GraphQL
+fn sanitize_cypher_query(input: &str) -> String {
+    let trimmed = input.trim_start();
+    let upper = trimmed.to_uppercase();
+
+    // Only sanitize if it looks like Cypher
+    if !(upper.starts_with("MATCH")
+        || upper.starts_with("CREATE")
+        || upper.starts_with("MERGE")
+        || upper.starts_with("RETURN")
+        || upper.starts_with("OPTIONAL MATCH")) {
+        return input.to_string();
+    }
+
+    let mut result = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    let mut in_pattern = false;
+    let mut paren_depth = 0;
+
+    while let Some(c) = chars.next() {
+        match c {
+            '(' => {
+                paren_depth += 1;
+                in_pattern = true;
+                result.push(c);
+            }
+            ')' => {
+                paren_depth -= 1;
+                result.push(c);
+                if paren_depth == 0 {
+                    in_pattern = false;
+                }
+            }
+            _ if c.is_whitespace() && !in_pattern => {
+                while chars.peek().map(|ch| ch.is_whitespace()).unwrap_or(false) {
+                    chars.next();
+                }
+                if let Some(&next) = chars.peek() {
+                    if next.is_ascii_alphabetic() && next.is_uppercase() {
+                        result.push(' ');
+                        continue;
+                    }
+                }
+                result.push(' ');
+            }
+            _ => result.push(c),
+        }
+    }
+    result.trim().to_string()
+}
+
 #[derive(Parser, Debug)]
 #[clap(author, version, about = "GraphDB Command Line Interface", long_about = None)]
 #[clap(propagate_version = true)]
 pub struct CliArgs {
-    #[clap(subcommand)]
-    pub command: Option<Commands>,
-    #[clap(long, short = 'c')]
+    /// Cypher/SQL/GraphQL query (positional or via -q) — language auto-detected if not specified
+    #[clap(value_name = "QUERY", trailing_var_arg = true)]
+    pub query: Vec<String>,
+    /// Execute query (explicit)
+    #[clap(long, short = 'q', value_name = "QUERY")]
+    pub explicit_query: Option<String>,
+    /// Run in interactive mode
+    #[clap(long, short = 'c', action = clap::ArgAction::SetTrue)]
     pub cli: bool,
+    /// Enable experimental plugins
     #[clap(long)]
     pub enable_plugins: bool,
-    #[clap(long, short = 'q')]
-    pub query: Option<String>,
+    // Internal flags
     #[clap(long, hide = true)]
     pub internal_rest_api_run: bool,
     #[clap(long, hide = true)]
@@ -75,9 +181,11 @@ pub struct CliArgs {
     pub internal_data_directory: Option<PathBuf>,
     #[clap(long, hide = true)]
     pub internal_cluster_range: Option<String>,
+    #[clap(subcommand)]
+    pub command: Option<Commands>,
 }
 
-#[derive(Debug, Clone, Subcommand)]
+#[derive(Debug, Clone, clap::Subcommand)]
 pub enum Commands {
     Start {
         #[arg(long, value_parser = clap::value_parser!(u16), help = "Port for the daemon. Conflicts with --daemon-port if both specified.")]
@@ -131,13 +239,12 @@ pub enum Commands {
         #[clap(subcommand)]
         action: ShowAction,
     },
-    Exec {
-        #[arg(long, help = "Command to execute on the storage engine")]
-        command: String,
-    },
+    #[clap(name = "query", alias = "q", alias = "e", alias = "exec", alias = "unified")]
     Query {
-        #[arg(long, help = "Query to execute on the storage engine")]
+        #[arg(value_name = "QUERY")]
         query: String,
+        #[arg(long, short = 'l', value_name = "LANG", help = "Query language: sql, cypher, graphql (auto-detected if omitted)")]
+        language: Option<String>,
     },
     Kv {
         #[arg(value_parser = parse_kv_operation, help = "Key-value operation (e.g., get, set, delete)")]
@@ -230,25 +337,20 @@ pub async fn get_query_engine_singleton() -> Result<Arc<QueryExecEngine>> {
     let mut singleton_guard = timeout(mutex_timeout, QUERY_ENGINE_SINGLETON.lock())
         .await
         .map_err(|_| anyhow!("Failed to acquire query engine singleton mutex after {} seconds", mutex_timeout.as_secs()))?;
-
     if let Some(engine) = singleton_guard.as_ref() {
         info!("Query engine singleton already initialized, returning existing instance");
         println!("===> Query engine singleton already initialized, returning existing instance");
         return Ok(Arc::clone(engine));
     }
-
     drop(singleton_guard);
-
     let query_engine = async move {
         info!("Starting query engine singleton initialization...");
         println!("===> Starting query engine singleton initialization...");
-
         info!("Calling initialize_storage_for_query with a timeout...");
         println!("===> Calling initialize_storage_for_query with a timeout...");
         timeout(TokioDuration::from_secs(60), initialize_storage_for_query(start_wrapper, stop_wrapper)).await
             .context("Storage initialization timed out after 60 seconds")?
             .context("Failed to initialize storage for query execution")?;
-
         let storage_config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
         info!("Loading storage config from {}", storage_config_path.display());
         println!("===> Loading storage config from {}", storage_config_path.display());
@@ -261,29 +363,22 @@ pub async fn get_query_engine_singleton() -> Result<Arc<QueryExecEngine>> {
             println!("===> No storage configuration file found at {}. Defaulting to InMemory storage. Use 'use storage <engine_name>' and 'save storage' to persist your configuration.", storage_config_path.display());
             StorageConfig::new_in_memory()
         };
-
         info!("Creating new Database instance...");
         println!("===> Creating new Database instance...");
         let database = timeout(TokioDuration::from_secs(60), Database::new(storage_config)).await
             .context("Database creation timed out after 60 seconds")?
             .map_err(|e| anyhow!("Failed to create Database: {}", e))?;
-
         info!("Creating new QueryExecEngine instance...");
         println!("===> Creating new QueryExecEngine instance...");
         let query_engine = Arc::new(QueryExecEngine::new(Arc::new(database)));
-        
         Ok::<Arc<QueryExecEngine>, anyhow::Error>(query_engine)
     }.await?;
-
     let mut singleton_guard = QUERY_ENGINE_SINGLETON.lock().await;
-
     info!("Storing query engine in singleton...");
     println!("===> Storing query engine in singleton...");
     *singleton_guard = Some(Arc::clone(&query_engine));
-
     info!("Query engine singleton initialization completed.");
     println!("===> Query engine singleton initialization completed.");
-
     Ok(query_engine)
 }
 
@@ -302,15 +397,11 @@ pub async fn run_single_command(
     if is_interactive && env::var("GRAPHDB_CLI_INTERACTIVE").is_err() {
         debug!("Setting GRAPHDB_CLI_INTERACTIVE=1 for command: {:?}", command);
         println!("===> Set GRAPHDB_CLI_INTERACTIVE=1 for command: {:?}", command);
-        unsafe {
-            env::set_var("GRAPHDB_CLI_INTERACTIVE", "1");
-        }
+        unsafe { env::set_var("GRAPHDB_CLI_INTERACTIVE", "1"); }
         env_var_set = true;
     }
-
     info!("Running command: {:?}", command);
     println!("===> Running command: {:?}", command);
-
     match command {
         Commands::Start {
             port: top_port,
@@ -398,7 +489,6 @@ pub async fn run_single_command(
                     }
                 }
             };
-
             match effective_action {
                 StartAction::All {
                     port,
@@ -538,7 +628,6 @@ pub async fn run_single_command(
                         } else {
                             StorageSettings::default()
                         };
-
                         let selected_config = if PathBuf::from(engine_config_file).exists() {
                             SelectedStorageConfig::load_from_yaml(&PathBuf::from(
                                 engine_config_file,
@@ -556,13 +645,11 @@ pub async fn run_single_command(
                             );
                             SelectedStorageConfig::default()
                         };
-
                         let mut merged_settings = storage_settings;
                         merged_settings.storage_engine_type = engine.to_string();
                         if let Some(port) = selected_config.storage.port {
                             merged_settings.default_port = port;
                         }
-
                         let storage_settings_wrapper =
                             StorageSettingsWrapper { storage: merged_settings };
                         let content = serde_yaml::to_string(&storage_settings_wrapper)
@@ -617,9 +704,7 @@ pub async fn run_single_command(
             )
             .await?;
         }
-        Commands::Interactive => {
-            // Handled by the main flow of start_cli()
-        }
+        Commands::Interactive => {}
         Commands::Help(help_args) => {
             let mut cmd = CliArgs::command();
             if let Some(command_filter) = help_args.filter_command {
@@ -677,30 +762,64 @@ pub async fn run_single_command(
                 }
             }
         }
-        Commands::Exec { command } => {
-            info!("Executing Exec command: {}", command);
-            println!("===> Executing Exec command: {}", command);
+        Commands::Query { query, language } => {
+            let raw_query = query.trim().to_string();
+            let detected_lang = if language.is_none() {
+                detect_query_language(&raw_query)
+            } else {
+                ""
+            };
+
+            let effective_lang = language
+                .as_deref()
+                .unwrap_or(detected_lang)
+                .trim()
+                .to_lowercase();
+
+            let query_to_execute = if effective_lang == "cypher" {
+                sanitize_cypher_query(&raw_query)
+            } else {
+                raw_query.clone()
+            };
+
+            info!(
+                "Executing query: '{}', language: {} (detected: {}, explicit: {:?})",
+                query_to_execute, effective_lang, detected_lang, language
+            );
+            println!(
+                "===> Executing query: '{}', language: {}",
+                query_to_execute, effective_lang
+            );
+
             let query_engine = get_query_engine_singleton().await?;
-            handlers_mod::handle_exec_command(query_engine, command).await?;
-        }
-        Commands::Query { query } => {
-            info!("Executing Query command: {}", query);
-            println!("===> Executing Query command: {}", query);
-            let query_engine = get_query_engine_singleton().await?;
-            handlers_mod::handle_query_command(query_engine, query).await?;
+
+            match effective_lang.as_str() {
+                "cypher" => handle_cypher_query(query_engine, query_to_execute).await?,
+                "sql" => handle_sql_query(query_engine, query_to_execute).await?,
+                "graphql" => handle_graphql_query(query_engine, query_to_execute).await?,
+                "unknown" | "" => {
+                    return Err(anyhow!(
+                        "Could not detect query language. Use --language sql|cypher|graphql"
+                    ));
+                }
+                _ => {
+                    return Err(anyhow!(
+                        "Unsupported query language: '{}'. Use sql, cypher, or graphql",
+                        effective_lang
+                    ));
+                }
+            }
         }
         Commands::Kv { operation, key, value } => {
             info!("Executing KV command: operation={}, key={:?}, value={:?}", operation, key, value);
             println!("===> Executing KV command: operation={}, key={:?}, value={:?}", operation, key, value);
             let query_engine = get_query_engine_singleton().await?;
-            println!("Out of get_query_engine_singleton - moving on");
             match parse_kv_operation(&operation) {
                 Ok(op) => {
                     match op.as_str() {
                         "get" => {
                             if let Some(key) = key {
-                                handlers_mod::handle_kv_command(query_engine, op, key, None)
-                                    .await?;
+                                handlers_mod::handle_kv_command(query_engine, op, key, None).await?;
                             } else {
                                 return Err(anyhow!("Missing key for 'kv get' command. Usage: kv get <key> or kv get --key <key>"));
                             }
@@ -708,8 +827,7 @@ pub async fn run_single_command(
                         "set" => {
                             match (key, value) {
                                 (Some(key), Some(value)) => {
-                                    handlers_mod::handle_kv_command(query_engine, op, key, Some(value))
-                                        .await?;
+                                    handlers_mod::handle_kv_command(query_engine, op, key, Some(value)).await?;
                                 }
                                 (Some(_), None) => {
                                     return Err(anyhow!("Missing value for 'kv set' command. Usage: kv set <key> <value> or kv set --key <key> --value <value>"));
@@ -721,8 +839,7 @@ pub async fn run_single_command(
                         }
                         "delete" => {
                             if let Some(key) = key {
-                                handlers_mod::handle_kv_command(query_engine, op, key, None)
-                                    .await?;
+                                handlers_mod::handle_kv_command(query_engine, op, key, None).await?;
                             } else {
                                 return Err(anyhow!("Missing key for 'kv delete' command. Usage: kv delete <key> or kv delete --key <key>"));
                             }
@@ -741,22 +858,19 @@ pub async fn run_single_command(
             info!("Executing Set command: key={}, value={}", key, value);
             println!("===> Executing Set command: key={}, value={}", key, value);
             let query_engine = get_query_engine_singleton().await?;
-            handlers_mod::handle_kv_command(query_engine, "set".to_string(), key, Some(value))
-                .await?;
+            handlers_mod::handle_kv_command(query_engine, "set".to_string(), key, Some(value)).await?;
         }
         Commands::Get { key } => {
             info!("Executing Get command: key={}", key);
             println!("===> Executing Get command: key={}", key);
             let query_engine = get_query_engine_singleton().await?;
-            handlers_mod::handle_kv_command(query_engine, "get".to_string(), key, None)
-                .await?;
+            handlers_mod::handle_kv_command(query_engine, "get".to_string(), key, None).await?;
         }
         Commands::Delete { key } => {
             info!("Executing Delete command: key={}", key);
             println!("===> Executing Delete command: key={}", key);
             let query_engine = get_query_engine_singleton().await?;
-            handlers_mod::handle_kv_command(query_engine, "delete".to_string(), key, None)
-                .await?;
+            handlers_mod::handle_kv_command(query_engine, "delete".to_string(), key, None).await?;
         }
         Commands::Migrate(action) => {
             let from_engine = action.from
@@ -778,15 +892,11 @@ pub async fn run_single_command(
             ).await?;
         }
     }
-
     if env_var_set {
         info!("Removing GRAPHDB_CLI_INTERACTIVE after command execution");
         println!("===> Removed GRAPHDB_CLI_INTERACTIVE after command execution");
-        unsafe {
-            env::remove_var("GRAPHDB_CLI_INTERACTIVE");
-        }
+        unsafe { env::remove_var("GRAPHDB_CLI_INTERACTIVE"); }
     }
-
     info!("Command execution completed successfully");
     println!("===> Command execution completed successfully");
     Ok(())
@@ -806,9 +916,7 @@ pub async fn start_cli() -> Result<()> {
         help_display_mod::print_filtered_help_clap_generated(&mut cmd, &command_filter);
         process::exit(0);
     }
-
-    let mut args = CliArgs::parse();
-
+    let args = CliArgs::parse();
     if args.internal_rest_api_run || args.internal_storage_daemon_run || args.internal_daemon_run {
         let converted_storage_engine = args.internal_storage_engine.map(|se_cli| se_cli.into());
         return handle_internal_daemon_run(
@@ -819,20 +927,26 @@ pub async fn start_cli() -> Result<()> {
             converted_storage_engine,
         ).await;
     }
-
-    let should_enter_interactive_mode = args.cli || args.command.is_none();
-
-    let daemon_handles: Arc<TokioMutex<HashMap<u16, (JoinHandle<()>, oneshot::Sender<()>)>>> = Arc::new(TokioMutex::new(HashMap::new()));
-    let rest_api_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>> = Arc::new(TokioMutex::new(None));
-    let rest_api_port_arc: Arc<TokioMutex<Option<u16>>> = Arc::new(TokioMutex::new(None));
-    let rest_api_handle: Arc<TokioMutex<Option<JoinHandle<()>>>> = Arc::new(TokioMutex::new(None));
-    let storage_daemon_shutdown_tx_opt: Arc<TokioMutex<Option<oneshot::Sender<()>>>> = Arc::new(TokioMutex::new(None));
-    let storage_daemon_handle: Arc<TokioMutex<Option<JoinHandle<()>>>> = Arc::new(TokioMutex::new(None));
-    let storage_daemon_port_arc: Arc<TokioMutex<Option<u16>>> = Arc::new(TokioMutex::new(None));
-
-    if let Some(command) = args.command {
+    let daemon_handles = Arc::new(TokioMutex::new(HashMap::new()));
+    let rest_api_shutdown_tx_opt = Arc::new(TokioMutex::new(None));
+    let rest_api_port_arc = Arc::new(TokioMutex::new(None));
+    let rest_api_handle = Arc::new(TokioMutex::new(None));
+    let storage_daemon_shutdown_tx_opt = Arc::new(TokioMutex::new(None));
+    let storage_daemon_handle = Arc::new(TokioMutex::new(None));
+    let storage_daemon_port_arc = Arc::new(TokioMutex::new(None));
+    // Resolve query from any source
+    let raw_query = if let Some(q) = args.explicit_query {
+        Some(q)
+    } else if !args.query.is_empty() {
+        Some(args.query.join(" "))
+    } else {
+        None
+    };
+    let should_enter_interactive = args.cli || (args.command.is_none() && raw_query.is_none());
+    if let Some(query) = raw_query {
+        let cmd = Commands::Query { query, language: None };
         run_single_command(
-            command,
+            cmd,
             daemon_handles.clone(),
             rest_api_shutdown_tx_opt.clone(),
             rest_api_port_arc.clone(),
@@ -841,13 +955,26 @@ pub async fn start_cli() -> Result<()> {
             storage_daemon_handle.clone(),
             storage_daemon_port_arc.clone(),
         ).await?;
-
-        if !should_enter_interactive_mode {
+        if !should_enter_interactive {
             return Ok(());
         }
     }
-
-    if should_enter_interactive_mode {
+    if let Some(cmd) = args.command {
+        run_single_command(
+            cmd,
+            daemon_handles.clone(),
+            rest_api_shutdown_tx_opt.clone(),
+            rest_api_port_arc.clone(),
+            rest_api_handle.clone(),
+            storage_daemon_shutdown_tx_opt.clone(),
+            storage_daemon_handle.clone(),
+            storage_daemon_port_arc.clone(),
+        ).await?;
+        if !should_enter_interactive {
+            return Ok(());
+        }
+    }
+    if should_enter_interactive {
         interactive_mod::run_cli_interactive(
             daemon_handles.clone(),
             rest_api_shutdown_tx_opt.clone(),
@@ -858,6 +985,5 @@ pub async fn start_cli() -> Result<()> {
             storage_daemon_port_arc.clone(),
         ).await?;
     }
-
     Ok(())
 }
