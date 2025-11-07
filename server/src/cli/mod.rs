@@ -14,6 +14,7 @@ pub mod handlers_storage;
 pub mod handlers_rest;
 pub mod handlers_all;
 pub mod handlers_queries;
+pub mod query_classifier;
 /*
 pub mod serializers;
 pub mod config_structs;

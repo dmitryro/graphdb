@@ -6,10 +6,13 @@
 // FIXED: 2025-08-08 - Added `permanent` boolean field to `UseAction::Storage` and `CommandType::UseStorage` to resolve `E0026` error in `config.rs`.
 // ADDED: 2025-08-09 - Added `Save` command with `Storage` and `Config` subcommands to save storage engine and configuration changes.
 // FIXED: 2025-08-09 - Added `ShowArgs` wrapper struct to fix `E0277` trait bound error for `ShowAction`.
+// UPDATED: 2025-11-06 - Unified `Exec`, `Query`, `-q`, `-c` into single `Query` command with optional `--language`.
+//                     Bare strings in interactive mode are now treated as queries with inference.
 
-use clap::{Parser, Subcommand, Arg, Args};
+use clap::{Parser, Subcommand, Arg, Args, ArgAction};
 use std::path::PathBuf;
 use uuid::Uuid;
+
 // Re-export StorageEngineType to make it accessible to `interactive.rs`
 pub use crate::config::StorageEngineType;
 
@@ -41,26 +44,28 @@ pub fn parse_kv_operation(operation: &str) -> Result<String, String> {
     }
 }
 
+/// A unified query that carries the raw string and an optional language hint.
+#[derive(Debug, Clone)]
+pub struct UnifiedQuery {
+    pub query: String,
+    pub language: Option<String>, // None → infer
+}
+
 /// Enum representing the parsed command type in interactive mode.
 #[derive(Debug, PartialEq, Clone)]
 pub enum CommandType {
     // Daemon Commands
     Daemon(DaemonCliCommand),
-
     // Rest Commands
     Rest(RestCliCommand),
-
     // Storage Commands
     Storage(StorageAction),
-
     // Use Commands
     UseStorage { engine: StorageEngineType, permanent: bool, migrate: bool },
     UsePlugin { enable: bool },
-
     // Save Commands
     SaveStorage,
     SaveConfig,
-
     // Top-level Start command variants (can also be subcommands of 'start')
     StartRest { port: Option<u16>, cluster: Option<String>, rest_port: Option<u16>, rest_cluster: Option<String> },
     StartStorage { port: Option<u16>, config_file: Option<PathBuf>, cluster: Option<String>, storage_port: Option<u16>, storage_cluster: Option<String> },
@@ -77,13 +82,11 @@ pub enum CommandType {
         storage_cluster: Option<String>,
         storage_config_file: Option<PathBuf>,
     },
-
     // Top-level Stop commands (can also be subcommands of 'stop')
     StopAll,
     StopRest(Option<u16>),
     StopDaemon(Option<u16>),
     StopStorage(Option<u16>),
-
     // Top-level Status commands (can also be subcommands of 'status')
     StatusSummary,
     StatusDaemon(Option<u16>),
@@ -91,23 +94,19 @@ pub enum CommandType {
     StatusCluster,
     StatusRaft(Option<u16>),
     //ShowStorage,
-
     // Authentication and User Management
     Auth { username: String, password: String },
     Authenticate { username: String, password: String },
     RegisterUser { username: String, password: String },
-
     // General Information
     Version,
     Health,
-
     // Reload Commands
     ReloadAll,
     ReloadRest,
     ReloadStorage,
     ReloadDaemon(Option<u16>),
     ReloadCluster,
-
     // Restart Commands
     RestartAll {
         port: Option<u16>,
@@ -131,13 +130,11 @@ pub enum CommandType {
     Help(HelpArgs),
     Exit,
     Unknown,
-
     // Key-Value and Query Commands
     Kv { action: KvAction },
     Migrate(MigrateAction),
-    Exec { command: String },
-    Query { query: String },
-    Unified { query: String, language: Option<String> },
+    /// Unified query command (used by `query`, `exec`, `-q`, `-c`, and bare strings)
+    Query { query: String, language: Option<String> },
 }
 
 #[derive(Debug, PartialEq, Clone, Args)]
@@ -146,13 +143,15 @@ pub struct HelpArgs {
     pub command_path: Vec<String>,
 }
 
-/// Arguments for a unified query command.
+/// Arguments for the unified query command.
 #[derive(Args, Debug, PartialEq, Clone)]
 pub struct QueryArgs {
     /// The query string to execute.
+    #[clap(value_name = "QUERY", help = "The query to run (Cypher, SQL, KV, etc.)")]
     pub query_string: String,
+
     /// Optional flag to explicitly specify the query language (e.g., cypher, sql, graphql, kv).
-    #[clap(long, short)]
+    #[clap(long = "language", short = 'l', value_name = "LANG", help = "Force a language (cypher|sql|kv|graphql). If omitted, language is inferred.")]
     pub language: Option<String>,
 }
 
@@ -165,13 +164,15 @@ pub struct CliArgs {
     pub command: Option<Commands>,
 
     /// Run CLI in interactive mode
-    #[clap(long, short = 'c')]
+    #[clap(long, short = 'c', action = ArgAction::SetTrue)]
     pub cli: bool,
+
     /// Enable experimental plugins
     #[clap(long)]
     pub enable_plugins: bool,
+
     /// Execute a direct query string
-    #[clap(long, short = 'q')]
+    #[clap(long, short = 'q', value_name = "QUERY", conflicts_with = "command")]
     pub query: Option<String>,
 
     // Internal flags for daemonized processes (hidden from help)
@@ -275,11 +276,8 @@ pub enum Commands {
     /// Show information about system components
     Show(ShowArgs),
     /// Execute a query against the running GraphDB REST API.
-    #[clap(alias = "q")]
+    #[clap(alias = "q", alias = "e")]
     Query(QueryArgs),
-    /// An alias for the `query` command.
-    #[clap(alias = "e")]
-    Exec(QueryArgs),
     /// Interact with the key-value store.
     #[clap(alias = "k")]
     Kv {
