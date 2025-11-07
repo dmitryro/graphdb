@@ -5,28 +5,35 @@ use serde_json::{json, Value};
 use std::path::{PathBuf, Path};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::os::unix::fs::PermissionsExt; // Added for from_mode
+use std::os::unix::fs::PermissionsExt;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::{self, JoinHandle};
 use tokio::sync::{oneshot, Mutex as TokioMutex};
 use tokio::time::{self, timeout, Duration as TokioDuration};
-use lib::daemon::daemon_management::{check_pid_validity, is_port_free, is_storage_daemon_running, find_pid_by_port, 
-                                     check_daemon_health, restart_daemon_process, stop_storage_daemon_by_port,
-                                     check_pid_validity_sync,                                       
-                                     get_or_create_daemon_with_ipc,
-                                     check_ipc_socket_exists,
-                                     verify_and_recover_ipc,};
+use lib::daemon::daemon_management::{
+    check_pid_validity, is_port_free, is_storage_daemon_running, find_pid_by_port,
+    check_daemon_health, restart_daemon_process, stop_storage_daemon_by_port,
+    check_pid_validity_sync, get_or_create_daemon_with_ipc, check_ipc_socket_exists,
+    verify_and_recover_ipc,
+};
 use lib::daemon::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
 use lib::query_exec_engine::query_exec_engine::QueryExecEngine;
 use lib::query_parser::{parse_query_from_string, QueryType};
-use lib::config::{StorageEngineType, SledConfig, RocksDBConfig, DEFAULT_STORAGE_CONFIG_PATH_RELATIVE, DEFAULT_DATA_DIRECTORY,
-                  default_data_directory, default_log_directory, daemon_api_storage_engine_type_to_string, load_cli_config};
-use lib::storage_engine::storage_engine::{StorageEngine, GraphStorageEngine, AsyncStorageEngineManager, StorageEngineManager, GLOBAL_STORAGE_ENGINE_MANAGER};
+use lib::config::{
+    StorageEngineType, SledConfig, RocksDBConfig, DEFAULT_STORAGE_CONFIG_PATH_RELATIVE,
+    DEFAULT_DATA_DIRECTORY, default_data_directory, default_log_directory,
+    daemon_api_storage_engine_type_to_string, load_cli_config,
+};
+use lib::storage_engine::storage_engine::{
+    StorageEngine, GraphStorageEngine, AsyncStorageEngineManager, StorageEngineManager,
+    GLOBAL_STORAGE_ENGINE_MANAGER,
+};
 use lib::commands::parse_kv_operation;
 use lib::storage_engine::rocksdb_storage::{ROCKSDB_DB, ROCKSDB_POOL_MAP};
-use lib::storage_engine::sled_storage::{ SLED_DB, SLED_POOL_MAP };
+use lib::storage_engine::sled_storage::{SLED_DB, SLED_POOL_MAP};
 use lib::config::{StorageConfig, MAX_SHUTDOWN_RETRIES, SHUTDOWN_RETRY_DELAY_MS, load_storage_config_from_yaml, QueryPlan, QueryResult, SledDbWithPath};
 use lib::database::Database;
+use lib::query_parser::{cypher_parser, sql_parser, graphql_parser};
 use crate::cli::handlers_storage::{start_storage_interactive};
 use models::errors::{GraphError, GraphResult};
 use daemon_api::{start_daemon, stop_port_daemon};
@@ -34,7 +41,6 @@ use lib::storage_engine::sled_client::SledClient;
 use lib::storage_engine::rocksdb_client::RocksDBClient;
 use zmq::{Context as ZmqContext, Message};
 use base64::Engine;
-
 
 async fn execute_and_print(engine: &Arc<QueryExecEngine>, query_string: &str) -> Result<()> {
     match engine.execute(query_string).await {
@@ -49,72 +55,115 @@ async fn execute_and_print(engine: &Arc<QueryExecEngine>, query_string: &str) ->
     Ok(())
 }
 
+pub async fn handle_cypher_query(
+    engine: Arc<QueryExecEngine>,
+    query: String,
+) -> Result<()> {
+    let trimmed_query = query.trim();
+    
+    if trimmed_query.is_empty() {
+        return Err(anyhow!("Cypher query cannot be empty"));
+    }
+
+    info!("Executing Cypher query: {}", trimmed_query);
+
+    let result = engine
+        .execute_cypher(trimmed_query)
+        .await
+        .map_err(|e| anyhow!("Cypher execution failed: {e}"))?;
+
+    let pretty_result = serde_json::to_string_pretty(&result)
+        .map_err(|e| anyhow!("Failed to serialize query result: {e}"))?;
+
+    println!("Cypher Query Result:\n{pretty_result}");
+    
+    Ok(())
+}
+
+pub async fn handle_sql_query(
+    engine: Arc<QueryExecEngine>,
+    query: String,
+) -> Result<()> {
+    info!("Executing SQL query: {}", query);
+    println!("Executing SQL query: {}", query);
+
+    if query.trim().is_empty() {
+        return Err(anyhow!("SQL query cannot be empty"));
+    }
+
+    let result = engine
+        .execute_sql(&query)
+        .await
+        .map_err(|e| anyhow!("Failed to execute SQL query: {}", e))?;
+
+    println!("SQL Query Result:\n{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
+}
+
+pub async fn handle_graphql_query(
+    engine: Arc<QueryExecEngine>,
+    query: String,
+) -> Result<()> {
+    info!("Executing GraphQL query: {}", query);
+    println!("Executing GraphQL query: {}", query);
+
+    if query.trim().is_empty() {
+        return Err(anyhow!("GraphQL query cannot be empty"));
+    }
+
+    let result = engine
+        .execute_graphql(&query)
+        .await
+        .map_err(|e| anyhow!("Failed to execute GraphQL query: {}", e))?;
+
+    println!("GraphQL Query Result:\n{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
+}
+
 pub async fn handle_unified_query(
     engine: Arc<QueryExecEngine>,
     query_string: String,
     language: Option<String>,
 ) -> Result<()> {
-    info!("Executing query: {}", query_string);
+    info!("Executing unified query: {}", query_string);
+    let query = query_string.trim().to_string();
 
-    let normalized_query = query_string.trim().to_uppercase();
+    if query.is_empty() {
+        return Err(anyhow!("Query cannot be empty"));
+    }
 
-    let query_type = if let Some(lang) = language {
-        let lang_lower = lang.to_lowercase();
-        match lang_lower.as_str() {
-            "cypher" => {
-                if normalized_query.starts_with("MATCH") || normalized_query.starts_with("CREATE") || normalized_query.starts_with("MERGE") {
-                    Ok("cypher")
-                } else {
-                    Err(anyhow!("Syntax conflict: --language cypher provided, but query does not appear to be a valid Cypher statement."))
-                }
-            },
-            "sql" | "graphql" => {
-                Err(anyhow!("Unsupported language flag: {}. Only a subset of Cypher is currently supported by the QueryExecEngine.", lang_lower))
-            },
-            _ => Err(anyhow!("Unsupported language flag: {}. Supported language is: cypher.", lang_lower))
-        }
-    } else {
-        if normalized_query.starts_with("MATCH") || normalized_query.starts_with("CREATE") || normalized_query.starts_with("MERGE") {
-            Ok("cypher")
-        } else {
-            Err(anyhow!("Could not determine query type from input string. Please use a recognized Cypher format or an explicit --language flag."))
-        }
-    };
+    let effective_lang = language.as_deref().unwrap_or("").trim().to_lowercase();
 
-    match query_type {
-        Ok("cypher") => {
-            info!("Detected Cypher query. Executing directly via QueryExecEngine.");
-            execute_and_print(&engine, &query_string).await
-        },
-        Err(e) => Err(e),
-        _ => unreachable!(),
+    match effective_lang.as_str() {
+        "cypher" | "" => handle_cypher_query(engine, query).await,
+        "sql" => handle_sql_query(engine, query).await,
+        "graphql" => handle_graphql_query(engine, query).await,
+        _ => Err(anyhow!(
+            "Unsupported language: '{}'. Use cypher, sql, or graphql",
+            effective_lang
+        )),
     }
 }
 
 pub async fn handle_interactive_query(engine: Arc<QueryExecEngine>, query_string: String) -> Result<()> {
     let normalized_query = query_string.trim().to_uppercase();
     info!("Attempting to identify interactive query: '{}'", normalized_query);
-
     if normalized_query == "EXIT" || normalized_query == "QUIT" {
         return Ok(());
     }
-
     handle_unified_query(engine, query_string, None).await
 }
 
 pub async fn handle_exec_command(engine: Arc<QueryExecEngine>, command: String) -> Result<()> {
     info!("Executing command '{}' on QueryExecEngine", command);
     println!("Executing command '{}'", command);
-
     if command.trim().is_empty() {
         return Err(anyhow!("Exec command cannot be empty. Usage: exec --command <command>"));
     }
-
     let result = engine
         .execute_command(&command)
         .await
         .map_err(|e| anyhow!("Failed to execute command '{}': {}", command, e))?;
-
     println!("Command Result: {}", result);
     Ok(())
 }
@@ -122,14 +171,11 @@ pub async fn handle_exec_command(engine: Arc<QueryExecEngine>, command: String) 
 pub async fn handle_query_command(engine: Arc<QueryExecEngine>, query: String) -> Result<()> {
     info!("Executing query '{}' on QueryExecEngine", query);
     println!("Executing query '{}'", query);
-
     if query.trim().is_empty() {
         return Err(anyhow!("Query cannot be empty. Usage: query --query <query>"));
     }
-
     let query_type = parse_query_from_string(&query)
         .map_err(|e| anyhow!("Failed to parse query '{}': {}", query, e))?;
-
     let result = match query_type {
         QueryType::Cypher => {
             info!("Detected Cypher query");
@@ -153,7 +199,6 @@ pub async fn handle_query_command(engine: Arc<QueryExecEngine>, query: String) -
                 .map_err(|e| anyhow!("Failed to execute GraphQL query '{}': {}", query, e))?
         }
     };
-
     println!("Query Result:\n{}", serde_json::to_string_pretty(&result)?);
     Ok(())
 }
@@ -163,42 +208,33 @@ fn do_zmq_request(addr: &str, request_data: &[u8]) -> Result<Value> {
     let client = zmq_context
         .socket(zmq::REQ)
         .context("Failed to create ZMQ socket")?;
-
     client.set_rcvtimeo((15 * 1000) as i32)
         .context("Failed to set receive timeout")?;
     client.set_sndtimeo((10 * 1000) as i32)
         .context("Failed to set send timeout")?;
     client.set_linger(500)
         .context("Failed to set linger")?;
-
     client.connect(addr)
         .context(format!("Failed to connect to {}", addr))?;
-    
+   
     debug!("Successfully connected to: {}", addr);
-
     client.send(request_data, 0)
         .context(format!("Failed to send request to {}", addr))?;
-
     debug!("Request sent successfully");
-
     let mut msg = zmq::Message::new();
     client.recv(&mut msg, 0)
         .context(format!("Failed to receive response from {}", addr))?;
-
     debug!("Received response");
-
     // Disconnect socket to release resources
     if let Err(e) = client.disconnect(addr) {
         warn!("Failed to disconnect ZMQ socket from {}: {}", addr, e);
     } else {
         debug!("Disconnected ZMQ socket from {}", addr);
     }
-    
+   
     let response: Value = serde_json::from_slice(msg.as_ref())
         .context(format!("Failed to deserialize response from {}", addr))?;
-
     debug!("Parsed response: {:?}", response);
-
     Ok(response)
 }
 
@@ -208,9 +244,7 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
     const RECEIVE_TIMEOUT_SECS: u64 = 15;
     const MAX_RETRIES: u32 = 3;
     const BASE_RETRY_DELAY_MS: u64 = 500;
-
     info!("Starting ZMQ KV operation: {} for key: {}", operation, key);
-
     // -----------------------------------------------------------------
     // 1. Find a daemon with verified IPC socket, or recover
     // -----------------------------------------------------------------
@@ -226,21 +260,18 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
                 && check_pid_validity_sync(metadata.pid)
         })
         .collect::<Vec<_>>();
-
     if daemons.is_empty() {
         error!("No running Sled daemon found");
         return Err(anyhow!(
             "No running Sled daemon found. Please start a daemon with 'storage start'"
         ));
     }
-
     // Sort by port (highest first) to prefer the default
     daemons.sort_by_key(|m| std::cmp::Reverse(m.port));
-
     // Try to find a daemon with a valid IPC socket
     let mut selected_daemon: Option<DaemonMetadata> = None;
     let mut broken_daemons: Vec<u16> = Vec::new();
-    
+   
     for daemon in &daemons {
         let socket_path = format!("/tmp/graphdb-{}.ipc", daemon.port);
         if tokio::fs::metadata(&socket_path).await.is_ok() {
@@ -255,7 +286,6 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
             broken_daemons.push(daemon.port);
         }
     }
-
     // If no daemon has IPC, attempt recovery on the first broken one
     if selected_daemon.is_none() && !broken_daemons.is_empty() {
         let recovery_port = broken_daemons[0];
@@ -267,22 +297,19 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
             "===> WARNING: No daemon with IPC found - attempting recovery on port {}",
             recovery_port
         );
-
         // Load config for recovery
         let config = load_storage_config_from_yaml(None).await.map_err(|e| {
             anyhow!("Failed to load config for IPC recovery: {}", e)
         })?;
-
         // Stop the broken daemon
         if let Err(e) = stop_storage_daemon_by_port(recovery_port).await {
             warn!("Failed to stop broken daemon on port {}: {}", recovery_port, e);
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
         // Start fresh daemon with IPC
         let cwd = std::env::current_dir().context("Failed to get current working directory")?;
         let config_path = cwd.join(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
-        
+       
         let mut recovery_config = config.clone();
         recovery_config.default_port = recovery_port;
         if let Some(ref mut ec) = recovery_config.engine_specific_config {
@@ -295,11 +322,9 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
                 .to_string();
             ec.storage.path = Some(PathBuf::from(format!("{}/sled/{}", base_dir, recovery_port)));
         }
-
         let shutdown_tx = Arc::new(TokioMutex::new(None));
         let handle = Arc::new(TokioMutex::new(None));
         let port_arc = Arc::new(TokioMutex::new(None));
-
         start_storage_interactive(
             Some(recovery_port),
             Some(config_path),
@@ -316,7 +341,6 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
                 recovery_port, e
             )
         })?;
-
         // Wait for IPC to be ready
         let mut ipc_ready = false;
         for attempt in 0..30 {
@@ -329,14 +353,12 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
                 break;
             }
         }
-
         if !ipc_ready {
             return Err(anyhow!(
                 "Failed to recover IPC on port {} after daemon restart",
                 recovery_port
             ));
         }
-
         // Refresh daemon metadata
         if let Ok(Some(daemon_meta)) = registry.get_daemon_metadata(recovery_port).await {
             selected_daemon = Some(daemon_meta);
@@ -347,20 +369,16 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
             ));
         }
     }
-
     let daemon = selected_daemon.ok_or_else(|| {
         error!("No Sled daemon has a valid IPC socket and recovery failed");
         anyhow!(
             "Sled daemons found but none have valid IPC sockets and recovery failed. Try 'start-storage'."
         )
     })?;
-
     info!("Selected Sled daemon on port: {}", daemon.port);
     println!("===> Selected daemon on port: {}", daemon.port);
-
     let socket_path = format!("/tmp/graphdb-{}.ipc", daemon.port);
     let addr = format!("ipc://{}", socket_path);
-
     // Final verification
     if !tokio::fs::metadata(&socket_path).await.is_ok() {
         error!(
@@ -372,7 +390,6 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
             socket_path
         ));
     }
-
     // -----------------------------------------------------------------
     // 2. Build the request (Base64 encoding)
     // -----------------------------------------------------------------
@@ -384,20 +401,20 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
             })?;
             json!({
                 "command": "set_key",
-                "key":   base64::engine::general_purpose::STANDARD.encode(&key),
+                "key": base64::engine::general_purpose::STANDARD.encode(&key),
                 "value": base64::engine::general_purpose::STANDARD.encode(&value),
-                "cf":    "kv_pairs"
+                "cf": "kv_pairs"
             })
         }
         "get" => json!({
             "command": "get_key",
-            "key":   base64::engine::general_purpose::STANDARD.encode(&key),
-            "cf":    "kv_pairs"
+            "key": base64::engine::general_purpose::STANDARD.encode(&key),
+            "cf": "kv_pairs"
         }),
         "delete" => json!({
             "command": "delete_key",
-            "key":   base64::engine::general_purpose::STANDARD.encode(&key),
-            "cf":    "kv_pairs"
+            "key": base64::engine::general_purpose::STANDARD.encode(&key),
+            "cf": "kv_pairs"
         }),
         "flush" => json!({ "command": "flush" }),
         _ => {
@@ -405,10 +422,8 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
             return Err(anyhow!("Unsupported operation: {}", operation));
         }
     };
-
     let request_data = serde_json::to_vec(&request)
         .map_err(|e| anyhow!("Failed to serialize request: {}", e))?;
-
     // -----------------------------------------------------------------
     // 3. Send the request with retries
     // -----------------------------------------------------------------
@@ -423,7 +438,6 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
             }),
         )
         .await;
-
         match response_result {
             Ok(Ok(response)) => {
                 let response_value = response?;
@@ -504,14 +518,12 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
                 warn!("Attempt {}/{} timed out", attempt, MAX_RETRIES);
             }
         }
-
         if attempt < MAX_RETRIES {
             let delay = BASE_RETRY_DELAY_MS * 2u64.pow(attempt - 1);
             debug!("Retrying after {}ms", delay);
             tokio::time::sleep(TokioDuration::from_millis(delay)).await;
         }
     }
-
     Err(last_error.unwrap_or_else(|| {
         anyhow!(
             "Failed to complete ZMQ operation after {} attempts",
@@ -526,9 +538,7 @@ async fn handle_kv_rocksdb_zmq(key: String, value: Option<String>, operation: &s
     const RECEIVE_TIMEOUT_SECS: u64 = 15;
     const MAX_RETRIES: u32 = 3;
     const BASE_RETRY_DELAY_MS: u64 = 500;
-
     info!("Starting ZMQ KV operation: {} for key: {}", operation, key);
-
     // -----------------------------------------------------------------
     // 1. Find a daemon with verified IPC socket, or recover
     // -----------------------------------------------------------------
@@ -544,21 +554,18 @@ async fn handle_kv_rocksdb_zmq(key: String, value: Option<String>, operation: &s
                 && check_pid_validity_sync(metadata.pid)
         })
         .collect::<Vec<_>>();
-
     if daemons.is_empty() {
         error!("No running RocksDB daemon found");
         return Err(anyhow!(
             "No running RocksDB daemon found. Please start a daemon with 'storage start'"
         ));
     }
-
     // Sort by port (highest first) to prefer the default
     daemons.sort_by_key(|m| std::cmp::Reverse(m.port));
-
     // Try to find a daemon with a valid IPC socket
     let mut selected_daemon: Option<DaemonMetadata> = None;
     let mut broken_daemons: Vec<u16> = Vec::new();
-    
+   
     for daemon in &daemons {
         let socket_path = format!("/tmp/graphdb-{}.ipc", daemon.port);
         if tokio::fs::metadata(&socket_path).await.is_ok() {
@@ -573,7 +580,6 @@ async fn handle_kv_rocksdb_zmq(key: String, value: Option<String>, operation: &s
             broken_daemons.push(daemon.port);
         }
     }
-
     // If no daemon has IPC, attempt recovery on the first broken one
     if selected_daemon.is_none() && !broken_daemons.is_empty() {
         let recovery_port = broken_daemons[0];
@@ -585,22 +591,19 @@ async fn handle_kv_rocksdb_zmq(key: String, value: Option<String>, operation: &s
             "===> WARNING: No daemon with IPC found - attempting recovery on port {}",
             recovery_port
         );
-
         // Load config for recovery
         let config = load_storage_config_from_yaml(None).await.map_err(|e| {
             anyhow!("Failed to load config for IPC recovery: {}", e)
         })?;
-
         // Stop the broken daemon
         if let Err(e) = stop_storage_daemon_by_port(recovery_port).await {
             warn!("Failed to stop broken daemon on port {}: {}", recovery_port, e);
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
         // Start fresh daemon with IPC
         let cwd = std::env::current_dir().context("Failed to get current working directory")?;
         let config_path = cwd.join(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
-        
+       
         let mut recovery_config = config.clone();
         recovery_config.default_port = recovery_port;
         if let Some(ref mut ec) = recovery_config.engine_specific_config {
@@ -613,11 +616,9 @@ async fn handle_kv_rocksdb_zmq(key: String, value: Option<String>, operation: &s
                 .to_string();
             ec.storage.path = Some(PathBuf::from(format!("{}/rocksdb/{}", base_dir, recovery_port)));
         }
-
         let shutdown_tx = Arc::new(TokioMutex::new(None));
         let handle = Arc::new(TokioMutex::new(None));
         let port_arc = Arc::new(TokioMutex::new(None));
-
         start_storage_interactive(
             Some(recovery_port),
             Some(config_path),
@@ -634,7 +635,6 @@ async fn handle_kv_rocksdb_zmq(key: String, value: Option<String>, operation: &s
                 recovery_port, e
             )
         })?;
-
         // Wait for IPC to be ready
         let mut ipc_ready = false;
         for attempt in 0..30 {
@@ -647,14 +647,12 @@ async fn handle_kv_rocksdb_zmq(key: String, value: Option<String>, operation: &s
                 break;
             }
         }
-
         if !ipc_ready {
             return Err(anyhow!(
                 "Failed to recover IPC on port {} after daemon restart",
                 recovery_port
             ));
         }
-
         // Refresh daemon metadata
         if let Ok(Some(daemon_meta)) = registry.get_daemon_metadata(recovery_port).await {
             selected_daemon = Some(daemon_meta);
@@ -665,20 +663,16 @@ async fn handle_kv_rocksdb_zmq(key: String, value: Option<String>, operation: &s
             ));
         }
     }
-
     let daemon = selected_daemon.ok_or_else(|| {
         error!("No RocksDB daemon has a valid IPC socket and recovery failed");
         anyhow!(
             "RocksDB daemons found but none have valid IPC sockets and recovery failed. Try 'start-storage'."
         )
     })?;
-
     info!("Selected RocksDB daemon on port: {}", daemon.port);
     println!("===> Selected daemon on port: {}", daemon.port);
-
     let socket_path = format!("/tmp/graphdb-{}.ipc", daemon.port);
     let addr = format!("ipc://{}", socket_path);
-
     // Final verification
     if !tokio::fs::metadata(&socket_path).await.is_ok() {
         error!(
@@ -690,9 +684,7 @@ async fn handle_kv_rocksdb_zmq(key: String, value: Option<String>, operation: &s
             socket_path
         ));
     }
-
     debug!("Connecting to RocksDB daemon at: {}", addr);
-
     // -----------------------------------------------------------------
     // 2. Build the request (plain text, no Base64)
     // -----------------------------------------------------------------
@@ -710,18 +702,15 @@ async fn handle_kv_rocksdb_zmq(key: String, value: Option<String>, operation: &s
         "clear" => json!({ "command": "clear_data" }),
         _ => return Err(anyhow!("Unsupported operation: {}", operation)),
     };
-
     debug!("Sending request: {:?}", request);
     let request_data = serde_json::to_vec(&request)
         .map_err(|e| anyhow!("Failed to serialize request: {}", e))?;
-
     // -----------------------------------------------------------------
     // 3. Send the request with retries
     // -----------------------------------------------------------------
     let mut last_error: Option<anyhow::Error> = None;
     for attempt in 1..=MAX_RETRIES {
         debug!("Attempt {}/{} to send ZMQ request", attempt, MAX_RETRIES);
-
         let response_result = tokio::time::timeout(
             TokioDuration::from_secs(CONNECT_TIMEOUT_SECS + REQUEST_TIMEOUT_SECS + RECEIVE_TIMEOUT_SECS),
             tokio::task::spawn_blocking({
@@ -731,7 +720,6 @@ async fn handle_kv_rocksdb_zmq(key: String, value: Option<String>, operation: &s
             })
         )
         .await;
-
         match response_result {
             Ok(Ok(response)) => {
                 let response_value = response?;
@@ -787,14 +775,12 @@ async fn handle_kv_rocksdb_zmq(key: String, value: Option<String>, operation: &s
                 warn!("Attempt {}/{} timed out", attempt, MAX_RETRIES);
             }
         }
-
         if attempt < MAX_RETRIES {
             let delay = BASE_RETRY_DELAY_MS * 2u64.pow(attempt - 1);
             debug!("Retrying after {}ms", delay);
             tokio::time::sleep(TokioDuration::from_millis(delay)).await;
         }
     }
-
     Err(last_error.unwrap_or_else(|| anyhow!("Failed to complete ZMQ operation after {} attempts", MAX_RETRIES)))
 }
 
@@ -802,11 +788,9 @@ pub async fn handle_kv_command(engine: Arc<QueryExecEngine>, operation: String, 
     debug!("In handle_kv_command: operation={}, key={}", operation, key);
     let validated_op = parse_kv_operation(&operation)
         .map_err(|e| anyhow!("Invalid KV operation: {}", e))?;
-
     let config = load_cli_config().await
         .map_err(|e| anyhow!("Failed to load CLI config: {}", e))?;
     debug!("Loaded config: {:?}", config);
-
     // Handle Sled and RocksDB via ZeroMQ, others via engine directly
     match config.storage.storage_engine_type {
         Some(StorageEngineType::Sled) => {
@@ -882,7 +866,6 @@ type StartStorageFn = fn(
     Arc<TokioMutex<Option<tokio::task::JoinHandle<()>>>>,
     Arc<TokioMutex<Option<u16>>>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), anyhow::Error>> + Send>>;
-
 type StopStorageFn = fn(
     Option<u16>,
     Arc<TokioMutex<Option<tokio::sync::oneshot::Sender<()>>>>,
@@ -896,7 +879,7 @@ pub async fn initialize_storage_for_query(
 ) -> Result<Arc<QueryExecEngine>, anyhow::Error> {
     static INIT_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _guard = INIT_MUTEX.lock().await;
-    
+   
     let config = match load_storage_config_from_yaml(None).await {
         Ok(c) => {
             info!("Loaded storage config: {:?}", c);
@@ -908,16 +891,16 @@ pub async fn initialize_storage_for_query(
             StorageConfig::default()
         }
     };
-    
+   
     let canonical_port = config
         .engine_specific_config
         .as_ref()
         .and_then(|esc| esc.storage.port)
         .unwrap_or(config.default_port);
-    
+   
     let cwd = std::env::current_dir().context("Failed to get current working directory")?;
     let config_path = cwd.join(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
-    
+   
     // Early return if engine manager already exists
     if let Some(manager) = GLOBAL_STORAGE_ENGINE_MANAGER.get() {
         let engine = manager.get_persistent_engine().await;
@@ -928,13 +911,13 @@ pub async fn initialize_storage_for_query(
             return Ok(Arc::new(QueryExecEngine::new(Arc::new(db))));
         }
     }
-    
+   
     let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
-    
-    // ✅ NEW: Smart daemon selection - find one with working IPC
+   
+    // Smart daemon selection - find one with working IPC
     info!("Finding daemon with working IPC for engine {:?}", config.storage_engine_type);
     println!("===> FINDING DAEMON WITH WORKING IPC FOR ENGINE {:?}", config.storage_engine_type);
-    
+   
     let working_port = match get_or_create_daemon_with_ipc(
         config.storage_engine_type.clone(),
         &config,
@@ -948,7 +931,7 @@ pub async fn initialize_storage_for_query(
             // No working daemon found - start one
             warn!("No working daemon found: {} - starting new daemon", e);
             println!("===> NO WORKING DAEMON FOUND - STARTING NEW DAEMON ON PORT {}", canonical_port);
-            
+           
             // Stop any broken daemon on canonical port
             if let Ok(Some(metadata)) = daemon_registry.get_daemon_metadata(canonical_port).await {
                 if check_pid_validity(metadata.pid).await {
@@ -957,12 +940,12 @@ pub async fn initialize_storage_for_query(
                     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                 }
             }
-            
+           
             // Start fresh daemon with IPC
             let shutdown_tx = Arc::new(TokioMutex::new(None));
             let handle = Arc::new(TokioMutex::new(None));
             let port_arc = Arc::new(TokioMutex::new(None));
-            
+           
             start_storage_interactive(
                 Some(canonical_port),
                 Some(config_path.clone()),
@@ -979,12 +962,12 @@ pub async fn initialize_storage_for_query(
                     canonical_port, e
                 )
             })?;
-            
+           
             // Wait for daemon to be ready
             let mut ready = false;
             for attempt in 0..30 {
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                
+               
                 if check_ipc_socket_exists(canonical_port).await {
                     if let Ok(Some(metadata)) = daemon_registry.get_daemon_metadata(canonical_port).await {
                         if check_pid_validity(metadata.pid).await {
@@ -993,30 +976,30 @@ pub async fn initialize_storage_for_query(
                         }
                     }
                 }
-                
+               
                 if attempt % 5 == 0 {
                     info!("Waiting for daemon IPC to be ready... (attempt {})", attempt + 1);
                 }
             }
-            
+           
             if !ready {
                 return Err(anyhow!(
                     "Daemon started on port {} but IPC socket not ready after 15 seconds",
                     canonical_port
                 ));
             }
-            
+           
             println!("===> NEW DAEMON WITH IPC READY ON PORT {}", canonical_port);
             canonical_port
         }
     };
-    
+   
     // Verify IPC one more time
     verify_and_recover_ipc(working_port).await.map_err(|e| {
         anyhow!("IPC verification failed for port {}: {}", working_port, e)
     })?;
-    
-    // ✅ Create or reuse manager for the working port
+   
+    // Create or reuse manager for the working port
     let manager = if let Some(m) = GLOBAL_STORAGE_ENGINE_MANAGER.get() {
         m.clone()
     } else {
@@ -1033,14 +1016,50 @@ pub async fn initialize_storage_for_query(
                 working_port, e
             )
         })?;
-        
+       
         let arc_manager = Arc::new(AsyncStorageEngineManager::from_manager(manager));
         GLOBAL_STORAGE_ENGINE_MANAGER.set(arc_manager.clone())
             .map_err(|_| anyhow!("Failed to set StorageEngineManager"))?;
         arc_manager
     };
-    
+   
     let engine = manager.get_persistent_engine().await;
     let db = Database { storage: engine, config };
     Ok(Arc::new(QueryExecEngine::new(Arc::new(db))))
+}
+
+pub async fn execute_query(
+    engine: Arc<QueryExecEngine>,
+    query: String,          // ← Raw query string
+    language: Option<String>,
+) -> Result<(), anyhow::Error> {
+    let lang = match language {
+        Some(l) => l,
+        None => return Err(anyhow!("Could not infer query language. Use --language sql|cypher")),
+    };
+
+    // PASS RAW QUERY STRING TO ENGINE — DO NOT PARSE HERE
+    let result = match lang.as_str() {
+        "cypher" => {
+            // Engine handles parsing internally
+            engine.execute_cypher(&query).await?
+        },
+        "sql" => {
+            // Engine handles parsing internally
+            engine.execute_sql(&query).await.map_err(|e| anyhow!(e))?
+        },
+        _ => return Err(anyhow!("Unsupported language: {}", lang)),
+    };
+
+    // Format and print result
+    let output = serde_json::to_string_pretty(&result)
+        .unwrap_or_else(|_| result.to_string());
+    println!("{}", output);
+    Ok(())
+}
+
+// Use this instead of format_result
+fn format_json_result(result: &serde_json::Value) -> String {
+    serde_json::to_string_pretty(result)
+        .unwrap_or_else(|_| result.to_string())
 }

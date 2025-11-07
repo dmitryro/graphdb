@@ -5204,4 +5204,3 @@ impl RaftNetwork<NodeId, BasicNode> for RaftTcpNetwork {
         }
     }
 }
-
