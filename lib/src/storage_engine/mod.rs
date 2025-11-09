@@ -46,17 +46,22 @@ pub mod mysql_storage;
 #[cfg(any(feature = "with-sled", feature = "with-rocksdb", feature = "with-tikv"))]
 pub mod hybrid_storage;
 #[cfg(feature = "with-sled")]
+pub mod  sled_wal_manager;
+#[cfg(feature = "with-sled")]
 pub mod sled_storage_daemon_pool;
 #[cfg(feature = "with-rocksdb")]
 pub mod rocksdb_storage_daemon_pool;
 #[cfg(feature = "with-rocksdb")]
 pub mod rocksdb_client;
+#[cfg(feature = "with-rocksdb")]
+pub mod rocksdb_wal_manager;
 // Re-export key items
 pub use crate::config::{
     CliConfigToml, StorageConfig, StorageEngineType, RocksDBConfig, SledConfig, TikvConfig, HybridConfig,
     format_engine_config, load_storage_config_from_yaml, SelectedStorageConfig,
 };
 pub use inmemory_storage::{InMemoryStorage as InMemoryGraphStorage};
+
 #[cfg(feature = "with-sled")]
 pub mod sled_storage;
 #[cfg(feature = "with-sled")]

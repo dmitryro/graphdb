@@ -27,7 +27,9 @@ use crate::commands::{Commands, CommandType, StatusArgs, RestartArgs, ReloadArgs
 use crate::daemon_utils::{is_port_in_cluster_range, is_valid_cluster_range, parse_cluster_range};
 pub use crate::storage_engine::storage_engine::{StorageEngineManager, GraphStorageEngine, GLOBAL_STORAGE_ENGINE_MANAGER};
 pub use crate::storage_engine::sled_client::{ZmqSocketWrapper};
+pub use crate::storage_engine::sled_wal_manager::{ SledWalManager };
 pub use crate::storage_engine::rocksdb_client::{ZmqSocketWrapper as RocksdDBZmqSocketWrapper};
+pub use crate::storage_engine::rocksdb_wal_manager::{ RocksDBWalManager };
 use models::{Vertex, Edge, Identifier, identifiers::SerializableUuid};
 use models::errors::{GraphError, GraphResult};
 use openraft_memstore::MemStore;
@@ -312,6 +314,7 @@ pub struct SledDaemon {
     pub vertices: Tree,
     pub edges: Tree,
     pub kv_pairs: Tree,
+    pub wal_manager: Arc<SledWalManager>,  // Add WAL manager
     pub running: Arc<TokioMutex<bool>>,
     #[cfg(feature = "with-openraft-sled")]
     pub raft_storage: Arc<openraft_sled::SledRaftStorage<TypeConfig>>,
@@ -502,6 +505,7 @@ pub struct RocksDBDaemon<'a> {
     pub kv_pairs: Arc<BoundColumnFamily<'a>>,
     pub vertices: Arc<BoundColumnFamily<'a>>,
     pub edges: Arc<BoundColumnFamily<'a>>,
+    pub wal_manager: Arc<RocksDBWalManager>,
     pub running: Arc<TokioMutex<bool>>,
     pub shutdown_tx: mpsc::Sender<()>,
     pub zmq_context: Arc<ZmqContext>,

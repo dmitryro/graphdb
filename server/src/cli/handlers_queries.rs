@@ -14,7 +14,7 @@ use lib::daemon::daemon_management::{
     check_pid_validity, is_port_free, is_storage_daemon_running, find_pid_by_port,
     check_daemon_health, restart_daemon_process, stop_storage_daemon_by_port,
     check_pid_validity_sync, get_or_create_daemon_with_ipc, check_ipc_socket_exists,
-    verify_and_recover_ipc,
+    verify_and_recover_ipc, is_zmq_reachable,
 };
 use lib::daemon::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
 use lib::query_exec_engine::query_exec_engine::QueryExecEngine;
@@ -31,7 +31,8 @@ use lib::storage_engine::storage_engine::{
 use lib::commands::parse_kv_operation;
 use lib::storage_engine::rocksdb_storage::{ROCKSDB_DB, ROCKSDB_POOL_MAP};
 use lib::storage_engine::sled_storage::{SLED_DB, SLED_POOL_MAP};
-use lib::config::{StorageConfig, MAX_SHUTDOWN_RETRIES, SHUTDOWN_RETRY_DELAY_MS, load_storage_config_from_yaml, QueryPlan, QueryResult, SledDbWithPath};
+use lib::config::{StorageConfig, MAX_SHUTDOWN_RETRIES, SHUTDOWN_RETRY_DELAY_MS, load_storage_config_from_yaml, 
+                  QueryPlan, QueryResult, SledDbWithPath, SledDaemon };
 use lib::database::Database;
 use lib::query_parser::{cypher_parser, sql_parser, graphql_parser};
 use crate::cli::handlers_storage::{start_storage_interactive};
@@ -879,11 +880,11 @@ pub async fn initialize_storage_for_query(
 ) -> Result<Arc<QueryExecEngine>, anyhow::Error> {
     static INIT_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _guard = INIT_MUTEX.lock().await;
-   
+
     let config = match load_storage_config_from_yaml(None).await {
         Ok(c) => {
             info!("Loaded storage config: {:?}", c);
-            println!("===> SUCCESSFULLY LOADED STORAGE CONFIG: {:?}", c);
+            println!("===> SUCCESSFULLY LOADED STORAGE CONFIG");
             c
         },
         Err(e) => {
@@ -891,61 +892,56 @@ pub async fn initialize_storage_for_query(
             StorageConfig::default()
         }
     };
-   
+
     let canonical_port = config
         .engine_specific_config
         .as_ref()
         .and_then(|esc| esc.storage.port)
         .unwrap_or(config.default_port);
-   
+
     let cwd = std::env::current_dir().context("Failed to get current working directory")?;
     let config_path = cwd.join(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
-   
-    // Early return if engine manager already exists
+
     if let Some(manager) = GLOBAL_STORAGE_ENGINE_MANAGER.get() {
         let engine = manager.get_persistent_engine().await;
         if engine.get_type() == config.storage_engine_type.to_string() {
             info!("StorageEngineManager already initialized. Reusing.");
             println!("===> STORAGE ENGINE MANAGER ALREADY INITIALIZED. REUSING.");
+            
+            // ✅ NO WAL REPLAY HERE — it's done during daemon startup
             let db = Database { storage: engine, config };
             return Ok(Arc::new(QueryExecEngine::new(Arc::new(db))));
         }
     }
-   
+
     let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
-   
-    // Smart daemon selection - find one with working IPC
+
     info!("Finding daemon with working IPC for engine {:?}", config.storage_engine_type);
     println!("===> FINDING DAEMON WITH WORKING IPC FOR ENGINE {:?}", config.storage_engine_type);
-   
+
     let working_port = match get_or_create_daemon_with_ipc(
         config.storage_engine_type.clone(),
         &config,
     ).await {
         Ok(port) => {
-            info!("Found working daemon with IPC on port {}", port);
-            println!("===> FOUND WORKING DAEMON WITH IPC ON PORT {}", port);
+            info!("Reusing existing healthy daemon on port {}", port);
+            println!("===> REUSING HEALTHY DAEMON ON PORT {}", port);
             port
         }
         Err(e) => {
-            // No working daemon found - start one
-            warn!("No working daemon found: {} - starting new daemon", e);
-            println!("===> NO WORKING DAEMON FOUND - STARTING NEW DAEMON ON PORT {}", canonical_port);
-           
-            // Stop any broken daemon on canonical port
-            if let Ok(Some(metadata)) = daemon_registry.get_daemon_metadata(canonical_port).await {
-                if check_pid_validity(metadata.pid).await {
-                    warn!("Stopping broken daemon on port {} before restart", canonical_port);
+            warn!("No healthy daemon found: {}", e);
+            println!("===> NO HEALTHY DAEMON FOUND - STARTING NEW ON PORT {}", canonical_port);
+
+            if let Ok(Some(meta)) = daemon_registry.get_daemon_metadata(canonical_port).await {
+                if check_pid_validity(meta.pid).await {
                     let _ = stop_storage_daemon_by_port(canonical_port).await;
                     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                 }
             }
-           
-            // Start fresh daemon with IPC
+
             let shutdown_tx = Arc::new(TokioMutex::new(None));
             let handle = Arc::new(TokioMutex::new(None));
             let port_arc = Arc::new(TokioMutex::new(None));
-           
             start_storage_interactive(
                 Some(canonical_port),
                 Some(config_path.clone()),
@@ -956,50 +952,30 @@ pub async fn initialize_storage_for_query(
                 port_arc,
             )
             .await
-            .map_err(|e| {
-                anyhow!(
-                    "Failed to start storage daemon on port {}: {}",
-                    canonical_port, e
-                )
-            })?;
-           
-            // Wait for daemon to be ready
+            .map_err(|e| anyhow!("Failed to start daemon: {}", e))?;
+
             let mut ready = false;
-            for attempt in 0..30 {
+            for _ in 0..30 {
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-               
-                if check_ipc_socket_exists(canonical_port).await {
-                    if let Ok(Some(metadata)) = daemon_registry.get_daemon_metadata(canonical_port).await {
-                        if check_pid_validity(metadata.pid).await {
-                            ready = true;
-                            break;
-                        }
-                    }
-                }
-               
-                if attempt % 5 == 0 {
-                    info!("Waiting for daemon IPC to be ready... (attempt {})", attempt + 1);
+                if check_ipc_socket_exists(canonical_port).await
+                    && is_zmq_reachable(canonical_port).await
+                {
+                    ready = true;
+                    break;
                 }
             }
-           
             if !ready {
-                return Err(anyhow!(
-                    "Daemon started on port {} but IPC socket not ready after 15 seconds",
-                    canonical_port
-                ));
+                return Err(anyhow!("New daemon on {} not ready", canonical_port));
             }
-           
-            println!("===> NEW DAEMON WITH IPC READY ON PORT {}", canonical_port);
             canonical_port
         }
     };
-   
-    // Verify IPC one more time
+
     verify_and_recover_ipc(working_port).await.map_err(|e| {
         anyhow!("IPC verification failed for port {}: {}", working_port, e)
     })?;
-   
-    // Create or reuse manager for the working port
+
+    // Create manager for the working port
     let manager = if let Some(m) = GLOBAL_STORAGE_ENGINE_MANAGER.get() {
         m.clone()
     } else {
@@ -1016,14 +992,16 @@ pub async fn initialize_storage_for_query(
                 working_port, e
             )
         })?;
-       
+
         let arc_manager = Arc::new(AsyncStorageEngineManager::from_manager(manager));
         GLOBAL_STORAGE_ENGINE_MANAGER.set(arc_manager.clone())
             .map_err(|_| anyhow!("Failed to set StorageEngineManager"))?;
         arc_manager
     };
-   
+
     let engine = manager.get_persistent_engine().await;
+    
+    // ✅ NO WAL REPLAY HERE — that's done during daemon startup
     let db = Database { storage: engine, config };
     Ok(Arc::new(QueryExecEngine::new(Arc::new(db))))
 }
