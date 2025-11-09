@@ -29,6 +29,7 @@ pub use crate::config::{
 }; 
 use crate::storage_engine::rocksdb_client::{ZmqSocketWrapper};
 use crate::storage_engine::storage_engine::{GraphStorageEngine, ApplicationStateMachine as RocksDBStateMachine};
+pub use crate::storage_engine::rocksdb_wal_manager::{ RocksDBWalManager, RocksDBWalOperation };
 use crate::storage_engine::storage_utils::{create_edge_key, deserialize_edge, deserialize_vertex, serialize_edge, serialize_vertex};
 use models::{Edge, Identifier, Vertex};
 use models::errors::{GraphError, GraphResult};
@@ -39,7 +40,8 @@ use crate::daemon::db_daemon_registry::{GLOBAL_DB_DAEMON_REGISTRY, DBDaemonMetad
 use crate::daemon::daemon_management::{parse_cluster_range, find_pid_by_port,
                                      is_storage_daemon_running, stop_process_by_pid, 
                                      is_pid_running, is_process_running, check_pid_validity, 
-                                     get_ipc_endpoint, force_cleanup_engine_lock, };
+                                     get_ipc_endpoint, force_cleanup_engine_lock,
+                                     check_process_status_by_port };
 use std::time::{SystemTime, UNIX_EPOCH};
 use futures::future::join_all;
 use uuid::Uuid;
@@ -119,61 +121,138 @@ fn get_shared_wal_file_path() -> PathBuf {
 }
 
 /// Leader election – first daemon that creates the lock wins.
-async fn become_wal_leader(canonical: &Path) -> GraphResult<bool> {
-    let lock = canonical.join("wal_leader.lock");
-    match tokio_fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&lock)
-        .await
-    {
-        Ok(_) => Ok(true),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-        Err(e) => Err(GraphError::Io(e.to_string())),
+// ──────────────────────────────────────────────────────────────
+// 1. become_wal_leader – uses config.port, no env, no ZMQ
+// ──────────────────────────────────────────────────────────────
+pub async fn become_wal_leader(canonical: &Path, my_port: u16) -> GraphResult<bool> {
+    let leader_file = canonical.join("wal_leader.info");
+    let lock_file = canonical.join("wal_leader.lock");
+
+    loop {
+        match tokio_fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_file)
+            .await
+        {
+            Ok(mut file) => {
+                let info = format!(
+                    "leader_port={}\npid={}\nts={}\n",
+                    my_port,
+                    std::process::id(),
+                    chrono::Utc::now().timestamp()
+                );
+                if file.write_all(info.as_bytes()).await.is_err() {
+                    let _ = tokio_fs::remove_file(&lock_file).await;
+                    return Ok(false);
+                }
+                let _ = file.sync_all().await;
+                info!("Became WAL leader (port {}) for cluster {:?}", my_port, canonical);
+                return Ok(true);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                match tokio_fs::read_to_string(&leader_file).await {
+                    Ok(content) => {
+                        let leader_port = content
+                            .lines()
+                            .find_map(|l| l.strip_prefix("leader_port=").map(|s| s.trim()))
+                            .and_then(|s| s.parse::<u16>().ok())
+                            .unwrap_or(0);
+                        info!("WAL leader is on port {} (we are follower)", leader_port);
+                        return Ok(false);
+                    }
+                    Err(_) => {
+                        warn!("Leader lock exists but no leader.info — forcing promotion");
+                        let _ = tokio_fs::remove_file(&lock_file).await;
+                        // Continue loop to retry
+                        continue;
+                    }
+                }
+            }
+            Err(e) => return Err(GraphError::Io(e.to_string())),
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
+// 2. get_leader_port – read-only, safe
+// ──────────────────────────────────────────────────────────────
+pub async fn get_leader_port(canonical: &Path) -> GraphResult<Option<u16>> {
+    let leader_file = canonical.join("wal_leader.info");
+    match tokio_fs::read_to_string(&leader_file).await {
+        Ok(content) => {
+            let port = content
+                .lines()
+                .find_map(|l| l.strip_prefix("leader_port=").map(|s| s.trim()))
+                .and_then(|s| s.parse::<u16>().ok());
+            Ok(port)
+        }
+        Err(_) => Ok(None),
     }
 }
 
 /// Append a serialized operation to the shared WAL (leader only).
-async fn append_wal(op: &WalOp) -> GraphResult<u64> {
-    let data = bincode::encode_to_vec(op, standard())
+async fn append_wal(op: &RocksDBWalOperation) -> GraphResult<u64> {
+    let data = bincode::encode_to_vec(op, bincode::config::standard())
         .map_err(|e| GraphError::StorageError(e.to_string()))?;
-
     let mut file = tokio_fs::OpenOptions::new()
         .write(true)
         .append(true)
         .create(true)
-        .open(&*SHARED_WAL_PATH)  // ← file path
+        .open(&*SHARED_WAL_PATH)
         .await
         .map_err(|e| GraphError::Io(e.to_string()))?;
-
     let offset = file.metadata().await?.len();
     file.write_all(&data).await?;
     file.write_all(b"\n").await?;
+    file.flush().await?;
+    info!("Appended WAL operation at offset {} (len {})", offset, data.len());
     Ok(offset)
 }
 
-/// Tail the WAL from `start_offset` and replay locally.
-async fn replay_wal_from(
-    db: &DB,
+/// Tail the WAL from `start_offset` and replay locally./// Tail the WAL from `start_offset` and replay locally.
+pub async fn replay_wal_from(
+    db: &Arc<DB>,
     cfs: &(Arc<BoundColumnFamily<'static>>, Arc<BoundColumnFamily<'static>>, Arc<BoundColumnFamily<'static>>),
-    start_offset: u64,
+    start_offset: u16,
 ) -> GraphResult<()> {
     let file = match tokio_fs::File::open(&*SHARED_WAL_PATH).await {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            info!("WAL file not found at {:?}, skipping replay", *SHARED_WAL_PATH);
+            return Ok(());
+        }
         Err(e) => return Err(GraphError::Io(e.to_string())),
     };
-
     let mut file = file;
-    file.seek(SeekFrom::Start(start_offset)).await?;
+
+    // Fixed: cast u16 → u64 for SeekFrom::Start
+    if file.seek(SeekFrom::Start(start_offset as u64)).await.is_err() {
+        warn!("Failed to seek to offset {} in WAL, starting from beginning", start_offset);
+    }
+
     let reader = BufReader::new(file);
     let mut lines = reader.lines();
-
-    while let Some(line) = lines.next_line().await? {
-        let (op, _) = bincode::decode_from_slice::<WalOp, _>(&line.as_bytes(), standard())
-            .map_err(|e| GraphError::StorageError(e.to_string()))?;
-        RocksDBDaemon::apply_op_locally(db, cfs, &op).await?;
+    let mut replayed = 0;
+    while let Some(line) = lines.next_line().await.map_err(|e| GraphError::Io(e.to_string()))? {
+        let line_bytes = line.as_bytes();
+        if line_bytes.is_empty() {
+            continue;
+        }
+        let (op, _): (RocksDBWalOperation, _) = match bincode::decode_from_slice(line_bytes, bincode::config::standard()) {
+            Ok(decoded) => decoded,
+            Err(e) => {
+                warn!("Failed to decode WAL entry, skipping: {}", e);
+                continue;
+            }
+        };
+        if let Err(e) = RocksDBDaemon::apply_op_locally(db, cfs, &op).await {
+            error!("Failed to apply WAL op during replay: {}", e);
+            return Err(e);
+        }
+        replayed += 1;
     }
+    info!("WAL replay completed from offset {} (replayed {} ops)", start_offset, replayed);
     Ok(())
 }
 
@@ -228,39 +307,313 @@ macro_rules! handle_rocksdb_op {
 }
 
 impl<'a> RocksDBDaemon<'a> {
-    /// Apply a WAL operation locally to the database
+    /// Background task to periodically sync WAL entries
+    /// Background WAL sync task – **full original logic** with CFs passed in.
+
+    pub fn start_background_wal_sync(
+        port: u16,
+        wal_manager: Arc<RocksDBWalManager>,
+        canonical_path: &PathBuf,
+        db: Arc<DB>,
+        kv_pairs: Arc<BoundColumnFamily<'static>>,
+        vertices: Arc<BoundColumnFamily<'static>>,
+        edges: Arc<BoundColumnFamily<'static>>,
+        running: Arc<TokioMutex<bool>>,
+    ) {
+        let canonical_path = canonical_path.clone();
+        tokio::spawn(async move {
+            println!("===> STARTING BACKGROUND WAL SYNC FOR PORT {}", port);
+
+            let mut last_leader_check = std::time::Instant::now();
+
+            while *running.lock().await {
+                tokio::time::sleep(TokioDuration::from_secs(2)).await;
+
+                // ──────────────────────────────────────────────────────────────
+                // LEADER HEARTBEAT
+                // ──────────────────────────────────────────────────────────────
+                if last_leader_check.elapsed() > std::time::Duration::from_secs(10) {
+                    if let Ok(Some(leader_port)) = get_leader_port(&canonical_path).await {
+                        if leader_port != port {
+                            let lock_path = canonical_path.join("wal_leader.lock");
+                            if !tokio::fs::metadata(&lock_path).await.is_ok() {
+                                warn!("Leader {} lock missing — promoting self", leader_port);
+                                let _ = tokio::fs::remove_file(&lock_path).await;
+                                let _ = become_wal_leader(&canonical_path, port).await;
+                            }
+                        }
+                    }
+                    last_leader_check = std::time::Instant::now();
+                }
+
+                // ──────────────────────────────────────────────────────────────
+                // WAL REPLICATION
+                // ──────────────────────────────────────────────────────────────
+                let offset_key = format!("__wal_offset_port_{}", port);
+                let last_offset = match db.get(&offset_key.as_bytes()) {
+                    Ok(Some(v)) => {
+                        String::from_utf8(v.to_vec())
+                            .ok()
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(0)
+                    }
+                    _ => 0,
+                };
+
+                let current_lsn = match wal_manager.current_lsn().await {
+                    Ok(lsn) => lsn,
+                    Err(_) => continue,
+                };
+
+                if current_lsn <= last_offset {
+                    continue;
+                }
+
+                let operations = match wal_manager.read_since(last_offset).await {
+                    Ok(ops) => ops,
+                    Err(_) => continue,
+                };
+
+                if operations.is_empty() {
+                    continue;
+                }
+
+                let mut latest_offset = last_offset;
+                let mut applied = 0;
+
+                for (offset, op) in operations {
+                    let op_size = bincode::encode_to_vec(&op, bincode::config::standard())
+                        .map(|v| v.len() as u64)
+                        .unwrap_or(0);
+
+                    let cfs = (kv_pairs.clone(), vertices.clone(), edges.clone());
+
+                    // ──────────────────────────────────────────────────────
+                    // Explicit Result<(), GraphError>
+                    // ──────────────────────────────────────────────────────
+                    let result: Result<(), GraphError> = match &op {
+                        RocksDBWalOperation::Put { cf, key, value } => {
+                            if let Some(column) = db.cf_handle(cf) {
+                                db.put_cf(&column, key, value)
+                                    .map_err(GraphError::from)
+                            } else {
+                                Ok::<(), GraphError>(())
+                            }
+                        }
+                        RocksDBWalOperation::Delete { cf, key } => {
+                            if let Some(column) = db.cf_handle(cf) {
+                                db.delete_cf(&column, key)
+                                    .map_err(GraphError::from)
+                            } else {
+                                Ok::<(), GraphError>(())
+                            }
+                        }
+                        RocksDBWalOperation::Flush { cf } => {
+                            if let Some(column) = db.cf_handle(cf) {
+                                db.flush_cf(&column)
+                                    .map_err(GraphError::from)
+                            } else {
+                                db.flush()
+                                    .map_err(GraphError::from)
+                            }
+                        }
+                    };
+
+                    if result.is_err() {
+                        break;
+                    }
+
+                    applied += 1;
+                    latest_offset = offset + 4 + op_size;
+                }
+
+                if latest_offset > last_offset && applied > 0 {
+                    if db.put(offset_key.as_bytes(), latest_offset.to_string().as_bytes()).is_ok() {
+                        let _ = db.flush();
+                        println!(
+                            "===> PORT {} SYNCED {} OPERATIONS (OFFSET: {} -> {})",
+                            port, applied, last_offset, latest_offset
+                        );
+                    }
+                }
+            }
+
+            println!("===> BACKGROUND WAL SYNC STOPPED FOR PORT {}", port);
+        });
+    }
+
+    async fn discover_other_ports(canonical_path: &PathBuf, exclude_port: u16) -> Vec<u16> {
+        let mut ports = Vec::new();
+        if let Ok(mut entries) = tokio_fs::read_dir(canonical_path).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if let Some(name) = entry.file_name().to_str() {
+                    if let Ok(p) = name.parse::<u16>() {
+                        if p != exclude_port && p >= 8049 && p <= 8054 {
+                            let db_path = entry.path();
+                            if db_path.join("CURRENT").exists() {
+                                ports.push(p);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        ports
+    }
+
+    /// Apply a WAL operation locally to the RocksDB database using pre-fetched CF handles
     pub async fn apply_op_locally(
-        db: &DB,
+        db: &Arc<DB>,
         cfs: &(Arc<BoundColumnFamily<'static>>, Arc<BoundColumnFamily<'static>>, Arc<BoundColumnFamily<'static>>),
-        op: &WalOp,
+        op: &RocksDBWalOperation,
     ) -> GraphResult<()> {
-        let (kv, vert, edge) = cfs;
-        let (handle, key, value) = match op {
-            WalOp::Put { cf, key, value } => {
-                let h = match cf.as_str() {
-                    "kv_pairs" => kv,
-                    "vertices" => vert,
-                    "edges"   => edge,
-                    _ => return Err(GraphError::StorageError(format!("unknown cf {}", cf))),
+        let (kv_pairs, vertices, edges) = cfs;
+
+        match op {
+            RocksDBWalOperation::Put { cf, key, value } => {
+                let cf_handle = match cf.as_str() {
+                    "kv_pairs" => kv_pairs,
+                    "vertices" => vertices,
+                    "edges" => edges,
+                    _ => return Err(GraphError::StorageError(format!("Unknown column family: {}", cf))),
                 };
-                (h, key, Some(value))
+                let write_opts = WriteOptions::default();
+                db.put_cf_opt(cf_handle, key, value, &write_opts)
+                    .map_err(|e| GraphError::StorageError(e.to_string()))?;
             }
-            WalOp::Delete { cf, key } => {
-                let h = match cf.as_str() {
-                    "kv_pairs" => kv,
-                    "vertices" => vert,
-                    "edges"   => edge,
-                    _ => return Err(GraphError::StorageError(format!("unknown cf {}", cf))),
+            RocksDBWalOperation::Delete { cf, key } => {
+                let cf_handle = match cf.as_str() {
+                    "kv_pairs" => kv_pairs,
+                    "vertices" => vertices,
+                    "edges" => edges,
+                    _ => return Err(GraphError::StorageError(format!("Unknown column family: {}", cf))),
                 };
-                (h, key, None)
+                let write_opts = WriteOptions::default();
+                db.delete_cf_opt(cf_handle, key, &write_opts)
+                    .map_err(|e| GraphError::StorageError(e.to_string()))?;
             }
-        };
-        let wo = WriteOptions::default();
-        match value {
-            Some(v) => db.put_cf_opt(handle, key, v, &wo)?,
-            None => db.delete_cf_opt(handle, key, &wo)?,
-        };
+            RocksDBWalOperation::Flush { cf } => {
+                if cf == "default" || cf.is_empty() {
+                    db.flush().map_err(|e| GraphError::StorageError(e.to_string()))?;
+                } else {
+                    let cf_handle = match cf.as_str() {
+                        "kv_pairs" => Some(kv_pairs),
+                        "vertices" => Some(vertices),
+                        "edges" => Some(edges),
+                        _ => None,
+                    };
+                    if let Some(handle) = cf_handle {
+                        db.flush_cf(handle).map_err(|e| GraphError::StorageError(e.to_string()))?;
+                    }
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Replay WAL operations from shared WAL using per-port offset tracking
+    pub async fn replay_from_all_wals(
+        canonical_path: &PathBuf,
+        current_port: u16,
+        db: &Arc<DB>,
+        kv_pairs: &Arc<BoundColumnFamily<'static>>,
+        vertices: &Arc<BoundColumnFamily<'static>>,
+        edges: &Arc<BoundColumnFamily<'static>>,
+    ) -> GraphResult<()> {
+        info!("Starting WAL replay for port {}", current_port);
+        println!("===> STARTING WAL REPLAY FOR PORT {}", current_port);
+
+        let wal_dir = canonical_path.join("wal_shared");
+        if !wal_dir.exists() || !wal_dir.join("shared.wal").exists() {
+            info!("No shared WAL file found, skipping replay");
+            println!("===> NO SHARED WAL FILE FOUND, SKIPPING REPLAY");
+            return Ok(());
+        }
+
+        let offset_key = format!("__wal_offset_port_{}", current_port);
+        let last_offset = db.get(offset_key.as_bytes())?
+            .and_then(|v| String::from_utf8(v.to_vec()).ok())
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(0);
+
+        println!("===> PORT {} LAST REPLICATED OFFSET: {}", current_port, last_offset);
+
+        let wal_mgr = RocksDBWalManager::new(canonical_path.clone(), current_port)
+            .await
+            .map_err(|e| GraphError::StorageError(format!("Failed to create WAL manager: {}", e)))?;
+
+        let current_wal_size = wal_mgr.current_lsn()
+            .await
+            .map_err(|e| GraphError::StorageError(format!("Failed to get WAL size: {}", e)))?;
+
+        if last_offset >= current_wal_size as u16 {
+            println!("===> PORT {} IS UP TO DATE (OFFSET {} >= WAL SIZE {})",
+                     current_port, last_offset, current_wal_size);
+            return Ok(());
+        }
+
+        let operations = wal_mgr.read_since(last_offset as u64)
+            .await
+            .map_err(|e| GraphError::StorageError(format!("Failed to read WAL: {}", e)))?;
+
+        println!("===> REPLAYING {} OPERATIONS FOR PORT {} (OFFSET {} to {})",
+                 operations.len(), current_port, last_offset, current_wal_size);
+
+        let cfs = (kv_pairs.clone(), vertices.clone(), edges.clone());
+        let mut latest_offset = last_offset as u64;
+        let mut applied_count = 0;
+
+        for (offset, op) in operations {
+            let op_size = bincode::encode_to_vec(&op, bincode::config::standard())
+                .map(|v| v.len() as u64)
+                .unwrap_or(0);
+
+            if let Err(e) = RocksDBDaemon::apply_op_locally(db, &cfs, &op).await {
+                error!("Failed to apply WAL op {}: {}", offset, e);
+                break;
+            }
+            applied_count += 1;
+            latest_offset = offset + 4 + op_size;
+        }
+
+        if latest_offset > last_offset as u64 {
+            let _ = db.put(offset_key.as_bytes(), latest_offset.to_string().as_bytes());
+            let _ = db.flush();
+            println!("===> REPLAYED {} OPERATIONS FOR PORT {} (OFFSET: {} to {})",
+                     applied_count, current_port, last_offset, latest_offset);
+        }
+
+        Ok(())
+    }
+
+    /// Start background task to replicate WAL to other ports
+    pub fn start_wal_replication(
+        port: u16,
+        wal_manager: Arc<RocksDBWalManager>,
+        db: Arc<rocksdb::DB>,
+        running: Arc<TokioMutex<bool>>,
+    ) {
+        tokio::spawn(async move {
+            while *running.lock().await {
+                tokio::time::sleep(TokioDuration::from_secs(1)).await;
+                if let Ok(current_lsn) = wal_manager.current_lsn().await {
+                    debug!("Port {} WAL at LSN {}", port, current_lsn);
+                }
+            }
+        });
+    }
+
+    async fn open_rocksdb_readonly(path: &Path, use_compression: bool) -> GraphResult<Arc<DB>> {
+        let mut opts = Options::default();
+        opts.create_if_missing(false);
+        opts.create_missing_column_families(false);
+        if use_compression {
+            opts.set_compression_type(DBCompressionType::Lz4);
+        }
+        let cfs = vec!["kv_pairs", "vertices", "edges"];
+        let db = DB::open_cf_for_read_only(&opts, path, cfs, false)
+            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+        Ok(Arc::new(db))
     }
 
     /// Helper function to encapsulate the blocking RocksDB I/O.
@@ -477,20 +830,15 @@ impl<'a> RocksDBDaemon<'a> {
         config: RocksDBConfig,
     ) -> GraphResult<(RocksDBDaemon<'static>, mpsc::Receiver<()>)> {
         println!("===> RocksDBDaemon::new() CALLED");
-
         let port = config.port.unwrap_or(DEFAULT_STORAGE_PORT);
-
-        // Acquire per-port lock to prevent concurrent initialization
         let _guard = get_rocksdb_daemon_port_lock(port).await;
         println!("===> ACQUIRED PER-PORT INIT LOCK FOR PORT {}", port);
 
         let db_path = PathBuf::from(config.path.clone());
         let db_path_clone = db_path.clone();
-
         info!("Initializing RocksDBDaemon at {:?}", db_path);
         println!("===> INITIALIZING ROCKSDB DAEMON AT {:?}", db_path);
 
-        // Create directory if needed
         tokio_fs::create_dir_all(&db_path)
             .await
             .map_err(|e| {
@@ -499,26 +847,37 @@ impl<'a> RocksDBDaemon<'a> {
                 GraphError::StorageError(format!("Failed to create dir: {}", e))
             })?;
 
-        // --- CRITICAL: Open DB under lock, reuse if possible ---
         let (db, kv_pairs, vertices, edges) = Self::open_rocksdb_with_cfs(
             &config,
             &db_path,
             config.use_compression,
             false,
-        )
-        .await?;
+        ).await?;
 
         info!("ROCKSDB AND COLUMN FAMILIES SUCCESSFULLY OPENED AT {:?}", db_path);
         println!("===> ROCKSDB AND COLUMN FAMILIES SUCCESSFULLY OPENED AT {:?}", db_path);
 
-        // --- ZMQ Setup ---
+        let canonical_path = db_path.parent().unwrap().to_path_buf();
+        let wal_manager = Arc::new(
+            RocksDBWalManager::new(canonical_path.clone(), port)
+                .await
+                .map_err(|e| GraphError::StorageError(format!("Failed to create RocksDB WAL manager: {}", e)))?
+        );
+
+        // REPLAY WAL ON STARTUP
+        RocksDBDaemon::replay_from_all_wals(&canonical_path, port, &db, &kv_pairs, &vertices, &edges).await?;
+
+        // ──────────────────────────────────────────────────────────────
+        // LEADER ELECTION ON STARTUP
+        // ──────────────────────────────────────────────────────────────
+        let _ = become_wal_leader(&canonical_path, port).await;
+
         let (ready_tx, ready_rx) = mpsc::channel::<()>(1);
         let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", port);
         let ipc_path = endpoint.strip_prefix("ipc://").unwrap_or(&endpoint);
 
-        // Clean stale socket BEFORE binding
         if Path::new(ipc_path).exists() {
-            let _ = tokio_fs::remove_file(ipc_path).await;
+            let _ = tokio::fs::remove_file(ipc_path).await;
             info!("Removed stale IPC socket at {}", ipc_path);
             println!("===> REMOVED STALE IPC SOCKET AT {}", ipc_path);
         }
@@ -527,32 +886,27 @@ impl<'a> RocksDBDaemon<'a> {
         let running = Arc::new(TokioMutex::new(true));
         let running_clone = running.clone();
 
-        // -----------------------------------------------------------------
-        // Spawn ZMQ server in background
-        // -----------------------------------------------------------------
         let zmq_thread_handle = {
             let zmq_context_thread = zmq_context.clone();
             let endpoint_thread = endpoint.clone();
             let config_thread = config.clone();
             let ready_tx = ready_tx.clone();
             let db_path_thread = db_path.clone();
-
-            // Pass the already-opened DB handles
             let db_clone = db.clone();
             let kv_clone = kv_pairs.clone();
             let vert_clone = vertices.clone();
             let edge_clone = edges.clone();
+            let wal_manager_clone = wal_manager.clone();
+            let canonical_path_thread = canonical_path.clone();
 
             std::thread::spawn(move || -> GraphResult<()> {
                 let rt = tokio::runtime::Runtime::new()
                     .expect("Failed to create runtime for ZMQ thread");
-
                 rt.block_on(async {
                     let socket_raw = zmq_context_thread
                         .socket(REP)
                         .map_err(|e| GraphError::StorageError(format!("ZMQ socket create failed: {}", e)))?;
 
-                    // Bind with retries
                     let mut bound = false;
                     for i in 0..5 {
                         match socket_raw.bind(&endpoint_thread) {
@@ -566,17 +920,15 @@ impl<'a> RocksDBDaemon<'a> {
                                 warn!("ZMQ bind attempt {} failed: {}", i + 1, e);
                                 println!("===> WARNING: ZMQ BIND ATTEMPT {} FAILED: {}", i + 1, e);
                                 if i < 4 {
-                                    sleep(TokioDuration::from_millis(100 * (i + 1) as u64)).await;
+                                    tokio::time::sleep(TokioDuration::from_millis(100 * (i + 1) as u64)).await;
                                 }
                             }
                         }
                     }
 
-                    // ✅ CRITICAL: Send readiness signal ONLY AFTER SUCCESSFUL BIND
                     if bound {
                         let _ = ready_tx.send(()).await;
                     } else {
-                        // ✅ Also send on failure to prevent hang
                         let _ = ready_tx.send(()).await;
                         return Err(GraphError::StorageError("ZMQ failed to bind after retries".to_string()));
                     }
@@ -584,14 +936,13 @@ impl<'a> RocksDBDaemon<'a> {
                     info!("ZMQ server bound successfully at {}", endpoint_thread);
                     println!("===> ZMQ SERVER BOUND SUCCESSFULLY AT {}", endpoint_thread);
 
-                    // Update registry: mark as zmq_ready
                     let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
                     let metadata = DaemonMetadata {
                         service_type: "storage".to_string(),
                         port,
                         pid: std::process::id(),
                         ip_address: config_thread.host.clone().unwrap_or("127.0.0.1".to_string()),
-                        data_dir: Some(db_path_thread),
+                        data_dir: Some(db_path_thread.clone()),
                         config_path: None,
                         engine_type: Some("rocksdb".to_string()),
                         last_seen_nanos: SystemTime::now()
@@ -612,7 +963,18 @@ impl<'a> RocksDBDaemon<'a> {
 
                     let zmq_socket = Arc::new(TokioMutex::new(socket_raw));
 
-                    // Run the ZMQ server loop
+                    // START BACKGROUND SYNC
+                    RocksDBDaemon::start_background_wal_sync(
+                        port,
+                        wal_manager_clone.clone(),
+                        &canonical_path_thread,
+                        db_clone.clone(),
+                        kv_clone.clone(),
+                        vert_clone.clone(),
+                        edge_clone.clone(),
+                        running_clone.clone(),
+                    );
+
                     RocksDBDaemon::run_zmq_server_lazy(
                         port,
                         config_thread,
@@ -623,15 +985,14 @@ impl<'a> RocksDBDaemon<'a> {
                         kv_clone,
                         vert_clone,
                         edge_clone,
-                        db_path.clone(),
-                    )
-                    .await
+                        wal_manager_clone,
+                        db_path_thread,
+                    ).await
                 })
             })
         };
 
         let (shutdown_tx, _) = mpsc::channel::<()>(1);
-
         let daemon = RocksDBDaemon {
             port,
             db_path: db_path_clone,
@@ -639,6 +1000,7 @@ impl<'a> RocksDBDaemon<'a> {
             kv_pairs,
             vertices,
             edges,
+            wal_manager,
             running: running.clone(),
             shutdown_tx,
             zmq_context: zmq_context.clone(),
@@ -651,9 +1013,8 @@ impl<'a> RocksDBDaemon<'a> {
             node_id: port as u64,
         };
 
-        info!("RocksDBDaemon initialized on port {} (DB opened)", port);
-        println!("===> ROCKSDB DAEMON INITIALIZED ON PORT {} (DB OPENED)", port);
-
+        info!("RocksDBDaemon initialized on port {} (real DB in ZMQ thread)", port);
+        println!("===> ROCKSDB DAEMON INITIALIZED ON PORT {} (REAL DB IN ZMQ THREAD)", port);
         Ok((daemon, ready_rx))
     }
 
@@ -666,13 +1027,9 @@ impl<'a> RocksDBDaemon<'a> {
     ) -> GraphResult<(RocksDBDaemon<'static>, mpsc::Receiver<()>)> {
         info!("RocksDBDaemon::new_with_db called – using supplied DB");
 
-        // --------------------------------------------------------------
-        // 1. Port selection
-        // --------------------------------------------------------------
         let config_port = config.port.unwrap_or(DEFAULT_STORAGE_PORT);
         let global_registry = GLOBAL_DAEMON_REGISTRY.get().await;
         let free_daemon_metadata = global_registry.find_free_storage_daemon().await?;
-
         let port: u16 = if let Some(metadata) = free_daemon_metadata {
             info!("Reusing uninitialized storage daemon port {} (registry).", metadata.port);
             metadata.port
@@ -681,16 +1038,10 @@ impl<'a> RocksDBDaemon<'a> {
             config_port
         };
 
-        // --------------------------------------------------------------
-        // 2. Derive per-port path
-        // --------------------------------------------------------------
         let base_db_path = PathBuf::from(config.path.clone());
         let db_path = base_db_path.join(port.to_string());
         info!("RocksDBDaemon using port {} at path {:?}", port, db_path);
 
-        // --------------------------------------------------------------
-        // 3. Clean stale lock
-        // --------------------------------------------------------------
         let lock_path = db_path.join("LOCK");
         if lock_path.exists() {
             if let Ok(Some(metadata)) = GLOBAL_DAEMON_REGISTRY.find_daemon_by_port(port).await {
@@ -707,9 +1058,6 @@ impl<'a> RocksDBDaemon<'a> {
             }
         }
 
-        // --------------------------------------------------------------
-        // 4. Extract column-family handles from the **same** DB
-        // --------------------------------------------------------------
         let kv_pairs: Arc<BoundColumnFamily<'static>> = unsafe {
             std::mem::transmute(Arc::new(
                 existing_db
@@ -732,31 +1080,13 @@ impl<'a> RocksDBDaemon<'a> {
             ))
         };
 
-        // --------------------------------------------------------------
-        // 5. **WAL REPLAY** – using correct signature
-        // --------------------------------------------------------------
-        let offset_file = db_path.join(format!("{}.offset", port));
-        let start_offset = if offset_file.exists() {
-            tokio_fs::read_to_string(&offset_file)
-                .await
-                .ok()
-                .and_then(|s| s.trim().parse::<u64>().ok())
-                .unwrap_or(0)
-        } else {
-            0
-        };
+        // === WAL MANAGER & REPLAY ===
+        let wal_manager = Arc::new(RocksDBWalManager::new(db_path.parent().unwrap().to_path_buf(), port).await
+            .map_err(|e| GraphError::StorageError(format!("Failed to create RocksDB WAL manager: {}", e)))?);
 
-        // Pass both DB and the **tuple of CF handles**
-        replay_wal_from(
-            &existing_db,
-            &(kv_pairs.clone(), vertices.clone(), edges.clone()),
-            start_offset,
-        )
-        .await?;
+        let canonical_path = db_path.parent().unwrap().to_path_buf();
+        RocksDBDaemon::replay_from_all_wals(&canonical_path, port, &existing_db, &kv_pairs, &vertices, &edges).await?;
 
-        // --------------------------------------------------------------
-        // 6. Raft (unchanged)
-        // --------------------------------------------------------------
         let node_id = port as u64;
         #[cfg(feature = "with-openraft-rocksdb")]
         let (raft, raft_storage) = {
@@ -785,9 +1115,6 @@ impl<'a> RocksDBDaemon<'a> {
         let (raft, raft_storage): (Option<Arc<Raft<TypeConfig>>>, Option<Arc<RocksDBRaftStorage>>) =
             (None, None);
 
-        // --------------------------------------------------------------
-        // 7. ZMQ readiness + stale socket cleanup
-        // --------------------------------------------------------------
         let (ready_tx, mut ready_rx) = mpsc::channel::<()>(1);
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
         let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", port);
@@ -800,9 +1127,6 @@ impl<'a> RocksDBDaemon<'a> {
 
         let running = Arc::new(TokioMutex::new(true));
 
-        // --------------------------------------------------------------
-        // 8. Build daemon struct
-        // --------------------------------------------------------------
         let daemon = RocksDBDaemon {
             port,
             db_path: db_path.clone(),
@@ -810,6 +1134,7 @@ impl<'a> RocksDBDaemon<'a> {
             kv_pairs: kv_pairs.clone(),
             vertices: vertices.clone(),
             edges: edges.clone(),
+            wal_manager: wal_manager.clone(),
             running: running.clone(),
             shutdown_tx: shutdown_tx.clone(),
             zmq_context: Arc::new(ZmqContext::new()),
@@ -822,9 +1147,6 @@ impl<'a> RocksDBDaemon<'a> {
             node_id,
         };
 
-        // --------------------------------------------------------------
-        // 9. Register daemon (zmq_ready = false)
-        // --------------------------------------------------------------
         let initial_metadata = DaemonMetadata {
             port,
             service_type: "storage".to_string(),
@@ -839,14 +1161,12 @@ impl<'a> RocksDBDaemon<'a> {
             zmq_ready: false,
             engine_synced: true,
         };
+
         GLOBAL_DAEMON_REGISTRY
             .register_daemon(initial_metadata.clone())
             .await
             .map_err(|e| GraphError::StorageError(format!("Failed to register daemon on port {}: {}", port, e)))?;
 
-        // --------------------------------------------------------------
-        // 10. Spawn ZMQ thread
-        // --------------------------------------------------------------
         let zmq_context_thread = daemon.zmq_context.clone();
         let endpoint_thread = endpoint.clone();
         let config_thread = config.clone();
@@ -857,6 +1177,7 @@ impl<'a> RocksDBDaemon<'a> {
         let vert_clone = vertices.clone();
         let edge_clone = edges.clone();
         let running_clone = running.clone();
+        let wal_manager_clone = wal_manager.clone();
 
         let zmq_thread_handle = std::thread::spawn(move || -> GraphResult<()> {
             let rt = tokio::runtime::Runtime::new()?;
@@ -882,9 +1203,7 @@ impl<'a> RocksDBDaemon<'a> {
                     }
                 }
 
-                // ✅ CRITICAL: Always send readiness signal
                 let _ = ready_tx_thread.send(()).await;
-
                 if !bound {
                     return Err(GraphError::StorageError("ZMQ failed to bind after retries".into()));
                 }
@@ -896,7 +1215,6 @@ impl<'a> RocksDBDaemon<'a> {
                 let _ = GLOBAL_DAEMON_REGISTRY.get().await.update_daemon_metadata(metadata).await;
 
                 let zmq_socket = Arc::new(TokioMutex::new(socket_raw));
-
                 RocksDBDaemon::run_zmq_server_lazy(
                     port,
                     config_thread,
@@ -907,6 +1225,7 @@ impl<'a> RocksDBDaemon<'a> {
                     kv_clone,
                     vert_clone,
                     edge_clone,
+                    wal_manager_clone,
                     db_path_thread,
                 )
                 .await
@@ -915,9 +1234,6 @@ impl<'a> RocksDBDaemon<'a> {
 
         *daemon.zmq_thread.lock().await = Some(zmq_thread_handle);
 
-        // --------------------------------------------------------------
-        // 11. Wait for ZMQ readiness WITH TIMEOUT
-        // --------------------------------------------------------------
         info!("Waiting for ZMQ readiness on port {}...", port);
         match tokio::time::timeout(TokioDuration::from_secs(10), ready_rx.recv()).await {
             Ok(Some(_)) => {
@@ -936,8 +1252,8 @@ impl<'a> RocksDBDaemon<'a> {
     }
 
     /* -------------------------------------------------------------
-        new_with_client
-        ------------------------------------------------------------- */
+        new_with_client — CLIENT MODE (READ-ONLY)
+       ------------------------------------------------------------- */
     pub async fn new_with_client(config: RocksDBConfig) -> GraphResult<Self> {
         let port = config.port.ok_or_else(|| {
             error!("No port specified in RocksDBConfig");
@@ -954,44 +1270,54 @@ impl<'a> RocksDBDaemon<'a> {
         info!("Initializing RocksDBDaemon in client mode (read-only) for port {}", port);
         println!("===> INITIALIZING ROCKSDB DAEMON IN CLIENT MODE (READ-ONLY) FOR PORT {}", port);
 
-        // Verify a daemon is actually running on this port
         if !is_storage_daemon_running(port).await {
             error!("No running daemon found on port {}", port);
             println!("===> ERROR: NO RUNNING DAEMON FOUND ON PORT {}", port);
             return Err(GraphError::StorageError(format!("No running daemon found on port {}", port)));
         }
 
-        // Open the database in read-only mode
         let mut opts = Options::default();
         opts.create_if_missing(false);
         opts.create_missing_column_families(false);
+
         let db = Arc::new(handle_rocksdb_op!(
             DB::open_for_read_only(&opts, &db_path, false),
             format!("Failed to open RocksDB in read-only mode at {}", db_path.display())
         )?);
 
-        // Get column family handles (simplified - single pass)
         let kv_pairs: Arc<BoundColumnFamily<'static>> = unsafe {
-            std::mem::transmute(Arc::new(db.cf_handle("kv_pairs").ok_or_else(|| {
-                GraphError::StorageError("Column family kv_pairs not found".to_string())
-            })?))
+            std::mem::transmute(Arc::new(
+                db.cf_handle("kv_pairs")
+                    .ok_or_else(|| GraphError::StorageError("Column family kv_pairs not found".to_string()))?
+            ))
         };
+
         let vertices: Arc<BoundColumnFamily<'static>> = unsafe {
-            std::mem::transmute(Arc::new(db.cf_handle("vertices").ok_or_else(|| {
-                GraphError::StorageError("Column family vertices not found".to_string())
-            })?))
+            std::mem::transmute(Arc::new(
+                db.cf_handle("vertices")
+                    .ok_or_else(|| GraphError::StorageError("Column family vertices not found".to_string()))?
+            ))
         };
+
         let edges: Arc<BoundColumnFamily<'static>> = unsafe {
-            std::mem::transmute(Arc::new(db.cf_handle("edges").ok_or_else(|| {
-                GraphError::StorageError("Column family edges not found".to_string())
-            })?))
+            std::mem::transmute(Arc::new(
+                db.cf_handle("edges")
+                    .ok_or_else(|| GraphError::StorageError("Column family edges not found".to_string()))?
+            ))
         };
+
+        // WAL MANAGER — REQUIRED EVEN IN CLIENT MODE
+        let canonical_path = db_path.parent().unwrap_or(&db_path).to_path_buf();
+        let wal_manager = Arc::new(
+            RocksDBWalManager::new(canonical_path, port)
+                .await
+                .map_err(|e| GraphError::StorageError(format!("Failed to create RocksDBWalManager: {}", e)))?
+        );
 
         let zmq_context = Arc::new(ZmqContext::new());
         let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
-
         let node_id = port as u64;
-        
+
         let daemon = Self {
             port,
             db_path,
@@ -999,10 +1325,11 @@ impl<'a> RocksDBDaemon<'a> {
             kv_pairs,
             vertices,
             edges,
+            wal_manager, // ← FIXED: MISSING FIELD
             running: Arc::new(TokioMutex::new(true)),
             shutdown_tx,
             zmq_context,
-            zmq_thread: Arc::new(TokioMutex::new(None)), // No thread in client mode
+            zmq_thread: Arc::new(TokioMutex::new(None)),
             #[cfg(feature = "with-openraft-rocksdb")]
             raft: None,
             #[cfg(feature = "with-openraft-rocksdb")]
@@ -1028,43 +1355,34 @@ impl<'a> RocksDBDaemon<'a> {
         kv_pairs: Arc<BoundColumnFamily<'static>>,
         vertices: Arc<BoundColumnFamily<'static>>,
         edges: Arc<BoundColumnFamily<'static>>,
+        wal_manager: Arc<RocksDBWalManager>,
         db_path: PathBuf,
     ) -> GraphResult<()> {
         info!("===> STARTING ZMQ SERVER FOR PORT {} (DB ALREADY OPEN)", port);
         println!("===> STARTING ZMQ SERVER FOR PORT {} (DB ALREADY OPEN)", port);
 
-        // Configure socket
-        {
-            let socket = zmq_socket.lock().await;
-            socket.set_linger(1000)
-                .map_err(|e| GraphError::StorageError(format!("Failed to set socket linger: {}", e)))?;
-            socket.set_rcvtimeo(SOCKET_TIMEOUT_MS)
-                .map_err(|e| GraphError::StorageError(format!("Failed to set receive timeout: {}", e)))?;
-            socket.set_sndtimeo(SOCKET_TIMEOUT_MS)
-                .map_err(|e| GraphError::StorageError(format!("Failed to set send timeout: {}", e)))?;
-            socket.set_maxmsgsize(MAX_MESSAGE_SIZE as i64)
-                .map_err(|e| GraphError::StorageError(format!("Failed to set max message size: {}", e)))?;
-        }
+        let mut socket = zmq_socket.lock().await;
+        socket.set_linger(1000)?;
+        socket.set_rcvtimeo(SOCKET_TIMEOUT_MS)?;
+        socket.set_sndtimeo(SOCKET_TIMEOUT_MS)?;
+        socket.set_maxmsgsize(MAX_MESSAGE_SIZE as i64)?;
+        drop(socket);
 
         info!("ZeroMQ server configured for port {}", port);
         println!("===> ZEROMQ SERVER CONFIGURED FOR PORT {}", port);
-
-        // Determine if this daemon is the WAL leader
-        let canonical = db_path.parent().unwrap().to_path_buf();
-        let is_leader = become_wal_leader(&canonical).await.unwrap_or(false);
 
         let mut consecutive_errors = 0;
 
         while *running.lock().await {
             let msg_result = {
-                let socket = zmq_socket.lock().await;
-                socket.recv_bytes(DONTWAIT)
+                let s = zmq_socket.lock().await;
+                s.recv_bytes(DONTWAIT)
             };
 
             let msg: Vec<u8> = match msg_result {
                 Ok(m) => {
                     consecutive_errors = 0;
-                    debug!("Received ZeroMQ message for port {}", port);
+                    debug!("Received ZMQ message for port {}", port);
                     m
                 }
                 Err(ZmqError::EAGAIN) => {
@@ -1073,9 +1391,12 @@ impl<'a> RocksDBDaemon<'a> {
                 }
                 Err(e) => {
                     consecutive_errors += 1;
-                    warn!("Failed to receive ZeroMQ message (attempt {}): {}", consecutive_errors, e);
+                    warn!(
+                        "Failed to receive ZMQ message (attempt {}): {}",
+                        consecutive_errors, e
+                    );
                     if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                        error!("Too many consecutive ZeroMQ errors, shutting down server");
+                        error!("Too many consecutive ZMQ errors, shutting down server");
                         break;
                     }
                     tokio::time::sleep(TokioDuration::from_millis(100)).await;
@@ -1085,8 +1406,8 @@ impl<'a> RocksDBDaemon<'a> {
 
             if msg.is_empty() {
                 let resp = json!({"status":"error","message":"Received empty message"});
-                let socket = zmq_socket.lock().await;
-                Self::send_zmq_response_static(&socket, &resp, port).await?;
+                let s = zmq_socket.lock().await;
+                Self::send_zmq_response_static(&s, &resp, port).await?;
                 continue;
             }
 
@@ -1094,64 +1415,258 @@ impl<'a> RocksDBDaemon<'a> {
                 Ok(r) => r,
                 Err(e) => {
                     let resp = json!({"status":"error","message":format!("Parse error: {}",e)});
-                    let socket = zmq_socket.lock().await;
-                    Self::send_zmq_response_static(&socket, &resp, port).await?;
+                    let s = zmq_socket.lock().await;
+                    Self::send_zmq_response_static(&s, &resp, port).await?;
                     continue;
                 }
             };
 
             let command = request.get("command").and_then(|c| c.as_str());
 
-            // -----------------------------------------------------------------
-            //  Helper to send a response and continue the loop
-            // -----------------------------------------------------------------
             macro_rules! send_resp {
                 ($resp:expr) => {{
-                    let socket = zmq_socket.lock().await;
-                    Self::send_zmq_response_static(&socket, &$resp, port).await?;
+                    let s = zmq_socket.lock().await;
+                    Self::send_zmq_response_static(&s, &$resp, port).await?;
                     continue;
                 }};
             }
 
             let response = match command {
-                // ── CONTROL COMMANDS ───────────────────────────────────────
-                Some("initialize") => {
-                    json!({
-                        "status": "success",
-                        "message": "ZMQ server is bound and DB is open.",
-                        "port": port,
-                        "ipc_path": &endpoint
-                    })
-                }
-                Some("status") | Some("ping") => {
-                    json!({"status":"success","port":port,"db_open":true})
-                }
-                Some("force_unlock") => {
-                    match Self::force_unlock_static(&db_path).await {
-                        Ok(_) => json!({"status":"success"}),
-                        Err(e) => json!({"status":"error","message":e.to_string()}),
+                Some("initialize") => json!({
+                    "status": "success",
+                    "message": "ZMQ server is bound and DB is open.",
+                    "port": port,
+                    "ipc_path": &endpoint
+                }),
+                Some("status") => json!({"status":"success","port":port,"db_open":true}),
+                Some("ping") => json!({
+                    "status": "pong",
+                    "message": "ZMQ server is bound and DB is open.",
+                    "port": port,
+                    "ipc_path": &endpoint,
+                    "db_open":true
+                }),
+                Some("force_unlock") => match Self::force_unlock_static(&db_path).await {
+                    Ok(_) => json!({"status":"success"}),
+                    Err(e) => json!({"status":"error","message":e.to_string()}),
+                },
+
+                // ──────────────────────────────────────────────────────────────
+                // MUTATING COMMANDS – WAL + LEADER ELECTION + FORWARDING
+                // ──────────────────────────────────────────────────────────────
+                Some(cmd) if [
+                    "set_key","delete_key",
+                    "create_vertex","update_vertex","delete_vertex",
+                    "create_edge","update_edge","delete_edge",
+                    "flush"
+                ].contains(&cmd) => {
+                    let canonical = db_path.parent().unwrap().to_path_buf();
+
+                    // Use port from config (not env)
+                    let is_leader = become_wal_leader(&canonical, port).await
+                        .map_err(|e| GraphError::StorageError(e.to_string()))?;
+
+                    if is_leader {
+                        // === WE ARE LEADER → APPEND + APPLY ===
+                        let op = match cmd {
+                            "set_key" => {
+                                let cf = request["cf"].as_str().unwrap_or("kv_pairs").to_string();
+                                let key = request["key"]
+                                    .as_str()
+                                    .ok_or_else(|| GraphError::StorageError("missing key".into()))?
+                                    .as_bytes()
+                                    .to_vec();
+                                let value = request["value"]
+                                    .as_str()
+                                    .ok_or_else(|| GraphError::StorageError("missing value".into()))?
+                                    .as_bytes()
+                                    .to_vec();
+                                RocksDBWalOperation::Put { cf, key, value }
+                            }
+                            "delete_key" => {
+                                let cf = request["cf"].as_str().unwrap_or("kv_pairs").to_string();
+                                let key = request["key"]
+                                    .as_str()
+                                    .ok_or_else(|| GraphError::StorageError("missing key".into()))?
+                                    .as_bytes()
+                                    .to_vec();
+                                RocksDBWalOperation::Delete { cf, key }
+                            }
+                            "create_vertex" | "update_vertex" => {
+                                let vertex: Vertex = serde_json::from_value(request["vertex"].clone())
+                                    .map_err(|e| GraphError::StorageError(format!("Invalid vertex: {}", e)))?;
+                                let key = vertex.id.as_bytes().to_vec();
+                                let value = serialize_vertex(&vertex)?;
+                                RocksDBWalOperation::Put {
+                                    cf: "vertices".to_string(),
+                                    key,
+                                    value,
+                                }
+                            }
+                            "delete_vertex" => {
+                                let id: Identifier = serde_json::from_value(request["id"].clone())
+                                    .map_err(|e| GraphError::StorageError(format!("Invalid id: {}", e)))?;
+                                let uuid = SerializableUuid::from(id.as_ref())?;
+                                RocksDBWalOperation::Delete {
+                                    cf: "vertices".to_string(),
+                                    key: uuid.as_bytes().to_vec(),
+                                }
+                            }
+                            "create_edge" | "update_edge" => {
+                                let edge: Edge = serde_json::from_value(request["edge"].clone())
+                                    .map_err(|e| GraphError::StorageError(format!("Invalid edge: {}", e)))?;
+                                let key = create_edge_key(&edge.outbound_id, &edge.t, &edge.inbound_id)?;
+                                let value = serialize_edge(&edge)?;
+                                RocksDBWalOperation::Put {
+                                    cf: "edges".to_string(),
+                                    key,
+                                    value,
+                                }
+                            }
+                            "delete_edge" => {
+                                let from: Identifier = serde_json::from_value(request["from"].clone())
+                                    .map_err(|e| GraphError::StorageError(format!("Invalid from: {}", e)))?;
+                                let to: Identifier = serde_json::from_value(request["to"].clone())
+                                    .map_err(|e| GraphError::StorageError(format!("Invalid to: {}", e)))?;
+                                let t: Identifier = serde_json::from_value(request["type"].clone())
+                                    .map_err(|e| GraphError::StorageError(format!("Invalid type: {}", e)))?;
+                                let from_uuid = SerializableUuid::from(from.as_ref())?;
+                                let to_uuid = SerializableUuid::from(to.as_ref())?;
+                                let key = create_edge_key(&from_uuid, &t, &to_uuid)?;
+                                RocksDBWalOperation::Delete {
+                                    cf: "edges".to_string(),
+                                    key,
+                                }
+                            }
+                            "flush" => {
+                                let cf = request["cf"].as_str().unwrap_or("default").to_string();
+                                RocksDBWalOperation::Flush { cf }
+                            }
+                            _ => unreachable!(),
+                        };
+
+                        let lsn = wal_manager.append(&op).await
+                            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+
+                        let cfs = (kv_pairs.clone(), vertices.clone(), edges.clone());
+                        RocksDBDaemon::apply_op_locally(&db, &cfs, &op).await
+                            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+
+                        let offset_key = format!("__wal_offset_port_{}", port);
+                        db.put(offset_key.as_bytes(), lsn.to_string().as_bytes())?;
+                        db.flush()?;
+
+                        json!({"status":"success", "offset": lsn, "leader": true})
+                    } else {
+                        // === NOT LEADER → FORWARD TO LEADER ===
+                        let leader_port = match get_leader_port(&canonical).await {
+                            Ok(Some(p)) => p,
+                            Ok(None) => {
+                                send_resp!(json!({"status":"error","message":"No leader found"}));
+                                continue;
+                            }
+                            Err(e) => {
+                                send_resp!(json!({"status":"error","message":format!("Leader lookup failed: {}", e)}));
+                                continue;
+                            }
+                        };
+
+                        if leader_port == 0 {
+                            send_resp!(json!({"status":"error","message":"Leader election in progress"}));
+                            continue;
+                        }
+
+                        let context = zmq::Context::new();
+                        let client = match context.socket(zmq::REQ) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                send_resp!(json!({"status":"error","message":format!("ZMQ socket error: {}", e)}));
+                                continue;
+                            }
+                        };
+
+                        if client.connect(&format!("ipc:///tmp/graphdb-{}.ipc", leader_port)).is_err() {
+                            send_resp!(json!({"status":"error","message":format!("Failed to connect to leader {}", leader_port)}));
+                            continue;
+                        }
+
+                        client.set_sndtimeo(5000).ok();
+                        client.set_rcvtimeo(5000).ok();
+
+                        let mut forward_req = request.clone();
+                        forward_req["forwarded_from"] = json!(port);
+                        forward_req["command"] = json!(cmd);
+
+                        let payload = match serde_json::to_vec(&forward_req) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                send_resp!(json!({"status":"error","message":format!("JSON serialize error: {}", e)}));
+                                continue;
+                            }
+                        };
+
+                        if client.send(&payload, 0).is_err() {
+                            send_resp!(json!({"status":"error","message":"ZMQ send failed"}));
+                            continue;
+                        }
+
+                        let resp_msg = match client.recv_bytes(0) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                send_resp!(json!({"status":"error","message":format!("ZMQ recv error: {}", e)}));
+                                continue;
+                            }
+                        };
+
+                        let resp: Value = match serde_json::from_slice(&resp_msg) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                send_resp!(json!({"status":"error","message":format!("Leader response parse error: {}", e)}));
+                                continue;
+                            }
+                        };
+
+                        info!("Forwarded write to leader port {} → {:?}", leader_port, resp);
+                        resp
                     }
                 }
-                // In RocksDBdDaemon::run_zmq_server_lazy, add this command case:
 
+                // ──────────────────────────────────────────────────────────────
+                // DATA CLEAR / RESET
+                // ──────────────────────────────────────────────────────────────
+                Some("clear_data") | Some("force_reset") => match Self::execute_db_command(
+                    command.unwrap(),
+                    &request,
+                    &db,
+                    &kv_pairs,
+                    &vertices,
+                    &edges,
+                    port,
+                    &db_path,
+                    &endpoint,
+                ).await {
+                    Ok(r) => r,
+                    Err(e) => json!({"status":"error","message":e.to_string()}),
+                },
+
+                // ──────────────────────────────────────────────────────────────
+                // FORCE IPC INIT
+                // ──────────────────────────────────────────────────────────────
                 Some("force_ipc_init") => {
                     info!("Received force_ipc_init command for port {}", port);
                     println!("===> FORCING IPC INITIALIZATION FOR PORT {}", port);
-                    
-                    // Verify IPC socket file exists
                     let ipc_path = format!("/tmp/graphdb-{}.ipc", port);
                     match tokio::fs::metadata(&ipc_path).await {
-                        Ok(_) => {
-                            json!({
-                                "status": "success",
-                                "message": "IPC socket already exists",
-                                "ipc_path": &ipc_path
-                            })
-                        }
+                        Ok(_) => json!({
+                            "status": "success",
+                            "message": "IPC socket already exists",
+                            "ipc_path": &ipc_path
+                        }),
                         Err(_) => {
-                            // IPC missing - this shouldn't happen in normal flow
-                            // but we can at least report it
-                            error!("IPC socket missing at {} even though ZMQ server is running", ipc_path);
+                            error!(
+                                "IPC socket missing at {} even though ZMQ server is running",
+                                ipc_path
+                            );
                             json!({
                                 "status": "error",
                                 "message": "IPC socket missing - server restart required",
@@ -1160,91 +1675,30 @@ impl<'a> RocksDBDaemon<'a> {
                         }
                     }
                 }
-                // ── WRITE-MODIFYING COMMANDS (WAL) ───────────────────────
-                Some(cmd) if [
-                    "set_key","delete_key",
-                    "create_vertex","update_vertex","delete_vertex",
-                    "create_edge","update_edge","delete_edge",
-                    "clear_data","force_reset","flush"
-                ].contains(&cmd) => {
-                    // Build WAL op
-                    let op = match cmd {
-                        "set_key" => {
-                            let cf = request["cf"].as_str().unwrap_or("kv_pairs").to_string();
-                            let key = request["key"]
-                                .as_str()
-                                .ok_or_else(|| GraphError::StorageError("missing key".to_string()))?
-                                .as_bytes()
-                                .to_vec();
-                            let value = request["value"]
-                                .as_str()
-                                .ok_or_else(|| GraphError::StorageError("missing value".to_string()))?
-                                .as_bytes()
-                                .to_vec();
-                            WalOp::Put { cf, key, value }
-                        }
-                        "delete_key" => {
-                            let cf = request["cf"].as_str().unwrap_or("kv_pairs").to_string();
-                            let key = request["key"]
-                                .as_str()
-                                .ok_or_else(|| GraphError::StorageError("missing key".to_string()))?
-                                .as_bytes()
-                                .to_vec();
-                            WalOp::Delete { cf, key }
-                        }
-                        // TODO: map other vertex/edge commands here
-                        _ => {
-                            let resp = json!({"status":"error","message":"unsupported write command"});
-                            send_resp!(resp);
-                        }
-                    };
 
-                    // Leader appends to WAL
-                    let offset = if is_leader {
-                        match append_wal(&op).await {
-                            Ok(o) => o,
-                            Err(e) => {
-                                let resp = json!({"status":"error","message":e.to_string()});
-                                send_resp!(resp);
-                            }
-                        }
-                    } else {
-                        0
-                    };
-
-                    // Persist offset (fire-and-forget)
-                    if is_leader {
-                        let _ = tokio_fs::write(
-                            canonical.join(format!("{}.offset", port)),
-                            offset.to_string().as_bytes(),
-                        ).await;
-                    }
-
-                    // Apply locally
-                    let cfs = &(kv_pairs.clone(), vertices.clone(), edges.clone());
-                    match RocksDBDaemon::apply_op_locally(&db, cfs, &op).await {
-                        Ok(_) => json!({"status":"success"}),
-                        Err(e) => json!({"status":"error","message":e.to_string()}),
-                    }
-                }
-                // ── READ-ONLY COMMANDS ─────────────────────────────────────
+                // ──────────────────────────────────────────────────────────────
+                // READ-ONLY COMMANDS
+                // ──────────────────────────────────────────────────────────────
                 Some(cmd) if [
                     "get_key",
                     "get_vertex","get_edge",
                     "get_all_vertices","get_all_edges",
                     "get_all_vertices_by_type","get_all_edges_by_type"
-                ].contains(&cmd) => {
-                    match Self::execute_db_command(
-                        cmd, &request,
-                        &db, &kv_pairs, &vertices, &edges,
-                        port, &db_path, &endpoint
-                    ).await {
-                        Ok(r) => r,
-                        Err(e) => json!({"status":"error","message":e.to_string()}),
-                    }
-                }
+                ].contains(&cmd) => match Self::execute_db_command(
+                    cmd,
+                    &request,
+                    &db,
+                    &kv_pairs,
+                    &vertices,
+                    &edges,
+                    port,
+                    &db_path,
+                    &endpoint,
+                ).await {
+                    Ok(r) => r,
+                    Err(e) => json!({"status":"error","message":e.to_string()}),
+                },
 
-                // ── FALLBACK ───────────────────────────────────────────────
                 Some(cmd) => {
                     error!("Unsupported command: {}", cmd);
                     json!({"status":"error","message":format!("Unsupported command: {}",cmd)})
@@ -2471,7 +2925,7 @@ impl<'a> RocksDBDaemon<'a> {
 
         let response = match request.get("command").and_then(|c| c.as_str()) {
             Some("status") => json!({ "status": "success", "port": self.port }),
-            Some("ping") => json!({ "status": "success", "message": "pong" }),
+            Some("ping") => json!({ "status": "success", "message": "pong", "db_open":true }),
             Some("set_key") => {
                 let cf_name = request.get("cf").and_then(|c| c.as_str()).unwrap_or("kv_pairs");
                 let key = match request.get("key").and_then(|k| k.as_str()) {
@@ -3536,7 +3990,10 @@ impl RocksDBDaemonPool {
     ) -> GraphResult<Self> {
         info!("Starting ZeroMQ server for RocksDBDaemon on port {}", port);
         let mut pool = Self::new();
-        
+
+        // Clone db_path EARLY to own it
+        let db_path_owned = db_path.to_path_buf();
+
         // Get the database from the client
         let db = client
             .inner
@@ -3545,29 +4002,40 @@ impl RocksDBDaemonPool {
             .lock()
             .await
             .clone();
-        
+
         // Get column family handles and transmute them to 'static lifetime
         let kv_pairs: Arc<BoundColumnFamily<'static>> = unsafe {
-            std::mem::transmute(Arc::new(db.cf_handle("kv_pairs").ok_or_else(|| {
-                GraphError::StorageError("Failed to open kv_pairs column family".to_string())
-            })?))
+            std::mem::transmute(Arc::new(
+                db.cf_handle("kv_pairs")
+                    .ok_or_else(|| GraphError::StorageError("Failed to open kv_pairs column family".to_string()))?
+            ))
         };
-        
+
         let vertices: Arc<BoundColumnFamily<'static>> = unsafe {
-            std::mem::transmute(Arc::new(db.cf_handle("vertices").ok_or_else(|| {
-                GraphError::StorageError("Failed to open vertices column family".to_string())
-            })?))
+            std::mem::transmute(Arc::new(
+                db.cf_handle("vertices")
+                    .ok_or_else(|| GraphError::StorageError("Failed to open vertices column family".to_string()))?
+            ))
         };
-        
+
         let edges: Arc<BoundColumnFamily<'static>> = unsafe {
-            std::mem::transmute(Arc::new(db.cf_handle("edges").ok_or_else(|| {
-                GraphError::StorageError("Failed to open edges column family".to_string())
-            })?))
+            std::mem::transmute(Arc::new(
+                db.cf_handle("edges")
+                    .ok_or_else(|| GraphError::StorageError("Failed to open edges column family".to_string()))?
+            ))
         };
-        
+
+        // WAL MANAGER — REQUIRED FIELD
+        let canonical_path = db_path_owned.parent().unwrap_or(&db_path_owned).to_path_buf();
+        let wal_manager = Arc::new(
+            RocksDBWalManager::new(canonical_path, port)
+                .await
+                .map_err(|e| GraphError::StorageError(format!("Failed to create RocksDBWalManager: {}", e)))?
+        );
+
         #[cfg(feature = "with-openraft-rocksdb")]
         let raft_storage = {
-            let raft_db_path = db_path.join("raft");
+            let raft_db_path = db_path_owned.join("raft");
             tokio::fs::create_dir_all(&raft_db_path).await
                 .map_err(|e| GraphError::StorageError(format!("Failed to create Raft directory: {}", e)))?;
             Some(Arc::new(
@@ -3576,24 +4044,26 @@ impl RocksDBDaemonPool {
                     .map_err(|e| GraphError::StorageError(format!("Failed to create Raft storage: {}", e)))?
             ))
         };
-        
+
         // Create ZMQ context and shutdown channel
         let zmq_context = Arc::new(ZmqContext::new());
         let (shutdown_tx, _shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
-        
-        // Build and insert daemon
+        let running = Arc::new(tokio::sync::Mutex::new(true));
+
+        // Build and insert daemon — CLONE ALL ARC VALUES
         pool.daemons.insert(
             port,
             Arc::new(RocksDBDaemon {
                 port,
-                db_path: db_path.to_path_buf(),
-                db,
-                kv_pairs,
-                vertices,
-                edges,
-                running: Arc::new(tokio::sync::Mutex::new(true)),
+                db_path: db_path_owned.clone(),
+                db: db.clone(),
+                kv_pairs: kv_pairs.clone(),
+                vertices: vertices.clone(),
+                edges: edges.clone(),
+                wal_manager: wal_manager.clone(),
+                running: running.clone(),
                 shutdown_tx,
-                zmq_context,
+                zmq_context: zmq_context.clone(),
                 zmq_thread: Arc::new(tokio::sync::Mutex::new(None)),
                 #[cfg(feature = "with-openraft-rocksdb")]
                 raft: None,
@@ -3603,7 +4073,72 @@ impl RocksDBDaemonPool {
                 node_id: port as u64,
             }),
         );
-        
+
+        // Start ZMQ server in background — ALL VALUES OWNED OR CLONED
+        let zmq_thread_handle = {
+            let zmq_context_thread = zmq_context.clone();
+            let db_clone = db.clone();
+            let kv_clone = kv_pairs.clone();
+            let vert_clone = vertices.clone();
+            let edge_clone = edges.clone();
+            let wal_manager_clone = wal_manager.clone();
+            let running_clone = running.clone();
+            let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", port);
+            let db_path_thread = db_path_owned.clone();
+
+            std::thread::spawn(move || -> GraphResult<()> {
+                let rt = tokio::runtime::Runtime::new()
+                    .expect("Failed to create runtime for ZMQ thread");
+                rt.block_on(async {
+                    let socket_raw = zmq_context_thread
+                        .socket(REP)
+                        .map_err(|e| GraphError::StorageError(format!("ZMQ socket create failed: {}", e)))?;
+
+                    let mut bound = false;
+                    for i in 0..5 {
+                        match socket_raw.bind(&endpoint) {
+                            Ok(_) => {
+                                bound = true;
+                                info!("ZMQ bound on attempt {}", i + 1);
+                                break;
+                            }
+                            Err(e) => {
+                                warn!("ZMQ bind attempt {} failed: {}", i + 1, e);
+                                if i < 4 {
+                                    tokio::time::sleep(TokioDuration::from_millis(100 * (i + 1) as u64)).await;
+                                }
+                            }
+                        }
+                    }
+
+                    if !bound {
+                        return Err(GraphError::StorageError("ZMQ failed to bind after retries".into()));
+                    }
+
+                    let zmq_socket = Arc::new(TokioMutex::new(socket_raw));
+                    RocksDBDaemon::run_zmq_server_lazy(
+                        port,
+                        RocksDBConfig::default(),
+                        running_clone,
+                        zmq_socket,
+                        endpoint,
+                        db_clone,
+                        kv_clone,
+                        vert_clone,
+                        edge_clone,
+                        wal_manager_clone,
+                        db_path_thread,
+                    )
+                    .await
+                })
+            })
+        };
+
+        // Store thread handle
+        if let Some(daemon) = pool.daemons.get(&port) {
+            *daemon.zmq_thread.lock().await = Some(zmq_thread_handle);
+        }
+
         Ok(pool)
     }
 
@@ -3903,20 +4438,7 @@ impl RocksDBDaemonPool {
             let _ = ready_rx.recv().await;
             info!("ZMQ server is ready on port {}", daemon.port);
         });
-/*
-        // Wait for ZMQ server to start
-        timeout(TokioDuration::from_secs(10), async {
-            while !self.is_zmq_server_running(port).await? {
-                tokio::time::sleep(TokioDuration::from_millis(100)).await;
-            }
-            Ok::<(), GraphError>(())
-        })
-        .await
-        .map_err(|_| {
-            error!("Timeout waiting for ZMQ server to start on port {}", port);
-            println!("===> ERROR: TIMEOUT WAITING FOR ZMQ SERVER TO START ON PORT {}", port);
-            GraphError::StorageError(format!("Timeout waiting for ZMQ server on port {}", port))
-        })??;*/
+
         // This line is now valid because the function is (&mut self).
         self.daemons.insert(port, Arc::new(daemon)); 
         info!("Added new daemon to pool for port {}", port);
@@ -4504,6 +5026,7 @@ impl RocksDBDaemonPool {
         cli_port: Option<u16>,
     ) -> GraphResult<()> {
         println!("====> IN initialize_cluster");
+        let _lock = get_cluster_init_lock().await.lock().await;  // HOLD HERE
         self._initialize_cluster_core(
             storage_config,
             config,
@@ -4536,7 +5059,7 @@ impl RocksDBDaemonPool {
     // use std::path::Path; // Although we now avoid Path::exists()
 
     // ─────────────────────────────────────────────────────────────────────────────
-    // UPDATED _initialize_cluster_core
+    // UPDATED _initialize_cluster_core — FULL WAL REPLAY + LEADER LOGIC
     // ─────────────────────────────────────────────────────────────────────────────
     async fn _initialize_cluster_core(
         &mut self,
@@ -4549,22 +5072,22 @@ impl RocksDBDaemonPool {
         println!("===> IN _initialize_cluster_core");
         info!("Starting initialization of RocksDBDaemonPool");
 
-        let _guard = get_cluster_init_lock().await.lock().await;
+        // REMOVED: let _guard = get_cluster_init_lock().await.lock().await;
+        // → Lock is already held in initialize_cluster()
 
         let mut initialized = self.initialized.write().await;
         if *initialized {
             warn!("RocksDBDaemonPool already initialized, skipping");
-            println!("===> WARNING: ROCKSDB DAEMON POOL ALREADY INITIALIZED, SKIPPING");
+            println!("===> WARNING: ROCKSDB DAEMON POEL ALREADY INITIALIZED, SKIPPING");
             return Ok(());
         }
 
         const DEFAULT_STORAGE_PORT: u16 = 8052;
         let port = cli_port.unwrap_or(config.port.unwrap_or(DEFAULT_STORAGE_PORT));
-
         info!("Canonical port: {}", port);
         println!("===> CANONICAL PORT: {}", port);
 
-        // ---------- 1. REACHABILITY CHECK ----------
+        // 1. REACHABILITY CHECK
         if self.is_zmq_reachable(port).await.unwrap_or(false) {
             info!("Daemon already running on port {}", port);
             println!("===> DAEMON ALREADY RUNNING ON PORT {}", port);
@@ -4573,7 +5096,7 @@ impl RocksDBDaemonPool {
             return Ok(());
         }
 
-        // ---------- 2. CLEAN STALE IPC ----------
+        // 2. CLEAN STALE IPC
         let ipc_path = format!("/tmp/graphdb-{}.ipc", port);
         if tokio_fs::metadata(&ipc_path).await.is_ok() {
             warn!("Stale IPC socket found at {}. Removing.", ipc_path);
@@ -4581,33 +5104,34 @@ impl RocksDBDaemonPool {
             let _ = tokio_fs::remove_file(&ipc_path).await;
         }
 
-        // ---------- 3. PER-PORT PATH ----------
+        // 3. PER-PORT PATH
         let db_path = storage_config
             .data_directory
             .as_ref()
             .unwrap_or(&PathBuf::from(DEFAULT_DATA_DIRECTORY))
             .join("rocksdb")
             .join(port.to_string());
-
         info!("Using RocksDB path: {:?}", db_path);
         println!("===> USING ROCKSDB PATH: {:?}", db_path);
 
-        // ---------- 4. CREATE DIR ----------
+        // 4. CREATE DIR
         if tokio_fs::metadata(&db_path).await.is_err() {
-            tokio_fs::create_dir_all(&db_path).await.map_err(|e| GraphError::Io(e.to_string()))?;
-            tokio_fs::set_permissions(&db_path, fs::Permissions::from_mode(0o700)).await.map_err(|e| GraphError::Io(e.to_string()))?;
+            tokio_fs::create_dir_all(&db_path).await
+                .map_err(|e| GraphError::Io(e.to_string()))?;
+            tokio_fs::set_permissions(&db_path, fs::Permissions::from_mode(0o700))
+                .await
+                .map_err(|e| GraphError::Io(e.to_string()))?;
         }
 
-        // ---------- 5. FORCE UNLOCK ----------
+        // 5. FORCE UNLOCK
         RocksDBClient::force_unlock(&db_path).await?;
         info!("Performed force unlock on RocksDB at {:?}", db_path);
         println!("===> PERFORMED FORCE UNLOCK ON ROCKSDB AT {:?}", db_path);
 
-        // ---------- 6. CREATE DAEMON ----------
+        // 6. CREATE DAEMON
         let mut daemon_config = config.clone();
         daemon_config.path = db_path.clone();
         daemon_config.port = Some(port);
-
         info!("Creating RocksDBDaemon with config: {:?}", daemon_config);
         println!("===> CREATING ROCKSDB DAEMON WITH CONFIG: {:?}", daemon_config);
 
@@ -4619,21 +5143,18 @@ impl RocksDBDaemonPool {
         .map_err(|_| GraphError::StorageError(format!("Timeout creating RocksDBDaemon on port {}", port)))?
         .map_err(|e| e)?;
 
-        // ---------- 7. WAIT FOR ZMQ ----------
-        let zmq_ready = timeout(TokioDuration::from_secs(10), ready_rx.recv())
-            .await
-            .unwrap_or(None) // Don't fail on timeout — continue anyway
-            .is_some();
-
-        if zmq_ready {
+        // 7. WAIT FOR ZMQ (NON-BLOCKING)
+        let zmq_ready = if let Ok(Some(_)) = timeout(TokioDuration::from_secs(10), ready_rx.recv()).await {
             info!("ZMQ readiness confirmed for port {}", port);
             println!("===> ZMQ READINESS CONFIRMED FOR PORT {}", port);
+            true
         } else {
             warn!("ZMQ readiness not confirmed for port {}, proceeding anyway", port);
             println!("===> WARNING: ZMQ READINESS NOT CONFIRMED FOR PORT {}, PROCEEDING ANYWAY", port);
-        }
+            false
+        };
 
-        // ---------- 8. VERIFY IPC ----------
+        // 8. VERIFY IPC
         if tokio_fs::metadata(&ipc_path).await.is_err() {
             warn!("ZMQ IPC file not created at {}, proceeding anyway", ipc_path);
             println!("===> WARNING: ZMQ IPC FILE NOT CREATED AT {}, PROCEEDING ANYWAY", ipc_path);
@@ -4642,30 +5163,29 @@ impl RocksDBDaemonPool {
             println!("===> ZMQ IPC FILE VERIFIED AT {}", ipc_path);
         }
 
-        // ---------- 9. REGISTER ----------
+        // 9. REGISTER
         let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
         let daemon_metadata = DaemonMetadata {
             service_type: "storage".to_string(),
             port,
-            pid: std::process::id(),
+            pid: std::process::id() as u32,
             ip_address: config.host.clone().unwrap_or("127.0.0.1".to_string()),
             data_dir: Some(db_path.clone()),
             config_path: storage_config.config_root_directory.clone().map(PathBuf::from),
             engine_type: Some("rocksdb".to_string()),
             last_seen_nanos: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64,
-            zmq_ready: zmq_ready,   // Reflect actual readiness
+            zmq_ready,
             engine_synced: true,
         };
-
         daemon_registry.register_daemon(daemon_metadata).await
             .map_err(|e| GraphError::StorageError(format!("Failed to register daemon on port {}: {}", port, e)))?;
 
-        // ---------- 10. STORE ----------
+        // 10. STORE
         self.daemons.insert(port, Arc::new(daemon));
         self.load_balancer.update_node_health(port, true, 0).await;
         *initialized = true;
 
-        // ---------- 11. HEALTH MONITOR ----------
+        // 11. HEALTH MONITOR
         let health_config = HealthCheckConfig {
             interval: TokioDuration::from_secs(10),
             connect_timeout: TokioDuration::from_secs(2),
@@ -4675,7 +5195,6 @@ impl RocksDBDaemonPool {
 
         info!("RocksDBDaemonPool initialized successfully on port {}", port);
         println!("===> ROCKSDB DAEMON POOL INITIALIZED SUCCESSFULLY ON PORT {}", port);
-
         Ok(())
     }
 

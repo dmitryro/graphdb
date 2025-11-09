@@ -3283,7 +3283,7 @@ impl StorageEngineManager {
     pub async fn use_storage(&mut self, new_config: StorageConfig, permanent: bool, migrate: bool) -> Result<(), GraphError> {
         info!("===> Starting use_storage for engine: {:?}, permanent: {:?}, migrate: {:?} ===", 
               new_config.storage_engine_type, permanent, migrate);
-        println!("===> Starting use_storage for engine: {:?}, permanent: {:?}, migrate: {:?} ===", 
+        println!("===============> Starting use_storage for engine: {:?}, permanent: {:?}, migrate: {:?} ===", 
                  new_config.storage_engine_type, permanent, migrate);
         trace!("use_storage called with engine_type: {:?}", new_config.storage_engine_type);
         let start_time = Instant::now();

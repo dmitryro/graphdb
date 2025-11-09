@@ -33,7 +33,7 @@ use rocksdb::{
 };
 
 // Helper function to normalize the engine path
-fn normalize_engine_path(mut path: PathBuf, engine_type_str: &str) -> PathBuf {
+pub fn normalize_engine_path(mut path: PathBuf, engine_type_str: &str) -> PathBuf {
     let engine_low = engine_type_str.to_lowercase();
 
     if let Some(last) = path.file_name() {

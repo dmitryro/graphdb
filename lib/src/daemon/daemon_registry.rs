@@ -215,6 +215,10 @@ impl AsyncRegistryWrapper {
     pub async fn find_free_storage_daemon(&self) -> Result<Option<DaemonMetadata>> {
         self.registry.inner.find_free_storage_daemon().await
     }
+
+    pub async fn list_storage_daemons(&self) -> Result<Vec<DaemonMetadata>> {
+        self.registry.inner.list_storage_daemons().await
+    }
 }
 
 #[derive(Debug)]
@@ -821,6 +825,27 @@ impl NonBlockingDaemonRegistry {
         info!("Registry closed gracefully");
         Ok(())
     }
+
+    pub async fn list_storage_daemons(&self) -> Result<Vec<DaemonMetadata>> {
+        self.clean_stale_daemons().await?;
+        
+        let memory = self.memory_store.read().await;
+        let storage_daemons: Vec<_> = memory
+            .values()
+            .filter(|m| m.service_type == "storage")
+            .cloned()
+            .collect();
+        drop(memory);
+
+        let mut valid = Vec::new();
+        for metadata in storage_daemons {
+            if NonBlockingDaemonRegistry::is_pid_running(metadata.pid).await.unwrap_or(false) {
+                valid.push(metadata);
+            }
+        }
+
+        Ok(valid)
+    }
 }
 
 pub struct DaemonRegistryWrapper {
@@ -907,6 +932,11 @@ impl DaemonRegistryWrapper {
         
         status.push_str("Improved non-blocking registry active\n");
         Ok(status)
+    }
+
+    // In DaemonRegistryWrapper
+    pub async fn list_storage_daemons(&self) -> Result<Vec<DaemonMetadata>> {
+        self.get().await.list_storage_daemons().await
     }
 }
 
