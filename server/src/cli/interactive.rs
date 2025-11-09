@@ -76,24 +76,25 @@ fn detect_raw_query_language(line: &str) -> Option<(&'static str, String)> {
     if trimmed.is_empty() {
         return None;
     }
-
     let upper = trimmed.to_ascii_uppercase();
+    let lower = trimmed.to_ascii_lowercase();
 
     // ---- SQL ----
+    // Only match full SQL patterns: SELECT, INSERT, UPDATE, WITH, or DELETE FROM
     if upper.starts_with("SELECT ")
         || upper.starts_with("INSERT ")
         || upper.starts_with("UPDATE ")
-        || upper.starts_with("DELETE ")
         || upper.starts_with("WITH ")
         || upper.starts_with("CREATE ")
         || upper.starts_with("DROP ")
         || upper.starts_with("ALTER ")
+        || upper.contains(" DELETE FROM ")
+        || upper.starts_with("DELETE FROM ")
     {
         return Some(("sql", trimmed.to_string()));
     }
 
     // ---- Cypher ----
-    let lower = trimmed.to_ascii_lowercase();
     if lower.starts_with("match ")
         || lower.starts_with("create ")
         || lower.starts_with("merge ")
@@ -101,7 +102,9 @@ fn detect_raw_query_language(line: &str) -> Option<(&'static str, String)> {
         || lower.starts_with("optional match ")
         || lower.starts_with("detach delete ")
         || lower.starts_with("remove ")
-        || lower.starts_with("set ")
+        || lower.starts_with("where ")
+        || lower.starts_with("order by ")
+        || lower.starts_with("limit ")
     {
         return Some(("cypher", trimmed.to_string()));
     }

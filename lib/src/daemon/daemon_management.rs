@@ -28,6 +28,7 @@ use std::os::unix::fs::FileTypeExt;
 use tokio::fs as tokio_fs;
 use rocksdb::{DBCompactionStyle, Options, WriteBatch, DB};
 use zmq::{ self, REQ, Context as ZmqContext, Message, SocketType};
+use glob::glob;
 use serde_json::{json, Value};
 use models::errors::{GraphError, GraphResult};
 use crate::config::{
@@ -35,6 +36,7 @@ use crate::config::{
     load_storage_config_str as load_storage_config,
     CLI_ASSUMED_DEFAULT_STORAGE_PORT_FOR_STATUS,
     StorageConfig,
+    DEFAULT_DATA_DIRECTORY,
     DEFAULT_DAEMON_PORT,
     DEFAULT_REST_API_PORT,
     DEFAULT_STORAGE_PORT,
@@ -51,7 +53,15 @@ use crate::config::{
 };
 use crate::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
 use crate::daemon::daemon_api::{start_daemon, stop_daemon, stop_port_daemon, DaemonError};
-use crate::daemon::storage_daemon_server::run_storage_daemon as start_storage_server;
+use crate::daemon::storage_daemon_server::{ StorageSettings, 
+                                            start_storage_daemon_server_real,
+                                            run_storage_daemon as start_storage_server};
+use crate::storage_engine::{ GLOBAL_STORAGE_ENGINE_MANAGER };
+use simplelog::{CombinedLogger, TermLogger, WriteLogger, LevelFilter, Config, ConfigBuilder, TerminalMode, ColorChoice};
+
+const ZMQ_PING_TIMEOUT_MS: u64 = 500;
+const ZMQ_INIT_TIMEOUT_MS: u64 = 3000;
+
 /// Helper to run an external command with a timeout.
 pub async fn run_command_with_timeout(
     command_name: &str,
@@ -1653,13 +1663,6 @@ pub fn parse_port_cluster_range(range: &str) -> Result<Vec<u16>, anyhow::Error> 
     }
 }        
 
-pub async fn is_pid_running(pid: u32) -> bool {
-    let mut sys = sysinfo::System::new();
-    let sysinfo_pid = sysinfo::Pid::from_u32(pid);
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[sysinfo_pid]), true);
-    sys.process(sysinfo_pid).is_some()
-}
-
 pub async fn find_port_by_pid(pid: u32) -> Option<u16> {
     let output = TokioCommand::new("lsof")
         .arg("-P")
@@ -2722,7 +2725,7 @@ pub fn extract_port(ipc_endpoint: &str) -> GraphResult<u16> {
 
 pub async fn stop_storage_daemon_by_port(port: u16) -> Result<(), anyhow::Error> {
     let registry = GLOBAL_DAEMON_REGISTRY.get().await;
-    
+
     if let Ok(Some(metadata)) = registry.get_daemon_metadata(port).await {
         if metadata.pid > 0 {
             // Try graceful shutdown first
@@ -2731,28 +2734,56 @@ pub async fn stop_storage_daemon_by_port(port: u16) -> Result<(), anyhow::Error>
                 nix::sys::signal::Signal::SIGTERM,
             ) {
                 warn!("Failed to send SIGTERM to PID {}: {}", metadata.pid, e);
-                
+
                 // Force kill if graceful fails
                 let _ = nix::sys::signal::kill(
                     nix::unistd::Pid::from_raw(metadata.pid as i32),
                     nix::sys::signal::Signal::SIGKILL,
                 );
             }
-            
+
             // Wait for process to die
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-            
+
             // Clean up IPC socket
             let socket_path = format!("/tmp/graphdb-{}.ipc", port);
             let _ = tokio::fs::remove_file(&socket_path).await;
-            
+
+            // === CRITICAL: DO NOT DELETE WAL DIRECTORY ===
+            // Only clean up sled DB files (optional), leave wal_<port> intact
+            // Inside stop_storage_daemon_by_port
+            if let Some(data_dir) = metadata.data_dir {
+                let sled_db_path = data_dir;
+                if sled_db_path.exists() {
+                    // Remove only sled files
+                    let patterns = ["db", "db.lck", "CURRENT", "LOCK", "MANIFEST-*", "OPTIONS-*", "LOG*"];
+                    for pattern in patterns {
+                        let glob_path = sled_db_path.join(pattern);
+                        if let Some(p) = glob_path.to_str() {
+                            if let Ok(paths) = glob(p) {
+                                for path in paths.flatten() {
+                                    if path.is_file() {
+                                        let _ = tokio::fs::remove_file(&path).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Remove empty dir
+                    if tokio_fs::read_dir(&sled_db_path).await?.next_entry().await?.is_none() {
+                        let _ = tokio_fs::remove_dir(&sled_db_path).await;
+                    }
+                }
+                // DO NOT TOUCH wal_<port>/
+            }
+
             // Remove from registry
             registry.unregister_daemon(port).await?;
-            
-            info!("Stopped daemon on port {} (PID {})", port, metadata.pid);
+
+            info!("Stopped daemon on port {} (PID {}) — WAL preserved", port, metadata.pid);
         }
     }
-    
+
     Ok(())
 }
 
@@ -2804,66 +2835,214 @@ pub async fn check_ipc_socket_exists(port: u16) -> bool {
     tokio::fs::metadata(&ipc_path).await.is_ok()
 }
 
+/// Lightweight ZMQ ping — does NOT rely on daemon state
+async fn send_zmq_ping(port: u16) -> Result<bool> {
+    let context = zmq::Context::new();
+    let socket = context.socket(zmq::REQ)?;
+    socket.set_rcvtimeo(ZMQ_PING_TIMEOUT_MS as i32)?;
+    socket.set_sndtimeo(ZMQ_PING_TIMEOUT_MS as i32)?;
+
+    let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", port);
+    socket.connect(&endpoint)?;
+
+    socket.send("ping", 0)?;
+    Ok(socket.recv_msg(0).is_ok())
+}
+
+/// Send JSON command to ZMQ and get JSON response
+async fn send_zmq_json_command(port: u16, command: &str) -> Result<Option<Value>> {
+    let context = ZmqContext::new();
+    let socket = context.socket(zmq::REQ)?;
+    socket.set_rcvtimeo(1000)?; // 1s
+    socket.set_sndtimeo(1000)?;
+    let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", port);
+    socket.connect(&endpoint)?;
+    let payload = json!({ "command": command });
+    let msg = serde_json::to_vec(&payload)?;
+    socket.send(&msg, 0)?;
+    let mut reply = Message::new();
+    if socket.recv(&mut reply, 0).is_err() {
+        return Ok(None);
+    }
+    let reply_bytes = reply.as_ref(); // Fixed: use .as_ref() instead of .as_bytes()
+    let response: Value = serde_json::from_slice(reply_bytes)
+        .map_err(|e| anyhow::anyhow!("Failed to parse ZMQ reply: {}", e))?;
+    Ok(Some(response))
+}
+
+/// Send INITIALIZE (your existing command)
+async fn send_initialize(port: u16) -> Result<bool> {
+    match timeout(Duration::from_millis(3000), send_zmq_json_command(port, "initialize")).await {
+        Ok(Ok(Some(resp))) => {
+            let status = resp.get("status").and_then(|s| s.as_str());
+            Ok(status == Some("success"))
+        }
+        _ => Ok(false),
+    }
+}
+
+pub async fn is_pid_running(pid: u32) -> bool {
+    let mut sys = sysinfo::System::new();
+    let sysinfo_pid = sysinfo::Pid::from_u32(pid);
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[sysinfo_pid]), true);
+    sys.process(sysinfo_pid).is_some()
+}
+
+/// Lightweight health check using your existing `ping`
+async fn is_zmq_healthy(port: u16) -> bool {
+    let context = zmq::Context::new();
+    let Ok(socket) = context.socket(zmq::REQ) else { return false };
+    let _ = socket.set_rcvtimeo(100);
+    let _ = socket.set_sndtimeo(100);
+
+    let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", port);
+    if socket.connect(&endpoint).is_err() { return false; }
+
+    let payload = json!({"command": "ping"});
+    let Ok(msg) = serde_json::to_vec(&payload) else { return false; };
+
+    if socket.send(&msg, zmq::DONTWAIT).is_err() { return false; }
+
+    let mut reply = zmq::Message::new();
+    socket.recv(&mut reply, zmq::DONTWAIT).is_ok()
+}
+
 /// Find a daemon with a working IPC socket, or create one
+/// Main function: reuse healthy daemon or create new
 pub async fn get_or_create_daemon_with_ipc(
-    engine: StorageEngineType,
+    engine_type: StorageEngineType,
     config: &StorageConfig,
-) -> Result<u16, anyhow::Error> {
+) -> Result<u16> {
     let registry = GLOBAL_DAEMON_REGISTRY.get().await;
-    let all_daemons = registry.get_all_daemon_metadata().await?;
-    
-    let engine_str = daemon_api_storage_engine_type_to_string(&engine);
-    
-    // Find daemons of the right engine
-    let mut matching_daemons: Vec<_> = all_daemons
-        .into_iter()
-        .filter(|d| {
-            d.service_type == "storage" 
-                && d.engine_type.as_deref() == Some(&engine_str)
-                && d.pid > 0
-        })
-        .collect();
-    
-    // Sort by port (prefer higher ports = more recent)
-    matching_daemons.sort_by_key(|d| std::cmp::Reverse(d.port));
-    
-    // Try to find one with working IPC
-    for daemon in &matching_daemons {
-        if check_pid_validity(daemon.pid).await {
-            if check_ipc_socket_exists(daemon.port).await {
-                info!("Found healthy daemon with IPC on port {}", daemon.port);
-                return Ok(daemon.port);
+
+    // === 1. REUSE ANY HEALTHY DAEMON (PID + IPC) ===
+    let candidates = registry.list_storage_daemons().await?;
+    for daemon in candidates {
+        let port = daemon.port;
+        let pid = daemon.pid;
+
+        if !is_pid_running(pid).await {
+            continue;
+        }
+
+        let ipc_path = format!("/tmp/graphdb-{}.ipc", port);
+        if Path::new(&ipc_path).exists() {
+            info!("REUSING HEALTHY DAEMON ON PORT {} (PID {})", port, pid);
+            return Ok(port);
+        }
+    }
+
+    // === 2. NO DAEMON → START ON DEFAULT PORT ===
+    let port = config.default_port;
+    let per_port_path = config.data_directory
+        .as_ref()
+        .ok_or_else(|| anyhow!("data_directory missing"))?
+        .join("sled")
+        .join(port.to_string());
+
+    // Ensure per-port dir exists
+    tokio::fs::create_dir_all(&per_port_path).await?;
+
+    let settings = StorageSettings {
+        default_port: port,
+        data_directory: per_port_path.clone(),
+        ..StorageSettings::load_from_yaml(&config.config_root_directory.as_ref().unwrap().join("storage_config.yaml"))?
+    };
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    // Skip logger init
+    if log::max_level() == LevelFilter::Off {
+        let log_file = std::fs::File::create(format!("{}/graphdb-storage-{}.out", settings.log_directory.display(), port))?;
+        simplelog::CombinedLogger::init(vec![
+            simplelog::TermLogger::new(LevelFilter::Info, simplelog::Config::default(), simplelog::TerminalMode::Mixed, simplelog::ColorChoice::Auto),
+            simplelog::WriteLogger::new(LevelFilter::Info, simplelog::Config::default(), log_file),
+        ])?;
+    }
+
+    let _ = start_storage_daemon_server_real(port, settings, shutdown_rx).await?;
+
+    let metadata = DaemonMetadata {
+        service_type: "storage".to_string(),
+        port,
+        pid: std::process::id(),
+        ip_address: "127.0.0.1".to_string(),
+        data_dir: Some(per_port_path),
+        config_path: config.config_root_directory.clone().map(PathBuf::from),
+        last_seen_nanos: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64,
+        engine_type: Some("sled".to_string()),
+        zmq_ready: true,
+        engine_synced: true,
+    };
+    registry.register_daemon(metadata).await?;
+
+    // Wait for IPC
+    let ipc_path = format!("/tmp/graphdb-{}.ipc", port);
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        if Path::new(&ipc_path).exists() {
+            info!("DAEMON READY ON PORT {}", port);
+            return Ok(port);
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+
+    Err(anyhow!("Timeout waiting for IPC on port {}", port))
+}
+
+/// Test if ZMQ server on port is alive using the correct field: "command"
+pub async fn is_zmq_reachable(port: u16) -> bool {
+    let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", port);
+    let context = ZmqContext::new();
+
+    let socket = match context.socket(zmq::REQ) {
+        Ok(s) => s,
+        Err(e) => {
+            debug!("ZMQ: Failed to create REQ socket for port {}: {}", port, e);
+            return false;
+        }
+    };
+
+    if socket.connect(&endpoint).is_err() {
+        debug!("ZMQ: Connect failed for port {} (endpoint: {})", port, endpoint);
+        return false;
+    }
+
+    // SEND: {"command": "ping"}
+    let ping_msg = r#"{"command": "ping"}"#;
+    if socket.send(ping_msg, 0).is_err() {
+        debug!("ZMQ: Send ping failed for port {}", port);
+        return false;
+    }
+
+    let mut msg = zmq::Message::new();
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(1000),
+        async {
+            socket.recv(&mut msg, 0).is_ok()
+        },
+    )
+    .await
+    {
+        Ok(true) => {
+            let response = msg.as_str().unwrap_or("");
+            let is_pong = response.contains("pong") || response.contains("success");
+            if is_pong {
+                debug!("ZMQ: Health check passed for port {}", port);
             } else {
-                warn!(
-                    "Daemon on port {} exists but IPC socket missing - will skip",
-                    daemon.port
-                );
+                debug!("ZMQ: Unexpected response from port {}: {}", port, response);
             }
+            is_pong
+        }
+        Ok(false) => {
+            debug!("ZMQ: Recv failed for port {}", port);
+            false
+        }
+        Err(_) => {
+            debug!("ZMQ: Health check timeout for port {}", port);
+            false
         }
     }
-    
-    // No daemon with IPC found - need to start one
-    warn!("No healthy daemon with IPC found for engine {} - need to start one", engine_str);
-    
-    // Find a free port
-    let cluster_ports = parse_cluster_range(&config.cluster_range)?;
-    let mut free_port: Option<u16> = None;
-    
-    for &port in &cluster_ports {
-        if !check_process_status_by_port("Storage Daemon", port).await {
-            free_port = Some(port);
-            break;
-        }
-    }
-    
-    let port = free_port.ok_or_else(|| {
-        anyhow!("No free port available in cluster range {}", config.cluster_range)
-    })?;
-    
-    Err(anyhow!(
-        "No daemon with working IPC found - caller must start daemon on port {}",
-        port
-    ))
 }
 
 pub fn check_pid_validity_sync(pid: u32) -> bool {
@@ -2889,4 +3068,58 @@ pub fn check_pid_validity_sync(pid: u32) -> bool {
         // (In production, you'd use platform-specific process checks)
         true
     }
+}
+
+
+/// Helper function to synchronize the daemon registry with the latest config from the StorageEngineManager.
+/// This ensures the 'status' command always shows the correct engine type.
+// Updated sync_daemon_registry_with_manager function
+pub async fn sync_daemon_registry_with_manager(
+    port: u16,
+    config: &StorageConfig,
+    _shutdown_tx_opt: &Arc<TokioMutex<Option<oneshot::Sender<()>>>>,
+) -> Result<(), anyhow::Error> {
+    let manager = GLOBAL_STORAGE_ENGINE_MANAGER.get()
+        .ok_or_else(|| anyhow!("StorageEngineManager not initialized"))?;
+    let engine_type = manager.current_engine_type().await;
+    
+    let base_data_dir = config.data_directory
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY));
+    let engine_path_name = daemon_api_storage_engine_type_to_string(&engine_type).to_lowercase();
+    let instance_path = base_data_dir.join(&engine_path_name).join(port.to_string());
+
+    let daemon_metadata = DaemonMetadata {
+        service_type: "storage".to_string(),
+        port,
+        pid: std::process::id(),
+        ip_address: "127.0.0.1".to_string(),
+        data_dir: Some(instance_path.clone()),
+        config_path: config.config_root_directory.clone(),
+        engine_type: Some(engine_type.to_string()),
+        last_seen_nanos: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0),
+        zmq_ready: false,
+        engine_synced: false,
+    };
+
+    // Check if daemon is already registered
+    if let Some(existing_metadata) = GLOBAL_DAEMON_REGISTRY.get_daemon_metadata(port).await? {
+        if existing_metadata.data_dir != Some(instance_path.clone()) || existing_metadata.engine_type != Some(engine_type.to_string()) {
+            warn!("Updating daemon metadata for port {} from path {:?} to {:?}", port, existing_metadata.data_dir, instance_path);
+            GLOBAL_DAEMON_REGISTRY.update_daemon_metadata(daemon_metadata).await?;
+            info!("Updated daemon metadata for port {} with path {:?}", port, instance_path);
+        } else {
+            info!("Daemon metadata for port {} already correct", port);
+        }
+    } else {
+        timeout(TokioDuration::from_secs(5), GLOBAL_DAEMON_REGISTRY.register_daemon(daemon_metadata))
+            .await
+            .map_err(|_| anyhow!("Timeout registering daemon on port {}", port))??;
+        info!("Registered daemon on port {} with path {:?}", port, instance_path);
+    }
+
+    Ok(())
 }

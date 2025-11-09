@@ -6,7 +6,7 @@ use bincode::{Encode, Decode, BorrowDecode};
 use internment::Intern;
 use uuid::Uuid;
 
-use crate::errors::{ValidationError, ValidationResult};
+use crate::errors::{ValidationError, ValidationResult, GraphError, GraphResult};
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -17,6 +17,11 @@ pub struct SerializableUuid(pub Uuid);
 impl SerializableUuid {
     pub fn as_bytes(&self) -> &[u8] {
         self.0.as_bytes()
+    }
+    pub fn from(s: &str) -> GraphResult<Self> {
+        Uuid::parse_str(s)
+            .map(SerializableUuid)
+            .map_err(|e| GraphError::StorageError(e.to_string()))
     }
 }
 

@@ -250,138 +250,109 @@ pub async fn handle_start_command_interactive(
 pub async fn handle_stop_command(args: StopArgs) -> Result<()> {
     println!("--->> STOP NON-INTERACTIVE");
     info!("Processing stop command with args: {:?}", args);
+
+    let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
+
     match args.action.unwrap_or(StopAction::All) {
         StopAction::All => {
             println!("Stopping all GraphDB components...");
             info!("Initiating stop for all components");
 
-            let all_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
-            debug!("Initial daemon registry state: {:?}", all_daemons);
-            if all_daemons.is_empty() {
-                println!("No running components found in registry.");
-                info!("No components registered in GLOBAL_DAEMON_REGISTRY");
-                return Ok(());
-            }
-
             let mut stopped_count = 0;
             let mut errors = Vec::new();
 
-            // Stop REST API daemons
-            let rest_daemons: Vec<DaemonMetadata> = all_daemons
-                .iter()
-                .filter(|d| d.service_type == "rest")
-                .cloned()
-                .collect();
-            for daemon in rest_daemons {
-                println!("Stopping REST API on port {} (PID: {})...", daemon.port, daemon.pid);
-                info!("Attempting to stop REST API on port {} (PID: {})", daemon.port, daemon.pid);
-                match stop_rest_api_interactive(
-                    Some(daemon.port),
-                    Arc::new(TokioMutex::new(None)),
-                    Arc::new(TokioMutex::new(None)),
-                    Arc::new(TokioMutex::new(None)),
-                )
-                .await
-                {
-                    Ok(()) => {
-                        if is_port_free(daemon.port).await {
-                            info!("REST API on port {} stopped successfully", daemon.port);
-                            stopped_count += 1;
-                        } else {
-                            warn!("REST API on port {} stopped but port is still in use", daemon.port);
-                            errors.push(format!("REST API on port {}: port still in use", daemon.port));
+            // === 1. STOP REST API ===
+            if let Ok(rest_meta) = daemon_registry.get_all_daemon_metadata().await {
+                for meta in rest_meta.iter().filter(|m| m.service_type == "rest") {
+                    println!("Stopping REST API on port {} (PID: {})...", meta.port, meta.pid);
+                    match stop_rest_api_interactive(
+                        Some(meta.port),
+                        Arc::new(TokioMutex::new(None)),
+                        Arc::new(TokioMutex::new(None)),
+                        Arc::new(TokioMutex::new(None)),
+                    ).await {
+                        Ok(()) => {
+                            if is_port_free(meta.port).await {
+                                info!("REST API on port {} stopped successfully", meta.port);
+                                println!("REST API on port {} stopped.", meta.port);
+                                stopped_count += 1;
+                            } else {
+                                warn!("REST API on port {} stopped but port is still in use", meta.port);
+                                errors.push(format!("REST API on port {}: port still in use", meta.port));
+                            }
                         }
-                    }
-                    Err(e) => {
-                        println!("Failed to stop REST API on port {}: {}", daemon.port, e);
-                        error!("Failed to stop REST API on port {}: {}", daemon.port, e);
-                        errors.push(format!("REST API on port {}: {}", daemon.port, e));
+                        Err(e) => {
+                            println!("Failed to stop REST API on port {}: {}", meta.port, e);
+                            error!("Failed to stop REST API on port {}: {}", meta.port, e);
+                            errors.push(format!("REST API on port {}: {}", meta.port, e));
+                        }
                     }
                 }
             }
 
-            // Stop main daemons
-            let main_daemons: Vec<DaemonMetadata> = all_daemons
-                .iter()
-                .filter(|d| d.service_type == "main")
-                .cloned()
-                .collect();
-            for daemon in main_daemons {
-                println!("Stopping main daemon on port {} (PID: {})...", daemon.port, daemon.pid);
-                info!("Attempting to stop main daemon on port {} (PID: {})", daemon.port, daemon.pid);
-                match stop_main_interactive(Some(daemon.port), Arc::new(TokioMutex::new(None))).await {
-                    Ok(()) => {
-                        if is_port_free(daemon.port).await {
-                            info!("Main daemon on port {} stopped successfully", daemon.port);
-                            stopped_count += 1;
-                        } else {
-                            warn!("Main daemon on port {} stopped but port is still in use", daemon.port);
-                            errors.push(format!("Main daemon on port {}: port still in use", daemon.port));
+            // === 2. STOP MAIN DAEMONS ===
+            if let Ok(main_meta) = daemon_registry.get_all_daemon_metadata().await {
+                for meta in main_meta.iter().filter(|m| m.service_type == "main") {
+                    println!("Stopping main daemon on port {} (PID: {})...", meta.port, meta.pid);
+                    match stop_main_interactive(Some(meta.port), Arc::new(TokioMutex::new(None))).await {
+                        Ok(()) => {
+                            if is_port_free(meta.port).await {
+                                info!("Main daemon on port {} stopped successfully", meta.port);
+                                println!("Main daemon on port {} stopped.", meta.port);
+                                stopped_count += 1;
+                            } else {
+                                warn!("Main daemon on port {} stopped but port is still in use", meta.port);
+                                errors.push(format!("Main daemon on port {}: port still in use", meta.port));
+                            }
                         }
-                    }
-                    Err(e) => {
-                        println!("Failed to stop main daemon on port {}: {}", daemon.port, e);
-                        error!("Failed to stop main daemon on port {}: {}", daemon.port, e);
-                        errors.push(format!("Main daemon on port {}: {}", daemon.port, e));
+                        Err(e) => {
+                            println!("Failed to stop main daemon on port {}: {}", meta.port, e);
+                            error!("Failed to stop main daemon on port {}: {}", meta.port, e);
+                            errors.push(format!("Main daemon on port {}: {}", meta.port, e));
+                        }
                     }
                 }
             }
 
-            // Stop storage daemons
-            let storage_daemons: Vec<DaemonMetadata> = all_daemons
-                .iter()
-                .filter(|d| d.service_type == "storage")
-                .cloned()
-                .collect();
-            for daemon in storage_daemons {
-                println!("Stopping storage daemon on port {} (PID: {})...", daemon.port, daemon.pid);
-                info!("Attempting to stop storage daemon on port {} (PID: {})", daemon.port, daemon.pid);
-                match stop_storage_interactive(
-                    Some(daemon.port),
-                    Arc::new(TokioMutex::new(None)),
-                    Arc::new(TokioMutex::new(None)),
-                    Arc::new(TokioMutex::new(None)),
-                )
-                .await
-                {
+            // === 3. STOP STORAGE DAEMONS — FIXED: CALL stop_storage_interactive(None) ===
+            let storage_daemons = daemon_registry.list_storage_daemons().await.unwrap_or_default();
+            if !storage_daemons.is_empty() {
+                println!("Stopping {} storage daemon(s)...", storage_daemons.len());
+                let shutdown_tx = Arc::new(TokioMutex::new(None));
+                let daemon_handle = Arc::new(TokioMutex::new(None));
+                let daemon_port = Arc::new(TokioMutex::new(None));
+
+                match stop_storage_interactive(None, shutdown_tx, daemon_handle, daemon_port).await {
                     Ok(()) => {
-                        if is_port_free(daemon.port).await {
-                            info!("Storage daemon on port {} stopped successfully", daemon.port);
-                            stopped_count += 1;
-                        } else {
-                            warn!("Storage daemon on port {} stopped but port is still in use", daemon.port);
-                            errors.push(format!("Storage daemon on port {}: port still in use", daemon.port));
+                        for daemon in &storage_daemons {
+                            if is_port_free(daemon.port).await {
+                                info!("Storage daemon on port {} stopped successfully", daemon.port);
+                                println!("Storage daemon on port {} stopped.", daemon.port);
+                                stopped_count += 1;
+                            } else {
+                                warn!("Storage daemon on port {} stopped but port is still in use", daemon.port);
+                                errors.push(format!("Storage daemon on port {}: port still in use", daemon.port));
+                            }
                         }
                     }
                     Err(e) => {
-                        println!("Failed to stop storage daemon on port {}: {}", daemon.port, e);
-                        error!("Failed to stop storage daemon on port {}: {}", daemon.port, e);
-                        errors.push(format!("Storage daemon on port {}: {}", daemon.port, e));
+                        error!("Failed to stop storage daemons: {}", e);
+                        errors.push(format!("Storage daemons: {}", e));
                     }
                 }
             }
 
-            // Clear any remaining registry entries
-            let remaining_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await.unwrap_or_default();
-            if !remaining_daemons.is_empty() {
-                warn!("Found stale registry entries after stopping components: {:?}", remaining_daemons);
-                for daemon in remaining_daemons {
-                    if let Err(e) = GLOBAL_DAEMON_REGISTRY.remove_daemon_by_type(&daemon.service_type, daemon.port).await {
-                        warn!("Failed to remove stale {} daemon on port {} from registry: {}", daemon.service_type, daemon.port, e);
-                        errors.push(format!("Failed to remove stale {} daemon on port {}: {}", daemon.service_type, daemon.port, e));
-                    } else {
-                        info!("Removed stale {} daemon on port {} from registry", daemon.service_type, daemon.port);
-                    }
+            // === 4. FINAL CLEANUP ===
+            let remaining = daemon_registry.get_all_daemon_metadata().await.unwrap_or_default();
+            for meta in remaining {
+                if let Err(e) = daemon_registry.unregister_daemon(meta.port).await {
+                    warn!("Failed to unregister stale {} on port {}: {}", meta.service_type, meta.port, e);
+                    errors.push(format!("Unregister {} on port {}: {}", meta.service_type, meta.port, e));
                 }
             }
 
             println!(
                 "Stop all completed: {} components stopped, {} failed.",
-                stopped_count,
-                errors.len()
-            );
-            info!(
-                "Stop all completed: {} components stopped, {} failed",
                 stopped_count,
                 errors.len()
             );
@@ -392,66 +363,50 @@ pub async fn handle_stop_command(args: StopArgs) -> Result<()> {
                 Err(anyhow!("Failed to stop one or more components: {:?}", errors))
             }
         }
+
+        // === OTHER CASES: Storage, Rest, Daemon ===
         StopAction::Storage { port } => {
-            info!("Stopping storage daemon on port {:?}", port);
-            stop_storage_interactive(
-                port,
-                Arc::new(TokioMutex::new(None)),
-                Arc::new(TokioMutex::new(None)),
-                Arc::new(TokioMutex::new(None)),
-            )
-            .await
-            .map_err(|e| anyhow!("Failed to stop storage daemon: {}", e))?;
+            let shutdown_tx = Arc::new(TokioMutex::new(None));
+            let daemon_handle = Arc::new(TokioMutex::new(None));
+            let daemon_port = Arc::new(TokioMutex::new(None));
+            stop_storage_interactive(port, shutdown_tx, daemon_handle, daemon_port).await?;
             if let Some(p) = port {
                 if is_port_free(p).await {
-                    info!("Storage daemon on port {} stopped successfully", p);
                     println!("Storage daemon on port {} stopped.", p);
-                    Ok(())
                 } else {
-                    Err(anyhow!("Storage daemon on port {} stopped but port is still in use", p))
+                    return Err(anyhow!("Storage daemon on port {} stopped but port is still in use", p));
                 }
-            } else {
-                Ok(())
             }
+            Ok(())
         }
+
         StopAction::Rest { port } => {
-            info!("Stopping REST API on port {:?}", port);
             stop_rest_api_interactive(
                 port,
                 Arc::new(TokioMutex::new(None)),
                 Arc::new(TokioMutex::new(None)),
                 Arc::new(TokioMutex::new(None)),
-            )
-            .await
-            .map_err(|e| anyhow!("Failed to stop REST API: {}", e))?;
+            ).await?;
             if let Some(p) = port {
                 if is_port_free(p).await {
-                    info!("REST API on port {} stopped successfully", p);
                     println!("REST API on port {} stopped.", p);
-                    Ok(())
                 } else {
-                    Err(anyhow!("REST API on port {} stopped but port is still in use", p))
+                    return Err(anyhow!("REST API on port {} stopped but port is still in use", p));
                 }
-            } else {
-                Ok(())
             }
+            Ok(())
         }
+
         StopAction::Daemon { port } => {
-            info!("Stopping main daemon on port {:?}", port);
-            stop_main_interactive(port, Arc::new(TokioMutex::new(None)))
-                .await
-                .map_err(|e| anyhow!("Failed to stop main daemon: {}", e))?;
+            stop_main_interactive(port, Arc::new(TokioMutex::new(None))).await?;
             if let Some(p) = port {
                 if is_port_free(p).await {
-                    info!("Main daemon on port {} stopped successfully", p);
                     println!("Main daemon on port {} stopped.", p);
-                    Ok(())
                 } else {
-                    Err(anyhow!("Main daemon on port {} stopped but port is still in use", p))
+                    return Err(anyhow!("Main daemon on port {} stopped but port is still in use", p));
                 }
-            } else {
-                Ok(())
             }
+            Ok(())
         }
     }
 }
