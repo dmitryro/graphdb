@@ -13,11 +13,12 @@ use tokio::fs as tokio_fs;
 use log::{info, debug, warn, error};
 use crate::config::{SledConfig, SledDaemon, SledDaemonPool, SledStorage, StorageConfig, StorageEngineType, 
                     DAEMON_REGISTRY_DB_PATH, DEFAULT_DATA_DIRECTORY, DEFAULT_STORAGE_PORT, ReplicationStrategy, 
-                    NodeHealth, LoadBalancer, HealthCheckConfig, SledClientMode, SledClient, DbArc, 
-                    daemon_api_storage_engine_type_to_string };
+                    NodeHealth, LoadBalancer, HealthCheckConfig, SledClientMode, SledClient,
+                    DbArc, daemon_api_storage_engine_type_to_string };
 use crate::storage_engine::sled_client::{ ZmqSocketWrapper };
 use crate::storage_engine::storage_utils::{create_edge_key, deserialize_edge, deserialize_vertex, serialize_edge, serialize_vertex};
 use crate::storage_engine::storage_engine::GraphStorageEngine;
+pub use crate::storage_engine::sled_wal_manager::{ SledWalManager, SledWalOperation };
 use models::{Edge, Identifier, Vertex, };
 use models::errors::{GraphError, GraphResult};
 use models::identifiers::{SerializableUuid};
@@ -157,7 +158,7 @@ async fn append_wal(op: &WalOp) -> GraphResult<u64> {
 
 /// Tail the WAL from `start_offset` and replay locally.
 async fn replay_wal_from(
-    db: &Arc<Db>,  // ← Now matches apply_op_locally
+    db: &Arc<sled::Db>,
     start_offset: u64,
 ) -> GraphResult<()> {
     let file = match tokio_fs::File::open(&*SHARED_WAL_PATH).await {
@@ -165,11 +166,13 @@ async fn replay_wal_from(
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(GraphError::Io(e.to_string())),
     };
+
     let mut file = file;
     file.seek(SeekFrom::Start(start_offset)).await?;
+
     let reader = BufReader::new(file);
+    let mut stream = tokio::io::BufReader::new(reader);
     let mut buf = Vec::new();
-    let mut stream = tokio::io::BufStream::new(reader);
 
     loop {
         buf.clear();
@@ -182,9 +185,10 @@ async fn replay_wal_from(
                 if buf.last() == Some(&b'\n') {
                     buf.pop();
                 }
-                let (op, _) = bincode::decode_from_slice::<WalOp, _>(&buf, standard())
+                // Decode as SledWalOperation
+                let (op, _) = bincode::decode_from_slice::<SledWalOperation, _>(&buf, standard())
                     .map_err(|e| GraphError::StorageError(e.to_string()))?;
-                SledDaemon::apply_op_locally(db, &op).await?;  // ← db is &Arc<Db>
+                SledDaemon::apply_op_locally(db, &op).await?;
             }
             Err(e) => {
                 error!("Error reading WAL: {}", e);
@@ -203,28 +207,177 @@ pub enum WalOp {
 }
 
 impl SledDaemon {
-    /// Apply a WAL operation locally to the Sled database
-    pub async fn apply_op_locally(db: &Arc<sled::Db>, op: &WalOp) -> GraphResult<()> {
-        let (tree_name, key, value) = match op {
-            WalOp::Put { tree, key, value } => (tree.as_str(), key, Some(value)),
-            WalOp::Delete { tree, key, .. } => (tree.as_str(), key, None),
-        };
-        let tree = db
-            .open_tree(tree_name)
-            .map_err(|e| GraphError::StorageError(format!("Failed to open tree '{}': {}", tree_name, e)))?;
-        match value {
-            Some(v) => {
-                tree.insert(key, v.as_slice())
-                    .map_err(|e| GraphError::StorageError(format!("Failed to insert into tree '{}': {}", tree_name, e)))?;
+    /// Background task to periodically sync WAL entries
+    pub fn start_background_wal_sync(
+        port: u16,
+        wal_manager: Arc<SledWalManager>,
+        canonical_path: &PathBuf,
+        db: Arc<sled::Db>,
+        vertices: Tree,
+        edges: Tree,
+        kv_pairs: Tree,
+        running: Arc<TokioMutex<bool>>,
+    ) {
+        let canonical_path = canonical_path.clone();
+        
+        tokio::spawn(async move {
+            println!("===> STARTING BACKGROUND WAL SYNC FOR PORT {}", port);
+            
+            while *running.lock().await {
+                tokio::time::sleep(TokioDuration::from_secs(2)).await;
+
+                let offset_key = format!("__wal_offset_port_{}", port);
+                let last_offset = match db.get(offset_key.as_bytes()) {
+                    Ok(Some(v)) => {
+                        String::from_utf8(v.to_vec())
+                            .ok()
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(0)
+                    }
+                    _ => 0,
+                };
+
+                let current_lsn = match wal_manager.current_lsn().await {
+                    Ok(lsn) => lsn,
+                    Err(_) => continue,
+                };
+
+                if current_lsn <= last_offset {
+                    continue;
+                }
+
+                let operations = match wal_manager.read_since(last_offset).await {
+                    Ok(ops) => ops,
+                    Err(_) => continue,
+                };
+
+                if operations.is_empty() {
+                    continue;
+                }
+
+                let mut latest_offset = last_offset;
+                let mut applied = 0;
+
+                for (offset, op) in operations {
+                    // Store serialized size before consuming op
+                    let op_size = bincode::serde::encode_to_vec(&op, bincode::config::standard())
+                        .map(|v| v.len() as u64)
+                        .unwrap_or(0);
+                    
+                    let result = match &op {
+                        SledWalOperation::Put { tree, key, value } => {
+                            let target_tree = match tree.as_str() {
+                                "kv_pairs" => Some(&kv_pairs),
+                                "vertices" => Some(&vertices),
+                                "edges" => Some(&edges),
+                                _ => None,
+                            };
+
+                            if let Some(t) = target_tree {
+                                match t.insert(key.as_slice(), value.as_slice()) {
+                                    Ok(_) => { applied += 1; Ok(()) }
+                                    Err(e) => Err(e),
+                                }
+                            } else {
+                                Ok(())
+                            }
+                        }
+                        SledWalOperation::Delete { tree, key } => {
+                            let target_tree = match tree.as_str() {
+                                "kv_pairs" => Some(&kv_pairs),
+                                "vertices" => Some(&vertices),
+                                "edges" => Some(&edges),
+                                _ => None,
+                            };
+
+                            if let Some(t) = target_tree {
+                                match t.remove(key.as_slice()) {
+                                    Ok(_) => { applied += 1; Ok(()) }
+                                    Err(e) => Err(e),
+                                }
+                            } else {
+                                Ok(())
+                            }
+                        }
+                        SledWalOperation::Flush { .. } => {
+                            match db.flush_async().await {
+                                Ok(_) => Ok(()),
+                                Err(e) => Err(e),
+                            }
+                        }
+                    };
+
+                    if result.is_err() {
+                        break;
+                    }
+
+                    latest_offset = offset + 4 + op_size;
+                }
+
+                if latest_offset > last_offset && applied > 0 {
+                    if db.insert(offset_key.as_bytes(), latest_offset.to_string().as_bytes()).is_ok() {
+                        let _ = db.flush_async().await;
+                        println!("===> PORT {} SYNCED {} OPERATIONS (OFFSET: {} -> {})",
+                                 port, applied, last_offset, latest_offset);
+                    }
+                }
             }
-            None => {
-                tree.remove(key)
-                    .map_err(|e| GraphError::StorageError(format!("Failed to delete from tree '{}': {}", tree_name, e)))?;
+
+            println!("===> BACKGROUND WAL SYNC STOPPED FOR PORT {}", port);
+        });
+    }
+
+    async fn discover_other_ports(canonical_path: &PathBuf, exclude_port: u16) -> Vec<u16> {
+        let mut ports = Vec::new();
+        if let Ok(mut entries) = tokio_fs::read_dir(canonical_path).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if let Some(name) = entry.file_name().to_str() {
+                    if let Ok(p) = name.parse::<u16>() {
+                        if p != exclude_port && p >= 8049 && p <= 8054 {
+                            let db_path = entry.path();
+                            if db_path.join("db").exists() || db_path.join("CURRENT").exists() {
+                                ports.push(p);
+                            }
+                        }
+                    }
+                }
             }
         }
-        // Flush immediately for WAL consistency
-        tree.flush_async().await
-            .map_err(|e| GraphError::StorageError(format!("Failed to flush tree '{}': {}", tree_name, e)))?;
+        ports
+    }
+
+    /// Apply a WAL operation locally to the Sled database
+    pub async fn apply_op_locally(
+        db: &Arc<sled::Db>,
+        op: &SledWalOperation,
+    ) -> GraphResult<()> {
+        match op {
+            SledWalOperation::Put { tree, key, value } => {
+                let t = match tree.as_str() {
+                    "kv_pairs" => db.open_tree("kv_pairs")?,
+                    "vertices" => db.open_tree("vertices")?,
+                    "edges" => db.open_tree("edges")?,
+                    _ => return Err(GraphError::StorageError("unknown tree".into())),
+                };
+                t.insert(key.as_slice(), value.as_slice())?;
+            }
+            SledWalOperation::Delete { tree, key } => {
+                let t = match tree.as_str() {
+                    "kv_pairs" => db.open_tree("kv_pairs")?,
+                    "vertices" => db.open_tree("vertices")?,
+                    "edges" => db.open_tree("edges")?,
+                    _ => return Err(GraphError::StorageError("unknown tree".into())),
+                };
+                t.remove(key.as_slice())?;
+            }
+            SledWalOperation::Flush { tree } => {
+                if let Ok(t) = db.open_tree(tree) {
+                    t.flush_async().await?;
+                } else {
+                    db.flush_async().await?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -286,28 +439,168 @@ impl SledDaemon {
         }
     }
 
+    /// Replay WAL operations from shared WAL using per-port offset tracking
+    pub async fn replay_from_all_wals(
+        canonical_path: &PathBuf,
+        current_port: u16,
+        db: &Arc<sled::Db>,
+    ) -> GraphResult<()> {
+        info!("Starting WAL replay for port {}", current_port);
+        println!("===> STARTING WAL REPLAY FOR PORT {}", current_port);
+
+        let wal_dir = canonical_path.join("wal_shared");
+        
+        if !wal_dir.exists() || !wal_dir.join("shared.wal").exists() {
+            info!("No shared WAL file found, skipping replay");
+            println!("===> NO SHARED WAL FILE FOUND, SKIPPING REPLAY");
+            return Ok(());
+        }
+
+        // Read last replicated offset for THIS port
+        let offset_key = format!("__wal_offset_port_{}", current_port);
+        let last_offset = db.get(offset_key.as_bytes())
+            .ok()
+            .flatten()
+            .and_then(|v| String::from_utf8(v.to_vec()).ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+
+        println!("===> PORT {} LAST REPLICATED OFFSET: {}", current_port, last_offset);
+
+        // Create WAL manager
+        let wal_mgr = SledWalManager::new(canonical_path.clone(), current_port)
+            .await
+            .map_err(|e| GraphError::StorageError(format!("Failed to create WAL manager: {}", e)))?;
+
+        // Get current WAL size
+        let current_wal_size = wal_mgr.current_lsn()
+            .await
+            .map_err(|e| GraphError::StorageError(format!("Failed to get WAL size: {}", e)))?;
+
+        if last_offset >= current_wal_size {
+            println!("===> PORT {} IS UP TO DATE (OFFSET {} >= WAL SIZE {})", 
+                     current_port, last_offset, current_wal_size);
+            return Ok(());
+        }
+
+        // Read operations since last offset
+        let operations = wal_mgr.read_since(last_offset)
+            .await
+            .map_err(|e| GraphError::StorageError(format!("Failed to read WAL: {}", e)))?;
+
+        println!("===> REPLAYING {} OPERATIONS FOR PORT {} (OFFSET {} -> {})", 
+                 operations.len(), current_port, last_offset, current_wal_size);
+
+        let mut latest_offset = last_offset;
+        let mut applied_count = 0;
+
+        for (offset, op) in operations {
+            // Store serialized size before consuming op
+            let op_size = bincode::serde::encode_to_vec(&op, bincode::config::standard())
+                .map(|v| v.len() as u64)
+                .unwrap_or(0);
+            
+            match op {
+                SledWalOperation::Put { tree, key, value } => {
+                    let target_tree = match tree.as_str() {
+                        "kv_pairs" => db.open_tree("kv_pairs"),
+                        "vertices" => db.open_tree("vertices"),
+                        "edges" => db.open_tree("edges"),
+                        _ => continue,
+                    };
+
+                    if let Ok(t) = target_tree {
+                        if t.insert(key.as_slice(), value.as_slice()).is_ok() {
+                            applied_count += 1;
+                        }
+                    }
+                }
+                SledWalOperation::Delete { tree, key } => {
+                    let target_tree = match tree.as_str() {
+                        "kv_pairs" => db.open_tree("kv_pairs"),
+                        "vertices" => db.open_tree("vertices"),
+                        "edges" => db.open_tree("edges"),
+                        _ => continue,
+                    };
+
+                    if let Ok(t) = target_tree {
+                        if t.remove(key.as_slice()).is_ok() {
+                            applied_count += 1;
+                        }
+                    }
+                }
+                SledWalOperation::Flush { .. } => {
+                    let _ = db.flush_async().await;
+                }
+            }
+
+            latest_offset = offset + 4 + op_size;
+        }
+
+        // Save the latest replicated offset
+        if latest_offset > last_offset {
+            let _ = db.insert(offset_key.as_bytes(), latest_offset.to_string().as_bytes());
+            let _ = db.flush_async().await;
+            
+            println!("===> REPLAYED {} OPERATIONS FOR PORT {} (OFFSET: {} -> {})",
+                     applied_count, current_port, last_offset, latest_offset);
+        }
+
+        Ok(())
+    }
+
+    /// Start background task to replicate WAL to other ports
+    pub fn start_wal_replication(
+        port: u16,
+        wal_manager: Arc<SledWalManager>,
+        db: Arc<sled::Db>,
+        vertices: Tree,
+        edges: Tree,
+        kv_pairs: Tree,
+        running: Arc<TokioMutex<bool>>,
+    ) {
+        tokio::spawn(async move {
+            while *running.lock().await {
+                // Sleep for 1 second between replication cycles
+                tokio::time::sleep(TokioDuration::from_secs(1)).await;
+
+                // Replication is passive - other daemons will read our WAL
+                // Just ensure our WAL is flushed
+                if let Ok(current_lsn) = wal_manager.current_lsn().await {
+                    debug!("Port {} WAL at LSN {}", port, current_lsn);
+                }
+            }
+        });
+    }
+
     /// Creates a new SledDaemon and returns it along with a shutdown signal receiver.
     // ============================================================================
     // SledDaemon::new
     // ============================================================================
+    /// Creates a new SledDaemon instance with WAL support
     pub async fn new(config: SledConfig) -> GraphResult<(Self, mpsc::Receiver<()>)> {
         println!("===> SledDaemon::new CALLED");
         let port = config.port.ok_or_else(|| {
             error!("No port specified in SledConfig");
-            println!("===> ERROR: NO PORT SPECIFIED IN SLED CONFIG");
             GraphError::ConfigurationError("No port specified in SledConfig".to_string())
         })?;
-
+        
         let port_lock = get_sled_daemon_port_lock(port).await;
         let _guard = port_lock.lock().await;
         println!("===> ACQUIRED PER-PORT INIT LOCK FOR PORT {}", port);
 
-        let db_path = PathBuf::from(&config.path);
-        let canonical_path = db_path.parent().unwrap().to_path_buf();
+        // Force per-port path
+        let db_path = {
+            let base = PathBuf::from(&config.path);
+            if base.file_name().and_then(|n| n.to_str()) == Some(&port.to_string()) {
+                base
+            } else {
+                base.join(port.to_string())
+            }
+        };
 
         if !db_path.exists() {
             tokio_fs::create_dir_all(&db_path).await.map_err(|e| {
-                error!("Failed to create directory at {:?}: {}", db_path, e);
                 GraphError::StorageError(format!("Failed to create directory: {}", e))
             })?;
         }
@@ -317,26 +610,24 @@ impl SledDaemon {
             &config, &db_path, cache_capacity, config.use_compression
         ).await?;
 
-        // WAL replay
-        let offset_file = canonical_path.join(format!("{}.offset", port));
-        let start_offset = match tokio_fs::read_to_string(&offset_file).await {
-            Ok(s) => s.trim().parse::<u64>().unwrap_or(0),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
-            Err(e) => return Err(GraphError::Io(e.to_string())),
-        };
-        if start_offset > 0 {
-            replay_wal_from(&db_arc, start_offset).await?;
-        }
+        // ✅ Initialize WAL manager (shared WAL)
+        let wal_dir = db_path.parent().unwrap_or(&db_path).to_path_buf();
+        let wal_manager = Arc::new(
+            SledWalManager::new(wal_dir.clone(), port)
+                .await
+                .map_err(|e| GraphError::StorageError(format!("Failed to create WAL manager: {}", e)))?
+        );
+
+        // ✅ Replay WAL from shared location
+        let canonical_path = db_path.parent().unwrap().to_path_buf();
+        Self::replay_from_all_wals(&canonical_path, port, &db_arc).await?;
+        println!("===> WAL REPLAY COMPLETED SUCCESSFULLY FOR PORT {}", port);
 
         // ZMQ setup
         let (tx, rx) = mpsc::channel(1);
         let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", port);
-        let ipc_path = endpoint.strip_prefix("ipc://").unwrap();
-
-        // ALWAYS remove stale IPC
-        let _ = tokio_fs::remove_file(ipc_path).await;
-
         let running = Arc::new(TokioMutex::new(true));
+
         let daemon = Self {
             port,
             db_path: db_path.clone(),
@@ -345,6 +636,7 @@ impl SledDaemon {
             edges: edges.clone(),
             kv_pairs: kv_pairs.clone(),
             running: running.clone(),
+            wal_manager: wal_manager.clone(),
             #[cfg(feature = "with-openraft-sled")]
             raft_storage: Arc::new(openraft_sled::SledRaftStorage::new(db_arc.clone())),
             #[cfg(feature = "with-openraft-sled")]
@@ -353,14 +645,26 @@ impl SledDaemon {
             raft: None,
         };
 
+        // ✅ Start background WAL sync with all required parameters
+        Self::start_background_wal_sync(
+            port,
+            wal_manager.clone(),
+            &canonical_path,
+            db_arc.clone(),
+            vertices.clone(),
+            edges.clone(),
+            kv_pairs.clone(),
+            running.clone(),
+        );
+
         let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
         let endpoint_clone = endpoint.clone();
         let db_path_clone = db_path.clone();
         let running_clone = running.clone();
-        // Wrap trees in Arc for the ZMQ thread
         let kv_pairs_arc = Arc::new(kv_pairs);
         let vertices_arc = Arc::new(vertices);
         let edges_arc = Arc::new(edges);
+        let wal_manager_clone = wal_manager.clone();
 
         let _zmq_thread_handle = std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
@@ -378,7 +682,7 @@ impl SledDaemon {
                 // Force remove and retry binding
                 let _ = tokio_fs::remove_file(endpoint_clone.strip_prefix("ipc://").unwrap()).await;
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
+                
                 let mut bound = false;
                 for i in 0..5 {
                     if zmq_socket_raw.bind(&endpoint_clone).is_ok() {
@@ -388,6 +692,7 @@ impl SledDaemon {
                     }
                     tokio::time::sleep(TokioDuration::from_millis(200 * (i + 1) as u64)).await;
                 }
+                
                 if !bound {
                     error!("Failed to bind ZMQ socket after retries");
                     return;
@@ -410,8 +715,17 @@ impl SledDaemon {
 
                 let zmq_socket = Arc::new(TokioMutex::new(zmq_socket_raw));
                 let _ = SledDaemon::run_zmq_server_lazy(
-                    port, config, running_clone, zmq_socket, endpoint_clone,
-                    db_arc, kv_pairs_arc, vertices_arc, edges_arc, db_path_clone,
+                    port, 
+                    config, 
+                    running_clone, 
+                    zmq_socket, 
+                    endpoint_clone,
+                    db_arc, 
+                    kv_pairs_arc, 
+                    vertices_arc, 
+                    edges_arc,
+                    wal_manager_clone,
+                    db_path_clone,
                 ).await;
             });
         });
@@ -420,13 +734,19 @@ impl SledDaemon {
         Ok((daemon, rx))
     }
 
-    /// Initializes a Sled Daemon using an existing sled::Db instance.
-    /// Returns the daemon and an mpsc::Receiver<()> to signal when the daemon has shut down.
+    /// Initializes a Sled Daemon using an existing sled::Db instance with WAL support
     pub async fn new_with_db(config: SledConfig, existing_db: Arc<sled::Db>) -> GraphResult<(Self, mpsc::Receiver<()>)> {
+        println!("===> SledDaemon::new_with_db CALLED");
         let port = config.port.ok_or_else(|| {
+            error!("No port specified in SledConfig");
             GraphError::ConfigurationError("No port specified in SledConfig".to_string())
         })?;
 
+        let port_lock = get_sled_daemon_port_lock(port).await;
+        let _guard = port_lock.lock().await;
+        println!("===> ACQUIRED PER-PORT INIT LOCK FOR PORT {}", port);
+
+        // Force per-port path
         let db_path = {
             let base = PathBuf::from(&config.path);
             if base.file_name().and_then(|n| n.to_str()) == Some(&port.to_string()) {
@@ -437,7 +757,7 @@ impl SledDaemon {
         };
 
         if !db_path.exists() {
-            tokio::fs::create_dir_all(&db_path).await.map_err(|e| {
+            tokio_fs::create_dir_all(&db_path).await.map_err(|e| {
                 GraphError::StorageError(format!("Failed to create directory at {:?}: {}", db_path, e))
             })?;
         }
@@ -454,20 +774,29 @@ impl SledDaemon {
         .map_err(|e| GraphError::StorageError(format!("Task panic: {:?}", e)))?
         .map_err(|e| GraphError::StorageError(format!("Tree open failed: {}", e)))?;
 
+        // ✅ Initialize WAL manager (shared WAL)
+        let wal_dir = db_path.parent().unwrap_or(&db_path).to_path_buf();
+        let wal_manager = Arc::new(
+            SledWalManager::new(wal_dir.clone(), port)
+                .await
+                .map_err(|e| GraphError::StorageError(format!("Failed to create WAL manager: {}", e)))?
+        );
+
+        // ✅ Replay WAL from shared location
+        let canonical_path = db_path.parent().unwrap().to_path_buf();
+        Self::replay_from_all_wals(&canonical_path, port, &existing_db).await?;
+        println!("===> WAL REPLAY COMPLETED SUCCESSFULLY FOR PORT {}", port);
+
+        // ZMQ setup
         let (tx, rx) = mpsc::channel(1);
         let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", port);
-        let ipc_path = endpoint.strip_prefix("ipc://").unwrap();
-
-        // ALWAYS remove stale IPC
-        let _ = tokio::fs::remove_file(ipc_path).await;
-
         let running = Arc::new(TokioMutex::new(true));
-        
+
         // Clone the trees before moving them into the daemon struct
         let vertices_clone = vertices.clone();
         let edges_clone = edges.clone();
         let kv_pairs_clone = kv_pairs.clone();
-        
+
         let daemon = Self {
             port,
             db_path: db_path.clone(),
@@ -476,24 +805,38 @@ impl SledDaemon {
             edges,
             kv_pairs,
             running: running.clone(),
+            wal_manager: wal_manager.clone(),
             #[cfg(feature = "with-openraft-sled")]
-            raft_storage: None,
+            raft_storage: Arc::new(openraft_sled::SledRaftStorage::new(existing_db.clone())),
             #[cfg(feature = "with-openraft-sled")]
             node_id: port as u64,
             #[cfg(feature = "with-openraft-sled")]
             raft: None,
         };
 
+        // ✅ Start background WAL sync with all required parameters
+        Self::start_background_wal_sync(
+            port,
+            wal_manager.clone(),
+            &canonical_path,
+            existing_db.clone(),
+            vertices_clone.clone(),  // ← Tree, not Arc<Tree>
+            edges_clone.clone(),     // ← Tree
+            kv_pairs_clone.clone(),  // ← Tree
+            running.clone(),
+        );
+
         let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
         let endpoint_clone = endpoint.clone();
         let db_path_clone = db_path.clone();
         let running_clone = running.clone();
         let db_arc = existing_db.clone();
-        
+
         // Wrap the cloned trees in Arc for the ZMQ thread
         let kv_clone = Arc::new(kv_pairs_clone);
         let vert_clone = Arc::new(vertices_clone);
         let edge_clone = Arc::new(edges_clone);
+        let wal_manager_clone = wal_manager.clone();
 
         let _zmq_thread_handle = std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
@@ -501,16 +844,17 @@ impl SledDaemon {
                 let context = ZmqContext::new();
                 let zmq_socket_raw = match context.socket(REP) {
                     Ok(s) => s,
-                    Err(_e) => {
+                    Err(e) => {
+                        error!("ZMQ socket create failed: {}", e);
                         let _ = tx.send(()).await;
                         return;
                     }
                 };
 
                 // Force remove and retry binding
-                let _ = tokio::fs::remove_file(endpoint_clone.strip_prefix("ipc://").unwrap()).await;
+                let _ = tokio_fs::remove_file(endpoint_clone.strip_prefix("ipc://").unwrap()).await;
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
+                
                 let mut bound = false;
                 for i in 0..5 {
                     if zmq_socket_raw.bind(&endpoint_clone).is_ok() {
@@ -520,7 +864,9 @@ impl SledDaemon {
                     }
                     tokio::time::sleep(TokioDuration::from_millis(200 * (i + 1) as u64)).await;
                 }
+                
                 if !bound {
+                    error!("Failed to bind ZMQ socket after retries");
                     return;
                 }
 
@@ -541,12 +887,22 @@ impl SledDaemon {
 
                 let zmq_socket = Arc::new(TokioMutex::new(zmq_socket_raw));
                 let _ = SledDaemon::run_zmq_server_lazy(
-                    port, config, running_clone, zmq_socket, endpoint_clone,
-                    db_arc, kv_clone, vert_clone, edge_clone, db_path_clone,
+                    port, 
+                    config, 
+                    running_clone, 
+                    zmq_socket, 
+                    endpoint_clone,
+                    db_arc, 
+                    kv_clone, 
+                    vert_clone, 
+                    edge_clone, 
+                    wal_manager_clone,
+                    db_path_clone,
                 ).await;
             });
         });
 
+        info!("SledDaemon created successfully with existing DB on port {}", port);
         Ok((daemon, rx))
     }
 
@@ -557,13 +913,6 @@ impl SledDaemon {
     ) -> GraphResult<Self> {
         println!("SledDaemon =================> LET US SEE IF THIS WAS EVER CALLED");
         
-        // Ensure necessary imports are available in the scope where SledDaemon is defined
-        use sled::Config;
-        use serde_json::json;
-        use tokio::fs;
-        use std::os::unix::fs::PermissionsExt;
-        use std::path::Path; // Added to resolve potential Path trait conflict/scope issue if needed elsewhere, but mainly for clarity of use.
-
         let port = config.port.ok_or_else(|| {
             GraphError::ConfigurationError("No port specified in SledConfig".to_string())
         })?;
@@ -689,6 +1038,11 @@ impl SledDaemon {
             println!("===> REGISTERED NEW SLED DB INSTANCE IN GLOBAL REGISTRY FOR PORT {}", port);
         }
 
+        let wal_path = db_path.parent().unwrap_or(&PathBuf::from("/opt/graphdb/storage_data")).to_path_buf();
+        let wal_manager = Arc::new(
+            SledWalManager::new(wal_path, port).await?
+        );
+
         let vertices_clone = vertices.clone();
         let edges_clone = edges.clone();
         let kv_pairs_clone = kv_pairs.clone();
@@ -710,6 +1064,7 @@ impl SledDaemon {
         let endpoint_clone = endpoint.clone();
         let ipc_addr = endpoint.clone();
 
+        // ✅ Include wal_manager in the struct initialization
         let daemon = Self {
             port,
             db_path, // Original db_path is MOVED here
@@ -718,6 +1073,7 @@ impl SledDaemon {
             edges, // Tree
             kv_pairs, // Tree
             running,
+            wal_manager, // ✅ Pass the WAL manager
             #[cfg(feature = "with-openraft-sled")]
             raft_storage: None,
             #[cfg(feature = "with-openraft-sled")]
@@ -738,7 +1094,6 @@ impl SledDaemon {
             engine_synced: false,
             pid: std::process::id(),
             port,
-
         };
         daemon_registry.register_daemon(daemon_metadata).await
             .map_err(|e| {
@@ -767,9 +1122,9 @@ impl SledDaemon {
                     endpoint_clone,
                 )
                 .await
-            {
-                eprintln!("===> ERROR: ZeroMQ server failed: {}", e);
-            }
+                {
+                    eprintln!("===> ERROR: ZeroMQ server failed: {}", e);
+                }
             });
         });
 
@@ -805,6 +1160,7 @@ impl SledDaemon {
         kv_pairs: Arc<Tree>,
         vertices: Arc<Tree>,
         edges: Arc<Tree>,
+        wal_manager: Arc<SledWalManager>,
         db_path: PathBuf,
     ) -> GraphResult<()> {
         info!("===> STARTING ZMQ SERVER FOR PORT {} (DB ALREADY OPEN)", port);
@@ -822,13 +1178,8 @@ impl SledDaemon {
             socket.set_maxmsgsize(MAX_MESSAGE_SIZE as i64)
                 .map_err(|e| GraphError::StorageError(format!("Failed to set max message size: {}", e)))?;
         }
-
         info!("ZeroMQ server configured for port {}", port);
         println!("===> ZEROMQ SERVER CONFIGURED FOR PORT {}", port);
-
-        // Determine if this daemon is the WAL leader
-        let canonical = db_path.parent().unwrap().to_path_buf();
-        let is_leader = become_wal_leader(&canonical).await.unwrap_or(false);
 
         let mut consecutive_errors = 0;
 
@@ -878,7 +1229,6 @@ impl SledDaemon {
             };
 
             let command = request.get("command").and_then(|c| c.as_str());
-
             macro_rules! send_resp {
                 ($resp:expr) => {{
                     let socket = zmq_socket.lock().await;
@@ -897,8 +1247,17 @@ impl SledDaemon {
                         "ipc_path": &endpoint
                     })
                 }
-                Some("status") | Some("ping") => {
+                Some("status") => {
                     json!({"status":"success","port":port,"db_open":true})
+                }
+                Some("ping") => {
+                    json!({
+                        "status": "pong",
+                        "message": "ZMQ server is bound and DB is open.",
+                        "port": port,
+                        "ipc_path": &endpoint,
+                        "db_open":true
+                    })
                 }
                 Some("force_unlock") => {
                     match Self::force_unlock_static(&db_path).await {
@@ -911,7 +1270,8 @@ impl SledDaemon {
                 Some(cmd) if [
                     "set_key","delete_key",
                     "create_vertex","update_vertex","delete_vertex",
-                    "create_edge","update_edge","delete_edge"
+                    "create_edge","update_edge","delete_edge",
+                    "flush"
                 ].contains(&cmd) => {
                     let op = match cmd {
                         "set_key" => {
@@ -926,7 +1286,7 @@ impl SledDaemon {
                                 .ok_or_else(|| GraphError::StorageError("missing value".to_string()))?
                                 .as_bytes()
                                 .to_vec();
-                            WalOp::Put { tree, key, value }
+                            SledWalOperation::Put { tree, key, value }
                         }
                         "delete_key" => {
                             let tree = request["cf"].as_str().unwrap_or("kv_pairs").to_string();
@@ -935,33 +1295,29 @@ impl SledDaemon {
                                 .ok_or_else(|| GraphError::StorageError("missing key".to_string()))?
                                 .as_bytes()
                                 .to_vec();
-                            WalOp::Delete { tree, key }
+                            SledWalOperation::Delete { tree, key }
                         }
-
                         "create_vertex" | "update_vertex" => {
                             let vertex: Vertex = serde_json::from_value(request["vertex"].clone())
                                 .map_err(|e| GraphError::StorageError(format!("Invalid vertex: {}", e)))?;
-                            let key = vertex.id.as_bytes().to_vec(); // SerializableUuid::as_bytes()
+                            let key = vertex.id.as_bytes().to_vec();
                             let value = serialize_vertex(&vertex)?;
-                            WalOp::Put { tree: "vertices".to_string(), key, value }
+                            SledWalOperation::Put { tree: "vertices".to_string(), key, value }
                         }
                         "delete_vertex" => {
                             let id: Identifier = serde_json::from_value(request["id"].clone())
                                 .map_err(|e| GraphError::StorageError(format!("Invalid id: {}", e)))?;
-                            // Identifier has no as_bytes() → convert to UUID string first?
-                            // But vertex keys are SerializableUuid → expect UUID string
-                            let uuid_str = id.as_ref(); // &str
+                            let uuid_str = id.as_ref();
                             let uuid = SerializableUuid::from_str(uuid_str)
                                 .map_err(|_| GraphError::StorageError("Invalid UUID in vertex id".into()))?;
-                            WalOp::Delete { tree: "vertices".to_string(), key: uuid.as_bytes().to_vec() }
+                            SledWalOperation::Delete { tree: "vertices".to_string(), key: uuid.as_bytes().to_vec() }
                         }
-
                         "create_edge" | "update_edge" => {
                             let edge: Edge = serde_json::from_value(request["edge"].clone())
                                 .map_err(|e| GraphError::StorageError(format!("Invalid edge: {}", e)))?;
-                            let key = create_edge_key(&edge.outbound_id, &edge.t, &edge.inbound_id)?; // &SerializableUuid
+                            let key = create_edge_key(&edge.outbound_id, &edge.t, &edge.inbound_id)?;
                             let value = serialize_edge(&edge)?;
-                            WalOp::Put { tree: "edges".to_string(), key, value }
+                            SledWalOperation::Put { tree: "edges".to_string(), key, value }
                         }
                         "delete_edge" => {
                             let from: Identifier = serde_json::from_value(request["from"].clone())
@@ -970,46 +1326,38 @@ impl SledDaemon {
                                 .map_err(|e| GraphError::StorageError(format!("Invalid to: {}", e)))?;
                             let t: Identifier = serde_json::from_value(request["type"].clone())
                                 .map_err(|e| GraphError::StorageError(format!("Invalid type: {}", e)))?;
-
-                            // Convert Identifier → SerializableUuid via string
                             let from_uuid = SerializableUuid::from_str(from.as_ref())
                                 .map_err(|_| GraphError::StorageError("Invalid UUID in 'from'".into()))?;
                             let to_uuid = SerializableUuid::from_str(to.as_ref())
                                 .map_err(|_| GraphError::StorageError("Invalid UUID in 'to'".into()))?;
-
                             let key = create_edge_key(&from_uuid, &t, &to_uuid)?;
-                            WalOp::Delete { tree: "edges".to_string(), key }
+                            SledWalOperation::Delete { tree: "edges".to_string(), key }
                         }
-
+                        "flush" => {
+                            let tree = request["cf"].as_str().unwrap_or("kv_pairs").to_string();
+                            SledWalOperation::Flush { tree }
+                        }
                         _ => unreachable!(),
                     };
 
-                    let offset = if is_leader {
-                        match append_wal(&op).await {
-                            Ok(o) => {
-                                let _ = tokio_fs::write(
-                                    canonical.join(format!("{}.offset", port)),
-                                    o.to_string().as_bytes(),
-                                ).await;
-                                o
-                            }
-                            Err(e) => {
-                                let resp = json!({"status":"error","message":e.to_string()});
-                                send_resp!(resp);
-                            }
-                        }
-                    } else {
-                        0
-                    };
+                    // WRITE TO WAL FIRST
+                    let lsn = wal_manager.append(&op).await
+                        .map_err(|e| GraphError::StorageError(e.to_string()))?;
 
-                    match SledDaemon::apply_op_locally(&db, &op).await {
-                        Ok(_) => json!({"status":"success", "offset": offset}),
-                        Err(e) => json!({"status":"error","message":e.to_string()}),
-                    }
+                    // Apply locally
+                    SledDaemon::apply_op_locally(&db, &op).await
+                        .map_err(|e| GraphError::StorageError(e.to_string()))?;
+
+                    // Update local offset
+                    let offset_key = format!("__wal_offset_port_{}", port);
+                    db.insert(offset_key.as_bytes(), lsn.to_string().as_bytes())?;
+                    db.flush_async().await?;
+
+                    json!({"status":"success", "offset": lsn})
                 }
 
-                // ── NON-WAL WRITE COMMANDS (clear, reset, flush) ───────────
-                Some("clear_data") | Some("force_reset") | Some("flush") => {
+                // ── NON-WAL WRITE COMMANDS (clear, reset) ───────────
+                Some("clear_data") | Some("force_reset") => {
                     match Self::execute_db_command(
                         command.unwrap(), &request,
                         &db, &kv_pairs, &vertices, &edges,
@@ -1019,32 +1367,20 @@ impl SledDaemon {
                         Err(e) => json!({"status":"error","message":e.to_string()}),
                     }
                 }
+
                 Some("force_ipc_init") => {
                     info!("Received force_ipc_init command for port {}", port);
                     println!("===> FORCING IPC INITIALIZATION FOR PORT {}", port);
-                    
-                    // Verify IPC socket file exists
                     let ipc_path = format!("/tmp/graphdb-{}.ipc", port);
                     match tokio::fs::metadata(&ipc_path).await {
-                        Ok(_) => {
-                            json!({
-                                "status": "success",
-                                "message": "IPC socket already exists",
-                                "ipc_path": &ipc_path
-                            })
-                        }
+                        Ok(_) => json!({"status": "success", "message": "IPC socket already exists", "ipc_path": &ipc_path}),
                         Err(_) => {
-                            // IPC missing - this shouldn't happen in normal flow
-                            // but we can at least report it
                             error!("IPC socket missing at {} even though ZMQ server is running", ipc_path);
-                            json!({
-                                "status": "error",
-                                "message": "IPC socket missing - server restart required",
-                                "ipc_path": &ipc_path
-                            })
+                            json!({"status": "error", "message": "IPC socket missing - server restart required", "ipc_path": &ipc_path})
                         }
                     }
                 }
+
                 // ── READ-ONLY COMMANDS ─────────────────────────────────────
                 Some(cmd) if [
                     "get_key",
@@ -1095,26 +1431,9 @@ impl SledDaemon {
         _endpoint: &str,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         match command {
-            "set_key" => {
-                let tree_name = request.get("cf").and_then(|c| c.as_str()).unwrap_or("kv_pairs");
-                let key = request.get("key").and_then(|k| k.as_str()).ok_or("Missing key")?;
-                let value = request.get("value").and_then(|v| v.as_str()).ok_or("Missing value")?;
-
-                let tree = match tree_name {
-                    "kv_pairs" => kv_pairs,
-                    "vertices" => vertices,
-                    "edges" => edges,
-                    _ => return Err(format!("Column family {} not found", tree_name).into()),
-                };
-                tree.insert(key.as_bytes(), value.as_bytes())?;
-                info!("Set key {} in {} for port {}", key, tree_name, port);
-                Ok(json!({"status": "success"}))
-            }
-
             "get_key" => {
                 let tree_name = request.get("cf").and_then(|c| c.as_str()).unwrap_or("kv_pairs");
                 let key = request.get("key").and_then(|k| k.as_str()).ok_or("Missing key")?;
-
                 let tree = match tree_name {
                     "kv_pairs" => kv_pairs,
                     "vertices" => vertices,
@@ -1122,24 +1441,8 @@ impl SledDaemon {
                     _ => return Err(format!("Column family {} not found", tree_name).into()),
                 };
                 let result = tree.get(key.as_bytes())?;
-                //  Decode as UTF-8 string, NOT Base64
                 let value_str = result.and_then(|v| String::from_utf8(v.to_vec()).ok());
                 Ok(json!({"status": "success", "value": value_str}))
-            }
-
-            "delete_key" => {
-                let tree_name = request.get("cf").and_then(|c| c.as_str()).unwrap_or("kv_pairs");
-                let key = request.get("key").and_then(|k| k.as_str()).ok_or("Missing key")?;
-
-                let tree = match tree_name {
-                    "kv_pairs" => kv_pairs,
-                    "vertices" => vertices,
-                    "edges" => edges,
-                    _ => return Err(format!("Column family {} not found", tree_name).into()),
-                };
-                tree.remove(key.as_bytes())?;
-                info!("Deleted key {} in {} for port {}", key, tree_name, port);
-                Ok(json!({"status": "success"}))
             }
 
             "flush" => {
@@ -1160,7 +1463,6 @@ impl SledDaemon {
             "get_all_vertices_by_type" => {
                 let vertex_type: Identifier =
                     serde_json::from_value(request["vertex_type"].clone()).map_err(|_| "Invalid or missing vertex_type")?;
-
                 let mut vertices_vec = Vec::new();
                 for item in vertices.iter() {
                     let (_, value) = item?;
@@ -1185,7 +1487,6 @@ impl SledDaemon {
             "get_all_edges_by_type" => {
                 let edge_type: Identifier =
                     serde_json::from_value(request["edge_type"].clone()).map_err(|_| "Invalid or missing edge_type")?;
-
                 let mut edges_vec = Vec::new();
                 for item in edges.iter() {
                     let (_, value) = item?;
@@ -3494,6 +3795,13 @@ impl SledDaemonPool {
             .open_tree("kv_pairs")
             .map_err(|e| GraphError::StorageError(format!("Failed to open kv_pairs tree: {}", e)))?;
 
+        // ✅ Create WAL manager for this daemon
+        let wal_manager = Arc::new(
+            SledWalManager::new(db_path.to_path_buf(), port)
+                .await
+                .map_err(|e| GraphError::StorageError(format!("Failed to create WAL manager: {}", e)))?
+        );
+
         pool.daemons.insert(
             port,
             Arc::new(SledDaemon {
@@ -3503,6 +3811,7 @@ impl SledDaemonPool {
                 vertices,
                 edges,
                 kv_pairs,
+                wal_manager, // ✅ Add the new field
                 running: Arc::new(TokioMutex::new(true)),
                 #[cfg(feature = "with-openraft-sled")]
                 raft_storage: Arc::new(
@@ -4090,19 +4399,16 @@ impl SledDaemonPool {
     ) -> GraphResult<()> {
         println!("===> IN _initialize_cluster_core");
         info!("Starting initialization of SledDaemonPool");
-
         let _guard = get_cluster_init_lock().await.lock().await;
-
         let mut initialized = self.initialized.write().await;
         if *initialized {
             warn!("SledDaemonPool already initialized, skipping");
             println!("===> WARNING: SLED DAEMON POOL ALREADY INITIALIZED, SKIPPING");
             return Ok(());
         }
-
         let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
         let port = cli_port.unwrap_or(config.port.unwrap_or(8052));
-        
+       
         info!("Canonical port: {}", port);
         println!("===> CANONICAL PORT: {}", port);
 
@@ -4115,90 +4421,106 @@ impl SledDaemonPool {
             return Ok(());
         }
 
-        // ---------- 1. Check for existing live daemon ----------
-        // DO NOT return early — we must ensure ZMQ IPC is created
-        let mut live_daemon_found = false;
+        let ipc_path = format!("/tmp/graphdb-{}.ipc", port);
+
+        // ---------- 1. Check for existing live daemon in registry ----------
+        let mut daemon_exists_and_is_live = false;
+        let mut daemon_zmq_ready = false;
+       
         if let Ok(Some(metadata)) = daemon_registry.get_daemon_metadata(port).await {
-            if is_pid_running(metadata.pid).await {
-                info!("Daemon already running on port {} (PID {}), but will ensure ZMQ IPC is ready", port, metadata.pid);
-                println!("===> DAEMON ALREADY RUNNING ON PORT {} (PID {}), ENSURING ZMQ IPC", port, metadata.pid);
-                live_daemon_found = true;
+            if metadata.service_type == "storage"
+                && metadata.engine_type.as_ref().map(|e| e.to_lowercase()) == Some("sled".to_string())
+                && metadata.pid > 0
+                && is_pid_running(metadata.pid).await
+            {
+                info!("Daemon already running on port {} (PID {})", port, metadata.pid);
+                println!("===> DAEMON ALREADY RUNNING ON PORT {} (PID {})", port, metadata.pid);
+                daemon_exists_and_is_live = true;
+                daemon_zmq_ready = metadata.zmq_ready;
             } else {
-                warn!("Found stale daemon registration for port {} (PID {} not running)", port, metadata.pid);
-                println!("===> WARNING: FOUND STALE DAEMON REGISTRATION FOR PORT {} (PID {} NOT RUNNING)", port, metadata.pid);
+                // Stale metadata
+                warn!("Found stale daemon registration for port {}, unregistering", port);
+                println!("===> WARNING: FOUND STALE DAEMON REGISTRY FOR PORT {} (PID {} NOT RUNNING)", port, metadata.pid);
+                let _ = daemon_registry.unregister_daemon(port).await;
             }
         }
-        
-        // Also check if ANY process is listening on this port
-        if !live_daemon_found && check_process_status_by_port("Storage Daemon", port).await {
-            warn!("Process already listening on port {}, but not yet in registry. Will wait then proceed.", port);
-            println!("===> WARNING: PROCESS ALREADY LISTENING ON PORT {}, WILL WAIT THEN PROCEED", port);
-            
-            // Wait up to 5 seconds for registration
+
+        // Also check if ANY process is listening (even if not in registry)
+        if !daemon_exists_and_is_live && check_process_status_by_port("Storage Daemon", port).await {
+            info!("Process listening on port {}, but not in registry. Waiting for registration...", port);
+            println!("===> PROCESS LISTENING ON PORT {}, BUT NOT IN REGISTRY. WAITING FOR REGISTRATION...", port);
+           
             for attempt in 0..10 {
                 tokio::time::sleep(TokioDuration::from_millis(500)).await;
                 if let Ok(Some(metadata)) = daemon_registry.get_daemon_metadata(port).await {
-                    if is_pid_running(metadata.pid).await {
+                    if metadata.service_type == "storage"
+                        && metadata.engine_type.as_ref().map(|e| e.to_lowercase()) == Some("sled".to_string())
+                        && is_pid_running(metadata.pid).await
+                    {
                         info!("Daemon registered itself on port {} after {} attempts", port, attempt + 1);
                         println!("===> DAEMON REGISTERED ON PORT {} AFTER {} ATTEMPTS", port, attempt + 1);
-                        live_daemon_found = true;
+                        daemon_exists_and_is_live = true;
+                        daemon_zmq_ready = metadata.zmq_ready;
                         break;
                     }
                 }
             }
         }
 
-        let ipc_path = format!("/tmp/graphdb-{}.ipc", port);
-        
-        // Always clean up stale IPC socket
+        // ---------- 2. REUSE IF IPC EXISTS (EVEN IF ZMQ NOT READY) ----------
         if Path::new(&ipc_path).exists() {
+            info!("IPC FILE EXISTS — REUSING DAEMON ON PORT {} (ZMQ may be starting)", port);
+            println!("===> IPC FILE EXISTS — REUSING DAEMON ON PORT {} (ZMQ MAY BE STARTING)", port);
+            self.load_balancer.update_node_health(port, true, 0).await;
+            *initialized = true;
+            return Ok(());
+        }
+
+        // ---------- 3. No daemon exists or not ready → proceed with creation ----------
+       
+        // Clean stale IPC only if no live daemon
+        if !daemon_exists_and_is_live && Path::new(&ipc_path).exists() {
             warn!("Removing stale IPC socket at {}", ipc_path);
             println!("===> REMOVING STALE IPC SOCKET AT {}", ipc_path);
             let _ = tokio_fs::remove_file(&ipc_path).await;
         }
 
-        // ---------- 2. Per-port path ----------
+        // Per-port path
         let db_path = storage_config
             .data_directory
             .as_ref()
             .unwrap_or(&PathBuf::from("/opt/graphdb/storage_data"))
             .join("sled")
             .join(port.to_string());
-
         info!("Using Sled path: {:?}", db_path);
         println!("===> USING SLED PATH: {:?}", db_path);
-
-        // ---------- 3. Create dir ----------
         if !db_path.exists() {
             info!("Creating Sled directory at {:?}", db_path);
             println!("===> CREATING SLED DIRECTORY AT {:?}", db_path);
             tokio_fs::create_dir_all(&db_path).await.map_err(|e| GraphError::Io(e.to_string()))?;
         }
-
-        // ---------- 4. Force unlock ----------
         SledClient::force_unlock(&db_path).await?;
         info!("Force unlocked database at {:?}", db_path);
         println!("===> FORCE UNLOCKED DATABASE AT {:?}", db_path);
 
-        // ---------- 5. WAL setup ----------
+        // WAL setup
         let canonical_path = storage_config
             .data_directory
             .as_ref()
             .unwrap_or(&PathBuf::from("/opt/graphdb/storage_data"))
             .join("sled");
         let is_leader = become_wal_leader(&canonical_path).await?;
-        let offset_file = canonical_path.join(format!("{}.offset", port));
+        let offset_file = db_path.join("wal.offset");
         let start_offset = match tokio_fs::read_to_string(&offset_file).await {
             Ok(s) => s.trim().parse::<u64>().unwrap_or(0),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
             Err(e) => return Err(GraphError::Io(e.to_string())),
         };
 
-        // ---------- 6. Create new daemon ----------
+        // Create new daemon — USE PER-PORT PATH
         let mut daemon_config = config.clone();
-        daemon_config.path = db_path.clone();
+        daemon_config.path = PathBuf::from(db_path.to_string_lossy().into_owned());  // CHANGED: use per-port path
         daemon_config.port = Some(port);
-
         info!("Creating SledDaemon with config: {:?}", daemon_config);
         println!("===> CREATING SLED DAEMON WITH CONFIG: {:?}", daemon_config);
 
@@ -4218,10 +4540,7 @@ impl SledDaemonPool {
             e
         })?;
 
-        // ---------- 7. Wait for ZMQ ----------
-        info!("Waiting for ZMQ readiness signal on port {}", port);
-        println!("===> WAITING FOR ZMQ READINESS SIGNAL ON PORT {}", port);
-
+        // Wait for ZMQ readiness
         timeout(TokioDuration::from_secs(10), ready_rx.recv())
             .await
             .map_err(|_| {
@@ -4235,7 +4554,7 @@ impl SledDaemonPool {
                 GraphError::StorageError("ZMQ readiness channel closed prematurely".into())
             })?;
 
-        // ---------- 8. Verify IPC ----------
+        // Verify IPC exists
         let mut ipc_check_attempts = 0;
         while !Path::new(&ipc_path).exists() && ipc_check_attempts < 10 {
             warn!("IPC file not found at {}, waiting... (attempt {})", ipc_path, ipc_check_attempts + 1);
@@ -4243,17 +4562,15 @@ impl SledDaemonPool {
             tokio::time::sleep(TokioDuration::from_millis(500)).await;
             ipc_check_attempts += 1;
         }
-
         if !Path::new(&ipc_path).exists() {
             error!("IPC file not created at {} after {} attempts", ipc_path, ipc_check_attempts);
             println!("===> ERROR: IPC FILE NOT CREATED AT {} AFTER {} ATTEMPTS", ipc_path, ipc_check_attempts);
             return Err(GraphError::StorageError(format!("IPC file not created: {}", ipc_path)));
         }
-
         info!("IPC file verified at {}", ipc_path);
         println!("===> ZMQ IPC FILE VERIFIED AT {}", ipc_path);
 
-        // ---------- 9. Register/Update ----------
+        // Register daemon
         let daemon_metadata = DaemonMetadata {
             service_type: "storage".to_string(),
             port,
@@ -4289,14 +4606,12 @@ impl SledDaemonPool {
             }
         }
 
-        // ---------- 10. Store ----------
+        // Store daemon
         self.daemons.insert(port, Arc::new(daemon));
         self.load_balancer.update_node_health(port, true, 0).await;
         *initialized = true;
-
         info!("SledDaemonPool initialized successfully on port {}", port);
         println!("===> SLED DAEMON POOL INITIALIZED SUCCESSFULLY ON PORT {}", port);
-
         Ok(())
     }
 

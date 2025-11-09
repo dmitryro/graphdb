@@ -36,6 +36,7 @@ use crate::config::config::{
     DEFAULT_CONFIG_ROOT_DIRECTORY_STR,
     EXECUTABLE_NAME,
     DAEMON_REGISTRY_DB_PATH,
+    daemon_api_storage_engine_type_to_string,
 };
 use crate::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
 use crate::storage_engine::config::StorageEngineType;
