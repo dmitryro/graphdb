@@ -361,9 +361,12 @@ pub async fn execute_cypher(
         }
         CypherQuery::CreateEdge { from_id, edge_type, to_id } => {
             let edge = Edge {
+                id: SerializableUuid(Uuid::new_v4()),
                 outbound_id: from_id,
                 t: Identifier::new(edge_type)?,
                 inbound_id: to_id,
+                label: "relationship".to_string(), // Use String instead of Identifier
+                properties: std::collections::BTreeMap::new(), // Use BTreeMap instead of HashMap
             };
             db.create_edge(edge.clone()).await?;
             Ok(json!({ "edge": edge }))
