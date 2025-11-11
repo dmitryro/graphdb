@@ -1014,6 +1014,7 @@ pub async fn initialize_storage_for_query(
 
             let db = Database {
                 storage: engine,
+                graph: graph.clone(),
                 config: config.clone(),
             };
             return Ok(Arc::new(QueryExecEngine::new(Arc::new(db))));
@@ -1080,6 +1081,7 @@ pub async fn initialize_storage_for_query(
 
     let db = Database {
         storage: engine,
+        graph: graph.clone(),
         config: config.clone(),
     };
 

@@ -154,6 +154,15 @@ impl SledStorage {
                 if let Some(existing_pool) = pool_map_guard.get(&port) {
                     info!("Reusing existing SledDaemonPool for port {}", port);
                     println!("===> REUSING EXISTING SLED DAEMON POOL FOR PORT {}", port);
+                    
+                    // Ensure the node is marked healthy in the load balancer even when reusing
+                    {
+                        let mut pool_guard = timeout(TokioDuration::from_secs(5), existing_pool.lock()).await
+                            .map_err(|_| GraphError::StorageError("Failed to acquire pool lock".to_string()))?;
+                        pool_guard.load_balancer.update_node_health(port, true, 0).await;
+                        println!("===> [LB] NODE {} MARKED HEALTHY IN SLED LOAD BALANCER (REUSING)", port);
+                    }
+                    
                     return Ok(SledStorage { pool: existing_pool.clone() });
                 }
             }
@@ -310,6 +319,14 @@ impl SledStorage {
                 let pool_map_guard = timeout(TokioDuration::from_secs(5), pool_map.lock()).await
                     .map_err(|_| GraphError::StorageError("Timeout acquiring pool map lock".to_string()))?;
                 if let Some(existing_pool) = pool_map_guard.get(&port) {
+                    // Ensure the node is marked healthy in the load balancer even when reusing
+                    {
+                        let mut pool_guard = timeout(TokioDuration::from_secs(5), existing_pool.lock()).await
+                            .map_err(|_| GraphError::StorageError("Failed to acquire pool lock".to_string()))?;
+                        pool_guard.load_balancer.update_node_health(port, true, 0).await;
+                        println!("===> [LB] NODE {} MARKED HEALTHY IN SLED LOAD BALANCER (REUSING WITH EXISTING DB)", port);
+                    }
+                    
                     return Ok(SledStorage { pool: existing_pool.clone() });
                 }
             }

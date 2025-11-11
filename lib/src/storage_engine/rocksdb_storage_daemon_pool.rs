@@ -4591,37 +4591,35 @@ impl RocksDBDaemonPool {
         } else {
             ReplicationStrategy::NNodes(self.load_balancer.replication_factor)
         };
-
         let write_nodes = self.load_balancer.get_write_nodes(strategy).await;
         if write_nodes.is_empty() {
             return Err(GraphError::StorageError("No healthy nodes available for write operation".to_string()));
         }
-
         println!("===> REPLICATED INSERT: Writing to {} nodes: {:?}", write_nodes.len(), write_nodes);
-
         #[cfg(feature = "with-openraft-rocksdb")]
         if matches!(strategy, ReplicationStrategy::Raft) && self.use_raft_for_scale {
             return self.insert_raft(key, value).await;
         }
-
         let mut success_count = 0;
         let mut errors = Vec::new();
-
         for port in &write_nodes {
-            match self.insert_to_node(*port, key, value).await {
+            let start_time = std::time::Instant::now();
+            let result = self.insert_to_node(*port, key, value).await;
+            let elapsed_ms = start_time.elapsed().as_millis() as u64;
+            match result {
                 Ok(_) => {
                     success_count += 1;
                     println!("===> REPLICATED INSERT: Success on node {}", port);
-                    self.load_balancer.update_node_health(*port, true, 0).await;
+                    self.load_balancer.update_node_health(*port, true, elapsed_ms).await;
                 }
                 Err(e) => {
-                    errors.push((*port, e));
-                    println!("===> REPLICATED INSERT: Failed on node {}: {:?}", port, errors.last().unwrap().1);
-                    self.load_balancer.update_node_health(*port, false, 0).await;
+                    let error_clone = e.clone(); // Clone the error before using it
+                    errors.push((*port, error_clone));
+                    println!("===> REPLICATED INSERT: Failed on node {}: {:?}", port, e);
+                    self.load_balancer.update_node_health(*port, false, elapsed_ms).await;
                 }
             }
         }
-
         let required_success = (write_nodes.len() / 2) + 1;
         if success_count >= required_success {
             println!("===> REPLICATED INSERT: Success! {}/{} nodes confirmed write", success_count, write_nodes.len());
@@ -5078,7 +5076,12 @@ impl RocksDBDaemonPool {
         let mut initialized = self.initialized.write().await;
         if *initialized {
             warn!("RocksDBDaemonPool already initialized, skipping");
-            println!("===> WARNING: ROCKSDB DAEMON POEL ALREADY INITIALIZED, SKIPPING");
+            println!("===> WARNING: ROCKSDB DAEMON POOL ALREADY INITIALIZED, SKIPPING");
+            
+            // Ensure the node is marked healthy in the load balancer even if already initialized
+            let port = cli_port.unwrap_or(config.port.unwrap_or(DEFAULT_STORAGE_PORT));
+            self.load_balancer.update_node_health(port, true, 0).await;
+            println!("===> [LB] NODE {} MARKED HEALTHY IN LOAD BALANCER (ALREADY INITIALIZED)", port);
             return Ok(());
         }
 
@@ -5147,6 +5150,9 @@ impl RocksDBDaemonPool {
         let zmq_ready = if let Ok(Some(_)) = timeout(TokioDuration::from_secs(10), ready_rx.recv()).await {
             info!("ZMQ readiness confirmed for port {}", port);
             println!("===> ZMQ READINESS CONFIRMED FOR PORT {}", port);
+            // Mark the node as healthy after ZMQ readiness is confirmed
+            self.load_balancer.update_node_health(port, true, 0).await;
+            println!("===> [LB] NODE {} MARKED HEALTHY IN LOAD BALANCER", port);
             true
         } else {
             warn!("ZMQ readiness not confirmed for port {}, proceeding anyway", port);
@@ -5182,6 +5188,7 @@ impl RocksDBDaemonPool {
 
         // 10. STORE
         self.daemons.insert(port, Arc::new(daemon));
+        // Make sure the node is marked healthy in the load balancer after storing the daemon
         self.load_balancer.update_node_health(port, true, 0).await;
         *initialized = true;
 
