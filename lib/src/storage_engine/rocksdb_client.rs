@@ -596,37 +596,118 @@ impl RocksDBClient {
     }
 
     pub async fn get_all_vertices(&self) -> GraphResult<Vec<Vertex>> {
-        let inner = self.inner.as_ref()
-            .ok_or_else(|| GraphError::StorageError("No database available".to_string()))?;
-        let db = inner.lock().await;
-        let cf = (*db).cf_handle("vertices")
-            .ok_or_else(|| GraphError::StorageError(format!("Missing column family: vertices")))?;
-        let iter = (*db).iterator_cf(&cf, rocksdb::IteratorMode::Start);
-        let mut vertices = Vec::new();
-        for res in iter {
-            let (_, value) = res.map_err(|e| GraphError::StorageError(format!("Failed to iterate vertices: {}", e)))?;
-            vertices.push(deserialize_vertex(&value)?);
+        match &self.mode {
+            Some(RocksDBClientMode::Direct) => {
+                let inner = self.inner.as_ref()
+                    .ok_or_else(|| GraphError::StorageError("No database available".to_string()))?;
+                let db = inner.lock().await;
+                let cf = (*db).cf_handle("vertices")
+                    .ok_or_else(|| GraphError::StorageError(format!("Missing column family: vertices")))?;
+                let iter = (*db).iterator_cf(&cf, rocksdb::IteratorMode::Start);
+                let mut vertices = Vec::new();
+                for res in iter {
+                    let (_, value) = res.map_err(|e| GraphError::StorageError(format!("Failed to iterate vertices: {}", e)))?;
+                    vertices.push(deserialize_vertex(&value)?);
+                }
+                info!("Retrieved {} vertices", vertices.len());
+                println!("===> Retrieved {} vertices", vertices.len());
+                Ok(vertices)
+            }
+            Some(RocksDBClientMode::ZMQ(port)) => {
+                let request = json!({ "command": "get_all_vertices" });
+                let response = self.send_zmq_request(*port, request).await?;
+                
+                if response.get("status").and_then(|s| s.as_str()) == Some("success") {
+                    if let Some(vertices_array) = response.get("vertices").and_then(|v| v.as_array()) {
+                        let mut vertices = Vec::new();
+                        for vertex_value in vertices_array {
+                            if let Ok(vertex) = serde_json::from_value::<Vertex>(vertex_value.clone()) {
+                                vertices.push(vertex);
+                            } else {
+                                warn!("Failed to deserialize vertex: {:?}", vertex_value);
+                            }
+                        }
+                        info!("Retrieved {} vertices via ZMQ from port {}", vertices.len(), port);
+                        println!("===> Retrieved {} vertices via ZMQ from port {}", vertices.len(), port);
+                        Ok(vertices)
+                    } else {
+                        // Handle case where response has vertices in a different format
+                        error!("ZMQ response missing 'vertices' array for get_all_vertices on port {}", port);
+                        println!("===> ERROR: ZMQ response missing 'vertices' array for get_all_vertices on port {}", port);
+                        Ok(Vec::new()) // Return empty list if vertices array is missing
+                    }
+                } else {
+                    let error_msg = response.get("message")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("Unknown error");
+                    error!("ZMQ get_all_vertices failed on port {}: {}", port, error_msg);
+                    println!("===> ERROR: ZMQ get_all_vertices failed on port {}: {}", port, error_msg);
+                    Err(GraphError::StorageError(format!("ZMQ get_all_vertices failed: {}", error_msg)))
+                }
+            }
+            None => {
+                error!("RocksDBClient mode not set");
+                println!("===> ERROR: RocksDBClient mode not set");
+                Err(GraphError::StorageError("RocksDBClient mode not set".to_string()))
+            }
         }
-        info!("Retrieved {} vertices", vertices.len());
-        println!("===> Retrieved {} vertices", vertices.len());
-        Ok(vertices)
     }
 
     pub async fn get_all_edges(&self) -> GraphResult<Vec<Edge>> {
-        let inner = self.inner.as_ref()
-            .ok_or_else(|| GraphError::StorageError("No database available".to_string()))?;
-        let db = inner.lock().await;
-        let cf = (*db).cf_handle("edges")
-            .ok_or_else(|| GraphError::StorageError(format!("Missing column family: edges")))?;
-        let iter = (*db).iterator_cf(&cf, rocksdb::IteratorMode::Start);
-        let mut edges = Vec::new();
-        for res in iter {
-            let (_, value) = res.map_err(|e| GraphError::StorageError(format!("Failed to iterate edges: {}", e)))?;
-            edges.push(deserialize_edge(&value)?);
+        match &self.mode {
+            Some(RocksDBClientMode::Direct) => {
+                let inner = self.inner.as_ref()
+                    .ok_or_else(|| GraphError::StorageError("No database available".to_string()))?;
+                let db = inner.lock().await;
+                let cf = (*db).cf_handle("edges")
+                    .ok_or_else(|| GraphError::StorageError(format!("Missing column family: edges")))?;
+                let iter = (*db).iterator_cf(&cf, rocksdb::IteratorMode::Start);
+                let mut edges = Vec::new();
+                for res in iter {
+                    let (_, value) = res.map_err(|e| GraphError::StorageError(format!("Failed to iterate edges: {}", e)))?;
+                    edges.push(deserialize_edge(&value)?);
+                }
+                info!("Retrieved {} edges", edges.len());
+                println!("===> Retrieved {} edges", edges.len());
+                Ok(edges)
+            }
+            Some(RocksDBClientMode::ZMQ(port)) => {
+                let request = json!({ "command": "get_all_edges" });
+                let response = self.send_zmq_request(*port, request).await?;
+                
+                if response.get("status").and_then(|s| s.as_str()) == Some("success") {
+                    if let Some(edges_array) = response.get("edges").and_then(|v| v.as_array()) {
+                        let mut edges = Vec::new();
+                        for edge_value in edges_array {
+                            if let Ok(edge) = serde_json::from_value::<Edge>(edge_value.clone()) {
+                                edges.push(edge);
+                            } else {
+                                warn!("Failed to deserialize edge: {:?}", edge_value);
+                            }
+                        }
+                        info!("Retrieved {} edges via ZMQ from port {}", edges.len(), port);
+                        println!("===> Retrieved {} edges via ZMQ from port {}", edges.len(), port);
+                        Ok(edges)
+                    } else {
+                        error!("ZMQ response missing 'edges' array for get_all_edges on port {}", port);
+                        println!("===> ERROR: ZMQ response missing 'edges' array for get_all_edges on port {}", port);
+                        Ok(Vec::new()) // Return empty list if edges array is missing
+                    }
+                } else {
+                    let error_msg = response.get("message")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("Unknown error");
+                    error!("ZMQ get_all_edges failed on port {}: {}", port, error_msg);
+                    println!("===> ERROR: ZMQ get_all_edges failed on port {}: {}", port, error_msg);
+                    Err(GraphError::StorageError(format!("ZMQ get_all_edges failed: {}", error_msg)))
+                }
+            }
+            None => {
+                error!("RocksDBClient mode not set");
+                println!("===> ERROR: RocksDBClient mode not set");
+                Err(GraphError::StorageError("RocksDBClient mode not set".to_string()))
+            }
         }
-        info!("Retrieved {} edges", edges.len());
-        println!("===> Retrieved {} edges", edges.len());
-        Ok(edges)
     }
 
     pub async fn clear_data(&self) -> GraphResult<()> {
