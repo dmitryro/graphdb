@@ -7,7 +7,7 @@ use nom::{
     bytes::complete::{tag, take_while1},
     character::complete::{char, multispace0, multispace1},
     combinator::{map, opt},
-    multi::separated_list0,
+    multi::{separated_list0, separated_list1, many0}, // Added many0
     sequence::{delimited, preceded, tuple},
     IResult,
     Parser,
@@ -29,6 +29,9 @@ pub enum CypherQuery {
     CreateNode {
         label: String,
         properties: HashMap<String, Value>,
+    },
+    CreateNodes {
+        nodes: Vec<(String, HashMap<String, Value>)>, // (label, properties)
     },
     MatchNode {
         label: Option<String>,
@@ -116,19 +119,35 @@ fn parse_properties(input: &str) -> IResult<&str, HashMap<String, Value>> {
     .parse(input)
 }
 
-// Parse a node pattern like `(n:Person {name: 'Alice'})`
+// Parse a node pattern like `(n:Person {name: 'Alice'})` or `(n:Person:Actor {name: 'Bob'})`
+// or `(n:Person&Actor {name: 'Charlie'})` - supports both : and & as label separators
 fn parse_node(input: &str) -> IResult<&str, (Option<String>, Option<String>, HashMap<String, Value>)> {
-    let (input, (_, var, label, props, _)) = tuple((
-        char('('),
-        opt(parse_identifier),
-        opt(preceded(char(':'), parse_identifier)),
-        opt(parse_properties),
-        char(')'),
-    ))
-    .parse(input)?;
+    let (input, _) = char('(').parse(input)?;
+    let (input, var) = opt(parse_identifier).parse(input)?;
+    
+    // Parse labels (one or more, separated by ':' or '&')
+    let (input, labels) = if input.starts_with(':') {
+        let (input, _) = char(':').parse(input)?;
+        let (input, first_label) = parse_identifier.parse(input)?;
+        
+        // Support both ':' and '&' as label separators
+        let (input, _) = many0(alt((
+            preceded(char(':'), parse_identifier),
+            preceded(char('&'), parse_identifier),
+        ))).parse(input)?;
+        
+        (input, Some(first_label.to_string()))
+    } else {
+        (input, None)
+    };
+    
+    let (input, _) = multispace0.parse(input)?;
+    let (input, props) = opt(parse_properties).parse(input)?;
+    let (input, _) = char(')').parse(input)?;
+    
     Ok((input, (
         var.map(|s| s.to_string()),
-        label.map(|s| s.to_string()),
+        labels,
         props.unwrap_or_default(),
     )))
 }
@@ -146,6 +165,34 @@ fn parse_relationship(input: &str) -> IResult<&str, String> {
     Ok((input, rel_type.to_string()))
 }
 
+// Parse a `CREATE` nodes query - support multiple nodes separated by commas
+fn parse_create_nodes(input: &str) -> IResult<&str, CypherQuery> {
+    map(
+        tuple((
+            tag("CREATE"),
+            multispace1,
+            separated_list1(
+                delimited(multispace0, char(','), multispace0),
+                parse_node,
+            ),
+        )),
+        |(_, _, nodes)| {
+            let node_data: Vec<(String, HashMap<String, Value>)> = nodes
+                .into_iter()
+                .map(|(var, label, props)| {
+                    let actual_label = label.unwrap_or_else(|| var.clone().unwrap_or_default());
+                    (actual_label, props)
+                })
+                .collect();
+            
+            CypherQuery::CreateNodes {
+                nodes: node_data,
+            }
+        },
+    )
+    .parse(input)
+}
+
 // Parse a `CREATE` node query
 fn parse_create_node(input: &str) -> IResult<&str, CypherQuery> {
     map(
@@ -158,24 +205,73 @@ fn parse_create_node(input: &str) -> IResult<&str, CypherQuery> {
     .parse(input)
 }
 
-// Parse a `MATCH` node query
+// Parse a `MATCH` node query - handle complex RETURN clauses
 fn parse_match_node(input: &str) -> IResult<&str, CypherQuery> {
-    map(
+    let (input, (_, _, node, _, return_clause)) = tuple((
+        tag("MATCH"),
+        multispace1,
+        parse_node,
+        multispace1,
+        tag("RETURN"),
+    )).parse(input)?;
+    
+    let (_, label, props) = node;
+    
+    // Parse complex RETURN expressions like:
+    // - n.name
+    // - labels(n) 
+    // - count(n)
+    // - n, r, m
+    // - n.name, labels(n) AS labels
+    // - count(n) AS total_vertices
+    
+    let (input, _) = parse_return_expressions(input)?;
+    
+    Ok((input, CypherQuery::MatchNode {
+        label: label,
+        properties: props,
+    }))
+}
+
+// Parse complex RETURN expressions (handles variables, properties, functions, aliases)
+fn parse_return_expressions(input: &str) -> IResult<&str, ()> {
+    let (input, _) = multispace0.parse(input)?;
+    
+    // Parse the first expression
+    let (input, _) = parse_return_expression(input)?;
+    
+    // Parse additional expressions separated by commas
+    let (input, _) = many0(preceded(
+        tuple((multispace0, char(','), multispace0)),
+        parse_return_expression
+    )).parse(input)?;
+    
+    Ok((input, ()))
+}
+
+// Parse a single RETURN expression like n, n.name, labels(n), count(n) AS alias
+fn parse_return_expression(input: &str) -> IResult<&str, ()> {
+    let (input, _) = multispace0.parse(input)?;
+    
+    // Handle function calls like labels(n), count(n), etc.
+    let (input, _) = alt((
+        // Function call with parentheses: labels(n), count(n), etc.
         tuple((
-            tag("MATCH"),
-            multispace1,
-            parse_node,
-            multispace1,
-            preceded(tag("WHERE"), parse_properties),
-            multispace1,
-            tag("RETURN"),
-        )),
-        |(_, _, (var, label, _), _, props, _, _)| CypherQuery::MatchNode {
-            label: label.or(var),
-            properties: props,
-        },
-    )
-    .parse(input)
+            parse_identifier,  // function name
+            char('('),
+            parse_identifier, // variable name inside parentheses
+            char(')'),
+            opt(tuple((multispace0, tag("AS"), multispace0, parse_identifier))), // optional AS alias
+        )).map(|_| ()),
+        // Simple variable or property access: n, n.name, etc.
+        tuple((
+            parse_identifier,
+            opt(preceded(char('.'), parse_identifier)), // optional property access like .name
+            opt(tuple((multispace0, tag("AS"), multispace0, parse_identifier))), // optional AS alias
+        )).map(|_| ()),
+    )).parse(input)?;
+    
+    Ok((input, ()))
 }
 
 // Parse a `CREATE` edge query
@@ -284,6 +380,7 @@ pub fn parse_cypher(query: &str) -> Result<CypherQuery, String> {
 
     let query = query.trim();
     let mut parser = alt((
+        parse_create_nodes,  // Add this before parse_create_node to handle multi-node first
         parse_create_node,
         parse_match_node,
         parse_create_edge,
@@ -342,6 +439,23 @@ pub async fn execute_cypher(
             };
             db.create_vertex(vertex.clone()).await?;
             Ok(json!({ "vertex": vertex }))
+        }
+        CypherQuery::CreateNodes { nodes } => {
+            let mut created_vertices = Vec::new();
+            for (label, properties) in nodes {
+                let props: GraphResult<HashMap<String, models::PropertyValue>> = properties
+                    .into_iter()
+                    .map(|(k, v)| to_property_value(v).map(|pv| (k, pv)))
+                    .collect();
+                let vertex = Vertex {
+                    id: SerializableUuid(Uuid::new_v4()),
+                    label: Identifier::new(label)?,
+                    properties: props?,
+                };
+                db.create_vertex(vertex.clone()).await?;
+                created_vertices.push(vertex);
+            }
+            Ok(json!({ "vertices": created_vertices }))
         }
         CypherQuery::MatchNode { label, properties } => {
             let vertices = db.get_all_vertices().await?;
@@ -438,12 +552,68 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_match_node() {
-        let query = "MATCH (n:Person) WHERE {name: 'Alice'} RETURN n";
+    fn test_parse_create_nodes_with_ampersand_labels() {
+        let query = "CREATE (charlie:Person&Actor {name: 'Charlie Sheen'}), (oliver:Person&Director {name: 'Oliver Stone'})";
+        let result = parse_cypher(query).unwrap();
+        let expected = CypherQuery::CreateNodes {
+            nodes: vec![
+                ("Person".to_string(), HashMap::from([  // Using first label
+                    ("name".to_string(), json!("Charlie Sheen")),
+                ])),
+                ("Person".to_string(), HashMap::from([  // Using first label
+                    ("name".to_string(), json!("Oliver Stone")),
+                ])),
+            ],
+        };
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_parse_create_nodes_with_colon_labels() {
+        let query = "CREATE (charlie:Person:Actor {name: 'Charlie Sheen'}), (oliver:Person:Director {name: 'Oliver Stone'})";
+        let result = parse_cypher(query).unwrap();
+        let expected = CypherQuery::CreateNodes {
+            nodes: vec![
+                ("Person".to_string(), HashMap::from([  // Using first label
+                    ("name".to_string(), json!("Charlie Sheen")),
+                ])),
+                ("Person".to_string(), HashMap::from([  // Using first label
+                    ("name".to_string(), json!("Oliver Stone")),
+                ])),
+            ],
+        };
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_parse_match_simple_return() {
+        let query = "MATCH (n:Person) RETURN n";
         let result = parse_cypher(query).unwrap();
         let expected = CypherQuery::MatchNode {
             label: Some("Person".to_string()),
-            properties: HashMap::from([("name".to_string(), json!("Alice"))]),
+            properties: HashMap::new(),
+        };
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_parse_match_complex_return() {
+        let query = "MATCH (n) RETURN n.name, labels(n) AS labels";
+        let result = parse_cypher(query).unwrap();
+        let expected = CypherQuery::MatchNode {
+            label: None,
+            properties: HashMap::new(),
+        };
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_parse_match_count_return() {
+        let query = "MATCH (n) RETURN count(n) AS total_vertices";
+        let result = parse_cypher(query).unwrap();
+        let expected = CypherQuery::MatchNode {
+            label: None,
+            properties: HashMap::new(),
         };
         assert_eq!(result, expected);
     }

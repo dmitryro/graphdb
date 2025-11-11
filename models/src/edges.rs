@@ -16,7 +16,7 @@ pub struct Edge {
     pub outbound_id: SerializableUuid,
 
     /// Edge type (e.g., "FOLLOWS", "HAS_DIAGNOSIS").
-    pub t: Identifier,
+    pub edge_type: Identifier,
 
     /// Target vertex.
     pub inbound_id: SerializableUuid,
@@ -33,23 +33,23 @@ impl Edge {
     ///
     /// # Arguments
     /// * `outbound_id` – source vertex
-    /// * `t`           – edge type (`Identifier`)
+    /// * `edge_type`           – edge type (`Identifier`)
     /// * `inbound_id`  – target vertex
     ///
-    /// The `label` defaults to the string representation of `t`.
+    /// The `label` defaults to the string representation of `edge_type`.
     pub fn new(
         outbound_id: impl Into<SerializableUuid>,
-        t: Identifier,
+        edge_type: Identifier,
         inbound_id: impl Into<SerializableUuid>,
     ) -> Self {
         let outbound_id = outbound_id.into();
         let inbound_id = inbound_id.into();
-        let label = t.to_string();
+        let label = edge_type.to_string();
 
         Self {
             id: SerializableUuid(Uuid::new_v4()),
             outbound_id,
-            t,
+            edge_type,
             inbound_id,
             label,
             properties: BTreeMap::new(),
@@ -75,7 +75,7 @@ impl Edge {
         Self {
             id: self.id,
             outbound_id: self.inbound_id,
-            t: self.t.clone(),
+            edge_type: self.edge_type.clone(),
             inbound_id: self.outbound_id,
             label: self.label.clone(),
             properties: self.properties.clone(),

@@ -1181,7 +1181,7 @@ pub async fn stop_storage_interactive(
         };
 
         // === STOP DAEMON ===
-        match daemon {
+        match &daemon {  // Use reference to avoid moving
             Some(d) if d.pid != 0 && d.pid != std::process::id() => {
                 if check_pid_validity(d.pid).await {
                     info!("Attempting to stop Storage Daemon on port {} (PID {})...", port, d.pid);
@@ -1203,7 +1203,10 @@ pub async fn stop_storage_interactive(
             Some(d) if d.pid == std::process::id() => {
                 warn!("PID {} for port {} matches CLI process. Skipping shutdown.", d.pid, port);
                 println!("===> WARNING: PID {} for port {} matches CLI process. Skipping shutdown.", d.pid, port);
-                failed_ports.push(format!("Port {} matches CLI PID", port));
+                // Don't treat this as an error - it means the daemon is the CLI process itself
+                info!("Port {} matches CLI process, treating as already handled.", port);
+                println!("===> PORT {} MATCHES CLI PROCESS, TREATING AS ALREADY HANDLED", port);
+                // Continue with cleanup but don't try to stop the daemon
             }
             Some(_) => {
                 warn!("No valid PID found for Storage Daemon on port {}. Checking for stray processes...", port);
@@ -1225,7 +1228,13 @@ pub async fn stop_storage_interactive(
                     } else {
                         warn!("Stray PID {} on port {} is invalid or matches CLI. Skipping.", new_pid, port);
                         println!("===> WARNING: Stray PID {} on port {} is invalid or matches CLI. Skipping.", new_pid, port);
-                        failed_ports.push(format!("Stray PID {} on port {} is invalid or matches CLI", new_pid, port));
+                        // Don't add to failed_ports if it matches CLI process, only if it's an invalid PID
+                        if new_pid == std::process::id() {
+                            info!("Stray PID {} matches CLI process on port {}, treating as handled.", new_pid, port);
+                            println!("===> STRAY PID {} MATCHES CLI PROCESS ON PORT {}, TREATING AS HANDLED", new_pid, port);
+                        } else {
+                            failed_ports.push(format!("Stray PID {} on port {} is invalid", new_pid, port));
+                        }
                     }
                 }
             }
@@ -1255,26 +1264,37 @@ pub async fn stop_storage_interactive(
             }
         }
 
-        // === CLEANUP: ZMQ SOCKET ===
-        if Path::new(&socket_path).exists() && !is_socket_used_by_cli(&socket_path).await.unwrap_or(false) {
-            if let Err(e) = std::fs::remove_file(&socket_path) {
-                warn!("Failed to remove ZMQ socket file at {}: {}", socket_path, e);
-                println!("===> WARNING: Failed to remove ZMQ socket at {}", socket_path);
-                failed_ports.push(format!("Failed to remove socket {}: {}", socket_path, e));
+        // === UNREGISTER FROM REGISTRY ===
+        // Only unregister if the daemon wasn't the CLI process
+        if daemon.as_ref().map_or(true, |d| d.pid != std::process::id()) {
+            if let Err(e) = daemon_registry.unregister_daemon(port).await {
+                warn!("Failed to remove daemon on port {} from registry: {}", port, e);
+                println!("===> WARNING: Failed to remove daemon on port {} from registry", port);
+                failed_ports.push(format!("Failed to unregister port {}: {}", port, e));
             } else {
-                info!("Successfully removed ZMQ socket file at {}", socket_path);
-                println!("===> SUCCESSFULLY REMOVED ZMQ SOCKET FILE AT {}", socket_path);
+                info!("Storage daemon on port {} removed from registry.", port);
+                println!("===> STORAGE DAEMON ON PORT {} REMOVED FROM REGISTRY", port);
             }
+        } else {
+            info!("Daemon on port {} was CLI process, skipping registry removal.", port);
+            println!("===> DAEMON ON PORT {} WAS CLI PROCESS, SKIPPING REGISTRY REMOVAL", port);
         }
 
-        // === UNREGISTER FROM REGISTRY ===
-        if let Err(e) = daemon_registry.unregister_daemon(port).await {
-            warn!("Failed to remove daemon on port {} from registry: {}", port, e);
-            println!("===> WARNING: Failed to remove daemon on port {} from registry", port);
-            failed_ports.push(format!("Failed to unregister port {}: {}", port, e));
+        // === CLEANUP: ZMQ SOCKET (only if daemon wasn't CLI process) ===
+        if daemon.as_ref().map_or(true, |d| d.pid != std::process::id()) {
+            if Path::new(&socket_path).exists() && !is_socket_used_by_cli(&socket_path).await.unwrap_or(false) {
+                if let Err(e) = std::fs::remove_file(&socket_path) {
+                    warn!("Failed to remove ZMQ socket file at {}: {}", socket_path, e);
+                    println!("===> WARNING: Failed to remove ZMQ socket at {}", socket_path);
+                    failed_ports.push(format!("Failed to remove socket {}: {}", socket_path, e));
+                } else {
+                    info!("Successfully removed ZMQ socket file at {}", socket_path);
+                    println!("===> SUCCESSFULLY REMOVED ZMQ SOCKET FILE AT {}", socket_path);
+                }
+            }
         } else {
-            info!("Storage daemon on port {} removed from registry.", port);
-            println!("===> STORAGE DAEMON ON PORT {} REMOVED FROM REGISTRY", port);
+            info!("Daemon on port {} was CLI process, keeping socket file.", port);
+            println!("===> DAEMON ON PORT {} WAS CLI PROCESS, KEEPING SOCKET FILE", port);
         }
 
         // === FINAL PORT CHECK WITH RETRIES ===
@@ -1290,6 +1310,11 @@ pub async fn stop_storage_interactive(
                     println!("===> STRAY PROCESS (PID {}) FOUND ON PORT {}. SENDING SIGKILL...", pid, port);
                     let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
                     sleep(TokioDuration::from_millis(1000)).await;
+                } else if pid == std::process::id() {
+                    // If the port is still in use by the CLI process, that's expected and not an error
+                    info!("Port {} still in use by CLI process, which is expected.", port);
+                    println!("===> PORT {} STILL IN USE BY CLI PROCESS, WHICH IS EXPECTED", port);
+                    break; // Exit the retry loop since this is expected behavior
                 }
             }
             sleep(TokioDuration::from_millis(1000)).await;
@@ -1299,6 +1324,10 @@ pub async fn stop_storage_interactive(
         if is_port_free(port).await {
             info!("Port {} is now free.", port);
             println!("===> PORT {} IS NOW FREE", port);
+        } else if find_pid_by_port(port).await.map_or(false, |pid| pid == std::process::id()) {
+            // If port is still in use by CLI process, that's expected and not an error
+            info!("Port {} still in use by CLI process, which is expected.", port);
+            println!("===> PORT {} STILL IN USE BY CLI PROCESS, WHICH IS EXPECTED", port);
         } else {
             let msg = if let Some(pid) = find_pid_by_port(port).await {
                 let system = System::new_with_specifics(RefreshKind::everything().with_processes(ProcessRefreshKind::everything()));

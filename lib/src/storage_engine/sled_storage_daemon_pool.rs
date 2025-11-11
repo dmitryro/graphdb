@@ -3870,41 +3870,66 @@ impl SledDaemonPool {
         } else {
             ReplicationStrategy::NNodes(self.load_balancer.replication_factor)
         };
-        
-        let write_nodes = self.load_balancer.get_write_nodes(strategy).await;
-        
+
+        // ──────────────────────────────────────────────────────────────
+        // 1. GET WRITE NODES — BUT ONLY AFTER HEALTH IS MARKED
+        // ──────────────────────────────────────────────────────────────
+        let write_nodes = self.load_balancer.get_write_nodes(strategy.clone()).await;
+
+        // ──────────────────────────────────────────────────────────────
+        // 2. DEBUG: SHOW WHAT WE SEE
+        // ──────────────────────────────────────────────────────────────
+        let all_nodes = self.load_balancer.get_all_nodes().await;
+        let healthy_nodes = self.load_balancer.get_healthy_nodes().await;
+        println!("===> [INSERT_REPLICATED] ALL NODES: {:?}", all_nodes);
+        println!("===> [INSERT_REPLICATED] HEALTHY NODES: {:?}", healthy_nodes);
+        println!("===> [INSERT_REPLICATED] WRITE NODES (strategy={:?}): {:?}", strategy, write_nodes);
+
         if write_nodes.is_empty() {
+            error!("===> [INSERT_REPLICATED] NO HEALTHY NODES — WRITE FAILED");
             return Err(GraphError::StorageError("No healthy nodes available for write operation".to_string()));
         }
-        
+
         println!("===> REPLICATED INSERT: Writing to {} nodes: {:?}", write_nodes.len(), write_nodes);
-        
-        // For Raft, use leader-based replication
-         #[cfg(feature = "with-openraft-sled")]
+
+        // ──────────────────────────────────────────────────────────────
+        // 3. RAFT PATH
+        // ──────────────────────────────────────────────────────────────
+        #[cfg(feature = "with-openraft-rocksdb")]
         if matches!(strategy, ReplicationStrategy::Raft) && self.use_raft_for_scale {
             return self.insert_raft(key, value).await;
         }
-        
-        // For non-Raft replication, write to multiple nodes
+
+        // ──────────────────────────────────────────────────────────────
+        // 4. NON-RAFT: WRITE TO ALL SELECTED NODES
+        // ──────────────────────────────────────────────────────────────
         let mut success_count = 0;
         let mut errors = Vec::new();
-        
-        for port in &write_nodes {
-            match self.insert_to_node(*port, key, value).await {
+
+        for &port in &write_nodes {
+            let start_time = std::time::Instant::now();
+            let result = self.insert_to_node(port, key, value).await;
+            let elapsed_ms = start_time.elapsed().as_millis() as u64;
+
+            match result {
                 Ok(_) => {
                     success_count += 1;
                     println!("===> REPLICATED INSERT: Success on node {}", port);
-                    self.load_balancer.update_node_health(*port, true, 0).await;
+                    // Mark as healthy with actual response time
+                    self.load_balancer.update_node_health(port, true, elapsed_ms).await;
                 }
                 Err(e) => {
-                    errors.push((*port, e));
+                    errors.push((port, e));
                     println!("===> REPLICATED INSERT: Failed on node {}: {:?}", port, errors.last().unwrap().1);
-                    self.load_balancer.update_node_health(*port, false, 0).await;
+                    // Mark as unhealthy with response time
+                    self.load_balancer.update_node_health(port, false, elapsed_ms).await;
                 }
             }
         }
-        
-        // Require majority success for write confirmation
+
+        // ──────────────────────────────────────────────────────────────
+        // 5. QUORUM CHECK
+        // ──────────────────────────────────────────────────────────────
         let required_success = (write_nodes.len() / 2) + 1;
         if success_count >= required_success {
             println!("===> REPLICATED INSERT: Success! {}/{} nodes confirmed write", success_count, write_nodes.len());
@@ -4404,6 +4429,11 @@ impl SledDaemonPool {
         if *initialized {
             warn!("SledDaemonPool already initialized, skipping");
             println!("===> WARNING: SLED DAEMON POOL ALREADY INITIALIZED, SKIPPING");
+            
+            // Ensure the node is marked healthy in the load balancer even if already initialized
+            let port = cli_port.unwrap_or(config.port.unwrap_or(8052));
+            self.load_balancer.update_node_health(port, true, 0).await;
+            println!("===> [LB] NODE {} MARKED HEALTHY IN SLED LOAD BALANCER (ALREADY INITIALIZED)", port);
             return Ok(());
         }
         let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;

@@ -159,7 +159,7 @@ impl RocksDBStorage {
         Self::ensure_single_instance(&db_path).await?;
         Self::force_unlock(&db_path).await?;
 
-        // 2. Pool
+        // 2. Pool - reuse existing pool from singleton map
         let pool_map = ROCKSDB_POOL_MAP.get_or_init(|| async { TokioMutex::new(HashMap::new()) }).await;
         let pool = {
             let mut guard = timeout(TokioDuration::from_secs(5), pool_map.lock()).await?;
@@ -172,7 +172,7 @@ impl RocksDBStorage {
             }
         };
 
-        // 3. Init cluster
+        // 3. Init cluster - this will handle initialization and health registration
         {
             let mut pool_guard = timeout(TokioDuration::from_secs(10), pool.lock()).await?;
             timeout(
@@ -300,6 +300,7 @@ impl RocksDBStorage {
             raft: None,
         })
     }
+
     // Assuming other necessary imports like fs, PathBuf, log, GraphError, DaemonMetadata, etc. are defined earlier
 
     // NOTE: The function signature has been updated to accept the client tuple
