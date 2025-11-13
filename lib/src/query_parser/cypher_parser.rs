@@ -13,15 +13,15 @@ use nom::{
     Parser,
 };
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{ BTreeMap, HashMap};
 use std::sync::Arc;
 use uuid::Uuid;
 use models::identifiers::{Identifier, SerializableUuid};
-use models::{Vertex, Edge};
+use models::{Vertex, Edge, properties::PropertyValue};
 use models::errors::{GraphError, GraphResult};
 use models::properties::SerializableFloat;
 use crate::database::Database;
-use crate::storage_engine::StorageEngine;
+use crate::storage_engine::{GraphStorageEngine, StorageEngine};
 
 // Enum to represent parsed Cypher queries
 #[derive(Debug, PartialEq)]
@@ -403,32 +403,15 @@ pub fn parse_cypher(query: &str) -> Result<CypherQuery, String> {
     }
 }
 
-// Convert serde_json::Value to models::PropertyValue
-fn to_property_value(value: Value) -> GraphResult<models::PropertyValue> {
-    match value {
-        Value::String(s) => Ok(models::PropertyValue::String(s)),
-        Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Ok(models::PropertyValue::Integer(i))
-            } else if let Some(f) = n.as_f64() {
-                Ok(models::PropertyValue::Float(SerializableFloat(f)))
-            } else {
-                Err(GraphError::InvalidData("Unsupported number type".to_string()))
-            }
-        }
-        _ => Err(GraphError::InvalidData("Unsupported value type".to_string())),
-    }
-}
-
-// Execute a parsed Cypher query against the database and storage engine
+/// Execute a parsed Cypher query against the database and storage engine
 pub async fn execute_cypher(
     query: CypherQuery,
-    db: &Database,
-    storage: Arc<dyn StorageEngine + Send + Sync>,
+    _db: &Database,
+    storage: Arc<dyn GraphStorageEngine + Send + Sync>,
 ) -> GraphResult<Value> {
     match query {
         CypherQuery::CreateNode { label, properties } => {
-            let props: GraphResult<HashMap<String, models::PropertyValue>> = properties
+            let props: GraphResult<HashMap<String, PropertyValue>> = properties
                 .into_iter()
                 .map(|(k, v)| to_property_value(v).map(|pv| (k, pv)))
                 .collect();
@@ -437,13 +420,14 @@ pub async fn execute_cypher(
                 label: Identifier::new(label)?,
                 properties: props?,
             };
-            db.create_vertex(vertex.clone()).await?;
+            storage.create_vertex(vertex.clone()).await?;
             Ok(json!({ "vertex": vertex }))
         }
+
         CypherQuery::CreateNodes { nodes } => {
             let mut created_vertices = Vec::new();
             for (label, properties) in nodes {
-                let props: GraphResult<HashMap<String, models::PropertyValue>> = properties
+                let props: GraphResult<HashMap<String, PropertyValue>> = properties
                     .into_iter()
                     .map(|(k, v)| to_property_value(v).map(|pv| (k, pv)))
                     .collect();
@@ -452,14 +436,15 @@ pub async fn execute_cypher(
                     label: Identifier::new(label)?,
                     properties: props?,
                 };
-                db.create_vertex(vertex.clone()).await?;
+                storage.create_vertex(vertex.clone()).await?;
                 created_vertices.push(vertex);
             }
             Ok(json!({ "vertices": created_vertices }))
         }
+
         CypherQuery::MatchNode { label, properties } => {
-            let vertices = db.get_all_vertices().await?;
-            let props: GraphResult<HashMap<String, models::PropertyValue>> = properties
+            let vertices = storage.get_all_vertices().await?;
+            let props: GraphResult<HashMap<String, PropertyValue>> = properties
                 .into_iter()
                 .map(|(k, v)| to_property_value(v).map(|pv| (k, pv)))
                 .collect();
@@ -473,45 +458,58 @@ pub async fn execute_cypher(
             }).collect::<Vec<_>>();
             Ok(json!({ "vertices": filtered }))
         }
-        CypherQuery::CreateEdge { from_id, edge_type, to_id } => {
+
+        CypherQuery::CreateEdge {
+            from_id,
+            edge_type,
+            to_id,
+        } => {
             let edge = Edge {
                 id: SerializableUuid(Uuid::new_v4()),
                 outbound_id: from_id,
                 t: Identifier::new(edge_type)?,
                 inbound_id: to_id,
-                label: "relationship".to_string(), // Use String instead of Identifier
-                properties: std::collections::BTreeMap::new(), // Use BTreeMap instead of HashMap
+                label: "relationship".to_string(),
+                properties: BTreeMap::new(),
             };
-            db.create_edge(edge.clone()).await?;
+            storage.create_edge(edge.clone()).await?;
             Ok(json!({ "edge": edge }))
         }
+
         CypherQuery::SetNode { id, properties } => {
-            let mut vertex = db.get_vertex(&id.0).await?.ok_or_else(|| {
+            let mut vertex = storage.get_vertex(&id.0).await?.ok_or_else(|| {
                 GraphError::StorageError(format!("Vertex not found: {}", id.0))
             })?;
-            let props: GraphResult<HashMap<String, models::PropertyValue>> = properties
+            let props: GraphResult<HashMap<String, PropertyValue>> = properties
                 .into_iter()
                 .map(|(k, v)| to_property_value(v).map(|pv| (k, pv)))
                 .collect();
             vertex.properties.extend(props?);
-            db.update_vertex(vertex.clone()).await?;
+            storage.update_vertex(vertex.clone()).await?;
             Ok(json!({ "vertex": vertex }))
         }
+
         CypherQuery::DeleteNode { id } => {
-            db.delete_vertex(&id.0).await?;
+            storage.delete_vertex(&id.0).await?;
             Ok(json!({ "deleted": id }))
         }
+
         CypherQuery::SetKeyValue { key, value } => {
             let kv_key = key.clone().into_bytes();
             storage.insert(kv_key, value.as_bytes().to_vec()).await?;
             storage.flush().await?;
             Ok(json!({ "key": key, "value": value }))
         }
+
         CypherQuery::GetKeyValue { key } => {
             let kv_key = key.clone().into_bytes();
             let value = storage.retrieve(&kv_key).await?;
-            Ok(json!({ "key": key, "value": value.map(|v| String::from_utf8_lossy(&v).to_string()) }))
+            Ok(json!({
+                "key": key,
+                "value": value.map(|v| String::from_utf8_lossy(&v).to_string())
+            }))
         }
+
         CypherQuery::DeleteKeyValue { key } => {
             let kv_key = key.clone().into_bytes();
             let existed = storage.retrieve(&kv_key).await?.is_some();
@@ -521,6 +519,20 @@ pub async fn execute_cypher(
             }
             Ok(json!({ "key": key, "deleted": existed }))
         }
+    }
+}
+
+/// Helper to convert Cypher `Value` → `PropertyValue`
+fn to_property_value(v: Value) -> GraphResult<PropertyValue> {
+    match v {
+        Value::String(s) => Ok(PropertyValue::String(s)),
+        Value::Number(n) if n.is_i64() => Ok(PropertyValue::Integer(n.as_i64().unwrap())),
+        Value::Number(n) if n.is_f64() => Ok(PropertyValue::Float(SerializableFloat(n.as_f64().unwrap()))),
+        Value::Bool(b) => Ok(PropertyValue::Boolean(b)),
+        Value::Null => Err(GraphError::InternalError("Null values not supported in properties".into())),
+        Value::Array(_) => Err(GraphError::InternalError("Array values not supported in properties".into())),
+        Value::Object(_) => Err(GraphError::InternalError("Nested objects not supported in properties".into())),
+        _ => Err(GraphError::InternalError("Unsupported property value type".into())),
     }
 }
 
