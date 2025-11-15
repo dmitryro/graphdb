@@ -636,7 +636,7 @@ impl Default for SledConfig {
             port: Some(8049),
             path: PathBuf::from("/opt/graphdb/storage_data/sled"),
             temporary: false,
-            use_compression: true,
+            use_compression: false,
             cache_capacity: None,
             storage_engine_type: StorageEngineType::Sled,
         }

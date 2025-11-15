@@ -40,7 +40,7 @@ where
             database: None,
             pd_endpoints: None,
             cache_capacity: Some(1024*1024*1024),
-            use_compression: true,
+            use_compression: false,
             temporary: false,
             use_raft_for_scale: false,
         };
@@ -187,7 +187,7 @@ pub fn create_default_selected_storage_config(engine_type: &StorageEngineType) -
             None
         },
         cache_capacity: Some(1024*1024*1024),
-        use_compression: true,
+        use_compression: false,
         temporary: false, 
         use_raft_for_scale: false,
     };
@@ -488,7 +488,7 @@ pub fn create_default_engine_specific_config(engine_type: &StorageEngineType) ->
                 database: None,
                 pd_endpoints: None,
                 cache_capacity: Some(1024*1024*1024),
-                use_compression: true,
+                use_compression: false,
                 temporary: false,
                 use_raft_for_scale: false,
             }
@@ -504,7 +504,7 @@ pub fn create_default_engine_specific_config(engine_type: &StorageEngineType) ->
                 database: None,
                 pd_endpoints: None,
                 cache_capacity: Some(1024*1024*1024),
-                use_compression: true,
+                use_compression: false,
                 temporary: false,
                 use_raft_for_scale: false,
             }
@@ -520,7 +520,7 @@ pub fn create_default_engine_specific_config(engine_type: &StorageEngineType) ->
                 database: None,
                 pd_endpoints: None,
                 cache_capacity: Some(1024*1024*1024),
-                use_compression: true,
+                use_compression: false,
                 temporary: false,
                 use_raft_for_scale: false,
             }
@@ -536,7 +536,7 @@ pub fn create_default_engine_specific_config(engine_type: &StorageEngineType) ->
                 database: None,
                 pd_endpoints: None,
                 cache_capacity: Some(1024*1024*1024),
-                use_compression: true,
+                use_compression: false,
                 temporary: false,
                 use_raft_for_scale: false,
             }
@@ -552,7 +552,7 @@ pub fn create_default_engine_specific_config(engine_type: &StorageEngineType) ->
                 database: Some("graphdb".to_string()),
                 pd_endpoints: None,
                 cache_capacity: Some(1024*1024*1024),
-                use_compression: true,
+                use_compression: false,
                 temporary: false,
                 use_raft_for_scale: false,
             }
@@ -568,7 +568,7 @@ pub fn create_default_engine_specific_config(engine_type: &StorageEngineType) ->
                 database: Some("graphdb".to_string()),
                 pd_endpoints: None,
                 cache_capacity: Some(1024*1024*1024),
-                use_compression: true,
+                use_compression: false,
                 temporary: false,
                 use_raft_for_scale: false,
             }
@@ -584,7 +584,7 @@ pub fn create_default_engine_specific_config(engine_type: &StorageEngineType) ->
                 database: None,
                 pd_endpoints: None,
                 cache_capacity: Some(1024*1024*1024),
-                use_compression: true,
+                use_compression: false,
                 temporary: false,
                 use_raft_for_scale: false,
             }
@@ -600,7 +600,7 @@ pub fn create_default_engine_specific_config(engine_type: &StorageEngineType) ->
                 database: None,
                 pd_endpoints: None,
                 cache_capacity: Some(1024*1024*1024),
-                use_compression: true,
+                use_compression: false,
                 temporary: false,
                 use_raft_for_scale: false,
             }
@@ -958,7 +958,7 @@ pub fn create_default_yaml_config(yaml_path: &PathBuf, engine_type: StorageEngin
             database: None,
             pd_endpoints: None,
             cache_capacity: Some(1024*1024*1024),
-            use_compression: true,
+            use_compression: false,
             temporary: false,
             use_raft_for_scale: false,
         }
