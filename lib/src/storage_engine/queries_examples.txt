@@ -1,0 +1,190 @@
+1. Get all vertices:
+MATCH (n) RETURN n
+
+2. Get all Person vertices:
+MATCH (n:Person) RETURN n
+
+3. Get specific vertices by property:
+MATCH (n:Person {name: 'Charlie Sheen'}) RETURN n
+or
+MATCH (n:Person {name: 'Oliver Stone'}) RETURN n
+
+4. Get vertices with multiple labels:
+MATCH (n:Person:Actor) RETURN n
+or
+MATCH (n:Person:Director) RETURN n
+
+5. Get all vertices with their labels and properties:
+MATCH (n) RETURN n.name, labels(n) AS labels
+
+6. Count total vertices:
+MATCH (n) RETURN count(n) AS total_vertices
+
+7.
+CREATE (charlie:Person:Actor {name: 'Charlie Sheen'}), (oliver:Person:Director {name: 'Oliver Stone'})
+or
+CREATE (charlie:Person&Actor {name: 'Charlie Sheen'}), (oliver:Person&Director {name: 'Oliver Stone'})
+
+
+-- 1. Create test data
+CREATE (:Person {id: "test1", name: "Test User 1", age: 42});
+
+-- 2. Read back
+MATCH (p:Person {id: "test1"}) RETURN p;
+
+-- 3. Update
+MATCH (p:Person {id: "test1"}) SET p.age = 43 RETURN p;
+
+-- 4. Create edge
+MATCH (a:Person {id: "test1"}), (b:Person {id: "alice"})
+CREATE (a)-[:TEST_EDGE {weight: 1.0}]->(b);
+
+-- 5. Query edge
+MATCH (a:Person {id: "test1"})-[r:TEST_EDGE]->(b)
+RETURN a.name, type(r), b.name, r.weight;
+
+-- 6. Delete edge
+MATCH (a:Person {id: "test1"})-[r:TEST_EDGE]->()
+DELETE r;
+
+-- 7. Delete vertex
+MATCH (p:Person {id: "test1"}) DETACH DELETE p;
+
+-- 1. Basic: Create a few people and relationships
+CREATE (:Person {id: "alice", name: "Alice", age: 30, active: true, score: 95.5});
+CREATE (:Person {id: "bob", name: "Bob", age: 35, active: true, score: 87.2});
+CREATE (:Person {id: "charlie", name: "Charlie", age: 28, active: false});
+
+CREATE (:Person {id: "diana", name: "Diana", age: 32})
+RETURN "Diana created" AS result;
+
+-- 2. Create relationships
+MATCH (a:Person {id: "alice"}), (b:Person {id: "bob"})
+CREATE (a)-[:KNOWS {since: 2018, strength: 0.9}]->(b);
+
+MATCH (a:Person {id: "alice"}), (c:Person {id: "charlie"})
+CREATE (a)-[:KNOWS {since: 2020, strength: 0.6}]->(c);
+
+MATCH (b:Person {id: "bob"}), (d:Person {id: "diana"})
+CREATE (b)-[:WORKS_WITH {project: "GraphDB"}]->(d);
+
+-- 3. Simple lookup by ID (most common test)
+MATCH (p:Person {id: "alice"}) RETURN p;
+
+-- 4. Get all vertices (should return all 4 people)
+MATCH (n) RETURN n;
+
+-- 5. Get all edges (should return 3 relationships)
+MATCH ()-[r]->() RETURN r;
+
+-- 6. Find friends of Alice
+MATCH (alice:Person {id: "alice"})-[:KNOWS]->(friend)
+RETURN friend.name AS friend_name, friend.age, friend.active;
+
+-- 7. Find who Alice knows, with relationship properties
+MATCH (alice:Person {id: "alice"})-[r:KNOWS]->(friend)
+RETURN friend.name, r.since, r.strength
+ORDER BY r.strength DESC;
+
+-- 8. Bidirectional friendship (Alice knows Bob AND Bob knows Alice)
+MATCH (a:Person {id: "alice"})-[:KNOWS]->(b:Person {id: "bob"}),
+      (b)-[:KNOWS]->(a)
+RETURN a.name, b.name;
+
+-- 9. Find people older than 30
+MATCH (p:Person)
+WHERE p.age > 30
+RETURN p.id, p.name, p.age;
+
+-- 10. Filter with multiple conditions
+MATCH (p:Person)
+WHERE p.age >= 30 AND p.active = true
+RETURN p.name, p.age;
+
+-- 11. Use string functions and case-insensitive search
+MATCH (p:Person)
+WHERE toLower(p.name) CONTAINS "ali"
+RETURN p;
+
+-- 12. Shortest path (very important for graph traversal testing)
+MATCH (alice:Person {id: "alice"}), (diana:Person {id: "diana"})
+MATCH path = shortestPath((alice)-[*..5]-(diana))
+RETURN [n IN nodes(path) | n.name] AS path_nodes,
+       [r IN relationships(path) | type(r)] AS edge_types;
+
+-- 13. All paths up to depth 3
+MATCH path = (a:Person {id: "alice"})-[*1..3]-(x)
+RETURN path
+LIMIT 20;
+
+-- 14. Count relationships per person
+MATCH (p:Person)-[r]->()
+RETURN p.name AS person, count(r) AS outgoing_count
+ORDER BY outgoing_count DESC;
+
+-- 15. Aggregation: average age of active users
+MATCH (p:Person)
+WHERE p.active = true
+RETURN avg(p.age) AS avg_active_age;
+
+-- 16. Update a vertex property
+MATCH (p:Person {id: "alice"})
+SET p.age = 31, p.last_seen = timestamp()
+RETURN p;
+
+-- 17. Add a new label
+MATCH (p:Person {id: "alice"})
+SET p:Employee
+RETURN labels(p);
+
+-- 18. Remove a property
+MATCH (p:Person {id: "bob"})
+REMOVE p.score
+RETURN p;
+
+-- 19. Update edge property
+MATCH (:Person {id: "alice"})-[r:KNOWS]->(:Person {id: "bob"})
+SET r.strength = 0.95, r.last_met = date()
+RETURN r;
+
+-- 20. Delete an edge
+MATCH (:Person {id: "alice"})-[r:KNOWS]->(:Person {id: "charlie"})
+DELETE r;
+
+-- 21. Delete a vertex (and all its relationships)
+MATCH (c:Person {id: "charlie"})
+DETACH DELETE c;
+
+-- 22. Optional match (should return nulls safely)
+MATCH (p:Person {id: "diana"})
+OPTIONAL MATCH (p)-[r:KNOWS]->(friend)
+RETURN p.name, friend.name AS knows_someone;
+
+-- 23. Complex pattern with multiple edge types
+MATCH (a:Person {id: "alice"})-[:KNOWS|WORKS_WITH]->(b)
+RETURN a.name, type(r), b.name;
+
+-- 24. Collect into lists (great for testing array handling)
+MATCH (p:Person)
+RETURN collect(p.name) AS all_names,
+       collect(p.age) AS all_ages;
+
+-- 25. Large batch create (stress test)
+UNWIND [
+  {id: "u100", name: "User100", age: 25},
+  {id: "u101", name: "User101", age: 29},
+  {id: "u102", name: "User102", age: 33}
+] AS user
+CREATE (:Person {id: user.id, name: user.name, age: user.age});
+
+-- 26. Case-sensitive vs insensitive
+MATCH (p:Person)
+WHERE p.name =~ "(?i)alice"
+RETURN p;
+
+-- 27. Exists check
+MATCH (p:Person {id: "alice"})
+RETURN exists(p.last_seen) AS has_last_seen;
+
+-- 28. Clear everything (use with caution!)
+MATCH (n) DETACH DELETE n;

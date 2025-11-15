@@ -415,8 +415,9 @@ pub struct RocksDBClient {
 }
 
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SledClient {
+    pub context: Arc<ZmqContext>,  // ADD THIS - share context, not socket
     /// The actual Sled database handle (only present in local mode). 
     /// Protected by Arc and TokioMutex for thread-safe access.
     pub inner: Option<Arc<TokioMutex<Arc<Db>>>>,
@@ -432,6 +433,19 @@ pub struct SledClient {
     
     /// The ZMQ socket handle (only present in ZMQ mode), protected for concurrent use.
     pub zmq_socket: Option<Arc<TokioMutex<ZmqSocketWrapper>>>,
+}
+
+impl std::fmt::Debug for SledClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SledClient")
+            .field("context", &"<ZmqContext>") // Placeholder since Context doesn't implement Debug
+            .field("inner", &self.inner)
+            .field("db_path", &self.db_path)
+            .field("is_running", &self.is_running)
+            .field("mode", &self.mode)
+            .field("zmq_socket", &self.zmq_socket)
+            .finish()
+    }
 }
 
 impl Drop for SledClient {

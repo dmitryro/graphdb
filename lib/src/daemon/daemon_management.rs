@@ -3003,6 +3003,11 @@ pub async fn is_zmq_reachable(port: u16) -> bool {
         }
     };
 
+    // Set timeouts to prevent hanging
+    let _ = socket.set_rcvtimeo(2000); // 2 seconds receive timeout
+    let _ = socket.set_sndtimeo(2000); // 2 seconds send timeout
+    let _ = socket.set_linger(100);    // 100ms linger
+
     if socket.connect(&endpoint).is_err() {
         debug!("ZMQ: Connect failed for port {} (endpoint: {})", port, endpoint);
         return false;
@@ -3016,8 +3021,8 @@ pub async fn is_zmq_reachable(port: u16) -> bool {
     }
 
     let mut msg = zmq::Message::new();
-    match tokio::time::timeout(
-        std::time::Duration::from_millis(1000),
+    match timeout(
+        std::time::Duration::from_millis(3000), // 3 second timeout for response
         async {
             socket.recv(&mut msg, 0).is_ok()
         },
@@ -3026,13 +3031,16 @@ pub async fn is_zmq_reachable(port: u16) -> bool {
     {
         Ok(true) => {
             let response = msg.as_str().unwrap_or("");
-            let is_pong = response.contains("pong") || response.contains("success");
-            if is_pong {
+            let is_success = response.contains("\"status\":\"success\"") || 
+                           response.contains("\"status\":\"pong\"") ||
+                           response.contains("success") || 
+                           response.contains("pong");
+            if is_success {
                 debug!("ZMQ: Health check passed for port {}", port);
             } else {
                 debug!("ZMQ: Unexpected response from port {}: {}", port, response);
             }
-            is_pong
+            is_success
         }
         Ok(false) => {
             debug!("ZMQ: Recv failed for port {}", port);

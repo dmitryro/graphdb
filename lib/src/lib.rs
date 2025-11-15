@@ -2,9 +2,9 @@
 // Updated: 2025-07-04 - Refactored to use new storage engine names and removed obsolete imports.
 
 #![cfg_attr(feature = "bench-suite", feature(test))]
-
+pub mod durability;
 pub mod query_parser;
-pub mod engine;
+pub mod graph_engine;
 pub mod graph_evolution;
 pub mod network_interfaces;
 pub mod plugin_system;
@@ -76,7 +76,7 @@ pub use crate::config::RocksDBStorage; // Re-export the new RocksDB storage
 // Do NOT glob-import engine and models together to avoid ambiguity
 // Instead, re-export them under namespaces
 pub mod api {
-    pub use crate::engine::{
+    pub use crate::graph_engine::{
         Graph,
         Edge as EngineEdge,
         Vertex as EngineVertex,
