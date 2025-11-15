@@ -177,7 +177,7 @@ pub mod selected_storage_config_serde {
                         database: None,
                         pd_endpoints: temp_config.pd_endpoints,
                         cache_capacity: Some(1024 * 1024 * 1024),
-                        use_compression: true,
+                        use_compression: false,
                         temporary: temp_config.temporary,
                         use_raft_for_scale: temp_config.use_raft_for_scale,
                     },
