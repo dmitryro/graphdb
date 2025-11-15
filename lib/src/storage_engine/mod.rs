@@ -125,7 +125,7 @@ pub async fn create_storage(config: &StorageConfig) -> Result<Arc<dyn GraphStora
                         port: None,
                         cache_capacity: None,
                         temporary: false, // Added missing field
-                        use_compression: true, // Added missing field
+                        use_compression: false, // Added missing field
                         use_raft_for_scale: false, // Added missing field
                         max_background_jobs: Some(1000),
                     },
@@ -182,7 +182,7 @@ pub async fn create_storage(config: &StorageConfig) -> Result<Arc<dyn GraphStora
                                     port: None,
                                     cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
                                     temporary: false,
-                                    use_compression: true,
+                                    use_compression: false,
                                 },
                             };
 
@@ -215,7 +215,7 @@ pub async fn create_storage(config: &StorageConfig) -> Result<Arc<dyn GraphStora
                                     port: None,
                                     cache_capacity: None,
                                     temporary: false, // Added missing field
-                                    use_compression: true, // Added missing field
+                                    use_compression: false, // Added missing field
                                     use_raft_for_scale: false, // Added missing field
                                     max_background_jobs: Some(1000),
                                 },
@@ -298,7 +298,7 @@ pub async fn create_storage(config: &StorageConfig) -> Result<Arc<dyn GraphStora
                         port: None,
                         cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
                         temporary: false,
-                        use_compression: true,
+                        use_compression: false,
                     },
                 };
 
