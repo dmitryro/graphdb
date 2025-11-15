@@ -32,14 +32,8 @@ use sysinfo::{System, RefreshKind, ProcessRefreshKind, Pid, ProcessesToUpdate};
 use sled::Config;
 
 pub static SLED_DB: LazyLock<OnceCell<TokioMutex<SledDbWithPath>>> = LazyLock::new(|| OnceCell::new());
-
-//pub static SLED_DB: LazyLock<OnceCell<TokioMutex<SledDbWithPath>>> = LazyLock::new(|| OnceCell::new());
 pub static SLED_POOL_MAP: LazyLock<OnceCell<TokioMutex<HashMap<u16, Arc<TokioMutex<SledDaemonPool>>>>>> = LazyLock::new(|| OnceCell::new());
-
-// Static variable to track active Sled database instances
 pub static SLED_ACTIVE_DATABASES: LazyLock<OnceCell<TokioMutex<HashSet<PathBuf>>>> = LazyLock::new(|| OnceCell::new());
-// Global ZMQ Connection Pool Map, keyed by "host:port".
-static ZMQ_CLIENT_POOL_MAP: OnceCell<TokioMutex<HashMap<String, Arc<TokioMutex<SledDaemonPool>>>>> = OnceCell::const_new();
 
 impl SledStorage {
     /// Ensures that only one instance of the database at the given path is active.
@@ -71,9 +65,8 @@ impl SledStorage {
         info!("Checking for stale Sled daemon on port {} with db_path {:?}", port, db_path);
         println!("===> CHECKING FOR STALE SLED DAEMON ON PORT {} WITH DB_PATH {:?}", port, db_path);
 
-        // 1. Check and clean up stale IPC socket file
         let ipc_path = get_ipc_endpoint(port);
-        let socket_path = &ipc_path[6..]; // Remove "ipc://" prefix
+        let socket_path = &ipc_path[6..];
         if std::path::Path::new(socket_path).exists() { 
             warn!("Stale IPC socket found at {}. Attempting cleanup.", ipc_path);
             println!("===> WARNING: STALE IPC SOCKET FOUND AT {}. ATTEMPTING CLEANUP.", ipc_path);
@@ -97,7 +90,6 @@ impl SledStorage {
         info!("Initializing SledStorage with config at {:?}", config.path);
         println!("===> INITIALIZING SLED STORAGE WITH PORT {:?}", config.port);
 
-        // === FIX: SCAN REGISTRY FOR ANY ACTIVE SLED DAEMON (NOT JUST CONFIG PORT) ===
         let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
         let mut active_port: Option<u16> = None;
 
@@ -118,16 +110,13 @@ impl SledStorage {
             }
         }
 
-        // === USE ACTIVE PORT OR FALLBACK TO CONFIG ===
         let port = active_port.unwrap_or_else(|| config.port.unwrap_or(DEFAULT_STORAGE_PORT));
         let ipc_endpoint = get_ipc_endpoint(port);
         let default_data_dir = PathBuf::from(DEFAULT_DATA_DIRECTORY);
         let base_data_dir = storage_config.data_directory.as_ref().unwrap_or(&default_data_dir);
         let db_path = base_data_dir.join("sled").join(port.to_string());
-        info!("Using Sled path (for identification only) {:?}", db_path);
-        println!("===> USING SLED PATH (FOR IDENTIFICATION ONLY) {:?}", db_path);
-        info!("Calculated ZMQ IPC endpoint: {}", ipc_endpoint);
-        println!("===> CALCULATED ZMQ IPC ENDPOINT: {}", ipc_endpoint);
+        info!("Using Sled path {:?}", db_path);
+        println!("===> USING SLED PATH {:?}", db_path);
 
         #[cfg(not(feature = "compression"))]
         if config.use_compression {
@@ -138,7 +127,6 @@ impl SledStorage {
             ));
         }
 
-        // === 1. Check GLOBAL_DAEMON_REGISTRY for existing healthy daemon (on the FINAL port) ===
         if let Some(meta) = daemon_registry.get_daemon_metadata(port).await? {
             if meta.data_dir == Some(db_path.clone())
                 && meta.engine_type == Some("sled".to_string())
@@ -155,7 +143,6 @@ impl SledStorage {
                     info!("Reusing existing SledDaemonPool for port {}", port);
                     println!("===> REUSING EXISTING SLED DAEMON POOL FOR PORT {}", port);
                     
-                    // Ensure the node is marked healthy in the load balancer even when reusing
                     {
                         let mut pool_guard = timeout(TokioDuration::from_secs(5), existing_pool.lock()).await
                             .map_err(|_| GraphError::StorageError("Failed to acquire pool lock".to_string()))?;
@@ -168,10 +155,8 @@ impl SledStorage {
             }
         }
 
-        // === 2. Clean up stale daemon (only if not healthy) ===
         Self::check_and_cleanup_stale_daemon(port, &db_path).await?;
 
-        // === 3. Acquire or create SledDaemonPool ===
         let pool = {
             let pool_map = SLED_POOL_MAP.get_or_init(|| async { TokioMutex::new(HashMap::new()) }).await;
             let mut pool_map_guard = timeout(TokioDuration::from_secs(5), pool_map.lock()).await
@@ -189,18 +174,16 @@ impl SledStorage {
             }
         };
 
-        // === 4. Initialize cluster ===
         {
             let mut pool_guard = timeout(TokioDuration::from_secs(10), pool.lock()).await
                 .map_err(|_| GraphError::StorageError("Failed to acquire pool lock".to_string()))?;
-            info!("Initializing cluster with use_raft_for_scale: {}", storage_config.use_raft_for_scale);
-            println!("===> INITIALIZING CLUSTER WITH USE_RAFT_FOR_SCALE: {}", storage_config.use_raft_for_scale);
+            info!("Initializing cluster");
+            println!("===> INITIALIZING CLUSTER");
             pool_guard.initialize_cluster(storage_config, config, Some(port)).await?;
             info!("Initialized cluster on port {}", port);
             println!("===> INITIALIZED CLUSTER ON PORT {}", port);
         }
 
-        // === 5. Initialize SLED_DB singleton (temp) ===
         let sled_db_instance = SLED_DB.get_or_try_init(|| async {
             info!("Initializing SLED_DB singleton for ZMQ client at port {}", port);
             println!("===> INITIALIZING SLED_DB SINGLETON FOR ZMQ CLIENT AT PORT {}", port);
@@ -215,7 +198,6 @@ impl SledStorage {
             }))
         }).await?;
 
-        // === 6. Initialize ZMQ client ===
         let client_tuple = {
             const MAX_RETRIES: usize = 20;
             const INITIAL_RETRY_DELAY_MS: u64 = 100;
@@ -245,13 +227,11 @@ impl SledStorage {
             })?
         };
 
-        // === 7. Store client in singleton ===
         {
             let mut sled_db_guard = sled_db_instance.lock().await;
             sled_db_guard.client = Some(client_tuple);
         }
 
-        // === 8. DO NOT REGISTER DAEMON HERE — CLI already did it ===
         info!("Successfully initialized SledStorage in {}ms", start_time.elapsed().as_millis());
         println!("===> SUCCESSFULLY INITIALIZED SledStorage IN {}ms", start_time.elapsed().as_millis());
         Ok(SledStorage { pool })
@@ -266,7 +246,6 @@ impl SledStorage {
         info!("Initializing SledStorage with existing database at {:?}", config.path);
         println!("===> INITIALIZING SLED STORAGE WITH EXISTING DB WITH PORT {:?}", config.port);
 
-        // === FIX: SCAN REGISTRY FOR ANY ACTIVE SLED DAEMON ===
         let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
         let mut active_port: Option<u16> = None;
 
@@ -287,16 +266,13 @@ impl SledStorage {
             }
         }
 
-        // === USE ACTIVE PORT OR FALLBACK TO CONFIG ===
         let port = active_port.unwrap_or_else(|| config.port.unwrap_or(DEFAULT_STORAGE_PORT));
         let ipc_endpoint = get_ipc_endpoint(port);
         let default_data_dir = PathBuf::from(DEFAULT_DATA_DIRECTORY);
         let base_data_dir = storage_config.data_directory.as_ref().unwrap_or(&default_data_dir);
         let db_path = base_data_dir.join("sled").join(port.to_string());
-        info!("Using Sled path (for identification only) {:?}", db_path);
-        println!("===> USING SLED PATH (FOR IDENTIFICATION ONLY) {:?}", db_path);
-        info!("Calculated ZMQ IPC endpoint: {}", ipc_endpoint);
-        println!("===> CALCULATED ZMQ IPC ENDPOINT: {}", ipc_endpoint);
+        info!("Using Sled path {:?}", db_path);
+        println!("===> USING SLED PATH {:?}", db_path);
 
         #[cfg(not(feature = "compression"))]
         if config.use_compression {
@@ -305,7 +281,6 @@ impl SledStorage {
             ));
         }
 
-        // === 1. Reuse healthy daemon from registry ===
         if let Some(meta) = daemon_registry.get_daemon_metadata(port).await? {
             if meta.data_dir == Some(db_path.clone())
                 && meta.engine_type == Some("sled".to_string())
@@ -319,7 +294,6 @@ impl SledStorage {
                 let pool_map_guard = timeout(TokioDuration::from_secs(5), pool_map.lock()).await
                     .map_err(|_| GraphError::StorageError("Timeout acquiring pool map lock".to_string()))?;
                 if let Some(existing_pool) = pool_map_guard.get(&port) {
-                    // Ensure the node is marked healthy in the load balancer even when reusing
                     {
                         let mut pool_guard = timeout(TokioDuration::from_secs(5), existing_pool.lock()).await
                             .map_err(|_| GraphError::StorageError("Failed to acquire pool lock".to_string()))?;
@@ -332,10 +306,8 @@ impl SledStorage {
             }
         }
 
-        // === 2. Clean up stale ===
         Self::check_and_cleanup_stale_daemon(port, &db_path).await?;
 
-        // === 3. Create or get pool ===
         let pool = {
             let pool_map = SLED_POOL_MAP.get_or_init(|| async { TokioMutex::new(HashMap::new()) }).await;
             let mut pool_map_guard = timeout(TokioDuration::from_secs(5), pool_map.lock()).await
@@ -349,7 +321,6 @@ impl SledStorage {
             }
         };
 
-        // === 4. Initialize cluster with existing DB ===
         {
             let mut pool_guard = timeout(TokioDuration::from_secs(10), pool.lock()).await
                 .map_err(|_| GraphError::StorageError("Failed to acquire pool lock".to_string()))?;
@@ -358,7 +329,6 @@ impl SledStorage {
                 .await?;
         }
 
-        // === 5. Store in singleton ===
         let sled_db_instance = SLED_DB.get_or_try_init(|| async {
             let vertices = existing_db.open_tree("vertices").map_err(|e| GraphError::StorageError(e.to_string()))?;
             let edges = existing_db.open_tree("edges").map_err(|e| GraphError::StorageError(e.to_string()))?;
@@ -379,7 +349,6 @@ impl SledStorage {
             }))
         }).await?;
 
-        // === 6. ZMQ client ===
         let client_tuple = {
             const MAX_RETRIES: usize = 20;
             let mut client_tuple_opt: Option<(SledClient, Arc<TokioMutex<ZmqSocketWrapper>>)> = None;
@@ -400,13 +369,11 @@ impl SledStorage {
             client_tuple_opt.unwrap()
         };
 
-        // === 7. Store client ===
         {
             let mut guard = sled_db_instance.lock().await;
             guard.client = Some(client_tuple);
         }
 
-        // === 8. NO REGISTRATION HERE ===
         info!("Successfully initialized SledStorage with existing DB in {}ms", start_time.elapsed().as_millis());
         println!("===> SUCCESSFULLY INITIALIZED SledStorage WITH EXISTING DB IN {}ms", start_time.elapsed().as_millis());
         Ok(SledStorage { pool })
@@ -418,6 +385,280 @@ impl SledStorage {
         Box::new(async move {
             SledStorage::new(&config, &storage_config).await
         })
+    }
+
+    // Internal implementation methods (same pattern as RocksDBStorage)
+    pub async fn add_vertex(&self, vertex: Vertex) -> GraphResult<()> {
+        let singleton = SLED_DB.get()
+            .ok_or_else(|| GraphError::StorageError("Sled singleton not initialized".to_string()))?;
+        
+        let guard = singleton.lock().await;
+        
+        if let Some((client, _socket)) = &guard.client {
+            println!("===> USING ZMQ CLIENT TO ADD VERTEX");
+            let client_clone = client.clone();
+            drop(guard);
+            return client_clone.create_vertex(vertex).await;
+        }
+        
+        println!("========================== USING DIRECT DB ACCESS TO ADD VERTEX ========================");
+        drop(guard);
+        
+        // Fallback to direct access
+        self.create_vertex_direct(vertex).await
+    }
+
+    pub async fn get_vertex_internal(&self, id: &Uuid) -> GraphResult<Option<Vertex>> {
+        let singleton = SLED_DB.get()
+            .ok_or_else(|| GraphError::StorageError("Sled singleton not initialized".to_string()))?;
+        
+        let guard = singleton.lock().await;
+        
+        if let Some((client, _socket)) = &guard.client {
+            println!("===> USING ZMQ CLIENT TO GET VERTEX");
+            let client_clone = client.clone();
+            drop(guard);
+            return client_clone.get_vertex(id).await;
+        }
+        
+        println!("========================== USING DIRECT DB ACCESS TO GET VERTEX ========================");
+        drop(guard);
+        
+        self.get_vertex_direct(id).await
+    }
+
+    pub async fn delete_vertex_internal(&self, id: &Uuid) -> GraphResult<()> {
+        let singleton = SLED_DB.get()
+            .ok_or_else(|| GraphError::StorageError("Sled singleton not initialized".to_string()))?;
+        
+        let guard = singleton.lock().await;
+        
+        if let Some((client, _socket)) = &guard.client {
+            println!("===> USING ZMQ CLIENT TO DELETE VERTEX");
+            let client_clone = client.clone();
+            drop(guard);
+            return client_clone.delete_vertex(id).await;
+        }
+        
+        println!("========================== USING DIRECT DB ACCESS TO DELETE VERTEX ========================");
+        drop(guard);
+        
+        self.delete_vertex_direct(id).await
+    }
+
+    pub async fn add_edge(&self, edge: Edge) -> GraphResult<()> {
+        let singleton = SLED_DB.get()
+            .ok_or_else(|| GraphError::StorageError("Sled singleton not initialized".to_string()))?;
+        
+        let guard = singleton.lock().await;
+        
+        if let Some((client, _socket)) = &guard.client {
+            println!("===> USING ZMQ CLIENT TO ADD EDGE");
+            let client_clone = client.clone();
+            drop(guard);
+            return client_clone.create_edge(edge).await;
+        }
+        
+        println!("========================== USING DIRECT DB ACCESS TO ADD EDGE ========================");
+        drop(guard);
+        
+        self.create_edge_direct(edge).await
+    }
+
+    pub async fn get_edge_internal(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> GraphResult<Option<Edge>> {
+        let singleton = SLED_DB.get()
+            .ok_or_else(|| GraphError::StorageError("Sled singleton not initialized".to_string()))?;
+        
+        let guard = singleton.lock().await;
+        
+        if let Some((client, _socket)) = &guard.client {
+            println!("===> USING ZMQ CLIENT TO GET EDGE");
+            let client_clone = client.clone();
+            drop(guard);
+            return client_clone.get_edge(outbound_id, edge_type, inbound_id).await;
+        }
+        
+        println!("========================== USING DIRECT DB ACCESS TO GET EDGE ========================");
+        drop(guard);
+        
+        self.get_edge_direct(outbound_id, edge_type, inbound_id).await
+    }
+
+    pub async fn delete_edge_internal(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> GraphResult<()> {
+        let singleton = SLED_DB.get()
+            .ok_or_else(|| GraphError::StorageError("Sled singleton not initialized".to_string()))?;
+        
+        let guard = singleton.lock().await;
+        
+        if let Some((client, _socket)) = &guard.client {
+            println!("===> USING ZMQ CLIENT TO DELETE EDGE");
+            let client_clone = client.clone();
+            drop(guard);
+            return client_clone.delete_edge(outbound_id, edge_type, inbound_id).await;
+        }
+        
+        println!("========================== USING DIRECT DB ACCESS TO DELETE EDGE ========================");
+        drop(guard);
+        
+        self.delete_edge_direct(outbound_id, edge_type, inbound_id).await
+    }
+
+    pub async fn get_all_vertices_internal(&self) -> GraphResult<Vec<Vertex>> {
+        let singleton = SLED_DB.get()
+            .ok_or_else(|| GraphError::StorageError("Sled singleton not initialized".to_string()))?;
+        
+        let guard = singleton.lock().await;
+        
+        if let Some((client, _socket)) = &guard.client {
+            println!("===> USING ZMQ CLIENT TO FETCH ALL VERTICES");
+            let client_clone = client.clone();
+            drop(guard);
+            return client_clone.get_all_vertices().await;
+        }
+        
+        println!("========================== USING DIRECT DB ACCESS TO GET ALL VERTICES ========================");
+        drop(guard);
+        
+        self.get_all_vertices_direct().await
+    }
+
+    pub async fn get_all_edges_internal(&self) -> GraphResult<Vec<Edge>> {
+        let singleton = SLED_DB.get()
+            .ok_or_else(|| GraphError::StorageError("Sled singleton not initialized".to_string()))?;
+        
+        let guard = singleton.lock().await;
+        
+        if let Some((client, _socket)) = &guard.client {
+            println!("===> USING ZMQ CLIENT TO FETCH ALL EDGES");
+            let client_clone = client.clone();
+            drop(guard);
+            return client_clone.get_all_edges().await;
+        }
+        
+        println!("========================== USING DIRECT DB ACCESS TO GET ALL EDGES ========================");
+        drop(guard);
+        
+        self.get_all_edges_direct().await
+    }
+
+    // Direct database access methods (fallback)
+    async fn create_vertex_direct(&self, vertex: Vertex) -> GraphResult<()> {
+        let db = SLED_DB.get().ok_or_else(|| GraphError::StorageError("Sled database not initialized".to_string()))?;
+        let db_lock = timeout(TokioDuration::from_secs(5), db.lock())
+            .await
+            .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock".to_string()))?;
+        let db_path = &db_lock.path;
+        info!("Creating vertex at path {:?}", db_path);
+        println!("===> CREATING VERTEX IN SLED DATABASE AT {:?}", db_path);
+
+        let vertices = db_lock.db.open_tree("vertices").map_err(|e| GraphError::StorageError(e.to_string()))?;
+        vertices.insert(vertex.id.0.as_bytes(), serialize_vertex(&vertex)?)
+            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+
+        db_lock.db.flush_async().await.map_err(|e| GraphError::StorageError(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_vertex_direct(&self, id: &Uuid) -> GraphResult<Option<Vertex>> {
+        let db = SLED_DB.get().ok_or_else(|| GraphError::StorageError("Sled database not initialized".to_string()))?;
+        let db_lock = timeout(TokioDuration::from_secs(5), db.lock())
+            .await
+            .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock".to_string()))?;
+
+        let vertices = db_lock.db.open_tree("vertices").map_err(|e| GraphError::StorageError(e.to_string()))?;
+        let vertex = vertices
+            .get(SerializableUuid(*id).0.as_bytes())
+            .map_err(|e| GraphError::StorageError(e.to_string()))?
+            .map(|v| deserialize_vertex(&*v))
+            .transpose()?;
+        Ok(vertex)
+    }
+
+    async fn delete_vertex_direct(&self, id: &Uuid) -> GraphResult<()> {
+        let db = SLED_DB.get().ok_or_else(|| GraphError::StorageError("Sled database not initialized".to_string()))?;
+        let db_lock = timeout(TokioDuration::from_secs(5), db.lock())
+            .await
+            .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock".to_string()))?;
+
+        let vertices = db_lock.db.open_tree("vertices").map_err(|e| GraphError::StorageError(e.to_string()))?;
+        vertices.remove(SerializableUuid(*id).0.as_bytes())
+            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+        db_lock.db.flush_async().await.map_err(|e| GraphError::StorageError(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn create_edge_direct(&self, edge: Edge) -> GraphResult<()> {
+        let db = SLED_DB.get().ok_or_else(|| GraphError::StorageError("Sled database not initialized".to_string()))?;
+        let db_lock = timeout(TokioDuration::from_secs(5), db.lock())
+            .await
+            .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock".to_string()))?;
+
+        let edges = db_lock.db.open_tree("edges").map_err(|e| GraphError::StorageError(e.to_string()))?;
+        let edge_key = create_edge_key(&SerializableUuid(edge.outbound_id.0), &edge.t, &SerializableUuid(edge.inbound_id.0))?;
+        edges.insert(&edge_key, serialize_edge(&edge)?)
+            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+        db_lock.db.flush_async().await.map_err(|e| GraphError::StorageError(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_edge_direct(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> GraphResult<Option<Edge>> {
+        let db = SLED_DB.get().ok_or_else(|| GraphError::StorageError("Sled database not initialized".to_string()))?;
+        let db_lock = timeout(TokioDuration::from_secs(5), db.lock())
+            .await
+            .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock".to_string()))?;
+
+        let edges = db_lock.db.open_tree("edges").map_err(|e| GraphError::StorageError(e.to_string()))?;
+        let edge_key = create_edge_key(&SerializableUuid(*outbound_id), edge_type, &SerializableUuid(*inbound_id))?;
+        let edge = edges
+            .get(&edge_key)
+            .map_err(|e| GraphError::StorageError(e.to_string()))?
+            .map(|v| deserialize_edge(&*v))
+            .transpose()?;
+        Ok(edge)
+    }
+
+    async fn delete_edge_direct(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> GraphResult<()> {
+        let db = SLED_DB.get().ok_or_else(|| GraphError::StorageError("Sled database not initialized".to_string()))?;
+        let db_lock = timeout(TokioDuration::from_secs(5), db.lock())
+            .await
+            .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock".to_string()))?;
+
+        let edges = db_lock.db.open_tree("edges").map_err(|e| GraphError::StorageError(e.to_string()))?;
+        let edge_key = create_edge_key(&SerializableUuid(*outbound_id), edge_type, &SerializableUuid(*inbound_id))?;
+        edges.remove(&edge_key)
+            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+        db_lock.db.flush_async().await.map_err(|e| GraphError::StorageError(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_all_vertices_direct(&self) -> GraphResult<Vec<Vertex>> {
+        let db = SLED_DB.get().ok_or_else(|| GraphError::StorageError("Sled database not initialized".to_string()))?;
+        let db_lock = timeout(TokioDuration::from_secs(5), db.lock())
+            .await
+            .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock".to_string()))?;
+
+        let vertices = db_lock.db.open_tree("vertices").map_err(|e| GraphError::StorageError(e.to_string()))?;
+        let mut vertex_vec = Vec::new();
+        for result in vertices.iter() {
+            let (_k, v) = result.map_err(|e| GraphError::StorageError(e.to_string()))?;
+            vertex_vec.push(deserialize_vertex(&*v)?);
+        }
+        Ok(vertex_vec)
+    }
+
+    async fn get_all_edges_direct(&self) -> GraphResult<Vec<Edge>> {
+        let db = SLED_DB.get().ok_or_else(|| GraphError::StorageError("Sled database not initialized".to_string()))?;
+        let db_lock = timeout(TokioDuration::from_secs(5), db.lock())
+            .await
+            .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock".to_string()))?;
+
+        let edges = db_lock.db.open_tree("edges").map_err(|e| GraphError::StorageError(e.to_string()))?;
+        let mut edge_vec = Vec::new();
+        for result in edges.iter() {
+            let (_k, v) = result.map_err(|e| GraphError::StorageError(e.to_string()))?;
+            edge_vec.push(deserialize_edge(&*v)?);
+        }
+        Ok(edge_vec)
     }
 
     pub async fn set_key(&self, key: &str, value: &str) -> GraphResult<()> {
@@ -441,7 +682,6 @@ impl SledStorage {
         })?;
         info!("Flushed {} bytes after setting key '{}'", bytes_flushed, key);
         println!("===> FLUSHED {} BYTES AFTER SETTING KEY {}", bytes_flushed, key);
-        // Verify persistence
         let value_opt = db_lock.db.get(key.as_bytes()).map_err(|e| {
             error!("Failed to verify key '{}': {}", key, e);
             println!("===> ERROR: FAILED TO VERIFY KEY {}", key);
@@ -486,7 +726,6 @@ impl SledStorage {
             warn!("Found lock file at {:?}", lock_path);
             println!("===> FOUND LOCK FILE AT {:?}", lock_path);
             
-            // Just remove the lock file, don't open the database
             match fs::remove_file(&lock_path).await {
                 Ok(_) => {
                     info!("Successfully removed lock file at {:?}", lock_path);
@@ -500,7 +739,6 @@ impl SledStorage {
                 Err(e) => {
                     warn!("Failed to remove lock file at {:?}: {}", lock_path, e);
                     println!("===> WARNING: FAILED TO REMOVE LOCK FILE AT {:?}", lock_path);
-                    // Continue anyway - the daemon will handle it
                 }
             }
         } else {
@@ -522,10 +760,8 @@ impl SledStorage {
         let base_data_dir = storage_config.data_directory.as_ref().unwrap_or(&default_data_dir);
         let db_path = base_data_dir.join("sled").join(port.to_string());
 
-        // Clean up stale daemon
         Self::check_and_cleanup_stale_daemon(port, &db_path).await?;
 
-        // Remove the database directory
         if db_path.exists() {
             info!("Destroying existing Sled database at {:?}", db_path);
             println!("===> DESTROYING EXISTING SLED DATABASE AT {:?}", db_path);
@@ -545,7 +781,6 @@ impl SledStorage {
             println!("===> SUCCESSFULLY REMOVED SLED DATABASE DIRECTORY AT {:?}", db_path);
         }
 
-        // Recreate the directory
         fs::create_dir_all(&db_path)
             .await
             .map_err(|e| {
@@ -554,7 +789,6 @@ impl SledStorage {
                 GraphError::StorageError(format!("Failed to recreate Sled database directory at {:?}: {}", db_path, e))
             })?;
 
-        // Initialize a new SledStorage instance
         Self::new(config, storage_config).await
             .map_err(|e| {
                 error!("Failed to initialize SledStorage after reset: {}", e);
@@ -610,8 +844,7 @@ impl StorageEngine for SledStorage {
             .await
             .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock".to_string()))?;
         let db_path = &db_lock.path;
-        info!("SledStorage::insert - inserting key {:?} into kv_pairs at {:?}", key, db_path);
-        debug!("Key (utf8 if possible): {:?}", String::from_utf8_lossy(&key));
+        info!("SledStorage::insert - inserting key into kv_pairs at {:?}", db_path);
         println!("===> INSERTING KEY INTO SLED DATABASE AT {:?}", db_path);
 
         db_lock.db
@@ -631,15 +864,6 @@ impl StorageEngine for SledStorage {
         info!("SledStorage::insert - flushed {} bytes after insert at {:?}", bytes_flushed, db_path);
         println!("===> FLUSHED {} BYTES AFTER INSERT AT {:?}", bytes_flushed, db_path);
 
-        let keys: Vec<_> = db_lock.db
-            .iter()
-            .keys()
-            .filter_map(|k| k.ok())
-            .map(|k| String::from_utf8_lossy(&*k).to_string())
-            .collect();
-        info!("SledStorage::insert - current kv_pairs keys at {:?}: {:?}", db_path, keys);
-        println!("===> CURRENT KV_PAIRS KEYS AT {:?}: {:?}", db_path, keys);
-
         Ok(())
     }
 
@@ -649,8 +873,7 @@ impl StorageEngine for SledStorage {
             .await
             .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock".to_string()))?;
         let db_path = &db_lock.path;
-        info!("SledStorage::retrieve - retrieving key {:?} from kv_pairs at {:?}", key, db_path);
-        debug!("Key (utf8 if possible): {:?}", String::from_utf8_lossy(&key));
+        info!("SledStorage::retrieve - retrieving key from kv_pairs at {:?}", db_path);
         println!("===> RETRIEVING KEY FROM SLED DATABASE AT {:?}", db_path);
 
         let value_opt = db_lock.db
@@ -661,15 +884,6 @@ impl StorageEngine for SledStorage {
                 GraphError::StorageError(e.to_string())
             })?;
 
-        let keys: Vec<_> = db_lock.db
-            .iter()
-            .keys()
-            .filter_map(|k| k.ok())
-            .map(|k| String::from_utf8_lossy(&*k).to_string())
-            .collect();
-        info!("SledStorage::retrieve - current kv_pairs keys at {:?}: {:?}", db_path, keys);
-        println!("===> CURRENT KV_PAIRS KEYS AT {:?}: {:?}", db_path, keys);
-
         Ok(value_opt.map(|v| v.to_vec()))
     }
 
@@ -679,7 +893,7 @@ impl StorageEngine for SledStorage {
             .await
             .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock".to_string()))?;
         let db_path = &db_lock.path;
-        info!("SledStorage::delete - deleting key {:?} from kv_pairs at {:?}", key, db_path);
+        info!("SledStorage::delete - deleting key from kv_pairs at {:?}", db_path);
         println!("===> DELETING KEY FROM SLED DATABASE AT {:?}", db_path);
 
         db_lock.db
@@ -698,15 +912,6 @@ impl StorageEngine for SledStorage {
             })?;
         info!("SledStorage::delete - flushed {} bytes after delete at {:?}", bytes_flushed, db_path);
         println!("===> FLUSHED {} BYTES AFTER DELETE AT {:?}", bytes_flushed, db_path);
-
-        let keys: Vec<_> = db_lock.db
-            .iter()
-            .keys()
-            .filter_map(|k| k.ok())
-            .map(|k| String::from_utf8_lossy(&*k).to_string())
-            .collect();
-        info!("SledStorage::delete - current kv_pairs keys at {:?}: {:?}", db_path, keys);
-        println!("===> CURRENT KV_PAIRS KEYS AT {:?}: {:?}", db_path, keys);
 
         Ok(())
     }
@@ -736,291 +941,43 @@ impl StorageEngine for SledStorage {
 #[async_trait]
 impl GraphStorageEngine for SledStorage {
     async fn create_vertex(&self, vertex: Vertex) -> GraphResult<()> {
-        let db = SLED_DB.get().ok_or_else(|| GraphError::StorageError("Sled database not initialized".to_string()))?;
-        let db_lock = timeout(TokioDuration::from_secs(5), db.lock())
-            .await
-            .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock".to_string()))?;
-        let db_path = &db_lock.path;
-        info!("Creating vertex at path {:?}", db_path);
-        println!("===> CREATING VERTEX IN SLED DATABASE AT {:?}", db_path);
-
-        let vertices = db_lock.db.open_tree("vertices").map_err(|e| GraphError::StorageError(e.to_string()))?;
-        vertices.insert(vertex.id.0.as_bytes(), serialize_vertex(&vertex)?)
-            .map_err(|e| {
-                error!("Failed to create vertex: {}", e);
-                println!("===> ERROR: FAILED TO CREATE VERTEX IN SLED DATABASE");
-                GraphError::StorageError(e.to_string())
-            })?;
-
-        let bytes_flushed = db_lock.db.flush_async().await
-            .map_err(|e| {
-                error!("Failed to flush after creating vertex: {}", e);
-                println!("===> ERROR: FAILED TO FLUSH SLED DATABASE AFTER CREATING VERTEX");
-                GraphError::StorageError(e.to_string())
-            })?;
-        info!("Flushed {} bytes after creating vertex at {:?}", bytes_flushed, db_path);
-        println!("===> FLUSHED {} BYTES AFTER CREATING VERTEX AT {:?}", bytes_flushed, db_path);
-
-        let vertex_keys: Vec<_> = vertices
-            .iter()
-            .keys()
-            .filter_map(|k| k.ok())
-            .map(|k| String::from_utf8_lossy(&*k).to_string())
-            .collect();
-        info!("Current vertex keys at {:?}: {:?}", db_path, vertex_keys);
-        println!("===> CURRENT VERTEX KEYS AT {:?}: {:?}", db_path, vertex_keys);
-        Ok(())
+        SledStorage::add_vertex(self, vertex).await
     }
 
     async fn get_vertex(&self, id: &Uuid) -> GraphResult<Option<Vertex>> {
-        let db = SLED_DB.get().ok_or_else(|| GraphError::StorageError("Sled database not initialized".to_string()))?;
-        let db_lock = timeout(TokioDuration::from_secs(5), db.lock())
-            .await
-            .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock".to_string()))?;
-        let db_path = &db_lock.path;
-        info!("Retrieving vertex with id {} from path {:?}", id, db_path);
-        println!("===> RETRIEVING VERTEX WITH ID {} FROM SLED DATABASE AT {:?}", id, db_path);
-
-        let vertices = db_lock.db.open_tree("vertices").map_err(|e| GraphError::StorageError(e.to_string()))?;
-        let vertex = vertices
-            .get(SerializableUuid(*id).0.as_bytes())
-            .map_err(|e| {
-                error!("Failed to retrieve vertex: {}", e);
-                println!("===> ERROR: FAILED TO RETRIEVE VERTEX FROM SLED DATABASE");
-                GraphError::StorageError(e.to_string())
-            })?
-            .map(|v| deserialize_vertex(&*v))
-            .transpose()?;
-
-        let vertex_keys: Vec<_> = vertices
-            .iter()
-            .keys()
-            .filter_map(|k| k.ok())
-            .map(|k| String::from_utf8_lossy(&*k).to_string())
-            .collect();
-        info!("Current vertex keys at {:?}: {:?}", db_path, vertex_keys);
-        println!("===> CURRENT VERTEX KEYS AT {:?}: {:?}", db_path, vertex_keys);
-        Ok(vertex)
+        SledStorage::get_vertex_internal(self, id).await
     }
 
     async fn update_vertex(&self, vertex: Vertex) -> GraphResult<()> {
-        let db = SLED_DB.get().ok_or_else(|| GraphError::StorageError("Sled database not initialized".to_string()))?;
-        let db_lock = timeout(TokioDuration::from_secs(5), db.lock())
-            .await
-            .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock".to_string()))?;
-        let db_path = &db_lock.path;
-        info!("Updating vertex at path {:?}", db_path);
-        println!("===> UPDATING VERTEX IN SLED DATABASE AT {:?}", db_path);
-
-        let vertices = db_lock.db.open_tree("vertices").map_err(|e| GraphError::StorageError(e.to_string()))?;
-        vertices.insert(vertex.id.0.as_bytes(), serialize_vertex(&vertex)?)
-            .map_err(|e| {
-                error!("Failed to update vertex: {}", e);
-                println!("===> ERROR: FAILED TO UPDATE VERTEX IN SLED DATABASE");
-                GraphError::StorageError(e.to_string())
-            })?;
-
-        let bytes_flushed = db_lock.db.flush_async().await
-            .map_err(|e| {
-                error!("Failed to flush after updating vertex: {}", e);
-                println!("===> ERROR: FAILED TO FLUSH SLED DATABASE AFTER UPDATING VERTEX");
-                GraphError::StorageError(e.to_string())
-            })?;
-        info!("Flushed {} bytes after updating vertex at {:?}", bytes_flushed, db_path);
-        println!("===> FLUSHED {} BYTES AFTER UPDATING VERTEX AT {:?}", bytes_flushed, db_path);
-
-        let vertex_keys: Vec<_> = vertices
-            .iter()
-            .keys()
-            .filter_map(|k| k.ok())
-            .map(|k| String::from_utf8_lossy(&*k).to_string())
-            .collect();
-        info!("Current vertex keys at {:?}: {:?}", db_path, vertex_keys);
-        println!("===> CURRENT VERTEX KEYS AT {:?}: {:?}", db_path, vertex_keys);
-        Ok(())
+        SledStorage::add_vertex(self, vertex).await
     }
 
     async fn delete_vertex(&self, id: &Uuid) -> GraphResult<()> {
-        let db = SLED_DB.get().ok_or_else(|| GraphError::StorageError("Sled database not initialized".to_string()))?;
-        let db_lock = timeout(TokioDuration::from_secs(5), db.lock())
-            .await
-            .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock".to_string()))?;
-        let db_path = &db_lock.path;
-        info!("Deleting vertex with id {} from path {:?}", id, db_path);
-        println!("===> DELETING VERTEX WITH ID {} FROM SLED DATABASE AT {:?}", id, db_path);
-
-        let vertices = db_lock.db.open_tree("vertices").map_err(|e| GraphError::StorageError(e.to_string()))?;
-        vertices.remove(SerializableUuid(*id).0.as_bytes())
-            .map_err(|e| {
-                error!("Failed to delete vertex: {}", e);
-                println!("===> ERROR: FAILED TO DELETE VERTEX FROM SLED DATABASE");
-                GraphError::StorageError(e.to_string())
-            })?;
-
-        let bytes_flushed = db_lock.db.flush_async().await
-            .map_err(|e| {
-                error!("Failed to flush after deleting vertex: {}", e);
-                println!("===> ERROR: FAILED TO FLUSH SLED DATABASE AFTER DELETING VERTEX");
-                GraphError::StorageError(e.to_string())
-            })?;
-        info!("Flushed {} bytes after deleting vertex at {:?}", bytes_flushed, db_path);
-        println!("===> FLUSHED {} BYTES AFTER DELETING VERTEX AT {:?}", bytes_flushed, db_path);
-
-        let vertex_keys: Vec<_> = vertices
-            .iter()
-            .keys()
-            .filter_map(|k| k.ok())
-            .map(|k| String::from_utf8_lossy(&*k).to_string())
-            .collect();
-        info!("Current vertex keys at {:?}: {:?}", db_path, vertex_keys);
-        println!("===> CURRENT VERTEX KEYS AT {:?}: {:?}", db_path, vertex_keys);
-        Ok(())
+        SledStorage::delete_vertex_internal(self, id).await
     }
     
     async fn create_edge(&self, edge: Edge) -> GraphResult<()> {
-        let db = SLED_DB.get().ok_or_else(|| GraphError::StorageError("Sled database not initialized".to_string()))?;
-        let db_lock = timeout(TokioDuration::from_secs(5), db.lock())
-            .await
-            .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock".to_string()))?;
-        let db_path = &db_lock.path;
-        info!("Creating edge at path {:?}", db_path);
-        println!("===> CREATING EDGE IN SLED DATABASE AT {:?}", db_path);
-
-        let edges = db_lock.db.open_tree("edges").map_err(|e| GraphError::StorageError(e.to_string()))?;
-        let edge_key = create_edge_key(&SerializableUuid(edge.outbound_id.0), &edge.t, &SerializableUuid(edge.inbound_id.0))?;
-        edges.insert(&edge_key, serialize_edge(&edge)?)
-            .map_err(|e| {
-                error!("Failed to create edge: {}", e);
-                println!("===> ERROR: FAILED TO CREATE EDGE IN SLED DATABASE");
-                GraphError::StorageError(e.to_string())
-            })?;
-
-        let bytes_flushed = db_lock.db.flush_async().await
-            .map_err(|e| {
-                error!("Failed to flush after creating edge: {}", e);
-                println!("===> ERROR: FAILED TO FLUSH SLED DATABASE AFTER CREATING EDGE");
-                GraphError::StorageError(e.to_string())
-            })?;
-        info!("Flushed {} bytes after creating edge at {:?}", bytes_flushed, db_path);
-        println!("===> FLUSHED {} BYTES AFTER CREATING EDGE AT {:?}", bytes_flushed, db_path);
-
-        let edge_keys: Vec<_> = edges
-            .iter()
-            .keys()
-            .filter_map(|k| k.ok())
-            .map(|k| String::from_utf8_lossy(&*k).to_string())
-            .collect();
-        info!("Current edge keys at {:?}: {:?}", db_path, edge_keys);
-        println!("===> CURRENT EDGE KEYS AT {:?}: {:?}", db_path, edge_keys);
-        Ok(())
+        SledStorage::add_edge(self, edge).await
     }
 
     async fn get_edge(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> GraphResult<Option<Edge>> {
-        let db = SLED_DB.get().ok_or_else(|| GraphError::StorageError("Sled database not initialized".to_string()))?;
-        let db_lock = timeout(TokioDuration::from_secs(5), db.lock())
-            .await
-            .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock".to_string()))?;
-        let db_path = &db_lock.path;
-        info!("Retrieving edge ({}, {}, {}) from path {:?}", outbound_id, edge_type, inbound_id, db_path);
-        println!("===> RETRIEVING EDGE ({}, {}, {}) FROM SLED DATABASE AT {:?}", outbound_id, edge_type, inbound_id, db_path);
-
-        let edges = db_lock.db.open_tree("edges").map_err(|e| GraphError::StorageError(e.to_string()))?;
-        let edge_key = create_edge_key(&SerializableUuid(*outbound_id), edge_type, &SerializableUuid(*inbound_id))?;
-        let edge = edges
-            .get(&edge_key)
-            .map_err(|e| {
-                error!("Failed to retrieve edge: {}", e);
-                println!("===> ERROR: FAILED TO RETRIEVE EDGE FROM SLED DATABASE");
-                GraphError::StorageError(e.to_string())
-            })?
-            .map(|v| deserialize_edge(&*v))
-            .transpose()?;
-
-        let edge_keys: Vec<_> = edges
-            .iter()
-            .keys()
-            .filter_map(|k| k.ok())
-            .map(|k| String::from_utf8_lossy(&*k).to_string())
-            .collect();
-        info!("Current edge keys at {:?}: {:?}", db_path, edge_keys);
-        println!("===> CURRENT EDGE KEYS AT {:?}: {:?}", db_path, edge_keys);
-        Ok(edge)
+        SledStorage::get_edge_internal(self, outbound_id, edge_type, inbound_id).await
     }
 
     async fn update_edge(&self, edge: Edge) -> GraphResult<()> {
-        let db = SLED_DB.get().ok_or_else(|| GraphError::StorageError("Sled database not initialized".to_string()))?;
-        let db_lock = timeout(TokioDuration::from_secs(5), db.lock())
-            .await
-            .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock".to_string()))?;
-        let db_path = &db_lock.path;
-        info!("Updating edge at path {:?}", db_path);
-        println!("===> UPDATING EDGE IN SLED DATABASE AT {:?}", db_path);
-
-        let edges = db_lock.db.open_tree("edges").map_err(|e| GraphError::StorageError(e.to_string()))?;
-        let edge_key = create_edge_key(&SerializableUuid(edge.outbound_id.0), &edge.t, &SerializableUuid(edge.inbound_id.0))?;
-        edges.insert(&edge_key, serialize_edge(&edge)?)
-            .map_err(|e| {
-                error!("Failed to update edge: {}", e);
-                println!("===> ERROR: FAILED TO UPDATE EDGE IN SLED DATABASE");
-                GraphError::StorageError(e.to_string())
-            })?;
-
-        let bytes_flushed = db_lock.db.flush_async().await
-            .map_err(|e| {
-                error!("Failed to flush after updating edge: {}", e);
-                println!("===> ERROR: FAILED TO FLUSH SLED DATABASE AFTER UPDATING EDGE");
-                GraphError::StorageError(e.to_string())
-            })?;
-        info!("Flushed {} bytes after updating edge at {:?}", bytes_flushed, db_path);
-        println!("===> FLUSHED {} BYTES AFTER UPDATING EDGE AT {:?}", bytes_flushed, db_path);
-
-        let edge_keys: Vec<_> = edges
-            .iter()
-            .keys()
-            .filter_map(|k| k.ok())
-            .map(|k| String::from_utf8_lossy(&*k).to_string())
-            .collect();
-        info!("Current edge keys at {:?}: {:?}", db_path, edge_keys);
-        println!("===> CURRENT EDGE KEYS AT {:?}: {:?}", db_path, edge_keys);
-        Ok(())
+        SledStorage::add_edge(self, edge).await
     }
 
     async fn delete_edge(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> GraphResult<()> {
-        let db = SLED_DB.get().ok_or_else(|| GraphError::StorageError("Sled database not initialized".to_string()))?;
-        let db_lock = timeout(TokioDuration::from_secs(5), db.lock())
-            .await
-            .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock".to_string()))?;
-        let db_path = &db_lock.path;
-        info!("Deleting edge ({}, {}, {}) from path {:?}", outbound_id, edge_type, inbound_id, db_path);
-        println!("===> DELETING EDGE ({}, {}, {}) FROM SLED DATABASE AT {:?}", outbound_id, edge_type, inbound_id, db_path);
+        SledStorage::delete_edge_internal(self, outbound_id, edge_type, inbound_id).await
+    }
 
-        let edges = db_lock.db.open_tree("edges").map_err(|e| GraphError::StorageError(e.to_string()))?;
-        let edge_key = create_edge_key(&SerializableUuid(*outbound_id), edge_type, &SerializableUuid(*inbound_id))?;
-        edges.remove(&edge_key)
-            .map_err(|e| {
-                error!("Failed to delete edge: {}", e);
-                println!("===> ERROR: FAILED TO DELETE EDGE FROM SLED DATABASE");
-                GraphError::StorageError(e.to_string())
-            })?;
+    async fn get_all_vertices(&self) -> Result<Vec<Vertex>, GraphError> {
+        SledStorage::get_all_vertices_internal(self).await
+    }
 
-        let bytes_flushed = db_lock.db.flush_async().await
-            .map_err(|e| {
-                error!("Failed to flush after deleting edge: {}", e);
-                println!("===> ERROR: FAILED TO FLUSH SLED DATABASE AFTER DELETING EDGE");
-                GraphError::StorageError(e.to_string())
-            })?;
-        info!("Flushed {} bytes after deleting edge at {:?}", bytes_flushed, db_path);
-        println!("===> FLUSHED {} BYTES AFTER DELETING EDGE AT {:?}", bytes_flushed, db_path);
-
-        let edge_keys: Vec<_> = edges
-            .iter()
-            .keys()
-            .filter_map(|k| k.ok())
-            .map(|k| String::from_utf8_lossy(&*k).to_string())
-            .collect();
-        info!("Current edge keys at {:?}: {:?}", db_path, edge_keys);
-        println!("===> CURRENT EDGE KEYS AT {:?}: {:?}", db_path, edge_keys);
-        Ok(())
+    async fn get_all_edges(&self) -> Result<Vec<Edge>, GraphError> {
+        SledStorage::get_all_edges_internal(self).await
     }
 
     async fn close(&self) -> GraphResult<()> {
@@ -1098,58 +1055,10 @@ impl GraphStorageEngine for SledStorage {
         Ok(Value::Null)
     }
 
-    async fn execute_query(&self, query_plan: QueryPlan) -> Result<QueryResult, GraphError> {
+    async fn execute_query(&self, _query_plan: QueryPlan) -> Result<QueryResult, GraphError> {
         info!("Executing query on SledStorage (returning null as not implemented)");
         println!("===> EXECUTING QUERY ON SLED STORAGE (NOT IMPLEMENTED)");
         Ok(QueryResult::Null)
-    }
-
-    async fn get_all_vertices(&self) -> Result<Vec<Vertex>, GraphError> {
-        let db = SLED_DB.get().ok_or_else(|| GraphError::StorageError("Sled database not initialized".to_string()))?;
-        let db_lock = timeout(TokioDuration::from_secs(5), db.lock())
-            .await
-            .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock".to_string()))?;
-        let db_path = &db_lock.path;
-        info!("Retrieving all vertices from path {:?}", db_path);
-        println!("===> RETRIEVING ALL VERTICES FROM SLED DATABASE AT {:?}", db_path);
-
-        let vertices = db_lock.db.open_tree("vertices").map_err(|e| GraphError::StorageError(e.to_string()))?;
-        let mut vertex_vec = Vec::new();
-        for result in vertices.iter() {
-            let (_k, v) = result.map_err(|e| {
-                error!("Failed to retrieve vertices: {}", e);
-                println!("===> ERROR: FAILED TO RETRIEVE VERTICES FROM SLED DATABASE");
-                GraphError::StorageError(e.to_string())
-            })?;
-            vertex_vec.push(deserialize_vertex(&*v)?);
-        }
-        info!("Retrieved {} vertices from path {:?}", vertex_vec.len(), db_path);
-        println!("===> RETRIEVED {} VERTICES FROM SLED DATABASE AT {:?}", vertex_vec.len(), db_path);
-        Ok(vertex_vec)
-    }
-
-    async fn get_all_edges(&self) -> Result<Vec<Edge>, GraphError> {
-        let db = SLED_DB.get().ok_or_else(|| GraphError::StorageError("Sled database not initialized".to_string()))?;
-        let db_lock = timeout(TokioDuration::from_secs(5), db.lock())
-            .await
-            .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock".to_string()))?;
-        let db_path = &db_lock.path;
-        info!("Retrieving all edges from path {:?}", db_path);
-        println!("===> RETRIEVING ALL EDGES FROM SLED DATABASE AT {:?}", db_path);
-
-        let edges = db_lock.db.open_tree("edges").map_err(|e| GraphError::StorageError(e.to_string()))?;
-        let mut edge_vec = Vec::new();
-        for result in edges.iter() {
-            let (_k, v) = result.map_err(|e| {
-                error!("Failed to retrieve edges: {}", e);
-                println!("===> ERROR: FAILED TO RETRIEVE EDGES FROM SLED DATABASE");
-                GraphError::StorageError(e.to_string())
-            })?;
-            edge_vec.push(deserialize_edge(&*v)?);
-        }
-        info!("Retrieved {} edges from path {:?}", edge_vec.len(), db_path);
-        println!("===> RETRIEVED {} EDGES FROM SLED DATABASE AT {:?}", edge_vec.len(), db_path);
-        Ok(edge_vec)
     }
 
     async fn clear_data(&self) -> Result<(), GraphError> {
@@ -1216,7 +1125,7 @@ impl Drop for SledStorage {
                 info!("Cleaning up SledStorage for port {}", port_u16);
                 println!("===> CLEANING UP SledStorage FOR PORT {}", port_u16);
 
-                // *** SLED_DB SECTION LEFT COMPLETELY UNTOUCHED ***
+                // *** SLED_DB SECTION: FLUSH, CLOSE ZMQ, RELEASE ACTIVE DB TRACKER ***
                 if let Some(sled_db) = SLED_DB.get() {
                     let mut sled_db_guard = match timeout(TokioDuration::from_secs(5), sled_db.lock()).await {
                         Ok(guard) => guard,
@@ -1226,7 +1135,6 @@ impl Drop for SledStorage {
                             return;
                         }
                     };
-                    // Clone db_path to avoid holding an immutable borrow
                     let db_path = sled_db_guard.path.clone();
                     info!("Flushing Sled database at {:?}", db_path);
                     println!("===> FLUSHING SLED DATABASE AT {:?}", db_path);
@@ -1234,18 +1142,17 @@ impl Drop for SledStorage {
                         error!("Failed to flush Sled database at {:?}: {:?}", db_path, e);
                         println!("===> ERROR: FAILED TO FLUSH SLED DATABASE AT {:?}: {:?}", db_path, e);
                     }
-                    // Now safe to mutate sled_db_guard
                     if let Some((_, zmq_socket)) = sled_db_guard.client.take() {
                         info!("Closing ZMQ client for path {:?}", db_path);
                         println!("===> CLOSING ZMQ CLIENT FOR PATH {:?}", db_path);
                         drop(zmq_socket);
                     }
-                    // Release instance from SLED_ACTIVE_DATABASES
+                    // Release from active databases tracker
                     Self::release_instance(&db_path).await;
                 }
                 // *** END SLED_DB SECTION ***
 
-                // Remove from pool map
+                // Remove from SLED_POOL_MAP
                 if let Some(pool_map) = SLED_POOL_MAP.get() {
                     let mut pool_map_guard = match timeout(TokioDuration::from_secs(5), pool_map.lock()).await {
                         Ok(guard) => guard,
@@ -1260,20 +1167,14 @@ impl Drop for SledStorage {
                     println!("===> REMOVED SledDaemonPool FOR PORT {} FROM POOL MAP", port_u16);
                 }
 
-                // *** FIXED: Now correctly uses the ACTUAL db_path from SLED_DB ***
-                let db_path = if let Some(sled_db) = SLED_DB.get() {
-                    sled_db.lock().await.path.clone()
-                } else {
-                    PathBuf::from(DEFAULT_DATA_DIRECTORY).join("sled").join(port_u16.to_string())
-                };
-                
-                if let Err(e) = Self::check_and_cleanup_stale_daemon(port_u16, &db_path).await {
-                    error!("Failed to clean up stale daemon for port {}: {}", port_u16, e);
-                    println!("===> ERROR: FAILED TO CLEAN UP STALE DAEMON FOR PORT {}: {}", port_u16, e);
-                } else {
-                    info!("Successfully cleaned up stale daemon for port {}", port_u16);
-                    println!("===> SUCCESSFULLY CLEANED UP STALE DAEMON FOR PORT {}", port_u16);
-                }
+                // *** REMOVED: DO NOT CALL check_and_cleanup_stale_daemon HERE ***
+                // This function removes entries from GLOBAL_DAEMON_REGISTRY even during normal shutdown.
+                // The daemon is already stopped via `pool.close(None)` earlier.
+                // Registry cleanup must be done by the daemon itself or via explicit command.
+
+                // Optional: Log that daemon should have cleaned up registry
+                info!("SledStorage drop complete for port {}. Daemon should have removed itself from GLOBAL_DAEMON_REGISTRY.", port_u16);
+                println!("===> SLED STORAGE DROP COMPLETE FOR PORT {}. DAEMON SHOULD SELF-REMOVE FROM REGISTRY.", port_u16);
             }
 
             info!("Completed SledStorage cleanup in {}ms", start_time.elapsed().as_millis());

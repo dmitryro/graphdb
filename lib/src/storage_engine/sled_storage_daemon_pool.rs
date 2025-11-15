@@ -32,9 +32,9 @@ use crate::daemon::daemon_management::{parse_cluster_range, is_daemon_running,  
 use std::time::{SystemTime, UNIX_EPOCH};
 use futures::future::join_all;
 use uuid::Uuid;
-use zmq::{Context as ZmqContext, Socket as ZmqSocket, Error as ZmqError, REP, REQ, DONTWAIT};
+use zmq::{self, Context as ZmqContext, Socket as ZmqSocket, Error as ZmqError, REP, REQ, DONTWAIT, PollEvents, PollItem};
 use std::fs::Permissions;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::{fs::PermissionsExt, io::AsRawFd, io::RawFd};
 use sysinfo::{System, RefreshKind, ProcessRefreshKind, Pid, ProcessesToUpdate};
 use nix::unistd::{ Pid as NixPid };
 use nix::sys::signal::{kill, Signal};
@@ -45,8 +45,7 @@ use std::fs::{self};
 use lazy_static::lazy_static;
 use std::sync::Mutex as StdMutex;
 use once_cell::sync::Lazy;
-use bincode::{Encode, Decode};
-use bincode::config::standard;
+use bincode::{Encode, Decode, decode_from_slice, config::standard};
 
 #[cfg(feature = "with-openraft-sled")]
 use {
@@ -83,6 +82,8 @@ const MAX_REGISTRY_ATTEMPTS: u32 = 5;
 const MAX_KILL_ATTEMPTS: usize = 10;
 const ZMQ_EAGAIN_SENTINEL: &str = "ZMQ_EAGAIN_SENTINEL"; 
 
+static PROCESSED_REQUESTS: Lazy<TokioMutex<HashSet<String>>> = 
+    Lazy::new(|| TokioMutex::new(HashSet::new()));
 static CLUSTER_INIT_LOCK: OnceCell<TokioMutex<()>> = OnceCell::const_new();
 
 async fn get_cluster_init_lock() -> &'static TokioMutex<()> {
@@ -123,17 +124,89 @@ fn get_shared_wal_file_path() -> PathBuf {
 }
 
 /// Leader election – first daemon that creates the lock wins.
-async fn become_wal_leader(canonical: &Path) -> GraphResult<bool> {
-    let lock = canonical.join("wal_leader.lock");
-    match tokio_fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&lock)
-        .await
-    {
-        Ok(_) => Ok(true),
-        Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(false),
-        Err(e) => Err(GraphError::Io(e.to_string())),
+// ──────────────────────────────────────────────────────────────
+// 1. become_wal_leader – uses config.port, no env, no ZMQ
+// ──────────────────────────────────────────────────────────────
+pub async fn become_wal_leader(canonical: &Path, my_port: u16) -> GraphResult<bool> {
+    let leader_file = canonical.join("wal_leader.info");
+    let lock_file = canonical.join("wal_leader.lock");
+    
+    loop {
+        match tokio_fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_file)
+            .await
+        {
+            Ok(_) => {
+                // Successfully created lock file, now write leader info
+                let info = format!(
+                    "leader_port={}\npid={}\nts={}\n",
+                    my_port,
+                    std::process::id(),
+                    chrono::Utc::now().timestamp()
+                );
+                
+                // Write to leader_file (not lock_file!)
+                match tokio_fs::write(&leader_file, info.as_bytes()).await {
+                    Ok(_) => {
+                        info!("Became WAL leader (port {}) for cluster {:?}", my_port, canonical);
+                        return Ok(true);
+                    }
+                    Err(e) => {
+                        error!("Failed to write leader info: {}", e);
+                        let _ = tokio_fs::remove_file(&lock_file).await;
+                        return Ok(false);
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Lock exists, read leader info
+                match tokio_fs::read_to_string(&leader_file).await {
+                    Ok(content) => {
+                        let leader_port = content
+                            .lines()
+                            .find_map(|l| l.strip_prefix("leader_port=").map(|s| s.trim()))
+                            .and_then(|s| s.parse::<u16>().ok())
+                            .unwrap_or(0);
+                        
+                        // CRITICAL FIX: If we ARE the leader port, we are the leader!
+                        if leader_port == my_port {
+                            info!("We are already the WAL leader on port {}", my_port);
+                            return Ok(true);
+                        }
+                        
+                        info!("WAL leader is on port {} (we are follower on port {})", leader_port, my_port);
+                        return Ok(false);
+                    }
+                    Err(_) => {
+                        warn!("Leader lock exists but no leader.info — forcing promotion");
+                        let _ = tokio_fs::remove_file(&lock_file).await;
+                        let _ = tokio_fs::remove_file(&leader_file).await;
+                        // Continue loop to retry
+                        continue;
+                    }
+                }
+            }
+            Err(e) => return Err(GraphError::Io(e.to_string())),
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
+// 2. get_leader_port – read-only, safe
+// ──────────────────────────────────────────────────────────────
+pub async fn get_leader_port(canonical: &Path) -> GraphResult<Option<u16>> {
+    let leader_file = canonical.join("wal_leader.info");
+    match tokio_fs::read_to_string(&leader_file).await {
+        Ok(content) => {
+            let port = content
+                .lines()
+                .find_map(|l| l.strip_prefix("leader_port=").map(|s| s.trim()))
+                .and_then(|s| s.parse::<u16>().ok());
+            Ok(port)
+        }
+        Err(_) => Ok(None),
     }
 }
 
@@ -346,41 +419,6 @@ impl SledDaemon {
         ports
     }
 
-    /// Apply a WAL operation locally to the Sled database
-    pub async fn apply_op_locally(
-        db: &Arc<sled::Db>,
-        op: &SledWalOperation,
-    ) -> GraphResult<()> {
-        match op {
-            SledWalOperation::Put { tree, key, value } => {
-                let t = match tree.as_str() {
-                    "kv_pairs" => db.open_tree("kv_pairs")?,
-                    "vertices" => db.open_tree("vertices")?,
-                    "edges" => db.open_tree("edges")?,
-                    _ => return Err(GraphError::StorageError("unknown tree".into())),
-                };
-                t.insert(key.as_slice(), value.as_slice())?;
-            }
-            SledWalOperation::Delete { tree, key } => {
-                let t = match tree.as_str() {
-                    "kv_pairs" => db.open_tree("kv_pairs")?,
-                    "vertices" => db.open_tree("vertices")?,
-                    "edges" => db.open_tree("edges")?,
-                    _ => return Err(GraphError::StorageError("unknown tree".into())),
-                };
-                t.remove(key.as_slice())?;
-            }
-            SledWalOperation::Flush { tree } => {
-                if let Ok(t) = db.open_tree(tree) {
-                    t.flush_async().await?;
-                } else {
-                    db.flush_async().await?;
-                }
-            }
-        }
-        Ok(())
-    }
-
     /// Helper function to encapsulate the blocking Sled I/O.
     /// **CRITICAL FIX:** Implements a retry mechanism to handle transient lock contention 
     /// from the main thread's pre-initialization cleanup logic (e.g., unlocking the DB).
@@ -438,6 +476,84 @@ impl SledDaemon {
             }
         }
     }
+    
+    /// Apply a WAL operation locally to the Sled database
+    pub async fn apply_op_locally(
+        db: &Arc<sled::Db>,
+        op: &SledWalOperation,
+    ) -> GraphResult<()> {
+        info!("APPLYING WAL OP LOCALLY: {:?}", op);
+        println!("====> APPLYING WAL OP LOCALLY: {:?}", op);
+
+        match op {
+            SledWalOperation::Put { tree, key, value } => {
+                println!("====> Opening tree: {}", tree);
+                let t = match tree.as_str() {
+                    "kv_pairs" => db.open_tree("kv_pairs")?,
+                    "vertices" => db.open_tree("vertices")?,
+                    "edges" => db.open_tree("edges")?,
+                    _ => {
+                        warn!("UNKNOWN TREE IN WAL OP: {}", tree);
+                        return Err(GraphError::StorageError(format!("Unknown tree: {}", tree)));
+                    }
+                };
+                println!("====> Tree opened successfully, inserting key (len={})", key.len());
+
+                t.insert(key.as_slice(), value.as_slice())
+                    .map_err(|e| {
+                        error!("PUT FAILED: {}", e);
+                        GraphError::StorageError(format!("Put failed on {}: {}", tree, e))
+                    })?;
+
+                println!("====> INSERT COMPLETE");
+                info!("PUT SUCCESS: TREE={}, key_len={}, value_len={}", tree, key.len(), value.len());
+            }
+            SledWalOperation::Delete { tree, key } => {
+                println!("====> Opening tree for delete: {}", tree);
+                let t = match tree.as_str() {
+                    "kv_pairs" => db.open_tree("kv_pairs")?,
+                    "vertices" => db.open_tree("vertices")?,
+                    "edges" => db.open_tree("edges")?,
+                    _ => {
+                        warn!("UNKNOWN TREE IN WAL DELETE: {}", tree);
+                        return Err(GraphError::StorageError(format!("Unknown tree: {}", tree)));
+                    }
+                };
+
+                t.remove(key.as_slice())
+                    .map_err(|e| GraphError::StorageError(format!("Delete failed on {}: {}", tree, e)))?;
+
+                println!("====> DELETE COMPLETE");
+                info!("DELETE SUCCESS: TREE={}, key_len={}", tree, key.len());
+            }
+            SledWalOperation::Flush { tree } => {
+                println!("====> Flushing tree: {}", tree);
+                if tree == "default" || tree.is_empty() {
+                    db.flush_async().await
+                        .map_err(|e| GraphError::StorageError(format!("Flush all failed: {}", e)))?;
+                    info!("FLUSH SUCCESS: all trees");
+                } else {
+                    let tree_handle = match tree.as_str() {
+                        "kv_pairs" => Some(db.open_tree("kv_pairs")?),
+                        "vertices" => Some(db.open_tree("vertices")?),
+                        "edges" => Some(db.open_tree("edges")?),
+                        _ => {
+                            warn!("FLUSH IGNORED: unknown tree {}", tree);
+                            None
+                        }
+                    };
+                    if let Some(t) = tree_handle {
+                        t.flush_async().await
+                            .map_err(|e| GraphError::StorageError(format!("Flush {} failed: {}", tree, e)))?;
+                        info!("FLUSH SUCCESS: TREE={}", tree);
+                    }
+                }
+                println!("====> FLUSH COMPLETE");
+            }
+        }
+        println!("====> apply_op_locally COMPLETED SUCCESSFULLY");
+        Ok(())
+    }
 
     /// Replay WAL operations from shared WAL using per-port offset tracking
     pub async fn replay_from_all_wals(
@@ -448,102 +564,57 @@ impl SledDaemon {
         info!("Starting WAL replay for port {}", current_port);
         println!("===> STARTING WAL REPLAY FOR PORT {}", current_port);
 
-        let wal_dir = canonical_path.join("wal_shared");
-        
-        if !wal_dir.exists() || !wal_dir.join("shared.wal").exists() {
-            info!("No shared WAL file found, skipping replay");
-            println!("===> NO SHARED WAL FILE FOUND, SKIPPING REPLAY");
+        let wal_path = canonical_path.join("wal_shared").join("shared.wal");
+        if !wal_path.exists() {
+            info!("No WAL file at {:?}, skipping", wal_path);
+            println!("===> NO WAL FILE, SKIPPING REPLAY");
             return Ok(());
         }
 
-        // Read last replicated offset for THIS port
         let offset_key = format!("__wal_offset_port_{}", current_port);
-        let last_offset = db.get(offset_key.as_bytes())
-            .ok()
-            .flatten()
+        let last_offset: u64 = db.get(&offset_key.as_bytes())?
             .and_then(|v| String::from_utf8(v.to_vec()).ok())
-            .and_then(|s| s.parse::<u64>().ok())
+            .and_then(|s| s.parse().ok())
             .unwrap_or(0);
 
-        println!("===> PORT {} LAST REPLICATED OFFSET: {}", current_port, last_offset);
+        let wal_mgr = SledWalManager::new(canonical_path.clone(), current_port).await?;
+        let current_lsn = wal_mgr.current_lsn().await?;
 
-        // Create WAL manager
-        let wal_mgr = SledWalManager::new(canonical_path.clone(), current_port)
-            .await
-            .map_err(|e| GraphError::StorageError(format!("Failed to create WAL manager: {}", e)))?;
+        println!("===> LAST OFFSET: {}, WAL LSN: {}", last_offset, current_lsn);
 
-        // Get current WAL size
-        let current_wal_size = wal_mgr.current_lsn()
-            .await
-            .map_err(|e| GraphError::StorageError(format!("Failed to get WAL size: {}", e)))?;
-
-        if last_offset >= current_wal_size {
-            println!("===> PORT {} IS UP TO DATE (OFFSET {} >= WAL SIZE {})", 
-                     current_port, last_offset, current_wal_size);
+        if last_offset >= current_lsn {
+            println!("===> PORT {} IS UP TO DATE", current_port);
             return Ok(());
         }
 
-        // Read operations since last offset
-        let operations = wal_mgr.read_since(last_offset)
-            .await
-            .map_err(|e| GraphError::StorageError(format!("Failed to read WAL: {}", e)))?;
+        let operations = wal_mgr.read_since(last_offset).await?;
+        if operations.is_empty() {
+            return Ok(());
+        }
 
-        println!("===> REPLAYING {} OPERATIONS FOR PORT {} (OFFSET {} -> {})", 
-                 operations.len(), current_port, last_offset, current_wal_size);
+        println!("===> REPLAYING {} OPS ({} → {})", operations.len(), last_offset, current_lsn);
 
         let mut latest_offset = last_offset;
-        let mut applied_count = 0;
+        let mut applied = 0;
 
         for (offset, op) in operations {
-            // Store serialized size before consuming op
             let op_size = bincode::serde::encode_to_vec(&op, bincode::config::standard())
                 .map(|v| v.len() as u64)
                 .unwrap_or(0);
-            
-            match op {
-                SledWalOperation::Put { tree, key, value } => {
-                    let target_tree = match tree.as_str() {
-                        "kv_pairs" => db.open_tree("kv_pairs"),
-                        "vertices" => db.open_tree("vertices"),
-                        "edges" => db.open_tree("edges"),
-                        _ => continue,
-                    };
 
-                    if let Ok(t) = target_tree {
-                        if t.insert(key.as_slice(), value.as_slice()).is_ok() {
-                            applied_count += 1;
-                        }
-                    }
-                }
-                SledWalOperation::Delete { tree, key } => {
-                    let target_tree = match tree.as_str() {
-                        "kv_pairs" => db.open_tree("kv_pairs"),
-                        "vertices" => db.open_tree("vertices"),
-                        "edges" => db.open_tree("edges"),
-                        _ => continue,
-                    };
-
-                    if let Ok(t) = target_tree {
-                        if t.remove(key.as_slice()).is_ok() {
-                            applied_count += 1;
-                        }
-                    }
-                }
-                SledWalOperation::Flush { .. } => {
-                    let _ = db.flush_async().await;
-                }
+            if let Err(e) = SledDaemon::apply_op_locally(db, &op).await {
+                error!("Replay failed at {}: {}", offset, e);
+                break;
             }
 
+            applied += 1;
             latest_offset = offset + 4 + op_size;
         }
 
-        // Save the latest replicated offset
         if latest_offset > last_offset {
-            let _ = db.insert(offset_key.as_bytes(), latest_offset.to_string().as_bytes());
+            let _ = db.insert(&offset_key.as_bytes(), latest_offset.to_string().as_bytes());
             let _ = db.flush_async().await;
-            
-            println!("===> REPLAYED {} OPERATIONS FOR PORT {} (OFFSET: {} -> {})",
-                     applied_count, current_port, last_offset, latest_offset);
+            println!("===> REPLAYED {} OPS ({} → {})", applied, last_offset, latest_offset);
         }
 
         Ok(())
@@ -914,242 +985,158 @@ impl SledDaemon {
         println!("SledDaemon =================> LET US SEE IF THIS WAS EVER CALLED");
         
         let port = config.port.ok_or_else(|| {
+            error!("No port specified in SledConfig");
             GraphError::ConfigurationError("No port specified in SledConfig".to_string())
         })?;
 
-        let db_path = if config.path.ends_with(&port.to_string()) {
-            config.path.clone()
-        } else {
-            config.path.join(port.to_string())
-        };
+        let port_lock = get_sled_daemon_port_lock(port).await;
+        let _guard = port_lock.lock().await;
+        println!("===> ACQUIRED PER-PORT INIT LOCK FOR PORT {}", port);
 
-        println!("===> Initializing Sled daemon at {:?}", db_path);
+        // Force per-port path
+        let db_path = {
+            let base = PathBuf::from(&config.path);
+            if base.file_name().and_then(|n| n.to_str()) == Some(&port.to_string()) {
+                base
+            } else {
+                base.join(port.to_string())
+            }
+        };
 
         if !db_path.exists() {
-            println!("===> Creating database directory at {:?}", db_path);
-            tokio::fs::create_dir_all(&db_path).await.map_err(|e| {
-                GraphError::StorageError(format!("Failed to create directory at {:?}: {}", db_path, e))
+            tokio_fs::create_dir_all(&db_path).await.map_err(|e| {
+                GraphError::StorageError(format!("Failed to create directory: {}", e))
             })?;
-            
-            let permissions = if cfg!(unix) {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::Permissions::from_mode(0o755)
-                }
-                #[cfg(not(unix))]
-                {
-                    std::fs::Permissions::from_mode(0o755)
-                }
-            } else {
-                std::fs::Permissions::from_mode(0o755)
-            };
-            
-            tokio_fs::set_permissions(&db_path, permissions)
-                .await
-                .map_err(|e| {
-                    GraphError::StorageError(format!("Failed to set permissions on directory at {:?}: {}", db_path, e))
-                })?;
-        } else if !db_path.is_dir() {
-            return Err(GraphError::StorageError(format!("Path {:?} is not a directory", db_path)));
         }
 
-        let metadata = tokio::fs::metadata(&db_path).await.map_err(|e| {
-            GraphError::StorageError(format!("Failed to access directory metadata at {:?}: {}", db_path, e))
-        })?;
-        if metadata.permissions().readonly() {
-            return Err(GraphError::StorageError(format!("Directory at {:?} is not writable", db_path)));
-        }
+        let cache_capacity = config.cache_capacity.unwrap_or(1024 * 1024 * 1024);
+        let (db_arc, vertices, edges, kv_pairs) = Self::open_sled_db_and_trees(
+            &config, &db_path, cache_capacity, config.use_compression
+        ).await?;
 
-        let db_registry = GLOBAL_DB_DAEMON_REGISTRY.get_registry().await;
-        let existing_db_metadata = db_registry.get_db_daemon_metadata_by_port(port).await?;
-
-        let mut reused_existing_db = false; // Track if we reused existing DB
-
-        let (db_arc, vertices, edges, kv_pairs) = if let Some(mut metadata) = existing_db_metadata {
-            if let (Some(db), Some(v), Some(e), Some(kv)) = (
-                metadata.sled_db_instance.take(),
-                metadata.sled_vertices.take(),
-                metadata.sled_edges.take(),
-                metadata.sled_kv_pairs.take(),
-            ) {
-                info!("Reusing existing Sled DB instance from registry for port {}", port);
-                println!("===> REUSING EXISTING SLED DB INSTANCE FROM REGISTRY FOR PORT {}", port);
-                reused_existing_db = true; // Mark as reused
-                (db, v, e, kv)
-            } else {
-                warn!("Incomplete Sled DB instance in registry for port {}, opening new", port);
-                println!("===> WARNING: INCOMPLETE SLED DB INSTANCE IN REGISTRY FOR PORT {}, OPENING NEW", port);
-                let sled_config = Config::new().path(&db_path);
-                let db = sled_config.open().map_err(|e| {
-                    GraphError::StorageError(format!("Failed to open Sled database at {:?}: {}", db_path, e))
-                })?;
-                let db_arc = Arc::new(db);
-                let vertices = db_arc.open_tree("vertices").map_err(|e| {
-                    GraphError::StorageError(format!("Failed to open vertices tree: {}", e))
-                })?;
-                let edges = db_arc.open_tree("edges").map_err(|e| {
-                    GraphError::StorageError(format!("Failed to open edges tree: {}", e))
-                })?;
-                let kv_pairs = db_arc.open_tree("kv_pairs").map_err(|e| {
-                    GraphError::StorageError(format!("Failed to open kv_pairs tree: {}", e))
-                })?;
-                (db_arc, vertices, edges, kv_pairs)
-            }
-        } else {
-            let sled_config = Config::new().path(&db_path);
-            let db = sled_config.open().map_err(|e| {
-                GraphError::StorageError(format!("Failed to open Sled database at {:?}: {}", db_path, e))
-            })?;
-            let db_arc = Arc::new(db);
-            let vertices = db_arc.open_tree("vertices").map_err(|e| {
-                GraphError::StorageError(format!("Failed to open vertices tree: {}", e))
-            })?;
-            let edges = db_arc.open_tree("edges").map_err(|e| {
-                GraphError::StorageError(format!("Failed to open edges tree: {}", e))
-            })?;
-            let kv_pairs = db_arc.open_tree("kv_pairs").map_err(|e| {
-                GraphError::StorageError(format!("Failed to open kv_pairs tree: {}", e))
-            })?;
-            (db_arc, vertices, edges, kv_pairs)
-        };
-
-        // If we opened a new DB (didn't reuse), register it
-        if !reused_existing_db { // Use the boolean instead of checking is_none()
-            let db_metadata = DBDaemonMetadata {
-                port,
-                pid: std::process::id(),
-                ip_address: "127.0.0.1".to_string(),
-                data_dir: Some(db_path.clone()),
-                config_path: None,
-                engine_type: Some("sled".to_string()),
-                last_seen_nanos: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64,
-                sled_db_instance: Some(db_arc.clone()),
-                rocksdb_db_instance: None,
-                sled_vertices: Some(vertices.clone()),
-                sled_edges: Some(edges.clone()),
-                sled_kv_pairs: Some(kv_pairs.clone()),
-                rocksdb_vertices: None,
-                rocksdb_edges: None,
-                rocksdb_kv_pairs: None,
-            };
-            db_registry.register_db_daemon(db_metadata).await?;
-            info!("Registered new Sled DB instance in global registry for port {}", port);
-            println!("===> REGISTERED NEW SLED DB INSTANCE IN GLOBAL REGISTRY FOR PORT {}", port);
-        }
-
-        let wal_path = db_path.parent().unwrap_or(&PathBuf::from("/opt/graphdb/storage_data")).to_path_buf();
+        // ✅ Initialize WAL manager (shared WAL)
+        let wal_dir = db_path.parent().unwrap_or(&db_path).to_path_buf();
         let wal_manager = Arc::new(
-            SledWalManager::new(wal_path, port).await?
+            SledWalManager::new(wal_dir.clone(), port)
+                .await
+                .map_err(|e| GraphError::StorageError(format!("Failed to create WAL manager: {}", e)))?
         );
 
-        let vertices_clone = vertices.clone();
-        let edges_clone = edges.clone();
-        let kv_pairs_clone = kv_pairs.clone();
-        let running = Arc::new(TokioMutex::new(true));
-        let running_clone = running.clone(); 
-        let db_path_for_metadata = db_path.clone(); // Clone db_path for metadata registry
+        // ✅ Replay WAL from shared location
+        let canonical_path = db_path.parent().unwrap().to_path_buf();
+        Self::replay_from_all_wals(&canonical_path, port, &db_arc).await?;
+        println!("===> WAL REPLAY COMPLETED SUCCESSFULLY FOR PORT {}", port);
 
+        // ZMQ setup
         let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", port);
-        let context = ZmqContext::new();
-        let zmq_socket = context
-            .socket(REP)
-            .map_err(|e| {
-                error!("Failed to create ZMQ socket for port {}: {}", port, e);
-                println!("===> ERROR: FAILED TO CREATE ZMQ SOCKET FOR PORT {}: {}", port, e);
-                GraphError::StorageError(format!("Failed to create ZMQ socket: {}", e))
-            })?;
-        let zmq_socket = Arc::new(TokioMutex::new(zmq_socket));
-        let zmq_socket_clone = zmq_socket.clone();
-        let endpoint_clone = endpoint.clone();
-        let ipc_addr = endpoint.clone();
+        let running = Arc::new(TokioMutex::new(true));
 
-        // ✅ Include wal_manager in the struct initialization
         let daemon = Self {
             port,
-            db_path, // Original db_path is MOVED here
-            db: db_arc, // Arc<Db>
-            vertices, // Tree (Originals are MOVED here)
-            edges, // Tree
-            kv_pairs, // Tree
-            running,
-            wal_manager, // ✅ Pass the WAL manager
+            db_path: db_path.clone(),
+            db: db_arc.clone(),
+            vertices: vertices.clone(),
+            edges: edges.clone(),
+            kv_pairs: kv_pairs.clone(),
+            running: running.clone(),
+            wal_manager: wal_manager.clone(),
             #[cfg(feature = "with-openraft-sled")]
-            raft_storage: None,
-            #[cfg(feature = "with-openraft-sled")]
-            raft: None,
+            raft_storage: Arc::new(openraft_sled::SledRaftStorage::new(db_arc.clone())),
             #[cfg(feature = "with-openraft-sled")]
             node_id: port as u64,
+            #[cfg(feature = "with-openraft-sled")]
+            raft: None,
         };
 
-        let daemon_registry = crate::daemon::daemon_registry::GLOBAL_DAEMON_REGISTRY.get().await;
-        let daemon_metadata = DaemonMetadata {
-            service_type: "storage".to_string(),
-            ip_address: config.host.clone().unwrap_or("127.0.0.1".to_string()),
-            data_dir: Some(db_path_for_metadata), // Use the cloned path
-            config_path: None,
-            engine_type: Some("sled".to_string()),
-            last_seen_nanos: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as i64,
-            zmq_ready: true,
-            engine_synced: false,
-            pid: std::process::id(),
+        // ✅ Start background WAL sync with all required parameters
+        Self::start_background_wal_sync(
             port,
-        };
-        daemon_registry.register_daemon(daemon_metadata).await
-            .map_err(|e| {
-                println!("===> ERROR: Failed to register daemon for port {}: {}", port, e);
-                GraphError::StorageError(format!("Failed to register daemon for port {}: {}", port, e))
-            })?;
-        println!("===> Registered daemon for port {} in global registry", port);
+            wal_manager.clone(),
+            &canonical_path,
+            db_arc.clone(),
+            vertices.clone(),
+            edges.clone(),
+            kv_pairs.clone(),
+            running.clone(),
+        );
 
-        println!("===> Time to run ZeroMQ server");
-        let daemon_for_zmq = daemon.clone();
-        let db_clone = Arc::clone(&daemon.db);
+        let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
+        let endpoint_clone = endpoint.clone();
+        let db_path_clone = db_path.clone();
+        let running_clone = running.clone();
+        let kv_pairs_arc = Arc::new(kv_pairs);
+        let vertices_arc = Arc::new(vertices);
+        let edges_arc = Arc::new(edges);
+        let wal_manager_clone = wal_manager.clone();
 
-        std::thread::spawn(move || {
-            let ipc_addr_thread = ipc_addr; // Move the IPC address into the thread
-            tokio::runtime::Runtime::new().unwrap().block_on(async move {
-                tokio::time::sleep(TokioDuration::from_millis(100)).await;
-                println!("===> Starting ZMQ server for IPC {}", ipc_addr_thread);
-                if let Err(e) = Self::run_zmq_server_static(
-                    port,
-                    db_clone,
-                    vertices_clone, // Uses the clone created before 'daemon' init
-                    edges_clone,    // Uses the clone created before 'daemon' init
-                    kv_pairs_clone, // Uses the clone created before 'daemon' init
-                    running_clone,  // Uses the clone created before 'daemon' init
-                    zmq_socket_clone,
-                    endpoint_clone,
-                )
-                .await
-                {
-                    eprintln!("===> ERROR: ZeroMQ server failed: {}", e);
+        let _zmq_thread_handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
+            rt.block_on(async {
+                let context = ZmqContext::new();
+                let zmq_socket_raw = match context.socket(REP) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!("ZMQ socket create failed: {}", e);
+                        return;
+                    }
+                };
+
+                // Force remove and retry binding
+                let _ = tokio_fs::remove_file(endpoint_clone.strip_prefix("ipc://").unwrap()).await;
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                
+                let mut bound = false;
+                for i in 0..5 {
+                    if zmq_socket_raw.bind(&endpoint_clone).is_ok() {
+                        bound = true;
+                        break;
+                    }
+                    tokio::time::sleep(TokioDuration::from_millis(200 * (i + 1) as u64)).await;
                 }
+                
+                if !bound {
+                    error!("Failed to bind ZMQ socket after retries");
+                    return;
+                }
+
+                // Update daemon metadata
+                let update_metadata = DaemonMetadata {
+                    service_type: "storage".to_string(),
+                    port,
+                    pid: std::process::id(),
+                    ip_address: "127.0.0.1".to_string(),
+                    data_dir: Some(db_path_clone.clone()),
+                    config_path: None,
+                    engine_type: Some("sled".to_string()),
+                    last_seen_nanos: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64,
+                    zmq_ready: true,
+                    engine_synced: true,
+                };
+                let _ = daemon_registry.update_daemon_metadata(update_metadata).await;
+
+                let zmq_socket = Arc::new(TokioMutex::new(zmq_socket_raw));
+                let _ = SledDaemon::run_zmq_server_lazy(
+                    port, 
+                    config, 
+                    running_clone, 
+                    zmq_socket, 
+                    endpoint_clone,
+                    db_arc, 
+                    kv_pairs_arc, 
+                    vertices_arc, 
+                    edges_arc,
+                    wal_manager_clone,
+                    db_path_clone,
+                ).await;
             });
         });
 
-        #[cfg(unix)]
-        {
-            let daemon_for_signal = daemon.clone();
-            tokio::spawn(async move {
-                let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("Failed to register SIGTERM handler");
-                sigterm.recv().await;
-                println!("===> WARNING: Received SIGTERM in Sled daemon");
-                if let Err(e) = daemon_for_signal.shutdown().await {
-                    eprintln!("===> ERROR: Failed to shutdown Sled daemon on SIGTERM: {}", e);
-                } else {
-                    println!("===> Sled daemon shutdown complete");
-                }
-            });
-        }
-
-        println!("===> Sled daemon initialization complete for port {}", port);
+        info!("SledDaemon created successfully on port {}", port);
         Ok(daemon)
     }
 
     /// ZMQ server – DB is already opened in `SledDaemon::new()`
-    /// All original commands are preserved.
+    /// Uses `zmq::poll()` + safe recv_msg(DONTWAIT) + rcvmore + async dedup
     async fn run_zmq_server_lazy(
         port: u16,
         _config: SledConfig,
@@ -1166,256 +1153,432 @@ impl SledDaemon {
         info!("===> STARTING ZMQ SERVER FOR PORT {} (DB ALREADY OPEN)", port);
         println!("===> STARTING ZMQ SERVER FOR PORT {} (DB ALREADY OPEN)", port);
 
-        // Configure socket
+        // Configure socket once
         {
-            let socket = zmq_socket.lock().await;
-            socket.set_linger(1000)
-                .map_err(|e| GraphError::StorageError(format!("Failed to set socket linger: {}", e)))?;
-            socket.set_rcvtimeo(SOCKET_TIMEOUT_MS)
-                .map_err(|e| GraphError::StorageError(format!("Failed to set receive timeout: {}", e)))?;
-            socket.set_sndtimeo(SOCKET_TIMEOUT_MS)
-                .map_err(|e| GraphError::StorageError(format!("Failed to set send timeout: {}", e)))?;
-            socket.set_maxmsgsize(MAX_MESSAGE_SIZE as i64)
-                .map_err(|e| GraphError::StorageError(format!("Failed to set max message size: {}", e)))?;
+            let mut socket = zmq_socket.lock().await;
+            socket.set_linger(0)?;
+            socket.set_rcvtimeo(100)?;   // Short – we poll + DONTWAIT
+            socket.set_sndtimeo(1000)?;
+            socket.set_maxmsgsize(MAX_MESSAGE_SIZE as i64)?;
+            socket.set_sndhwm(10000)?;
+            socket.set_rcvhwm(10000)?;
+            socket.set_immediate(true)?;
         }
+
         info!("ZeroMQ server configured for port {}", port);
         println!("===> ZEROMQ SERVER CONFIGURED FOR PORT {}", port);
 
         let mut consecutive_errors = 0;
+        let poll_timeout_ms = 10;
+
+        // === Get raw FD once ===
+        let raw_fd: RawFd = {
+            let s = zmq_socket.lock().await;
+            (&*s).as_raw_fd()
+        };
+
+        // === Create PollItem array ONCE ===
+        let mut poll_items = [PollItem::from_fd(raw_fd, zmq::POLLIN)];
 
         while *running.lock().await {
-            let msg_result = {
-                let socket = zmq_socket.lock().await;
-                socket.recv_bytes(DONTWAIT)
-            };
+            // === 1. POLL: Non-blocking check for incoming message ===
+            let poll_result = zmq::poll(&mut poll_items, poll_timeout_ms);
 
-            let msg: Vec<u8> = match msg_result {
-                Ok(m) => {
+            let msg: Vec<u8> = match poll_result {
+                Ok(n) if n > 0 && poll_items[0].is_readable() => {
+                    let mut full_msg = Vec::new();
+                    let mut s = zmq_socket.lock().await;
+
+                    loop {
+                        match s.recv_msg(zmq::DONTWAIT) {
+                            Ok(part) => {
+                                full_msg.extend_from_slice(&part);
+                                if !s.get_rcvmore()? {
+                                    break;
+                                }
+                            }
+                            Err(zmq::Error::EAGAIN) => {
+                                drop(s);
+                                tokio::time::sleep(TokioDuration::from_millis(1)).await;
+                                s = zmq_socket.lock().await;
+                                continue;
+                            }
+                            Err(e) => {
+                                consecutive_errors += 1;
+                                warn!("ZMQ recv error (attempt {}): {}", consecutive_errors, e);
+                                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                                    error!("Too many ZMQ errors – shutting down server on port {}", port);
+                                    return Err(GraphError::ZmqError(String::from(format!("{:?}", e))));
+                                }
+                                full_msg.clear();
+                                break;
+                            }
+                        }
+                    }
+
+                    if full_msg.is_empty() {
+                        continue;
+                    }
+
                     consecutive_errors = 0;
-                    debug!("Received ZeroMQ message for port {}", port);
-                    m
+                    debug!("Received ZMQ message ({} bytes) on port {}", full_msg.len(), port);
+                    full_msg
                 }
-                Err(ZmqError::EAGAIN) => {
-                    tokio::time::sleep(TokioDuration::from_millis(10)).await;
+                Ok(_) => {
+                    tokio::task::yield_now().await;
                     continue;
                 }
                 Err(e) => {
-                    consecutive_errors += 1;
-                    warn!("Failed to receive ZeroMQ message (attempt {}): {}", consecutive_errors, e);
-                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                        error!("Too many consecutive ZeroMQ errors, shutting down server");
-                        break;
-                    }
+                    error!("ZMQ poll error: {}", e);
                     tokio::time::sleep(TokioDuration::from_millis(100)).await;
                     continue;
                 }
             };
 
+            // === 2. PARSE REQUEST (no lock) ===
             if msg.is_empty() {
                 let resp = json!({"status":"error","message":"Received empty message"});
-                let socket = zmq_socket.lock().await;
-                Self::send_zmq_response_static(&socket, &resp, port).await?;
+                let _ = Self::send_zmq_response_static(&*zmq_socket.lock().await, &resp, port).await;
                 continue;
             }
 
             let request: Value = match serde_json::from_slice(&msg) {
                 Ok(r) => r,
                 Err(e) => {
-                    let resp = json!({"status":"error","message":format!("Parse error: {}",e)});
-                    let socket = zmq_socket.lock().await;
-                    Self::send_zmq_response_static(&socket, &resp, port).await?;
+                    let resp = json!({"status":"error","message":format!("Parse error: {}", e)});
+                    let _ = Self::send_zmq_response_static(&*zmq_socket.lock().await, &resp, port).await;
                     continue;
                 }
             };
 
-            let command = request.get("command").and_then(|c| c.as_str());
-            macro_rules! send_resp {
-                ($resp:expr) => {{
-                    let socket = zmq_socket.lock().await;
-                    Self::send_zmq_response_static(&socket, &$resp, port).await?;
+            // === DEDUP: Check request_id (async-safe) ===
+            let request_id = request.get("request_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+            {
+                let mut processed = PROCESSED_REQUESTS.lock().await;
+                if processed.contains(&request_id) {
+                    debug!("Duplicate request_id {} on port {} – skipping", request_id, port);
+                    let resp = json!({"status": "success", "note": "idempotent", "request_id": request_id});
+                    let _ = Self::send_zmq_response_static(&*zmq_socket.lock().await, &resp, port).await;
                     continue;
-                }};
+                }
+                processed.insert(request_id.clone());
             }
 
+            let command = request.get("command").and_then(|c| c.as_str());
+
+            // === 3. PROCESS COMMAND ===
             let response = match command {
-                // ── CONTROL COMMANDS ───────────────────────────────────────
-                Some("initialize") => {
-                    json!({
-                        "status": "success",
-                        "message": "ZMQ server is bound and DB is open.",
-                        "port": port,
-                        "ipc_path": &endpoint
-                    })
+                Some("initialize") => json!({
+                    "status": "success",
+                    "message": "ZMQ server is bound and DB is open.",
+                    "port": port,
+                    "ipc_path": &endpoint,
+                    "request_id": request_id
+                }),
+                Some("status") => json!({"status":"success","port":port,"db_open":true,"request_id": request_id}),
+                Some("ping") => json!({
+                    "status": "pong",
+                    "message": "ZMQ server is bound and DB is open.",
+                    "port": port,
+                    "ipc_path": &endpoint,
+                    "db_open":true,
+                    "request_id": request_id
+                }),
+                Some("force_unlock") => match Self::force_unlock_static(&db_path).await {
+                    Ok(_) => json!({"status":"success","request_id": request_id}),
+                    Err(e) => json!({"status":"error","message":e.to_string(),"request_id": request_id}),
+                },
+
+                // === MUTATING COMMANDS (WAL + LEADER) ===
+                Some(cmd) if [
+                    "set_key", "delete_key",
+                    "create_vertex", "update_vertex", "delete_vertex",
+                    "create_edge", "update_edge", "delete_edge",
+                    "flush"
+                ].contains(&cmd) => {
+                    let canonical = db_path.parent().unwrap().to_path_buf();
+                    let is_leader = match become_wal_leader(&canonical, port).await {
+                        Ok(l) => l,
+                        Err(e) => {
+                            let resp = json!({"status":"error","message":format!("Leader election failed: {}", e),"request_id": request_id});
+                            let _ = Self::send_zmq_response_static(&*zmq_socket.lock().await, &resp, port).await;
+                            continue;
+                        }
+                    };
+
+                    println!("====> IN run_zmq_server_lazy - command {:?}, is_leader: {}", cmd, is_leader);
+
+                    // Build the response based on leader/follower status
+                    let response = if is_leader {
+                        // === LEADER: APPLY LOCALLY ===
+                        let op = match cmd {
+                            "set_key" => {
+                                let tree = request["cf"].as_str().unwrap_or("kv_pairs").to_string();
+                                let key = request["key"].as_str().ok_or_else(|| GraphError::StorageError("missing key".into()))?.as_bytes().to_vec();
+                                let value = request["value"].as_str().ok_or_else(|| GraphError::StorageError("missing value".into()))?.as_bytes().to_vec();
+                                SledWalOperation::Put { tree, key, value }
+                            }
+                            "delete_key" => {
+                                let tree = request["cf"].as_str().unwrap_or("kv_pairs").to_string();
+                                let key = request["key"].as_str().ok_or_else(|| GraphError::StorageError("missing key".into()))?.as_bytes().to_vec();
+                                SledWalOperation::Delete { tree, key }
+                            }
+                            "create_vertex" | "update_vertex" => {
+                                let vertex: Vertex = serde_json::from_value(request["vertex"].clone())
+                                    .map_err(|e| GraphError::StorageError(format!("Invalid vertex: {}", e)))?;
+                                let key = vertex.id.as_bytes().to_vec();
+                                let value = serialize_vertex(&vertex)?;
+                                SledWalOperation::Put { tree: "vertices".to_string(), key, value }
+                            }
+                            "delete_vertex" => {
+                                let id: Identifier = serde_json::from_value(request["id"].clone())
+                                    .map_err(|e| GraphError::StorageError(format!("Invalid id: {}", e)))?;
+                                let uuid = SerializableUuid::from_str(id.as_ref())
+                                    .map_err(|_| GraphError::StorageError("Invalid UUID in vertex".into()))?;
+                                SledWalOperation::Delete { tree: "vertices".to_string(), key: uuid.as_bytes().to_vec() }
+                            }
+                            "create_edge" | "update_edge" => {
+                                let edge: Edge = serde_json::from_value(request["edge"].clone())
+                                    .map_err(|e| GraphError::StorageError(format!("Invalid edge: {}", e)))?;
+                                let key = create_edge_key(&edge.outbound_id, &edge.t, &edge.inbound_id)?;
+                                let value = serialize_edge(&edge)?;
+                                SledWalOperation::Put { tree: "edges".to_string(), key, value }
+                            }
+                            "delete_edge" => {
+                                let from: Identifier = serde_json::from_value(request["from"].clone())
+                                    .map_err(|e| GraphError::StorageError(format!("Invalid from: {}", e)))?;
+                                let to: Identifier = serde_json::from_value(request["to"].clone())
+                                    .map_err(|e| GraphError::StorageError(format!("Invalid to: {}", e)))?;
+                                let t: Identifier = serde_json::from_value(request["type"].clone())
+                                    .map_err(|e| GraphError::StorageError(format!("Invalid type: {}", e)))?;
+                                let from_uuid = SerializableUuid::from_str(from.as_ref())
+                                    .map_err(|_| GraphError::StorageError("Invalid UUID from".into()))?;
+                                let to_uuid = SerializableUuid::from_str(to.as_ref())
+                                    .map_err(|_| GraphError::StorageError("Invalid UUID to".into()))?;
+                                let key = create_edge_key(&from_uuid, &t, &to_uuid)?;
+                                SledWalOperation::Delete { tree: "edges".to_string(), key }
+                            }
+                            "flush" => {
+                                let tree = request["cf"].as_str().unwrap_or("default").to_string();
+                                SledWalOperation::Flush { tree }
+                            }
+                            _ => unreachable!(),
+                        };
+
+                        println!("====> LEADER: About to append to WAL");
+                        let lsn = match wal_manager.append(&op).await {
+                            Ok(lsn) => {
+                                println!("====> LEADER: WAL append successful, lsn: {}", lsn);
+                                lsn
+                            }
+                            Err(e) => {
+                                println!("====> LEADER: WAL append failed: {}", e);
+                                let resp = json!({"status":"error","message":e.to_string(),"request_id": request_id});
+                                let _ = Self::send_zmq_response_static(&*zmq_socket.lock().await, &resp, port).await;
+                                continue;
+                            }
+                        };
+
+                        println!("====> LEADER: About to apply operation locally");
+                        if let Err(e) = SledDaemon::apply_op_locally(&db, &op).await {
+                            println!("====> LEADER: Apply operation failed: {}", e);
+                            let resp = json!({"status":"error","message":e.to_string(),"request_id": request_id});
+                            let _ = Self::send_zmq_response_static(&*zmq_socket.lock().await, &resp, port).await;
+                            continue;
+                        }
+                        println!("====> LEADER: Operation applied successfully");
+
+                        let offset_key = format!("__wal_offset_port_{}", port);
+                        if let Err(e) = db.insert(offset_key.as_bytes(), lsn.to_string().as_bytes()) {
+                            warn!("Failed to update WAL offset for port {}: {}", port, e);
+                        }
+
+                        // Spawn async flush (non-blocking)
+                        tokio::spawn({
+                            let db_clone = db.clone();
+                            async move { let _ = db_clone.flush_async().await; }
+                        });
+
+                        println!("====> LEADER: Returning success response");
+                        json!({"status":"success", "offset": lsn, "leader": true, "request_id": request_id})
+                    } else {
+                        // === FOLLOWER: FORWARD TO LEADER ===
+                        println!("====> FOLLOWER: Attempting to get leader port");
+                        let leader_port = match get_leader_port(&canonical).await {
+                            Ok(Some(p)) => {
+                                println!("====> FOLLOWER: Leader port is {}", p);
+                                p
+                            }
+                            Ok(None) => {
+                                println!("====> FOLLOWER: No leader available");
+                                let resp = json!({"status":"error","message":"No leader available","request_id": request_id});
+                                let _ = Self::send_zmq_response_static(&*zmq_socket.lock().await, &resp, port).await;
+                                continue;
+                            }
+                            Err(e) => {
+                                println!("====> FOLLOWER: Leader lookup failed: {}", e);
+                                let resp = json!({"status":"error","message":format!("Leader lookup failed: {}", e),"request_id": request_id});
+                                let _ = Self::send_zmq_response_static(&*zmq_socket.lock().await, &resp, port).await;
+                                continue;
+                            }
+                        };
+
+                        if leader_port == 0 {
+                            println!("====> FOLLOWER: Leader port is 0, election pending");
+                            let resp = json!({"status":"error","message":"Leader election pending","request_id": request_id});
+                            let _ = Self::send_zmq_response_static(&*zmq_socket.lock().await, &resp, port).await;
+                            continue;
+                        }
+
+                        // Check if leader IPC socket exists before trying to connect
+                        let leader_ipc_path = format!("/tmp/graphdb-{}.ipc", leader_port);
+                        if tokio::fs::metadata(&leader_ipc_path).await.is_err() {
+                            println!("====> FOLLOWER: Leader IPC socket doesn't exist at {}", leader_ipc_path);
+                            error!("Leader IPC socket missing at {} - leader might not be running", leader_ipc_path);
+                            let resp = json!({
+                                "status":"error",
+                                "message":format!("Leader on port {} not reachable (IPC socket missing)", leader_port),
+                                "request_id": request_id
+                            });
+                            let _ = Self::send_zmq_response_static(&*zmq_socket.lock().await, &resp, port).await;
+                            continue;
+                        }
+                        println!("====> FOLLOWER: Leader IPC socket exists at {}", leader_ipc_path);
+
+                        println!("====> FOLLOWER: Creating new ZMQ context and socket");
+                        let context = zmq::Context::new();
+                        let client = match context.socket(zmq::REQ) {
+                            Ok(c) => {
+                                println!("====> FOLLOWER: Socket created successfully");
+                                c
+                            }
+                            Err(e) => {
+                                println!("====> FOLLOWER: Socket creation failed: {}", e);
+                                let resp = json!({"status":"error","message":format!("ZMQ socket error: {}", e),"request_id": request_id});
+                                let _ = Self::send_zmq_response_static(&*zmq_socket.lock().await, &resp, port).await;
+                                continue;
+                            }
+                        };
+
+                        let leader_endpoint = format!("ipc:///tmp/graphdb-{}.ipc", leader_port);
+                        println!("====> FOLLOWER: Connecting to leader at {}", leader_endpoint);
+                        if let Err(e) = client.connect(&leader_endpoint) {
+                            println!("====> FOLLOWER: Connection failed: {}", e);
+                            let resp = json!({"status":"error","message":format!("Failed to connect to leader {}: {}", leader_port, e),"request_id": request_id});
+                            let _ = Self::send_zmq_response_static(&*zmq_socket.lock().await, &resp, port).await;
+                            continue;
+                        }
+                        println!("====> FOLLOWER: Connected to leader");
+
+                        client.set_sndtimeo(2000).ok();
+                        client.set_rcvtimeo(3000).ok();  // Reduced timeout
+
+                        let mut forward_req = request.clone();
+                        forward_req["forwarded_from"] = json!(port);
+                        forward_req["command"] = json!(cmd);
+                        forward_req["request_id"] = json!(request_id);
+
+                        let payload = match serde_json::to_vec(&forward_req) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                println!("====> FOLLOWER: Serialization failed: {}", e);
+                                let resp = json!({"status":"error","message":format!("JSON serialize error: {}", e),"request_id": request_id});
+                                let _ = Self::send_zmq_response_static(&*zmq_socket.lock().await, &resp, port).await;
+                                continue;
+                            }
+                        };
+
+                        println!("====> FOLLOWER: Sending request to leader ({} bytes)", payload.len());
+                        if let Err(e) = client.send(&payload, 0) {
+                            println!("====> FOLLOWER: Send to leader failed: {}", e);
+                            let resp = json!({"status":"error","message":format!("ZMQ send failed: {}", e),"request_id": request_id});
+                            let _ = Self::send_zmq_response_static(&*zmq_socket.lock().await, &resp, port).await;
+                            continue;
+                        }
+                        println!("====> FOLLOWER: Request sent, waiting for leader response...");
+
+                        let resp_msg = match client.recv_bytes(0) {
+                            Ok(m) => {
+                                println!("====> FOLLOWER: Received response from leader ({} bytes)", m.len());
+                                m
+                            }
+                            Err(e) => {
+                                println!("====> FOLLOWER: Recv from leader failed: {}", e);
+                                let resp = json!({"status":"error","message":format!("ZMQ recv error: {}", e),"request_id": request_id});
+                                let _ = Self::send_zmq_response_static(&*zmq_socket.lock().await, &resp, port).await;
+                                continue;
+                            }
+                        };
+
+                        println!("====> FOLLOWER: Parsing leader response");
+                        match serde_json::from_slice(&resp_msg) {
+                            Ok(resp) => resp,
+                            Err(e) => {
+                                let resp = json!({"status":"error","message":format!("Leader response parse error: {}", e),"request_id": request_id});
+                                let _ = Self::send_zmq_response_static(&*zmq_socket.lock().await, &resp, port).await;
+                                continue;
+                            }
+                        }
+                    };
+                    
+                    // This is the key: we set response variable and let it fall through to the send at the bottom
+                    response
                 }
-                Some("status") => {
-                    json!({"status":"success","port":port,"db_open":true})
-                }
-                Some("ping") => {
-                    json!({
-                        "status": "pong",
-                        "message": "ZMQ server is bound and DB is open.",
-                        "port": port,
-                        "ipc_path": &endpoint,
-                        "db_open":true
-                    })
-                }
-                Some("force_unlock") => {
-                    match Self::force_unlock_static(&db_path).await {
-                        Ok(_) => json!({"status":"success"}),
-                        Err(e) => json!({"status":"error","message":e.to_string()}),
+                // === READ COMMANDS ===
+                Some(cmd) if [
+                    "get_key", "get_vertex", "get_edge",
+                    "get_all_vertices", "get_all_edges",
+                    "get_all_vertices_by_type", "get_all_edges_by_type"
+                ].contains(&cmd) => {
+                    match Self::execute_db_command(cmd, &request, &db, &kv_pairs, &vertices, &edges, port, &db_path, &endpoint).await {
+                        Ok(mut r) => {
+                            r["request_id"] = json!(request_id);
+                            r
+                        }
+                        Err(e) => json!({"status":"error","message":e.to_string(),"request_id": request_id}),
                     }
                 }
 
-                // ── WRITE-MODIFYING COMMANDS (WAL) ───────────────────────
-                Some(cmd) if [
-                    "set_key","delete_key",
-                    "create_vertex","update_vertex","delete_vertex",
-                    "create_edge","update_edge","delete_edge",
-                    "flush"
-                ].contains(&cmd) => {
-                    let op = match cmd {
-                        "set_key" => {
-                            let tree = request["cf"].as_str().unwrap_or("kv_pairs").to_string();
-                            let key = request["key"]
-                                .as_str()
-                                .ok_or_else(|| GraphError::StorageError("missing key".to_string()))?
-                                .as_bytes()
-                                .to_vec();
-                            let value = request["value"]
-                                .as_str()
-                                .ok_or_else(|| GraphError::StorageError("missing value".to_string()))?
-                                .as_bytes()
-                                .to_vec();
-                            SledWalOperation::Put { tree, key, value }
-                        }
-                        "delete_key" => {
-                            let tree = request["cf"].as_str().unwrap_or("kv_pairs").to_string();
-                            let key = request["key"]
-                                .as_str()
-                                .ok_or_else(|| GraphError::StorageError("missing key".to_string()))?
-                                .as_bytes()
-                                .to_vec();
-                            SledWalOperation::Delete { tree, key }
-                        }
-                        "create_vertex" | "update_vertex" => {
-                            let vertex: Vertex = serde_json::from_value(request["vertex"].clone())
-                                .map_err(|e| GraphError::StorageError(format!("Invalid vertex: {}", e)))?;
-                            let key = vertex.id.as_bytes().to_vec();
-                            let value = serialize_vertex(&vertex)?;
-                            SledWalOperation::Put { tree: "vertices".to_string(), key, value }
-                        }
-                        "delete_vertex" => {
-                            let id: Identifier = serde_json::from_value(request["id"].clone())
-                                .map_err(|e| GraphError::StorageError(format!("Invalid id: {}", e)))?;
-                            let uuid_str = id.as_ref();
-                            let uuid = SerializableUuid::from_str(uuid_str)
-                                .map_err(|_| GraphError::StorageError("Invalid UUID in vertex id".into()))?;
-                            SledWalOperation::Delete { tree: "vertices".to_string(), key: uuid.as_bytes().to_vec() }
-                        }
-                        "create_edge" | "update_edge" => {
-                            let edge: Edge = serde_json::from_value(request["edge"].clone())
-                                .map_err(|e| GraphError::StorageError(format!("Invalid edge: {}", e)))?;
-                            let key = create_edge_key(&edge.outbound_id, &edge.t, &edge.inbound_id)?;
-                            let value = serialize_edge(&edge)?;
-                            SledWalOperation::Put { tree: "edges".to_string(), key, value }
-                        }
-                        "delete_edge" => {
-                            let from: Identifier = serde_json::from_value(request["from"].clone())
-                                .map_err(|e| GraphError::StorageError(format!("Invalid from: {}", e)))?;
-                            let to: Identifier = serde_json::from_value(request["to"].clone())
-                                .map_err(|e| GraphError::StorageError(format!("Invalid to: {}", e)))?;
-                            let t: Identifier = serde_json::from_value(request["type"].clone())
-                                .map_err(|e| GraphError::StorageError(format!("Invalid type: {}", e)))?;
-                            let from_uuid = SerializableUuid::from_str(from.as_ref())
-                                .map_err(|_| GraphError::StorageError("Invalid UUID in 'from'".into()))?;
-                            let to_uuid = SerializableUuid::from_str(to.as_ref())
-                                .map_err(|_| GraphError::StorageError("Invalid UUID in 'to'".into()))?;
-                            let key = create_edge_key(&from_uuid, &t, &to_uuid)?;
-                            SledWalOperation::Delete { tree: "edges".to_string(), key }
-                        }
-                        "flush" => {
-                            let tree = request["cf"].as_str().unwrap_or("kv_pairs").to_string();
-                            SledWalOperation::Flush { tree }
-                        }
-                        _ => unreachable!(),
-                    };
-
-                    // WRITE TO WAL FIRST
-                    let lsn = wal_manager.append(&op).await
-                        .map_err(|e| GraphError::StorageError(e.to_string()))?;
-
-                    // Apply locally
-                    SledDaemon::apply_op_locally(&db, &op).await
-                        .map_err(|e| GraphError::StorageError(e.to_string()))?;
-
-                    // Update local offset
-                    let offset_key = format!("__wal_offset_port_{}", port);
-                    db.insert(offset_key.as_bytes(), lsn.to_string().as_bytes())?;
-                    db.flush_async().await?;
-
-                    json!({"status":"success", "offset": lsn})
-                }
-
-                // ── NON-WAL WRITE COMMANDS (clear, reset) ───────────
                 Some("clear_data") | Some("force_reset") => {
-                    match Self::execute_db_command(
-                        command.unwrap(), &request,
-                        &db, &kv_pairs, &vertices, &edges,
-                        port, &db_path, &endpoint
-                    ).await {
-                        Ok(r) => r,
-                        Err(e) => json!({"status":"error","message":e.to_string()}),
+                    match Self::execute_db_command(command.unwrap(), &request, &db, &kv_pairs, &vertices, &edges, port, &db_path, &endpoint).await {
+                        Ok(mut r) => {
+                            r["request_id"] = json!(request_id);
+                            r
+                        }
+                        Err(e) => json!({"status":"error","message":e.to_string(),"request_id": request_id}),
                     }
                 }
 
                 Some("force_ipc_init") => {
-                    info!("Received force_ipc_init command for port {}", port);
-                    println!("===> FORCING IPC INITIALIZATION FOR PORT {}", port);
                     let ipc_path = format!("/tmp/graphdb-{}.ipc", port);
                     match tokio::fs::metadata(&ipc_path).await {
-                        Ok(_) => json!({"status": "success", "message": "IPC socket already exists", "ipc_path": &ipc_path}),
-                        Err(_) => {
-                            error!("IPC socket missing at {} even though ZMQ server is running", ipc_path);
-                            json!({"status": "error", "message": "IPC socket missing - server restart required", "ipc_path": &ipc_path})
-                        }
+                        Ok(_) => json!({"status": "success", "message": "IPC socket already exists", "ipc_path": &ipc_path, "request_id": request_id}),
+                        Err(_) => json!({"status": "error", "message": "IPC socket missing - server restart required", "ipc_path": &ipc_path, "request_id": request_id}),
                     }
                 }
 
-                // ── READ-ONLY COMMANDS ─────────────────────────────────────
-                Some(cmd) if [
-                    "get_key",
-                    "get_vertex","get_edge",
-                    "get_all_vertices","get_all_edges",
-                    "get_all_vertices_by_type","get_all_edges_by_type"
-                ].contains(&cmd) => {
-                    match Self::execute_db_command(
-                        cmd, &request,
-                        &db, &kv_pairs, &vertices, &edges,
-                        port, &db_path, &endpoint
-                    ).await {
-                        Ok(r) => r,
-                        Err(e) => json!({"status":"error","message":e.to_string()}),
-                    }
-                }
-
-                // ── FALLBACK ───────────────────────────────────────────────
-                Some(cmd) => {
-                    error!("Unsupported command: {}", cmd);
-                    json!({"status":"error","message":format!("Unsupported command: {}",cmd)})
-                }
-                None => {
-                    error!("No command specified in request");
-                    json!({"status":"error","message":"No command specified"})
-                }
+                Some(cmd) => json!({"status":"error","message":format!("Unsupported command: {}", cmd),"request_id": request_id}),
+                None => json!({"status":"error","message":"No command specified","request_id": request_id}),
             };
 
-            let socket = zmq_socket.lock().await;
-            Self::send_zmq_response_static(&socket, &response, port).await?;
+            // === 4. SEND RESPONSE: lock only for send ===
+            {
+                let s = zmq_socket.lock().await;
+                if let Err(e) = Self::send_zmq_response_static(&*s, &response, port).await {
+                    error!("Failed to send ZMQ response on port {}: {}", port, e);
+                }
+            }
         }
 
         info!("ZMQ server shutting down for port {}", port);
-        let socket = zmq_socket.lock().await;
-        let _ = socket.disconnect(&endpoint);
+        {
+            let s = zmq_socket.lock().await;
+            let _ = s.disconnect(&endpoint);
+        }
         Ok(())
     }
 
@@ -1428,8 +1591,10 @@ impl SledDaemon {
         edges: &Arc<Tree>,
         port: u16,
         db_path: &PathBuf,
-        _endpoint: &str,
+        endpoint: &str,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        use bincode::{decode_from_slice, config::standard};
+
         match command {
             "get_key" => {
                 let tree_name = request.get("cf").and_then(|c| c.as_str()).unwrap_or("kv_pairs");
@@ -1438,64 +1603,60 @@ impl SledDaemon {
                     "kv_pairs" => kv_pairs,
                     "vertices" => vertices,
                     "edges" => edges,
-                    _ => return Err(format!("Column family {} not found", tree_name).into()),
+                    _ => return Err(format!("Tree {} not found", tree_name).into()),
                 };
                 let result = tree.get(key.as_bytes())?;
-                let value_str = result.and_then(|v| String::from_utf8(v.to_vec()).ok());
+                let value_str = result.map(|v| String::from_utf8_lossy(&v).to_string());
                 Ok(json!({"status": "success", "value": value_str}))
             }
 
-            "flush" => {
-                db.flush_async().await?;
-                Ok(json!({"status": "success"}))
-            }
-
             "get_all_vertices" => {
-                let mut vertices_vec = Vec::new();
+                println!("===========> in execute_db_command - will try to get all vertices {:?}", command);
+                let mut vec = Vec::new();
                 for item in vertices.iter() {
                     let (_, value) = item?;
-                    let vertex = deserialize_vertex(&value)?;
-                    vertices_vec.push(vertex);
+                    let v = deserialize_vertex(&value)?;
+                    vec.push(v);
                 }
-                Ok(json!({"status": "success", "vertices": vertices_vec}))
+                Ok(json!({"status": "success", "vertices": vec}))
             }
-
+            
             "get_all_vertices_by_type" => {
-                let vertex_type: Identifier =
-                    serde_json::from_value(request["vertex_type"].clone()).map_err(|_| "Invalid or missing vertex_type")?;
-                let mut vertices_vec = Vec::new();
+                let vertex_type: Identifier = serde_json::from_value(request["vertex_type"].clone())
+                    .map_err(|_| "Invalid or missing vertex_type")?;
+                let mut vec = Vec::new();
                 for item in vertices.iter() {
                     let (_, value) = item?;
-                    let vertex = deserialize_vertex(&value)?;
-                    if vertex.label == vertex_type {
-                        vertices_vec.push(vertex);
+                    let v = deserialize_vertex(&value)?;
+                    if v.label == vertex_type {
+                        vec.push(v);
                     }
                 }
-                Ok(json!({"status": "success", "vertices": vertices_vec}))
+                Ok(json!({"status": "success", "vertices": vec}))
             }
 
             "get_all_edges" => {
-                let mut edges_vec = Vec::new();
+                let mut vec = Vec::new();
                 for item in edges.iter() {
                     let (_, value) = item?;
-                    let edge = deserialize_edge(&value)?;
-                    edges_vec.push(edge);
+                    let e = deserialize_edge(&value)?;
+                    vec.push(e);
                 }
-                Ok(json!({"status": "success", "edges": edges_vec}))
+                Ok(json!({"status": "success", "edges": vec}))
             }
-
+            
             "get_all_edges_by_type" => {
-                let edge_type: Identifier =
-                    serde_json::from_value(request["edge_type"].clone()).map_err(|_| "Invalid or missing edge_type")?;
-                let mut edges_vec = Vec::new();
+                let edge_type: Identifier = serde_json::from_value(request["edge_type"].clone())
+                    .map_err(|_| "Invalid or missing edge_type")?;
+                let mut vec = Vec::new();
                 for item in edges.iter() {
                     let (_, value) = item?;
-                    let edge = deserialize_edge(&value)?;
-                    if edge.t == edge_type {
-                        edges_vec.push(edge);
+                    let e = deserialize_edge(&value)?;
+                    if e.t == edge_type {
+                        vec.push(e);
                     }
                 }
-                Ok(json!({"status": "success", "edges": edges_vec}))
+                Ok(json!({"status": "success", "edges": vec}))
             }
 
             "clear_data" => {
@@ -1503,7 +1664,7 @@ impl SledDaemon {
                 db.flush_async().await?;
                 Ok(json!({"status": "success"}))
             }
-
+            
             "force_reset" => {
                 kv_pairs.clear()?;
                 vertices.clear()?;
@@ -1513,685 +1674,39 @@ impl SledDaemon {
                 Ok(json!({"status": "success"}))
             }
 
-            "force_unlock" => {
-                Self::force_unlock_static(db_path).await?;
-                Ok(json!({"status": "success"}))
-            }
-
-            "force_unlock_path" => {
-                Self::force_unlock_path_static(db_path).await?;
-                Ok(json!({"status": "success"}))
+            "set_key" | "delete_key" | "create_vertex" | "update_vertex"
+            | "delete_vertex" | "create_edge" | "update_edge"
+            | "delete_edge" | "flush" => {
+                Err("Mutating commands are not allowed in execute_db_command. Use ZMQ mutating path with WAL.".into())
             }
 
             cmd => {
-                error!("Unsupported command: {}", cmd);
+                error!("Unsupported command in execute_db_command: {}", cmd);
                 Ok(json!({"status": "error", "message": format!("Unsupported command: {}", cmd)}))
             }
         }
     }
 
-    async fn send_zmq_response_static(socket: &ZmqSocket, response: &Value, port: u16) -> GraphResult<()> {
+    async fn send_zmq_response_static(
+        socket: &ZmqSocket,
+        response: &Value,
+        port: u16,
+    ) -> GraphResult<()> {
         let response_data = serde_json::to_vec(response)
             .map_err(|e| {
                 error!("Failed to serialize ZMQ response for port {}: {}", port, e);
                 GraphError::StorageError(format!("Failed to serialize response: {}", e))
             })?;
-        socket
-            .send(response_data, 0)
+
+        let response_len = response_data.len();
+
+        socket.send(response_data, 0)
             .map_err(|e| {
-                error!("Failed to send ZMQ response for port {}: {}", port, e);
+                error!("CRITICAL: Failed to send ZMQ response for port {}: {}", port, e);
                 GraphError::StorageError(format!("Failed to send response: {}", e))
             })?;
-        Ok(())
-    }
 
-    async fn run_zmq_server_static(
-        port: u16,
-        db: Arc<Db>,
-        vertices: Tree,
-        edges: Tree,
-        kv_pairs: Tree,
-        running: Arc<TokioMutex<bool>>,
-        zmq_socket: Arc<TokioMutex<ZmqSocket>>,
-        endpoint: String,
-    ) -> GraphResult<()> {
-        const SOCKET_TIMEOUT_MS: i32 = 10_000;
-        const MAX_MESSAGE_SIZE: i32 = 1_024 * 1_024;
-
-        // Get db_path from the already available information
-        // Since we're in the daemon context, we can construct it directly
-        // The actual db_path should be passed in or derived from the trees
-        // For now, we'll use a placeholder - but ideally this should be passed as parameter
-        let db_path = {
-            // Extract path from the DB - this is more reliable than registry lookup
-            // Note: sled::Db doesn't expose path directly, so we need to pass it in
-            // For now, we'll use a fallback, but the real fix is to pass db_path as parameter
-            PathBuf::from(format!("{}/sled/{}", DEFAULT_DATA_DIRECTORY, port))
-        };
-
-        println!("==============================> Starting ZMQ server for port {}", port);
-
-        // Configure socket options BEFORE any binding (should already be bound by caller)
-        {
-            let socket = zmq_socket.lock().await;
-            socket
-                .set_linger(1000)
-                .map_err(|e| GraphError::StorageError(format!("Failed to set socket linger for port {}: {}", port, e)))?;
-            socket
-                .set_rcvtimeo(SOCKET_TIMEOUT_MS)
-                .map_err(|e| GraphError::StorageError(format!("Failed to set receive timeout for port {}: {}", port, e)))?;
-            socket
-                .set_sndtimeo(SOCKET_TIMEOUT_MS)
-                .map_err(|e| GraphError::StorageError(format!("Failed to set send timeout for port {}: {}", port, e)))?;
-            socket
-                .set_maxmsgsize(MAX_MESSAGE_SIZE as i64)
-                .map_err(|e| GraphError::StorageError(format!("Failed to set max message size for port {}: {}", port, e)))?;
-        }
-
-        // DO NOT bind again here - socket should already be bound by the caller
-        // DO NOT remove IPC file here - it should have been cleaned up before binding
-
-        tokio::time::sleep(TokioDuration::from_millis(100)).await;
-
-        info!("ZMQ server configured and ready for port {}", port);
-        println!("===> ZMQ SERVER CONFIGURED AND READY FOR PORT {}", port);
-
-        let mut consecutive_errors = 0;
-        const MAX_CONSECUTIVE_ERRORS: u32 = 10;
-
-        while *running.lock().await {
-            let msg_result = {
-                let socket = zmq_socket.lock().await;
-                socket.recv_bytes(zmq::DONTWAIT)
-            };
-
-            let msg: Vec<u8> = match msg_result {
-                Ok(msg_bytes) => {
-                    consecutive_errors = 0;
-                    debug!("Received ZeroMQ message for port {}: {:?}", port, String::from_utf8_lossy(&msg_bytes));
-                    msg_bytes
-                }
-                Err(zmq::Error::EAGAIN) => {
-                    tokio::time::sleep(TokioDuration::from_millis(10)).await;
-                    continue;
-                }
-                Err(e) => {
-                    consecutive_errors += 1;
-                    warn!("Failed to receive ZeroMQ message for port {} (attempt {}): {}", port, consecutive_errors, e);
-                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                        error!("Too many consecutive ZeroMQ errors for port {}, shutting down server", port);
-                        break;
-                    }
-                    tokio::time::sleep(TokioDuration::from_millis(100)).await;
-                    continue;
-                }
-            };
-
-            if msg.is_empty() {
-                error!("Received empty message for port {}", port);
-                let response = json!({"status": "error", "message": "Received empty message"});
-                let socket = zmq_socket.lock().await;
-                Self::send_zmq_response_static(&socket, &response, port).await?;
-                continue;
-            }
-
-            let request: Value = match serde_json::from_slice(&msg) {
-                Ok(req) => {
-                    debug!("Parsed request for port {}: {:?}", port, req);
-                    req
-                }
-                Err(e) => {
-                    error!("Failed to parse ZeroMQ request for port {}: {}", port, e);
-                    let response = json!({"status": "error", "message": format!("Failed to parse request: {}", e)});
-                    let socket = zmq_socket.lock().await;
-                    Self::send_zmq_response_static(&socket, &response, port).await?;
-                    continue;
-                }
-            };
-
-            let response = match request.get("command").and_then(|c| c.as_str()) {
-                Some("initialize") => {
-                    info!("Initialization command received for port {}", port);
-                    json!({
-                        "status": "success",
-                        "message": "ZMQ server is bound and ready.",
-                        "port": port,
-                        "ipc_path": endpoint
-                    })
-                }
-                Some("status") | Some("ping") => {
-                    json!({"status": "success", "port": port})
-                }
-                Some("set_key") => {
-                    let key = match request.get("key").and_then(|k| k.as_str()) {
-                        Some(k) => k,
-                        None => {
-                            let response = json!({"status": "error", "message": "Missing key in set_key request"});
-                            let socket = zmq_socket.lock().await;
-                            Self::send_zmq_response_static(&socket, &response, port).await?;
-                            continue;
-                        }
-                    };
-                    let value = match request.get("value").and_then(|v| v.as_str()) {
-                        Some(v) => v,
-                        None => {
-                            let response = json!({"status": "error", "message": "Missing value in set_key request"});
-                            let socket = zmq_socket.lock().await;
-                            Self::send_zmq_response_static(&socket, &response, port).await?;
-                            continue;
-                        }
-                    };
-
-                    // Decode the base64-encoded value
-                    let decoded_value = match general_purpose::STANDARD.decode(value) {
-                        Ok(decoded) => decoded,
-                        Err(e) => {
-                            error!("Failed to decode base64 value for key {}: {}", key, e);
-                            let response = json!({"status": "error", "message": format!("Invalid base64 value: {}", e)});
-                            let socket = zmq_socket.lock().await;
-                            Self::send_zmq_response_static(&socket, &response, port).await?;
-                            continue;
-                        }
-                    };
-
-                    match Self::insert_static(&kv_pairs, &db, db_path.as_path(), key.as_bytes(), &decoded_value).await {
-                        Ok(_) => json!({"status": "success"}),
-                        Err(e) => json!({"status": "error", "message": e.to_string()}),
-                    }
-                }
-                Some("get_key") => {
-                    let key = match request.get("key").and_then(|k| k.as_str()) {
-                        Some(k) => k,
-                        None => {
-                            let response = json!({"status": "error", "message": "Missing key in get_key request"});
-                            let socket = zmq_socket.lock().await;
-                            Self::send_zmq_response_static(&socket, &response, port).await?;
-                            continue;
-                        }
-                    };
-
-                    match Self::retrieve_static(&kv_pairs, db_path.as_path(), key.as_bytes()).await {
-                        Ok(Some(val)) => {
-                            let value_str = String::from_utf8_lossy(&val).to_string();
-                            json!({"status": "success", "value": value_str})
-                        }
-                        Ok(None) => json!({"status": "success", "value": null}),
-                        Err(e) => json!({"status": "error", "message": e.to_string()}),
-                    }
-                }
-                Some("delete_key") => {
-                    let key = match request.get("key").and_then(|k| k.as_str()) {
-                        Some(k) => k,
-                        None => {
-                            let response = json!({"status": "error", "message": "Missing key in delete_key request"});
-                            let socket = zmq_socket.lock().await;
-                            Self::send_zmq_response_static(&socket, &response, port).await?;
-                            continue;
-                        }
-                    };
-
-                    match Self::delete_static(&kv_pairs, &db, db_path.as_path(), key.as_bytes()).await {
-                        Ok(_) => json!({"status": "success"}),
-                        Err(e) => json!({"status": "error", "message": e.to_string()}),
-                    }
-                }
-                Some("flush") => {
-                    match Self::flush_static(&db, db_path.as_path()).await {
-                        Ok(_) => json!({"status": "success", "bytes_flushed": 0}),
-                        Err(e) => json!({"status": "error", "message": e.to_string()}),
-                    }
-                }
-                Some("get_all_vertices") => {
-                    match Self::get_all_vertices_static(&vertices, db_path.as_path()).await {
-                        Ok(vertices_list) => json!({"status": "success", "vertices": vertices_list}),
-                        Err(e) => json!({"status": "error", "message": e.to_string()}),
-                    }
-                }
-                Some("get_all_edges") => {
-                    match Self::get_all_edges_static(&edges, db_path.as_path()).await {
-                        Ok(edges_list) => json!({"status": "success", "edges": edges_list}),
-                        Err(e) => json!({"status": "error", "message": e.to_string()}),
-                    }
-                }
-                Some("clear_data") => {
-                    match Self::clear_data_static(&kv_pairs, &db, db_path.as_path()).await {
-                        Ok(_) => json!({"status": "success", "bytes_flushed": 0}),
-                        Err(e) => json!({"status": "error", "message": e.to_string()}),
-                    }
-                }
-                Some("create_vertex") => {
-                    let vertex = match request.get("vertex").and_then(|v| serde_json::from_value::<Vertex>(v.clone()).ok()) {
-                        Some(v) => v,
-                        None => {
-                            let response = json!({"status": "error", "message": "Invalid or missing vertex in create_vertex request"});
-                            let socket = zmq_socket.lock().await;
-                            Self::send_zmq_response_static(&socket, &response, port).await?;
-                            continue;
-                        }
-                    };
-
-                    match Self::create_vertex_static(&vertices, &db, db_path.as_path(), &vertex).await {
-                        Ok(_) => json!({"status": "success"}),
-                        Err(e) => json!({"status": "error", "message": e.to_string()}),
-                    }
-                }
-                Some("get_vertex") => {
-                    let id = match request.get("id").and_then(|i| Uuid::parse_str(i.as_str().unwrap_or("")).ok()) {
-                        Some(i) => i,
-                        None => {
-                            let response = json!({"status": "error", "message": "Invalid or missing id in get_vertex request"});
-                            let socket = zmq_socket.lock().await;
-                            Self::send_zmq_response_static(&socket, &response, port).await?;
-                            continue;
-                        }
-                    };
-
-                    match Self::get_vertex_static(&vertices, db_path.as_path(), &id).await {
-                        Ok(Some(vertex)) => json!({"status": "success", "vertex": vertex}),
-                        Ok(None) => json!({"status": "success", "vertex": null}),
-                        Err(e) => json!({"status": "error", "message": e.to_string()}),
-                    }
-                }
-                Some("update_vertex") => {
-                    let vertex = match request.get("vertex").and_then(|v| serde_json::from_value::<Vertex>(v.clone()).ok()) {
-                        Some(v) => v,
-                        None => {
-                            let response = json!({"status": "error", "message": "Invalid or missing vertex in update_vertex request"});
-                            let socket = zmq_socket.lock().await;
-                            Self::send_zmq_response_static(&socket, &response, port).await?;
-                            continue;
-                        }
-                    };
-
-                    match Self::update_vertex_static(&vertices, &db, db_path.as_path(), &vertex).await {
-                        Ok(_) => json!({"status": "success"}),
-                        Err(e) => json!({"status": "error", "message": e.to_string()}),
-                    }
-                }
-                Some("delete_vertex") => {
-                    let id = match request.get("id").and_then(|i| Uuid::parse_str(i.as_str().unwrap_or("")).ok()) {
-                        Some(i) => i,
-                        None => {
-                            let response = json!({"status": "error", "message": "Invalid or missing id in delete_vertex request"});
-                            let socket = zmq_socket.lock().await;
-                            Self::send_zmq_response_static(&socket, &response, port).await?;
-                            continue;
-                        }
-                    };
-
-                    match Self::delete_vertex_static(&vertices, &edges, &db, db_path.as_path(), &id).await {
-                        Ok(_) => json!({"status": "success"}),
-                        Err(e) => json!({"status": "error", "message": e.to_string()}),
-                    }
-                }
-                Some("create_edge") => {
-                    let edge = match request.get("edge").and_then(|e| serde_json::from_value::<Edge>(e.clone()).ok()) {
-                        Some(e) => e,
-                        None => {
-                            let response = json!({"status": "error", "message": "Invalid or missing edge in create_edge request"});
-                            let socket = zmq_socket.lock().await;
-                            Self::send_zmq_response_static(&socket, &response, port).await?;
-                            continue;
-                        }
-                    };
-
-                    match Self::create_edge_static(&edges, &db, db_path.as_path(), &edge).await {
-                        Ok(_) => json!({"status": "success"}),
-                        Err(e) => json!({"status": "error", "message": e.to_string()}),
-                    }
-                }
-                Some("get_edge") => {
-                    let outbound_id = match request.get("outbound_id").and_then(|i| Uuid::parse_str(i.as_str().unwrap_or("")).ok()) {
-                        Some(i) => i,
-                        None => {
-                            let response = json!({"status": "error", "message": "Invalid or missing outbound_id in get_edge request"});
-                            let socket = zmq_socket.lock().await;
-                            Self::send_zmq_response_static(&socket, &response, port).await?;
-                            continue;
-                        }
-                    };
-                    let edge_type = match request.get("edge_type").and_then(|t| serde_json::from_value::<Identifier>(t.clone()).ok()) {
-                        Some(t) => t,
-                        None => {
-                            let response = json!({"status": "error", "message": "Invalid or missing edge_type in get_edge request"});
-                            let socket = zmq_socket.lock().await;
-                            Self::send_zmq_response_static(&socket, &response, port).await?;
-                            continue;
-                        }
-                    };
-                    let inbound_id = match request.get("inbound_id").and_then(|i| Uuid::parse_str(i.as_str().unwrap_or("")).ok()) {
-                        Some(i) => i,
-                        None => {
-                            let response = json!({"status": "error", "message": "Invalid or missing inbound_id in get_edge request"});
-                            let socket = zmq_socket.lock().await;
-                            Self::send_zmq_response_static(&socket, &response, port).await?;
-                            continue;
-                        }
-                    };
-
-                    match Self::get_edge_static(&edges, db_path.as_path(), &outbound_id, &edge_type, &inbound_id).await {
-                        Ok(Some(edge)) => json!({"status": "success", "edge": edge}),
-                        Ok(None) => json!({"status": "success", "edge": null}),
-                        Err(e) => json!({"status": "error", "message": e.to_string()}),
-                    }
-                }
-                Some("update_edge") => {
-                    let edge = match request.get("edge").and_then(|e| serde_json::from_value::<Edge>(e.clone()).ok()) {
-                        Some(e) => e,
-                        None => {
-                            let response = json!({"status": "error", "message": "Invalid or missing edge in update_edge request"});
-                            let socket = zmq_socket.lock().await;
-                            Self::send_zmq_response_static(&socket, &response, port).await?;
-                            continue;
-                        }
-                    };
-
-                    match Self::update_edge_static(&edges, &db, db_path.as_path(), &edge).await {
-                        Ok(_) => json!({"status": "success"}),
-                        Err(e) => json!({"status": "error", "message": e.to_string()}),
-                    }
-                }
-                Some("delete_edge") => {
-                    let outbound_id = match request.get("outbound_id").and_then(|i| Uuid::parse_str(i.as_str().unwrap_or("")).ok()) {
-                        Some(i) => i,
-                        None => {
-                            let response = json!({"status": "error", "message": "Invalid or missing outbound_id in delete_edge request"});
-                            let socket = zmq_socket.lock().await;
-                            Self::send_zmq_response_static(&socket, &response, port).await?;
-                            continue;
-                        }
-                    };
-                    let edge_type = match request.get("edge_type").and_then(|t| serde_json::from_value::<Identifier>(t.clone()).ok()) {
-                        Some(t) => t,
-                        None => {
-                            let response = json!({"status": "error", "message": "Invalid or missing edge_type in delete_edge request"});
-                            let socket = zmq_socket.lock().await;
-                            Self::send_zmq_response_static(&socket, &response, port).await?;
-                            continue;
-                        }
-                    };
-                    let inbound_id = match request.get("inbound_id").and_then(|i| Uuid::parse_str(i.as_str().unwrap_or("")).ok()) {
-                        Some(i) => i,
-                        None => {
-                            let response = json!({"status": "error", "message": "Invalid or missing inbound_id in delete_edge request"});
-                            let socket = zmq_socket.lock().await;
-                            Self::send_zmq_response_static(&socket, &response, port).await?;
-                            continue;
-                        }
-                    };
-
-                    match Self::delete_edge_static(&edges, &db, db_path.as_path(), &outbound_id, &edge_type, &inbound_id).await {
-                        Ok(_) => json!({"status": "success"}),
-                        Err(e) => json!({"status": "error", "message": e.to_string()}),
-                    }
-                }
-                Some("force_reset") => {
-                    match Self::force_reset_static(&db, db_path.as_path()).await {
-                        Ok(_) => json!({"status": "success"}),
-                        Err(e) => json!({"status": "error", "message": e.to_string()}),
-                    }
-                }
-                Some("force_unlock") => {
-                    match Self::force_unlock_static(db_path.as_path()).await {
-                        Ok(_) => json!({"status": "success"}),
-                        Err(e) => json!({"status": "error", "message": e.to_string()}),
-                    }
-                }
-                Some("force_unlock_path") => {
-                    match Self::force_unlock_path_static(db_path.as_path()).await {
-                        Ok(_) => json!({"status": "success"}),
-                        Err(e) => json!({"status": "error", "message": e.to_string()}),
-                    }
-                }
-                Some(cmd) => {
-                    error!("Unsupported command for port {}: {}", port, cmd);
-                    json!({"status": "error", "message": format!("Unsupported command: {}", cmd)})
-                }
-                None => {
-                    error!("No command specified in request for port {}: {:?}", port, request);
-                    json!({"status": "error", "message": "No command specified"})
-                }
-            };
-
-            let socket = zmq_socket.lock().await;
-            Self::send_zmq_response_static(&socket, &response, port).await?;
-        }
-
-        info!("ZMQ server shutting down for port {}", port);
-        // Note: disconnect is not typically needed for IPC sockets, and may cause issues
-        // The socket will be cleaned up when the daemon shuts down
-        Ok(())
-    }
-
-    // Assuming necessary imports are in scope, including:
-    // use base64::{Engine as _, general_purpose};
-    // use tokio::time::{Duration as TokioDuration};
-    // use tokio::sync::Mutex as TokioMutex;
-    // use std::sync::Arc;
-    // use serde_json::{json, Value};
-    // use zmq;
-    // use log::{info, debug, warn, error};
-    // use sled::{Tree, Db};
-    // use crate::models::errors::{GraphError, GraphResult}; // Assuming your error types
-    // use general_purpose::STANDARD; // Assuming this alias is used for brevity
-    // Method 1: run_zmq_server_static (for SledDaemonPool)
-    // Method 1: run_zmq_server_static (for SledDaemonPool)
-
-    // Method 2: run_zmq_server (for SledDaemon instance method)
-    // Method 2: run_zmq_server (for SledDaemon instance method) - MODIFIED
-    // This version is updated to ensure the command logic for persistence (flush) and
-    // argument error handling matches the run_zmq_server_static version.
-    async fn run_zmq_server(&self) -> GraphResult<()> {
-        const SOCKET_TIMEOUT_MS: i32 = 10_000;
-        const MAX_MESSAGE_SIZE: i32 = 1_024 * 1_024;
-
-        println!("===> STARTING ZMQ SERVER FOR PORT {}", self.port);
-
-        let context = ZmqContext::new();
-        let responder = context.socket(zmq::REP)
-            .map_err(|e| GraphError::StorageError(format!("Failed to create ZeroMQ socket for port {}: {}", self.port, e)))?;
-
-        responder.set_linger(1000)
-            .map_err(|e| GraphError::StorageError(format!("Failed to set socket linger: {}", e)))?;
-        responder.set_rcvtimeo(SOCKET_TIMEOUT_MS)
-            .map_err(|e| GraphError::StorageError(format!("Failed to set receive timeout: {}", e)))?;
-        responder.set_sndtimeo(SOCKET_TIMEOUT_MS)
-            .map_err(|e| GraphError::StorageError(format!("Failed to set send timeout: {}", e)))?;
-        responder.set_maxmsgsize(MAX_MESSAGE_SIZE as i64)
-            .map_err(|e| GraphError::StorageError(format!("Failed to set max message size: {}", e)))?;
-
-        let socket_path = format!("/tmp/graphdb-{}.ipc", self.port);
-        if tokio_fs::metadata(&socket_path).await.is_ok() {
-            tokio_fs::remove_file(&socket_path).await
-                .map_err(|e| GraphError::StorageError(format!("Failed to remove IPC socket file: {}", e)))?;
-        }
-
-        let endpoint = format!("ipc://{}", socket_path);
-        responder.bind(&endpoint)
-            .map_err(|e| GraphError::StorageError(format!("Failed to bind ZMQ socket to {}: {}", endpoint, e)))?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            tokio_fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o666)).await
-                .map_err(|e| GraphError::StorageError(format!("Failed to set socket permissions: {}", e)))?;
-        }
-
-        tokio::time::sleep(TokioDuration::from_millis(100)).await;
-
-        info!("ZMQ server configured and bound for port {}", self.port);
-        println!("===> ZMQ SERVER CONFIGURED AND BOUND FOR PORT {}", self.port);
-
-        let mut consecutive_errors = 0;
-        const MAX_CONSECUTIVE_ERRORS: u32 = 10;
-
-        while *self.running.lock().await {
-            let msg_result = responder.recv_bytes(zmq::DONTWAIT);
-            
-            let msg: Vec<u8> = match msg_result {
-                Ok(msg_bytes) => {
-                    consecutive_errors = 0;
-                    debug!("Received message for port {}", self.port);
-                    msg_bytes
-                }
-                Err(zmq::Error::EAGAIN) => {
-                    tokio::time::sleep(TokioDuration::from_millis(10)).await;
-                    continue;
-                }
-                Err(e) => {
-                    consecutive_errors += 1;
-                    warn!("Failed to receive message for port {} (attempt {}): {}", self.port, consecutive_errors, e);
-                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                        error!("Too many consecutive errors for port {}, shutting down", self.port);
-                        break;
-                    }
-                    tokio::time::sleep(TokioDuration::from_millis(100)).await;
-                    continue;
-                }
-            };
-
-            if msg.is_empty() {
-                let response = json!({"status": "error", "message": "Empty message"});
-                let _ = responder.send(serde_json::to_vec(&response)?, 0);
-                continue;
-            }
-
-            let request: Value = match serde_json::from_slice(&msg) {
-                Ok(req) => req,
-                Err(e) => {
-                    error!("Failed to parse request for port {}: {}", self.port, e);
-                    let response = json!({"status": "error", "message": format!("Parse error: {}", e)});
-                    let _ = responder.send(serde_json::to_vec(&response)?, 0);
-                    continue;
-                }
-            };
-
-            let response = match request.get("command").and_then(|c| c.as_str()) {
-                Some("initialize") | Some("status") | Some("ping") => {
-                    json!({"status": "success", "port": self.port, "ipc_path": endpoint})
-                }
-                Some("set_key") => {
-                    let key = match request.get("key").and_then(|k| k.as_str()) {
-                        Some(k) => k,
-                        None => {
-                            // Replicated error flow: send response and continue loop
-                            let response = json!({"status": "error", "message": "Missing key in set_key request"});
-                            let _ = responder.send(serde_json::to_vec(&response)?, 0);
-                            continue;
-                        }
-                    };
-                    let value = match request.get("value").and_then(|v| v.as_str()) {
-                        Some(v) => v,
-                        None => {
-                            // Replicated error flow: send response and continue loop
-                            let response = json!({"status": "error", "message": "Missing value in set_key request"});
-                            let _ = responder.send(serde_json::to_vec(&response)?, 0);
-                            continue;
-                        }
-                    };
-                    
-                    // Use self.insert (instance method)
-                    match self.insert(key.as_bytes(), value.as_bytes()).await {
-                        Ok(_) => {
-                            // REPLICATE: Explicit flush and error handling from run_zmq_server_static
-                            if let Err(e) = self.db.flush() {
-                                json!({"status": "error", "message": format!("Failed to flush: {}", e)})
-                            } else {
-                                json!({"status": "success"})
-                            }
-                        }
-                        Err(e) => json!({"status": "error", "message": e.to_string()}),
-                    }
-                }
-                Some("get_key") => {
-                    let key = match request.get("key").and_then(|k| k.as_str()) {
-                        Some(k) => k,
-                        None => {
-                            // Replicated error flow: send response and continue loop
-                            let response = json!({"status": "error", "message": "Missing key in get_key request"});
-                            let _ = responder.send(serde_json::to_vec(&response)?, 0);
-                            continue;
-                        }
-                    };
-
-                    // Use self.retrieve (instance method)
-                    match self.retrieve(key.as_bytes()).await {
-                        Ok(Some(val)) => {
-                            let value_str = String::from_utf8_lossy(&val).to_string();
-                            json!({"status": "success", "value": value_str})
-                        }
-                        Ok(None) => json!({"status": "success", "value": null}),
-                        Err(e) => json!({"status": "error", "message": e.to_string()}),
-                    }
-                }
-                Some("delete_key") => {
-                    let key = match request.get("key").and_then(|k| k.as_str()) {
-                        Some(k) => k,
-                        None => {
-                            // Replicated error flow: send response and continue loop
-                            let response = json!({"status": "error", "message": "Missing key in delete_key request"});
-                            let _ = responder.send(serde_json::to_vec(&response)?, 0);
-                            continue;
-                        }
-                    };
-                    
-                    // Use self.delete (instance method)
-                    match self.delete(key.as_bytes()).await {
-                        Ok(_) => {
-                            // REPLICATE: Explicit flush and error handling from run_zmq_server_static
-                            if let Err(e) = self.db.flush() {
-                                json!({"status": "error", "message": format!("Failed to flush: {}", e)})
-                            } else {
-                                json!({"status": "success"})
-                            }
-                        }
-                        Err(e) => json!({"status": "error", "message": e.to_string()}),
-                    }
-                }
-                Some("flush") => {
-                    match self.db.flush() {
-                        Ok(bytes) => json!({"status": "success", "bytes_flushed": bytes}),
-                        Err(e) => json!({"status": "error", "message": e.to_string()}),
-                    }
-                }
-                Some("get_all_vertices") => {
-                    let vertices_list: Vec<Value> = self.vertices.iter()
-                        .filter_map(|res| res.ok())
-                        .filter_map(|(_, v)| serde_json::from_slice(&v).ok())
-                        .collect();
-                    json!({"status": "success", "vertices": vertices_list})
-                }
-                Some("get_all_edges") => {
-                    let edges_list: Vec<Value> = self.edges.iter()
-                        .filter_map(|res| res.ok())
-                        .filter_map(|(_, v)| serde_json::from_slice(&v).ok())
-                        .collect();
-                    json!({"status": "success", "edges": edges_list})
-                }
-                Some("clear_data") => {
-                    match (|| -> Result<usize, GraphError> {
-                        self.vertices.clear().map_err(|e| GraphError::StorageError(e.to_string()))?;
-                        self.edges.clear().map_err(|e| GraphError::StorageError(e.to_string()))?;
-                        self.kv_pairs.clear().map_err(|e| GraphError::StorageError(e.to_string()))?;
-                        let bytes = self.db.flush().map_err(|e| GraphError::StorageError(e.to_string()))?;
-                        Ok(bytes)
-                    })() {
-                        Ok(bytes) => json!({"status": "success", "bytes_flushed": bytes}),
-                        Err(e) => json!({"status": "error", "message": e.to_string()}),
-                    }
-                }
-                Some(cmd) => json!({"status": "error", "message": format!("Unsupported command: {}", cmd)}),
-                None => json!({"status": "error", "message": "No command specified"}),
-            };
-
-            let _ = responder.send(serde_json::to_vec(&response)?, 0);
-        }
-
-        info!("ZMQ server shutting down for port {}", self.port);
-        let _ = responder.disconnect(&endpoint);
-        if tokio_fs::metadata(&socket_path).await.is_ok() {
-            let _ = tokio_fs::remove_file(&socket_path).await;
-        }
+        debug!("Successfully sent ZMQ response for port {} ({} bytes)", port, response_len);
         Ok(())
     }
 
@@ -2792,69 +2307,82 @@ impl SledDaemon {
             Err(GraphError::StorageError(error_msg))
         }
     }
+    /*
 
     pub async fn get_all_vertices(&self) -> GraphResult<Vec<Vertex>> {
-        info!("SledDaemon::get_all_vertices - Sending request to ZeroMQ server on port {}", self.port);
-        println!("===> SLED DAEMON GET_ALL_VERTICES - SENDING REQUEST TO ZEROMQ SERVER ON PORT {}", self.port);
-        let context = ZmqContext::new();
-        let socket = context.socket(zmq::REQ)
-            .map_err(|e| GraphError::StorageError(format!("Failed to create ZeroMQ socket: {}", e)))?;
-        let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", self.port);
-        socket.connect(&endpoint)
-            .map_err(|e| GraphError::StorageError(format!("Failed to connect to ZeroMQ socket {}: {}", endpoint, e)))?;
+        info!("SledDaemon::get_all_vertices - Reading vertices from local sled database on port {}", self.port);
 
-        let request = json!({ "command": "get_all_vertices" });
-        socket.send(serde_json::to_vec(&request)?, 0)
-            .map_err(|e| GraphError::StorageError(format!("Failed to send get_all_vertices request: {}", e)))?;
-        let reply = socket.recv_bytes(0)
-            .map_err(|e| GraphError::StorageError(format!("Failed to receive get_all_vertices response: {}", e)))?;
-        let response: Value = serde_json::from_slice(&reply)?;
+        // Direct access to self.db which is Arc<sled::Db>
+        let db = &self.db;
 
-        if response["status"] == "success" {
-            let vertices: Vec<Vertex> = serde_json::from_value(response["vertices"].clone())
-                .map_err(|e| GraphError::StorageError(format!("Failed to deserialize vertices: {}", e)))?;
-            info!("SledDaemon::get_all_vertices - Retrieved {} vertices", vertices.len());
-            println!("===> SLED DAEMON GET_ALL_VERTICES - RETRIEVED {} VERTICES", vertices.len());
-            Ok(vertices)
-        } else {
-            let error_msg = response["message"].as_str().unwrap_or("Unknown error").to_string();
-            error!("SledDaemon::get_all_vertices - Failed: {}", error_msg);
-            println!("===> SLED DAEMON GET_ALL_VERTICES - FAILED: {}", error_msg);
-            Err(GraphError::StorageError(error_msg))
+        let mut vertices = Vec::new();
+
+        // Iterate through the "vertices" tree
+        let vertices_tree = db
+            .open_tree("vertices")
+            .map_err(|e| GraphError::StorageError(format!("Failed to open 'vertices' tree: {}", e)))?;
+
+        for result in vertices_tree.iter() {
+            let (_, value) = result
+                .map_err(|e| GraphError::StorageError(format!("Failed to iterate vertices tree: {}", e)))?;
+
+            let (vertex, _len): (Vertex, usize) = bincode::decode_from_slice(
+                &value,
+                bincode::config::standard(),
+            )
+            .map_err(|e| {
+                GraphError::DeserializationError(format!(
+                    "Failed to bincode-decode vertex from value: {}",
+                    e
+                ))
+            })?;
+
+            vertices.push(vertex);
         }
+
+        info!("SledDaemon::get_all_vertices - Successfully retrieved {} vertices", vertices.len());
+        println!("===> SLED DAEMON GET_ALL_VERTICES - RETRIEVED {} VERTICES FROM LOCAL DB", vertices.len());
+
+        Ok(vertices)
     }
 
     pub async fn get_all_edges(&self) -> GraphResult<Vec<Edge>> {
-        info!("SledDaemon::get_all_edges - Sending request to ZeroMQ server on port {}", self.port);
-        println!("===> SLED DAEMON GET_ALL_EDGES - SENDING REQUEST TO ZEROMQ SERVER ON PORT {}", self.port);
-        let context = ZmqContext::new();
-        let socket = context.socket(zmq::REQ)
-            .map_err(|e| GraphError::StorageError(format!("Failed to create ZeroMQ socket: {}", e)))?;
-        let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", self.port);
-        socket.connect(&endpoint)
-            .map_err(|e| GraphError::StorageError(format!("Failed to connect to ZeroMQ socket {}: {}", endpoint, e)))?;
+        info!("SledDaemon::get_all_edges - Reading edges from local sled database on port {}", self.port);
 
-        let request = json!({ "command": "get_all_edges" });
-        socket.send(serde_json::to_vec(&request)?, 0)
-            .map_err(|e| GraphError::StorageError(format!("Failed to send get_all_edges request: {}", e)))?;
-        let reply = socket.recv_bytes(0)
-            .map_err(|e| GraphError::StorageError(format!("Failed to receive get_all_edges response: {}", e)))?;
-        let response: Value = serde_json::from_slice(&reply)?;
+        // Direct access to self.db which is Arc<sled::Db>
+        let db = &self.db;
 
-        if response["status"] == "success" {
-            let edges: Vec<Edge> = serde_json::from_value(response["edges"].clone())
-                .map_err(|e| GraphError::StorageError(format!("Failed to deserialize edges: {}", e)))?;
-            info!("SledDaemon::get_all_edges - Retrieved {} edges", edges.len());
-            println!("===> SLED DAEMON GET_ALL_EDGES - RETRIEVED {} EDGES", edges.len());
-            Ok(edges)
-        } else {
-            let error_msg = response["message"].as_str().unwrap_or("Unknown error").to_string();
-            error!("SledDaemon::get_all_edges - Failed: {}", error_msg);
-            println!("===> SLED DAEMON GET_ALL_EDGES - FAILED: {}", error_msg);
-            Err(GraphError::StorageError(error_msg))
+        let mut edges = Vec::new();
+
+        // Iterate through the "edges" tree
+        let edges_tree = db
+            .open_tree("edges")
+            .map_err(|e| GraphError::StorageError(format!("Failed to open 'edges' tree: {}", e)))?;
+
+        for result in edges_tree.iter() {
+            let (_, value) = result
+                .map_err(|e| GraphError::StorageError(format!("Failed to iterate edges tree: {}", e)))?;
+
+            let (edge, _len): (Edge, usize) = bincode::decode_from_slice(
+                &value,
+                bincode::config::standard(),
+            )
+            .map_err(|e| {
+                GraphError::DeserializationError(format!(
+                    "Failed to bincode-decode edge from value: {}",
+                    e
+                ))
+            })?;
+
+            edges.push(edge);
         }
-    }
 
+        info!("SledDaemon::get_all_edges - Successfully retrieved {} edges", edges.len());
+        println!("===> SLED DAEMON GET_ALL_EDGES - RETRIEVED {} EDGES FROM LOCAL DB", edges.len());
+
+        Ok(edges)
+    }
+*/
     pub async fn clear_data(&self) -> GraphResult<()> {
         info!("SledDaemon::clear_data - Sending clear_data request to ZeroMQ server on port {}", self.port);
         println!("===> SLED DAEMON CLEAR_DATA - SENDING CLEAR_DATA REQUEST TO ZEROMQ SERVER ON PORT {}", self.port);
@@ -4539,7 +4067,7 @@ impl SledDaemonPool {
             .as_ref()
             .unwrap_or(&PathBuf::from("/opt/graphdb/storage_data"))
             .join("sled");
-        let is_leader = become_wal_leader(&canonical_path).await?;
+        let is_leader = become_wal_leader(&canonical_path, port).await?;
         let offset_file = db_path.join("wal.offset");
         let start_offset = match tokio_fs::read_to_string(&offset_file).await {
             Ok(s) => s.trim().parse::<u64>().unwrap_or(0),

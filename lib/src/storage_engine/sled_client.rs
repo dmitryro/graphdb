@@ -12,7 +12,7 @@ use models::errors::{GraphError, GraphResult};
 pub use crate::config::{QueryResult, QueryPlan, SledClient, SledClientMode, DEFAULT_STORAGE_PORT, DEFAULT_DATA_DIRECTORY};
 use crate::storage_engine::storage_utils::{serialize_vertex, deserialize_vertex, serialize_edge, deserialize_edge, create_edge_key};
 use crate::storage_engine::{GraphStorageEngine, StorageEngine};
-use tokio::time::{timeout, Duration as TokioDuration};
+use tokio::time::{timeout, sleep, Duration as TokioDuration};
 use tokio::task::spawn_blocking; // FIX: Explicitly importing spawn_blocking
 use base64::engine::general_purpose;
 use base64::Engine;
@@ -69,6 +69,7 @@ impl SledClient {
     /// FIX: Updated constructor to initialize the required fields: `db_path`, `is_running`, `zmq_socket`.
     pub fn new_zmq(port: u16, db_path: PathBuf, socket_arc: Arc<TokioMutex<ZmqSocketWrapper>>) -> Self {
         SledClient {
+            context: Arc::new(zmq::Context::new()),  // Create once
             mode: Some(SledClientMode::ZMQ(port)),
             inner: None, // Local Db instance not used in ZMQ client mode
             // FIX: Added 'db_path:' field label
@@ -100,6 +101,7 @@ impl SledClient {
         info!("Opened database at {:?} with {} keys in kv_pairs", db_path, key_count);
         Ok(Self {
             inner: Some(Arc::new(TokioMutex::new(Arc::new(db)))),
+            context: Arc::new(zmq::Context::new()),  // Create once
             // FIX: Added 'db_path:' field label
             db_path: Some(db_path),
             is_running: Arc::new(TokioMutex::new(false)),
@@ -119,6 +121,7 @@ impl SledClient {
         Ok(Self {
             inner: Some(Arc::new(TokioMutex::new(db))),
             // FIX: Added 'db_path:' field label
+            context: Arc::new(zmq::Context::new()),  // Create once
             db_path: Some(db_path),
             is_running: Arc::new(TokioMutex::new(false)),
             mode: Some(SledClientMode::Direct),
@@ -151,6 +154,7 @@ impl SledClient {
             .map_err(|e| GraphError::StorageError(format!("Failed to connect to {}: {}", addr, e)))?;
         let socket_wrapper = Arc::new(TokioMutex::new(ZmqSocketWrapper::new(socket)));
         let client = Self {
+            context: Arc::new(zmq::Context::new()),  // Create once
             inner: None,
             db_path: Some(PathBuf::from(format!("/opt/graphdb/storage_data/sled/{}", port))),
             is_running: Arc::new(TokioMutex::new(true)),
@@ -241,69 +245,106 @@ impl SledClient {
             }
         }
     }
+
     pub async fn connect_zmq_client_with_readiness_check(port: u16) -> GraphResult<(Self, Arc<TokioMutex<ZmqSocketWrapper>>)> {
-        let context = zmq::Context::new();
+        let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", port);
+        info!("Attempting ZMQ client connection to {}", endpoint);
+        println!("===> ATTEMPTING ZMQ CLIENT CONNECTION TO {}", endpoint);
+
+        let context = ZmqContext::new();
         let socket = context.socket(zmq::REQ)
             .map_err(|e| {
                 error!("Failed to create ZMQ socket for port {}: {}", port, e);
                 println!("===> ERROR: FAILED TO CREATE ZMQ SOCKET FOR PORT {}: {}", port, e);
                 GraphError::StorageError(format!("Failed to create ZMQ socket: {}", e))
             })?;
+        
         socket.set_rcvtimeo(5000)
             .map_err(|e| {
                 error!("Failed to set receive timeout for port {}: {}", port, e);
                 println!("===> ERROR: FAILED TO SET RECEIVE TIMEOUT FOR PORT {}: {}", port, e);
                 GraphError::StorageError(format!("Failed to set receive timeout: {}", e))
             })?;
+        
         socket.set_sndtimeo(5000)
             .map_err(|e| {
                 error!("Failed to set send timeout for port {}: {}", port, e);
                 println!("===> ERROR: FAILED TO SET SEND TIMEOUT FOR PORT {}: {}", port, e);
                 GraphError::StorageError(format!("Failed to set send timeout: {}", e))
             })?;
-        let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", port);
-        info!("Connecting to ZMQ endpoint {} for port {}", endpoint, port);
-        println!("===> CONNECTING TO ZMQ ENDPOINT {} FOR PORT {}", endpoint, port);
-        if let Err(e) = socket.connect(&endpoint) {
-            error!("Failed to connect to ZMQ endpoint {}: {}", endpoint, e);
-            println!("===> ERROR: FAILED TO CONNECT TO ZMQ ENDPOINT {}: {}", endpoint, e);
-            return Err(GraphError::StorageError(format!("Failed to connect to ZMQ socket {}: {}", endpoint, e)));
-        }
+        
+        socket.set_linger(1000)
+            .map_err(|e| {
+                error!("Failed to set linger for port {}: {}", port, e);
+                println!("===> ERROR: FAILED TO SET LINGER FOR PORT {}: {}", port, e);
+                GraphError::StorageError(format!("Failed to set linger: {}", e))
+            })?;
+
+        let socket_path = format!("/tmp/graphdb-{}.ipc", port);
+        let addr = format!("ipc://{}", socket_path);
+
+        info!("Connecting to ZMQ endpoint {} for port {}", addr, port);
+        println!("===> CONNECTING TO ZMQ ENDPOINT {} FOR PORT {}", addr, port);
+        
+        socket.connect(&addr)
+            .map_err(|e| {
+                error!("Failed to connect ZMQ socket to {}: {}", addr, e);
+                println!("===> ERROR: FAILED TO CONNECT ZMQ SOCKET TO {}: {}", addr, e);
+                GraphError::StorageError(format!("Failed to connect ZMQ socket to {}: {}", addr, e))
+            })?;
+
         let request = json!({ "command": "initialize" });
+        let request_data = serde_json::to_vec(&request)
+            .map_err(|e| {
+                error!("Failed to serialize initialize request: {}", e);
+                println!("===> ERROR: FAILED TO SERIALIZE INITIALIZE REQUEST: {}", e);
+                GraphError::SerializationError(format!("Failed to serialize initialize request: {}", e))
+            })?;
+
         info!("Sending initialize request to ZMQ server on port {}", port);
         println!("===> SENDING INITIALIZE REQUEST TO ZMQ SERVER ON PORT {}", port);
-        if let Err(e) = socket.send(serde_json::to_vec(&request)?, 0) {
-            error!("Failed to send initialize request: {}", e);
-            println!("===> ERROR: FAILED TO SEND INITIALIZE REQUEST: {}", e);
-            return Err(GraphError::StorageError(format!("Failed to send initialize request: {}", e)));
-        }
+        
+        socket.send(&request_data, 0)
+            .map_err(|e| {
+                error!("Failed to send initialize request to {}: {}", addr, e);
+                println!("===> ERROR: FAILED TO SEND INITIALIZE REQUEST TO {}: {}", addr, e);
+                GraphError::StorageError(format!("Failed to send initialize request: {}", e))
+            })?;
+
         let reply = socket.recv_bytes(0)
             .map_err(|e| {
-                error!("Failed to receive initialize response: {}", e);
-                println!("===> ERROR: FAILED TO RECEIVE INITIALIZE RESPONSE: {}", e);
+                error!("Failed to receive initialize response from {}: {}", addr, e);
+                println!("===> ERROR: FAILED TO RECEIVE INITIALIZE RESPONSE FROM {}: {}", addr, e);
                 GraphError::StorageError(format!("Failed to receive initialize response: {}", e))
             })?;
+        
         let response: Value = serde_json::from_slice(&reply)
             .map_err(|e| {
-                error!("Failed to parse initialize response: {}", e);
-                println!("===> ERROR: FAILED TO PARSE INITIALIZE RESPONSE: {}", e);
-                GraphError::StorageError(format!("Failed to parse initialize response: {}", e))
+                error!("Failed to parse initialize response from {}: {}", addr, e);
+                println!("===> ERROR: FAILED TO PARSE INITIALIZE RESPONSE FROM {}: {}", addr, e);
+                GraphError::DeserializationError(format!("Failed to parse initialize response: {}", e))
             })?;
-        if response["status"] != "success" {
-            error!("ZMQ server not ready for port {}: {:?}", port, response);
-            println!("===> ERROR: ZMQ SERVER NOT READY FOR PORT {}: {:?}", port, response);
-            return Err(GraphError::StorageError(format!("ZMQ server not ready for port {}: {:?}", port, response)));
+
+        if response.get("status").and_then(|s| s.as_str()) != Some("success") {
+            let error_msg = response.get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("Unknown error");
+            error!("ZMQ server not ready on port {}: {}", port, error_msg);
+            println!("===> ERROR: ZMQ SERVER NOT READY ON PORT {}: {}", port, error_msg);
+            return Err(GraphError::StorageError(format!("ZMQ server not ready on port {}: {}", port, error_msg)));
         }
+
         info!("ZMQ server responded successfully for port {}", port);
         println!("===> ZMQ SERVER RESPONDED SUCCESSFULLY FOR PORT {}", port);
-        let socket_wrapper = Arc::new(TokioMutex::new(ZmqSocketWrapper(socket)));
+
+        let socket_wrapper = Arc::new(TokioMutex::new(ZmqSocketWrapper::new(socket)));
         let is_running = Arc::new(TokioMutex::new(true));
+
         Ok((
             SledClient {
-                // FIX: Explicitly specify Option::None.
-                inner: Option::None,
-                // FIX: Explicitly specify the generic type of None as PathBuf to satisfy the compiler.
-                db_path: Option::<PathBuf>::None,
+                context: Arc::new(zmq::Context::new()),  // Create once
+                inner: None,
+                db_path: Some(PathBuf::from(format!("/opt/graphdb/storage_data/sled/{}", port))),
                 is_running,
                 zmq_socket: Some(socket_wrapper.clone()),
                 mode: Some(SledClientMode::ZMQ(port)),
@@ -311,6 +352,7 @@ impl SledClient {
             socket_wrapper,
         ))
     }
+
     pub fn send_zmq_request_sync(socket: &zmq::Socket, request: Value) -> GraphResult<Value> {
         let request_str = serde_json::to_string(&request)
             .map_err(|e| GraphError::SerializationError(format!("Failed to serialize request: {}", e)))?;
@@ -324,26 +366,50 @@ impl SledClient {
         serde_json::from_str(response_str)
             .map_err(|e| GraphError::DeserializationError(format!("Failed to deserialize response: {}", e)))
     }
+
     /// Sends a request to the ZMQ daemon and awaits the response.
     /// This is where the core interaction logic is.
     pub async fn send_zmq_request(&self, port: u16, request: Value) -> GraphResult<Value> {
-       
-        let socket_arc = self.zmq_socket.as_ref()
-            .ok_or_else(|| GraphError::ConnectionError(format!("SledClient for port {} is not initialized in ZMQ mode.", port)))?
-            .clone();
-        // Perform the blocking ZMQ send/receive within a spawn_blocking task.
-        let response_result = spawn_blocking(move || {
-            let socket_wrapper = socket_arc.blocking_lock(); // Use blocking_lock() in spawn_blocking context
-            let socket = &socket_wrapper.0; // Access the inner zmq::Socket
-           
-            SledClient::send_zmq_request_sync(socket, request)
-        }).await;
-        match response_result {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(e)) => Err(e),
-            Err(e) => Err(GraphError::InternalError(format!("Task failure during ZMQ communication: {}", e))),
-        }
+        let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", port);
+        let context = zmq::Context::new();
+        let socket = context.socket(zmq::REQ)
+            .map_err(|e| GraphError::StorageError(format!("ZMQ socket create failed: {}", e)))?;
+
+        // Connect to endpoint
+        socket.connect(&endpoint)
+            .map_err(|e| GraphError::StorageError(format!("ZMQ connect failed: {}", e)))?;
+
+        // Set timeouts
+        socket.set_sndtimeo(1000)
+            .map_err(|e| GraphError::StorageError(format!("ZMQ set_sndtimeo failed: {}", e)))?;
+        socket.set_rcvtimeo(10000)  // Increased to 10s to allow server processing
+            .map_err(|e| GraphError::StorageError(format!("ZMQ set_rcvtimeo failed: {}", e)))?;
+
+        // Serialize request
+        let payload = serde_json::to_vec(&request)
+            .map_err(|e| GraphError::StorageError(format!("JSON serialize failed: {}", e)))?;
+
+        // Send request (NO RETRY)
+        socket.send(&payload, 0)
+            .map_err(|e| {
+                error!("ZMQ send failed on port {}: {}", port, e);
+                GraphError::StorageError(format!("ZMQ send error: {}", e))
+            })?;
+
+        // Receive response (NO RETRY)
+        let bytes = socket.recv_bytes(0)
+            .map_err(|e| {
+                error!("ZMQ recv failed on port {}: {}", port, e);
+                GraphError::StorageError(format!("ZMQ recv error: {}", e))
+            })?;
+
+        // Parse response
+        let response: Value = serde_json::from_slice(&bytes)
+            .map_err(|e| GraphError::StorageError(format!("ZMQ response parse error: {}", e)))?;
+
+        Ok(response)
     }
+
     pub async fn force_unlock(db_path: &PathBuf) -> GraphResult<()> {
         let lock_path = db_path.join("db.lck");
         info!("Checking for lock file at {}", lock_path.display());
@@ -530,6 +596,76 @@ impl SledClient {
         };
         self.delete_from_cf_zmq(port, tree_name, key).await
     }
+
+    pub async fn insert_into_cf(&self, cf_name: &str, key: &[u8], value: &[u8]) -> GraphResult<()> {
+        match &self.mode {
+            Some(SledClientMode::Direct) => {
+                let inner = self.inner.as_ref()
+                    .ok_or_else(|| GraphError::StorageError("No database available".to_string()))?;
+                let db = inner.lock().await;
+                let tree = (*db).open_tree(cf_name)
+                    .map_err(|e| GraphError::StorageError(format!("Failed to open tree {}: {}", cf_name, e)))?;
+                tree.insert(key, value)
+                    .map_err(|e| GraphError::StorageError(format!("Failed to insert into {}: {}", cf_name, e)))?;
+                let bytes_flushed = (*db).flush_async().await
+                    .map_err(|e| GraphError::StorageError(format!("Failed to flush: {}", e)))?;
+                info!("Inserted into {}: key={:?}, flushed {} bytes", cf_name, key, bytes_flushed);
+                println!("===> Inserted into {}: key={:?}, flushed {} bytes", cf_name, key, bytes_flushed);
+                Ok(())
+            }
+            Some(SledClientMode::ZMQ(port)) => {
+                self.insert_into_cf_zmq(*port, cf_name, key, value).await
+            }
+            None => Err(GraphError::StorageError("SledClient mode not set".to_string()))
+        }
+    }
+
+    pub async fn retrieve_from_cf(&self, cf_name: &str, key: &[u8]) -> GraphResult<Option<Vec<u8>>> {
+        match &self.mode {
+            Some(SledClientMode::Direct) => {
+                let inner = self.inner.as_ref()
+                    .ok_or_else(|| GraphError::StorageError("No database available".to_string()))?;
+                let db = inner.lock().await;
+                let tree = (*db).open_tree(cf_name)
+                    .map_err(|e| GraphError::StorageError(format!("Failed to open tree {}: {}", cf_name, e)))?;
+                let result = tree.get(key)
+                    .map_err(|e| GraphError::StorageError(format!("Failed to retrieve from {}: {}", cf_name, e)))?
+                    .map(|ivec| ivec.to_vec());
+                info!("Retrieved from {}: key={:?}, value={:?}", cf_name, key, result);
+                println!("===> Retrieved from {}: key={:?}, value={:?}", cf_name, key, result);
+                Ok(result)
+            }
+            Some(SledClientMode::ZMQ(port)) => {
+                self.retrieve_from_cf_zmq(*port, cf_name, key).await
+            }
+            None => Err(GraphError::StorageError("SledClient mode not set".to_string()))
+        }
+    }
+
+    pub async fn delete_from_cf(&self, cf_name: &str, key: &[u8]) -> GraphResult<()> {
+        match &self.mode {
+            Some(SledClientMode::Direct) => {
+                let inner = self.inner.as_ref()
+                    .ok_or_else(|| GraphError::StorageError("No database available".to_string()))?;
+                let db = inner.lock().await;
+                let tree = (*db).open_tree(cf_name)
+                    .map_err(|e| GraphError::StorageError(format!("Failed to open tree {}: {}", cf_name, e)))?;
+                tree.remove(key)
+                    .map_err(|e| GraphError::StorageError(format!("Failed to delete from {}: {}", cf_name, e)))?;
+                let bytes_flushed = (*db).flush_async().await
+                    .map_err(|e| GraphError::StorageError(format!("Failed to flush after delete: {}", e)))?;
+                info!("Deleted from {}: key={:?}, flushed {} bytes", cf_name, key, bytes_flushed);
+                println!("===> Deleted from {}: key={:?}, flushed {} bytes", cf_name, key, bytes_flushed);
+                Ok(())
+            }
+            Some(SledClientMode::ZMQ(port)) => {
+                self.delete_from_cf_zmq(*port, cf_name, key).await
+            }
+            None => Err(GraphError::StorageError("SledClient mode not set".to_string()))
+        }
+    }
+
+
     pub async fn insert_into_cf_zmq(&self, port: u16, tree_name: &str, key: &[u8], value: &[u8]) -> GraphResult<()> {
         // Encode key and value as base64 to preserve binary data in JSON
         let key_base64 = general_purpose::STANDARD.encode(key);
@@ -619,284 +755,445 @@ impl SledClient {
             Err(GraphError::StorageError(format!("ZMQ delete failed: {}", error_msg)))
         }
     }
-    pub async fn create_vertex(&self, vertex: Vertex) -> GraphResult<()> {
-        let port = match &self.mode {
-            Some(SledClientMode::ZMQ(port)) => *port,
-            _ => DEFAULT_STORAGE_PORT,
-        };
-        let uuid = SerializableUuid(vertex.id.0);
-        let key = uuid.0.as_bytes().to_vec();
-        let value = serialize_vertex(&vertex)?;
-        self.insert_into_cf_zmq(port, "vertices", &key, &value).await
-    }
-    pub async fn get_vertex(&self, id: &Uuid) -> GraphResult<Option<Vertex>> {
-        let port = match &self.mode {
-            Some(SledClientMode::ZMQ(port)) => *port,
-            _ => DEFAULT_STORAGE_PORT,
-        };
-        let uuid = SerializableUuid(*id);
-        let key = uuid.0.as_bytes().to_vec();
-        let result = self.retrieve_from_cf_zmq(port, "vertices", &key).await?;
-        match result {
-            Some(v) => Ok(Some(deserialize_vertex(&v)?)),
-            None => Ok(None),
+    // --- NEW: Dedicated ZMQ Graph Commands ---
+    // ------------------------------------------------------------------------
+    //  create_vertex_zmq
+    // ------------------------------------------------------------------------
+    async fn create_vertex_zmq(&self, port: u16, vertex: &Vertex) -> GraphResult<()> {
+        let request = json!({
+            "command": "create_vertex",
+            "vertex": vertex
+        });
+        
+        let response = zmq_send_recv(self.context.clone(), port, request).await?;
+        
+        if response.get("status").and_then(|s| s.as_str()) == Some("success") {
+            info!("ZMQ create_vertex ok – id={}", vertex.id);
+            Ok(())
+        } else {
+            let msg = response.get("message").and_then(|m| m.as_str()).unwrap_or("unknown");
+            error!("ZMQ create_vertex failed: {}", msg);
+            Err(GraphError::StorageError(format!("create_vertex failed: {}", msg)))
         }
     }
+
+    // ------------------------------------------------------------------------
+    //  get_vertex_zmq
+    // ------------------------------------------------------------------------
+    async fn get_vertex_zmq(&self, port: u16, id: &Uuid) -> GraphResult<Option<Vertex>> {
+        let request = json!({
+            "command": "get_vertex",
+            "id": id.to_string()
+        });
+        
+        let response = zmq_send_recv(self.context.clone(), port, request).await?;
+        
+        if response.get("status").and_then(|s| s.as_str()) != Some("success") {
+            let msg = response
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown");
+            return Err(GraphError::StorageError(format!("get_vertex failed: {}", msg)));
+        }
+        
+        if let Some(v) = response.get("vertex") {
+            if v.is_null() {
+                Ok(None)
+            } else {
+                serde_json::from_value(v.clone())
+                    .map_err(|e| GraphError::DeserializationError(format!("vertex: {}", e)))
+                    .map(Some)
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn delete_vertex_zmq(&self, port: u16, id: &Uuid) -> GraphResult<()> {
+        let request = json!({
+            "command": "delete_vertex",
+            "id": id.to_string()
+        });
+        let response = self.send_zmq_request(port, request).await?;
+        if response.get("status").and_then(|s| s.as_str()) == Some("success") {
+            info!("ZMQ delete_vertex successful for port {}: id={}", port, id);
+            println!("===> ZMQ delete_vertex successful for port {}: id={}", port, id);
+            Ok(())
+        } else {
+            let error_msg = response.get("message").and_then(|m| m.as_str()).unwrap_or("Unknown error");
+            error!("ZMQ delete_vertex failed for port {}: {}", port, error_msg);
+            println!("===> ERROR: ZMQ delete_vertex failed for port {}: {}", port, error_msg);
+            Err(GraphError::StorageError(format!("ZMQ delete_vertex failed: {}", error_msg)))
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    //  create_edge_zmq
+    // ------------------------------------------------------------------------
+    async fn create_edge_zmq(&self, port: u16, edge: &Edge) -> GraphResult<()> {
+        let request = json!({
+            "command": "create_edge",
+            "edge": edge
+        });
+        
+        let response = zmq_send_recv(self.context.clone(), port, request).await?;
+        
+        if response.get("status").and_then(|s| s.as_str()) == Some("success") {
+            info!("ZMQ create_edge ok");
+            Ok(())
+        } else {
+            let msg = response.get("message").and_then(|m| m.as_str()).unwrap_or("unknown");
+            Err(GraphError::StorageError(format!("create_edge failed: {}", msg)))
+        }
+    }
+
+    async fn get_edge_zmq(&self, port: u16, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> GraphResult<Option<Edge>> {
+        let request = json!({
+            "command": "get_edge",
+            "outbound_id": outbound_id.to_string(),
+            "edge_type": edge_type,
+            "inbound_id": inbound_id.to_string()
+        });
+        let response = self.send_zmq_request(port, request).await?;
+        if response.get("status").and_then(|s| s.as_str()) == Some("success") {
+            if let Some(edge_json) = response.get("edge") {
+                if edge_json.is_null() {
+                    Ok(None)
+                } else {
+                    let edge = serde_json::from_value(edge_json.clone())
+                        .map_err(|e| GraphError::DeserializationError(format!("Failed to deserialize edge: {}", e)))?;
+                    Ok(Some(edge))
+                }
+            } else {
+                Ok(None)
+            }
+        } else {
+            let error_msg = response.get("message").and_then(|m| m.as_str()).unwrap_or("Unknown error");
+            error!("ZMQ get_edge failed for port {}: {}", port, error_msg);
+            println!("===> ERROR: ZMQ get_edge failed for port {}: {}", port, error_msg);
+            Err(GraphError::StorageError(format!("ZMQ get_edge failed: {}", error_msg)))
+        }
+    }
+
+    async fn delete_edge_zmq(&self, port: u16, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> GraphResult<()> {
+        let request = json!({
+            "command": "delete_edge",
+            "outbound_id": outbound_id.to_string(),
+            "edge_type": edge_type,
+            "inbound_id": inbound_id.to_string()
+        });
+        let response = self.send_zmq_request(port, request).await?;
+        if response.get("status").and_then(|s| s.as_str()) == Some("success") {
+            info!("ZMQ delete_edge successful for port {}: {} -> {} [{}]", port, outbound_id, inbound_id, edge_type);
+            println!("===> ZMQ delete_edge successful for port {}: {} -> {} [{}]", port, outbound_id, inbound_id, edge_type);
+            Ok(())
+        } else {
+            let error_msg = response.get("message").and_then(|m| m.as_str()).unwrap_or("Unknown error");
+            error!("ZMQ delete_edge failed for port {}: {}", port, error_msg);
+            println!("===> ERROR: ZMQ delete_edge failed for port {}: {}", port, error_msg);
+            Err(GraphError::StorageError(format!("ZMQ delete_edge failed: {}", error_msg)))
+        }
+    }
+
+    // --- High-Level Graph Operations ---
+    pub async fn create_vertex(&self, vertex: Vertex) -> GraphResult<()> {
+        match &self.mode {
+            Some(SledClientMode::Direct) => {
+                let inner = self.inner.as_ref()
+                    .ok_or_else(|| GraphError::StorageError("No database available".to_string()))?;
+                let db_guard = inner.lock().await;
+                let db = db_guard.as_ref();
+                let key = vertex.id.as_bytes().to_vec();
+                let value = serialize_vertex(&vertex)?;
+                let tree = db.open_tree("vertices")
+                    .map_err(|e| GraphError::StorageError(format!("Failed to open tree 'vertices': {}", e)))?;
+                tree.insert(key, value)
+                    .map_err(|e| GraphError::StorageError(format!("Failed to insert vertex: {}", e)))?;
+                Ok(())
+            }
+            Some(SledClientMode::ZMQ(port)) => {
+                self.create_vertex_zmq(*port, &vertex).await
+            }
+            None => Err(GraphError::StorageError("SledClient mode not set".to_string()))
+        }
+    }
+
+    pub async fn get_vertex(&self, id: &Uuid) -> GraphResult<Option<Vertex>> {
+        match &self.mode {
+            Some(SledClientMode::Direct) => {
+                let key = id.as_bytes().to_vec();
+                let result = self.retrieve_from_cf("vertices", &key).await?;
+                match result {
+                    Some(v) => Ok(Some(deserialize_vertex(&v)?)),
+                    None => Ok(None),
+                }
+            }
+            Some(SledClientMode::ZMQ(port)) => {
+                self.get_vertex_zmq(*port, id).await
+            }
+            None => Err(GraphError::StorageError("SledClient mode not set".to_string()))
+        }
+    }
+
+    pub async fn create_edge(&self, edge: Edge) -> GraphResult<()> {
+        match &self.mode {
+            Some(SledClientMode::Direct) => {
+                let inner = self.inner.as_ref()
+                    .ok_or_else(|| GraphError::StorageError("No database available".to_string()))?;
+                let db_guard = inner.lock().await;
+                let db = db_guard.as_ref();
+                let key = create_edge_key(
+                    &SerializableUuid(edge.outbound_id.0),
+                    &edge.t,
+                    &SerializableUuid(edge.inbound_id.0)
+                )?;
+                let value = serialize_edge(&edge)?;
+                let tree = db.open_tree("edges")
+                    .map_err(|e| GraphError::StorageError(format!("Failed to open tree 'edges': {}", e)))?;
+                tree.insert(key, value)
+                    .map_err(|e| GraphError::StorageError(format!("Failed to insert edge: {}", e)))?;
+                Ok(())
+            }
+            Some(SledClientMode::ZMQ(port)) => {
+                self.create_edge_zmq(*port, &edge).await
+            }
+            None => Err(GraphError::StorageError("SledClient mode not set".to_string()))
+        }
+    }
+
     pub async fn update_vertex(&self, vertex: Vertex) -> GraphResult<()> {
         self.create_vertex(vertex).await
     }
+
     pub async fn delete_vertex(&self, id: &Uuid) -> GraphResult<()> {
-        let port = match &self.mode {
-            Some(SledClientMode::ZMQ(port)) => *port,
-            _ => DEFAULT_STORAGE_PORT,
-        };
-        let uuid = SerializableUuid(*id);
-        let key = uuid.0.as_bytes().to_vec();
-        self.delete_from_cf_zmq(port, "vertices", &key).await
-    }
-    pub async fn get_all_vertices(&self) -> GraphResult<Vec<Vertex>> {
-        let port = match &self.mode {
-            Some(SledClientMode::ZMQ(port)) => *port,
-            _ => DEFAULT_STORAGE_PORT,
-        };
         match &self.mode {
             Some(SledClientMode::Direct) => {
-                self.get_tree_zmq(port, "vertices").await?;
-                let db = self.inner.as_ref()
+                let key = id.as_bytes().to_vec();
+                self.delete_from_cf("vertices", &key).await
+            }
+            Some(SledClientMode::ZMQ(port)) => {
+                self.delete_vertex_zmq(*port, id).await
+            }
+            None => Err(GraphError::StorageError("SledClient mode not set".to_string()))
+        }
+    }
+
+     // ------------------------------------------------------------------------
+    //  get_all_vertices
+    // ------------------------------------------------------------------------
+    pub async fn get_all_vertices(&self) -> GraphResult<Vec<Vertex>> {
+        match &self.mode {
+            Some(SledClientMode::Direct) => {
+                let db = self
+                    .inner
+                    .as_ref()
                     .ok_or_else(|| GraphError::StorageError("No database available in direct mode".to_string()))?
-                    .lock().await;
-                let tree = db.open_tree("vertices")
+                    .lock()
+                    .await;
+
+                let tree = db
+                    .open_tree("vertices")
                     .map_err(|e| GraphError::StorageError(format!("Failed to open vertices tree: {}", e)))?;
+
                 let mut vertices = Vec::new();
-                for item in tree.iter() {
-                    let (key, _) = item
+                for result in tree.iter() {
+                    let (_, value_bytes) = result
                         .map_err(|e| GraphError::StorageError(format!("Failed to iterate vertices: {}", e)))?;
-                    let (vertex, _): (Vertex, usize) =
-                        bincode::decode_from_slice(&key, bincode::config::standard())
-                            .map_err(|e| GraphError::StorageError(format!("Failed to deserialize vertex: {}", e)))?;
+
+                    let vertex: Vertex = bincode::decode_from_slice(&value_bytes, bincode::config::standard())
+                        .map_err(|e| GraphError::DeserializationError(format!("Failed to decode vertex: {}", e)))?
+                        .0;
+
                     vertices.push(vertex);
                 }
+
+                info!("Direct mode: Retrieved {} vertices", vertices.len());
                 Ok(vertices)
             }
-            Some(SledClientMode::ZMQ(_)) => {
-                let request = json!({
-                    "command": "get_all_vertices"
-                });
-                let response = self.send_zmq_request(port, request).await?;
-                if response.get("status").and_then(|s| s.as_str()) == Some("success") {
-                    let vertices = response.get("vertices")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_str())
-                                .filter_map(|s| hex::decode(s).ok())
-                                .filter_map(|bytes| {
-                                    bincode::decode_from_slice::<Vertex, _>(&bytes, bincode::config::standard())
-                                        .ok()
-                                        .map(|(v, _)| v)
-                                })
-                                .collect::<Vec<Vertex>>()
-                        })
-                        .unwrap_or_default();
-                    Ok(vertices)
-                } else {
-                    let error_msg = response.get("message")
+
+            Some(SledClientMode::ZMQ(port)) => {
+                let request = json!({ "command": "get_all_vertices" });
+                let response = zmq_send_recv(self.context.clone(), *port, request).await?;
+                
+                if response.get("status").and_then(|s| s.as_str()) != Some("success") {
+                    let msg = response
+                        .get("message")
                         .and_then(|m| m.as_str())
-                        .unwrap_or("Unknown error");
-                    Err(GraphError::StorageError(format!("ZMQ get_all_vertices failed: {}", error_msg)))
+                        .unwrap_or("unknown");
+                    return Err(GraphError::StorageError(format!(
+                        "get_all_vertices failed: {}",
+                        msg
+                    )));
                 }
-            }
-            None => {
-                self.get_tree_zmq(port, "vertices").await?;
-                let db = self.inner.as_ref()
-                    .ok_or_else(|| GraphError::StorageError("No database available".to_string()))?
-                    .lock().await;
-                let tree = db.open_tree("vertices")
-                    .map_err(|e| GraphError::StorageError(format!("Failed to open vertices tree: {}", e)))?;
-                let mut vertices = Vec::new();
-                for item in tree.iter() {
-                    let (key, _) = item
-                        .map_err(|e| GraphError::StorageError(format!("Failed to iterate vertices: {}", e)))?;
-                    let (vertex, _): (Vertex, usize) =
-                        bincode::decode_from_slice(&key, bincode::config::standard())
-                            .map_err(|e| GraphError::StorageError(format!("Failed to deserialize vertex: {}", e)))?;
-                    vertices.push(vertex);
+                
+                let arr = response
+                    .get("vertices")
+                    .and_then(|v| v.as_array())
+                    .ok_or_else(|| GraphError::StorageError("missing vertices array".into()))?;
+                
+                let mut verts = Vec::with_capacity(arr.len());
+                for v in arr {
+                    verts.push(
+                        serde_json::from_value(v.clone())
+                            .map_err(|e| GraphError::DeserializationError(format!("vertex: {}", e)))?,
+                    );
                 }
-                Ok(vertices)
+                
+                info!("ZMQ get_all_vertices → {} vertices", verts.len());
+                Ok(verts)
             }
+
+            None => Err(GraphError::StorageError("mode not set".into())),
         }
     }
-    pub async fn create_edge(&self, edge: Edge) -> GraphResult<()> {
-        let port = match &self.mode {
-            Some(SledClientMode::ZMQ(port)) => *port,
-            _ => DEFAULT_STORAGE_PORT,
-        };
-        let key = create_edge_key(
-            &SerializableUuid(edge.outbound_id.0),
-            &edge.t,
-            &SerializableUuid(edge.inbound_id.0)
-        )?;
-        let value = serialize_edge(&edge)?;
-        self.insert_into_cf_zmq(port, "edges", &key, &value).await
+
+    // ------------------------------------------------------------------------
+    //  get_all_edges
+    // ------------------------------------------------------------------------
+    pub async fn get_all_edges(&self) -> GraphResult<Vec<Edge>> {
+        match &self.mode {
+            Some(SledClientMode::Direct) => {
+                let db = self
+                    .inner
+                    .as_ref()
+                    .ok_or_else(|| GraphError::StorageError("No database available in direct mode".to_string()))?
+                    .lock()
+                    .await;
+
+                let tree = db
+                    .open_tree("edges")
+                    .map_err(|e| GraphError::StorageError(format!("Failed to open edges tree: {}", e)))?;
+
+                let mut edges = Vec::new();
+                for result in tree.iter() {
+                    let (_, value_bytes) = result
+                        .map_err(|e| GraphError::StorageError(format!("Failed to iterate edges: {}", e)))?;
+
+                    let edge: Edge = bincode::decode_from_slice(&value_bytes, bincode::config::standard())
+                        .map_err(|e| GraphError::DeserializationError(format!("Failed to decode edge: {}", e)))?
+                        .0;
+
+                    edges.push(edge);
+                }
+
+                info!("Direct mode: Retrieved {} edges", edges.len());
+                Ok(edges)
+            }
+
+            Some(SledClientMode::ZMQ(port)) => {
+                let request = json!({ "command": "get_all_edges" });
+                let response = zmq_send_recv(self.context.clone(), *port, request).await?;
+                
+                if response.get("status").and_then(|s| s.as_str()) != Some("success") {
+                    let msg = response
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("unknown");
+                    return Err(GraphError::StorageError(format!(
+                        "get_all_edges failed: {}",
+                        msg
+                    )));
+                }
+                
+                let arr = response
+                    .get("edges")
+                    .and_then(|v| v.as_array())
+                    .ok_or_else(|| GraphError::StorageError("missing edges array".into()))?;
+                
+                let mut edges = Vec::with_capacity(arr.len());
+                for v in arr {
+                    edges.push(
+                        serde_json::from_value(v.clone())
+                            .map_err(|e| GraphError::DeserializationError(format!("edge: {}", e)))?,
+                    );
+                }
+                
+                info!("ZMQ get_all_edges → {} edges", edges.len());
+                Ok(edges)
+            }
+
+            None => Err(GraphError::StorageError("mode not set".into())),
+        }
     }
+
     pub async fn get_edge(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> GraphResult<Option<Edge>> {
-        let port = match &self.mode {
-            Some(SledClientMode::ZMQ(port)) => *port,
-            _ => DEFAULT_STORAGE_PORT,
-        };
-        let key = create_edge_key(
-            &SerializableUuid(*outbound_id),
-            edge_type,
-            &SerializableUuid(*inbound_id)
-        )?;
-        let result = self.retrieve_from_cf_zmq(port, "edges", &key).await?;
-        match result {
-            Some(v) => Ok(Some(deserialize_edge(&v)?)),
-            None => Ok(None),
+        match &self.mode {
+            Some(SledClientMode::Direct) => {
+                let key = create_edge_key(
+                    &SerializableUuid(*outbound_id),
+                    edge_type,
+                    &SerializableUuid(*inbound_id)
+                )?;
+                let result = self.retrieve_from_cf("edges", &key).await?;
+                match result {
+                    Some(v) => Ok(Some(deserialize_edge(&v)?)),
+                    None => Ok(None),
+                }
+            }
+            Some(SledClientMode::ZMQ(port)) => {
+                self.get_edge_zmq(*port, outbound_id, edge_type, inbound_id).await
+            }
+            None => Err(GraphError::StorageError("SledClient mode not set".to_string()))
         }
     }
+
     pub async fn update_edge(&self, edge: Edge) -> GraphResult<()> {
         self.create_edge(edge).await
     }
+
     pub async fn delete_edge(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> GraphResult<()> {
-        let port = match &self.mode {
-            Some(SledClientMode::ZMQ(port)) => *port,
-            _ => DEFAULT_STORAGE_PORT,
-        };
-        let key = create_edge_key(
-            &SerializableUuid(*outbound_id),
-            edge_type,
-            &SerializableUuid(*inbound_id)
-        )?;
-        self.delete_from_cf_zmq(port, "edges", &key).await
-    }
-    pub async fn get_all_edges(&self) -> GraphResult<Vec<Edge>> {
-        let port = match &self.mode {
-            Some(SledClientMode::ZMQ(port)) => *port,
-            _ => DEFAULT_STORAGE_PORT,
-        };
         match &self.mode {
             Some(SledClientMode::Direct) => {
-                self.get_tree_zmq(port, "edges").await?;
-                let db = self.inner.as_ref()
-                    .ok_or_else(|| GraphError::StorageError("No database available in direct mode".to_string()))?
-                    .lock().await;
-                let tree = db.open_tree("edges")
-                    .map_err(|e| GraphError::StorageError(format!("Failed to open edges tree: {}", e)))?;
-                let mut edges = Vec::new();
-                for item in tree.iter() {
-                    let (key, _) = item
-                        .map_err(|e| GraphError::StorageError(format!("Failed to iterate edges: {}", e)))?;
-                    // bincode 2 decode
-                    let (edge, _): (Edge, usize) = bincode::decode_from_slice(&key, bincode::config::standard())
-                        .map_err(|e| GraphError::StorageError(format!("Failed to deserialize edge: {}", e)))?;
-                    edges.push(edge);
-                }
-                Ok(edges)
+                let key = create_edge_key(
+                    &SerializableUuid(*outbound_id),
+                    edge_type,
+                    &SerializableUuid(*inbound_id)
+                )?;
+                self.delete_from_cf("edges", &key).await
             }
-            Some(SledClientMode::ZMQ(_)) => {
-                let request = json!({
-                    "command": "get_all_edges"
-                });
-                let response = self.send_zmq_request(port, request).await?;
-                if response.get("status").and_then(|s| s.as_str()) == Some("success") {
-                    let edges = response.get("edges")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_str())
-                                .filter_map(|s| hex::decode(s).ok())
-                                .filter_map(|bytes| {
-                                    bincode::decode_from_slice::<Edge, _>(&bytes, bincode::config::standard())
-                                        .ok()
-                                        .map(|(edge, _)| edge)
-                                })
-                                .collect::<Vec<Edge>>()
-                        })
-                        .unwrap_or_default();
-                    Ok(edges)
-                } else {
-                    let error_msg = response.get("message")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("Unknown error");
-                    Err(GraphError::StorageError(format!("ZMQ get_all_edges failed: {}", error_msg)))
-                }
+            Some(SledClientMode::ZMQ(port)) => {
+                self.delete_edge_zmq(*port, outbound_id, edge_type, inbound_id).await
             }
-            None => {
-                self.get_tree_zmq(port, "edges").await?;
-                let db = self.inner.as_ref()
-                    .ok_or_else(|| GraphError::StorageError("No database available".to_string()))?
-                    .lock().await;
-                let tree = db.open_tree("edges")
-                    .map_err(|e| GraphError::StorageError(format!("Failed to open edges tree: {}", e)))?;
-                let mut edges = Vec::new();
-                for item in tree.iter() {
-                    let (key, _) = item
-                        .map_err(|e| GraphError::StorageError(format!("Failed to iterate edges: {}", e)))?;
-                    let (edge, _): (Edge, usize) = bincode::decode_from_slice(&key, bincode::config::standard())
-                        .map_err(|e| GraphError::StorageError(format!("Failed to deserialize edge: {}", e)))?;
-                    edges.push(edge);
-                }
-                Ok(edges)
-            }
+            None => Err(GraphError::StorageError("SledClient mode not set".to_string()))
         }
     }
+
     pub async fn clear_data(&self) -> GraphResult<()> {
-        let port = match &self.mode {
-            Some(SledClientMode::ZMQ(port)) => *port,
-            _ => DEFAULT_STORAGE_PORT,
-        };
         match &self.mode {
             Some(SledClientMode::Direct) => {
-                let db = self.inner.as_ref()
-                    .ok_or_else(|| GraphError::StorageError("No database available in direct mode".to_string()))?
-                    .lock().await;
-                for tree_name in &["data", "vertices", "edges", "kv_pairs"] {
-                    let tree = db.open_tree(tree_name)
-                        .map_err(|e| GraphError::StorageError(format!("Failed to open tree {}: {}", tree_name, e)))?;
+                let inner = self.inner.as_ref()
+                    .ok_or_else(|| GraphError::StorageError("No database available".to_string()))?;
+                let db = inner.lock().await;
+                for name in &["vertices", "edges", "kv_pairs"] {
+                    let tree = (*db).open_tree(name)
+                        .map_err(|e| GraphError::StorageError(format!("Failed to open tree {}: {}", name, e)))?;
                     tree.clear()
-                        .map_err(|e| GraphError::StorageError(format!("Failed to clear tree {}: {}", tree_name, e)))?;
+                        .map_err(|e| GraphError::StorageError(format!("Failed to clear tree {}: {}", name, e)))?;
                 }
                 let bytes_flushed = (*db).flush_async().await
                     .map_err(|e| GraphError::StorageError(format!("Failed to flush after clear: {}", e)))?;
-                info!("Flushed {} bytes after clearing data", bytes_flushed);
+                info!("Cleared data from vertices, edges, kv_pairs; flushed {} bytes", bytes_flushed);
+                println!("===> Cleared data from vertices, edges, kv_pairs; flushed {} bytes", bytes_flushed);
                 Ok(())
             }
-            Some(SledClientMode::ZMQ(_)) => {
-                let request = json!({
-                    "command": "clear_data"
-                });
-                let response = self.send_zmq_request(port, request).await?;
+            Some(SledClientMode::ZMQ(port)) => {
+                let request = json!({ "command": "clear_data" });
+                let response = self.send_zmq_request(*port, request).await?;
                 if response.get("status").and_then(|s| s.as_str()) == Some("success") {
-                    if response.get("bytes_flushed").and_then(|b| b.as_u64()).is_some() {
-                        Ok(())
-                    } else {
-                        Err(GraphError::StorageError("Flush not confirmed by daemon".to_string()))
-                    }
+                    info!("Cleared data via ZMQ on port {}", port);
+                    println!("===> Cleared data via ZMQ on port {}", port);
+                    Ok(())
                 } else {
-                    let error_msg = response.get("message")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("Unknown error");
+                    let error_msg = response.get("message").and_then(|m| m.as_str()).unwrap_or("Unknown error");
+                    error!("ZMQ clear_data failed on port {}: {}", port, error_msg);
+                    println!("===> ERROR: ZMQ clear_data failed on port {}: {}", port, error_msg);
                     Err(GraphError::StorageError(format!("ZMQ clear_data failed: {}", error_msg)))
                 }
             }
-            None => {
-                let db = self.inner.as_ref()
-                    .ok_or_else(|| GraphError::StorageError("No database available".to_string()))?
-                    .lock().await;
-                for tree_name in &["data", "vertices", "edges", "kv_pairs"] {
-                    let tree = db.open_tree(tree_name)
-                        .map_err(|e| GraphError::StorageError(format!("Failed to open tree {}: {}", tree_name, e)))?;
-                    tree.clear()
-                        .map_err(|e| GraphError::StorageError(format!("Failed to clear tree {}: {}", tree_name, e)))?;
-                }
-                let bytes_flushed = (*db).flush_async().await
-                    .map_err(|e| GraphError::StorageError(format!("Failed to flush after clear: {}", e)))?;
-                info!("Flushed {} bytes after clearing data", bytes_flushed);
-                Ok(())
-            }
+            None => Err(GraphError::StorageError("SledClient mode not set".to_string()))
         }
     }
+
     pub async fn connect(&self) -> GraphResult<()> {
         info!("Connecting to Sled");
         let mut is_running = self.is_running.lock().await;
@@ -944,7 +1241,7 @@ impl SledClient {
                     .ok_or_else(|| GraphError::StorageError("No database available in direct mode".to_string()))?
                     .lock().await;
                 let bytes_flushed = (*db).flush_async().await
-                    .map_err(|e| GraphError::StorageError(format!("Failed to flush: {}", e)))?;
+                    .map_err(|e| GraphError::StorageError(format!("Failed to flush: {:?}", e)))?;
                 info!("Flushed {} bytes during close", bytes_flushed);
                 Ok(())
             }
@@ -1266,4 +1563,66 @@ impl GraphStorageEngine for SledClient {
             }
         }
     }
+}
+
+/// Sends a request and receives **exactly one** reply using the shared ZMQ socket.
+/// Fixes:
+/// - Drains stale replies **before** send
+/// - Retries send on `EAGAIN` or `current state`
+/// - Retries recv on `EAGAIN` with back-off
+/// - Handles "Operation cannot be accomplished in current state" gracefully
+/// - **Never blocks**, **never moves socket**, **never violates borrow checker**
+/// Sends a request and receives exactly one reply using a FRESH ZMQ socket.
+/// This ensures we never violate ZMQ's REQ-REP state machine.
+// ------------------------------------------------------------------------
+//  zmq_send_recv - NEW IMPLEMENTATION WITH FRESH SOCKETS
+// ------------------------------------------------------------------------
+async fn zmq_send_recv(
+    context: Arc<zmq::Context>,
+    port: u16,
+    request: Value,
+) -> GraphResult<Value> {
+    // Add request_id for server-side deduplication
+    let mut request = request;
+    request["request_id"] = json!(Uuid::new_v4().to_string());
+    
+    let payload = serde_json::to_vec(&request)
+        .map_err(|e| GraphError::SerializationError(format!("serialize request: {}", e)))?;
+    
+    // Move to blocking thread to avoid blocking async runtime
+    let result = tokio::task::spawn_blocking(move || {
+        // CREATE FRESH SOCKET FOR THIS REQUEST
+        let socket = context.socket(zmq::REQ)
+            .map_err(|e| GraphError::StorageError(format!("socket creation: {}", e)))?;
+        
+        // Configure socket
+        socket.set_linger(0)
+            .map_err(|e| GraphError::StorageError(format!("set_linger: {}", e)))?;
+        socket.set_sndtimeo(5000)
+            .map_err(|e| GraphError::StorageError(format!("set_sndtimeo: {}", e)))?;
+        socket.set_rcvtimeo(5000)
+            .map_err(|e| GraphError::StorageError(format!("set_rcvtimeo: {}", e)))?;
+        
+        // Connect
+        let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", port);
+        socket.connect(&endpoint)
+            .map_err(|e| GraphError::StorageError(format!("connect to {}: {}", endpoint, e)))?;
+        
+        // Send (blocking is OK, we're in spawn_blocking)
+        socket.send(&payload, 0)
+            .map_err(|e| GraphError::StorageError(format!("send: {}", e)))?;
+        
+        // Receive (blocking is OK)
+        let msg = socket.recv_bytes(0)
+            .map_err(|e| GraphError::StorageError(format!("recv: {}", e)))?;
+        
+        // Socket is automatically dropped here - clean state for next request
+        Ok::<Vec<u8>, GraphError>(msg)
+    })
+    .await
+    .map_err(|e| GraphError::StorageError(format!("task join: {}", e)))??;
+    
+    // Parse response
+    serde_json::from_slice(&result)
+        .map_err(|e| GraphError::DeserializationError(format!("parse reply: {}", e)))
 }

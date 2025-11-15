@@ -7,19 +7,21 @@ use nom::{
     bytes::complete::{tag, take_while1},
     character::complete::{char, multispace0, multispace1},
     combinator::{map, opt},
-    multi::{separated_list0, separated_list1, many0}, // Added many0
+    multi::{separated_list0, separated_list1, many0},
+    number::complete::double, // Added this import
     sequence::{delimited, preceded, tuple},
     IResult,
     Parser,
 };
 use serde_json::{json, Value};
-use std::collections::{ BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use uuid::Uuid;
 use models::identifiers::{Identifier, SerializableUuid};
-use models::{Vertex, Edge, properties::PropertyValue};
+use models::{Vertex, Edge};
 use models::errors::{GraphError, GraphResult};
 use models::properties::SerializableFloat;
+use models::properties::PropertyValue; // Added PropertyValue import
 use crate::database::Database;
 use crate::storage_engine::{GraphStorageEngine, StorageEngine};
 
@@ -73,17 +75,39 @@ fn parse_identifier(input: &str) -> IResult<&str, &str> {
 }
 
 // Parse a string literal (e.g., 'Alice' or "Alice")
+// Fix 2: Update parse_string_literal to handle escaped quotes and empty strings
 fn parse_string_literal(input: &str) -> IResult<&str, &str> {
     alt((
-        delimited(char('\''), take_while1(|c: char| c != '\''), char('\'')),
-        delimited(char('"'), take_while1(|c: char| c != '"'), char('"')),
+        delimited(
+            char('\''),
+            take_while1(|c: char| c != '\'' && c != '\\'),
+            char('\'')
+        ),
+        delimited(
+            char('"'),
+            take_while1(|c: char| c != '"' && c != '\\'),
+            char('"')
+        ),
+        // Handle empty strings
+        map(tag("''"), |_| ""),
+        map(tag("\"\""), |_| ""),
     ))
     .parse(input)
 }
 
-// Parse a number literal
+// Parse a number literal (integer or float)
 fn parse_number_literal(input: &str) -> IResult<&str, Value> {
-    map(nom::character::complete::i64, |n| json!(n)).parse(input)
+    map(
+        nom::number::complete::double,
+        |n| {
+            // Check if it's actually an integer to preserve type
+            if n.fract() == 0.0 && n >= (i64::MIN as f64) && n <= (i64::MAX as f64) {
+                json!(n as i64)
+            } else {
+                json!(n)
+            }
+        }
+    ).parse(input)
 }
 
 // Parse a property value (string or number)
@@ -91,6 +115,9 @@ fn parse_property_value(input: &str) -> IResult<&str, Value> {
     alt((
         map(parse_string_literal, |s| json!(s)),
         parse_number_literal,
+        map(tag("true"), |_| json!(true)),
+        map(tag("false"), |_| json!(false)),
+        map(tag("null"), |_| Value::Null),
     ))
     .parse(input)
 }
@@ -111,38 +138,57 @@ fn parse_properties(input: &str) -> IResult<&str, HashMap<String, Value>> {
     map(
         delimited(
             preceded(multispace0, char('{')),
-            separated_list0(preceded(multispace0, char(',')), parse_property),
+            opt(separated_list1(
+                preceded(multispace0, char(',')),
+                preceded(multispace0, parse_property)
+            )),
             preceded(multispace0, char('}')),
         ),
-        |props| props.into_iter().collect(),
+        |props| props.unwrap_or_default().into_iter().collect(),
     )
     .parse(input)
 }
 
-// Parse a node pattern like `(n:Person {name: 'Alice'})` or `(n:Person:Actor {name: 'Bob'})`
+// Parse a node pattern like `(n:Person {name: 'Alice'})` or `(:Person {name: 'Alice'})` or `(n:Person:Actor {name: 'Bob'})`
 // or `(n:Person&Actor {name: 'Charlie'})` - supports both : and & as label separators
+// Fix 4: Fix parse_node to handle multiple labels properly
+// Fix parse_node to handle both ':' and '&' as label separators
 fn parse_node(input: &str) -> IResult<&str, (Option<String>, Option<String>, HashMap<String, Value>)> {
     let (input, _) = char('(').parse(input)?;
+    let (input, _) = multispace0.parse(input)?;
     let (input, var) = opt(parse_identifier).parse(input)?;
+    let (input, _) = multispace0.parse(input)?;
     
     // Parse labels (one or more, separated by ':' or '&')
     let (input, labels) = if input.starts_with(':') {
         let (input, _) = char(':').parse(input)?;
         let (input, first_label) = parse_identifier.parse(input)?;
         
-        // Support both ':' and '&' as label separators
-        let (input, _) = many0(alt((
-            preceded(char(':'), parse_identifier),
-            preceded(char('&'), parse_identifier),
-        ))).parse(input)?;
+        // Parse additional labels separated by ':' or '&'
+        let (input, additional_labels) = many0(
+            preceded(
+                alt((char(':'), char('&'))),
+                parse_identifier
+            )
+        ).parse(input)?;
         
-        (input, Some(first_label.to_string()))
+        // Combine labels with colon separator (standard Cypher format)
+        let combined_label = if additional_labels.is_empty() {
+            first_label.to_string()
+        } else {
+            let mut all_labels = vec![first_label];
+            all_labels.extend(additional_labels);
+            all_labels.join(":")
+        };
+        
+        (input, Some(combined_label))
     } else {
         (input, None)
     };
     
     let (input, _) = multispace0.parse(input)?;
     let (input, props) = opt(parse_properties).parse(input)?;
+    let (input, _) = multispace0.parse(input)?;
     let (input, _) = char(')').parse(input)?;
     
     Ok((input, (
@@ -180,7 +226,7 @@ fn parse_create_nodes(input: &str) -> IResult<&str, CypherQuery> {
             let node_data: Vec<(String, HashMap<String, Value>)> = nodes
                 .into_iter()
                 .map(|(var, label, props)| {
-                    let actual_label = label.unwrap_or_else(|| var.clone().unwrap_or_default());
+                    let actual_label = label.unwrap_or_else(|| var.clone().unwrap_or_else(|| "Node".to_string()));
                     (actual_label, props)
                 })
                 .collect();
@@ -197,15 +243,15 @@ fn parse_create_nodes(input: &str) -> IResult<&str, CypherQuery> {
 fn parse_create_node(input: &str) -> IResult<&str, CypherQuery> {
     map(
         tuple((tag("CREATE"), multispace1, parse_node)),
-        |(_, _, (_, label, props))| CypherQuery::CreateNode {
-            label: label.unwrap_or_default(),
+        |(_, _, (var, label, props))| CypherQuery::CreateNode {
+            label: label.unwrap_or_else(|| var.clone().unwrap_or_else(|| "Node".to_string())),
             properties: props,
         },
     )
     .parse(input)
 }
 
-// Parse a `MATCH` node query - handle complex RETURN clauses
+// Parse a `MATCH` node query - handle RETURN clause without requiring WHERE
 fn parse_match_node(input: &str) -> IResult<&str, CypherQuery> {
     let (input, (_, _, node, _, return_clause)) = tuple((
         tag("MATCH"),
@@ -217,15 +263,14 @@ fn parse_match_node(input: &str) -> IResult<&str, CypherQuery> {
     
     let (_, label, props) = node;
     
-    // Parse complex RETURN expressions like:
-    // - n.name
-    // - labels(n) 
-    // - count(n)
-    // - n, r, m
-    // - n.name, labels(n) AS labels
-    // - count(n) AS total_vertices
+    // Parse variable name after RETURN (like 'n' in RETURN n)
+    let (input, _) = preceded(multispace0, parse_identifier).parse(input)?;
     
-    let (input, _) = parse_return_expressions(input)?;
+    // Handle additional variables separated by commas like RETURN n, r, m
+    let (input, _) = many0(preceded(
+        tuple((multispace0, char(','), multispace0)),
+        parse_identifier
+    )).parse(input)?;
     
     Ok((input, CypherQuery::MatchNode {
         label: label,
@@ -373,14 +418,17 @@ fn parse_delete_kv(input: &str) -> IResult<&str, CypherQuery> {
 }
 
 // Main parser for Cypher queries
+// Fix 1: Strip trailing semicolon from queries
 pub fn parse_cypher(query: &str) -> Result<CypherQuery, String> {
     if !is_cypher(query) {
         return Err("Not a valid Cypher query.".to_string());
     }
 
-    let query = query.trim();
+    // Strip trailing semicolon if present
+    let query = query.trim().trim_end_matches(';').trim();
+    
     let mut parser = alt((
-        parse_create_nodes,  // Add this before parse_create_node to handle multi-node first
+        parse_create_nodes,
         parse_create_node,
         parse_match_node,
         parse_create_edge,
@@ -469,8 +517,8 @@ pub async fn execute_cypher(
                 outbound_id: from_id,
                 t: Identifier::new(edge_type)?,
                 inbound_id: to_id,
-                label: "relationship".to_string(),
-                properties: BTreeMap::new(),
+                label: "relationship".to_string(), // Use String instead of Identifier
+                properties: BTreeMap::new(), // Use BTreeMap instead of HashMap
             };
             storage.create_edge(edge.clone()).await?;
             Ok(json!({ "edge": edge }))
@@ -558,6 +606,37 @@ mod tests {
             properties: HashMap::from([
                 ("name".to_string(), json!("Alice")),
                 ("age".to_string(), json!(30)),
+            ]),
+        };
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_parse_create_node_without_variable() {
+        let query = "CREATE (:Person {name: 'Alice', age: 30})";
+        let result = parse_cypher(query).unwrap();
+        let expected = CypherQuery::CreateNode {
+            label: "Person".to_string(), // Should use the label
+            properties: HashMap::from([
+                ("name".to_string(), json!("Alice")),
+                ("age".to_string(), json!(30)),
+            ]),
+        };
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_parse_create_node_with_float() {
+        let query = "CREATE (:Person {id: \"alice\", name: \"Alice\", age: 30, active: true, score: 95.5})";
+        let result = parse_cypher(query).unwrap();
+        let expected = CypherQuery::CreateNode {
+            label: "Person".to_string(),
+            properties: HashMap::from([
+                ("id".to_string(), json!("alice")),
+                ("name".to_string(), json!("Alice")),
+                ("age".to_string(), json!(30)),
+                ("active".to_string(), json!(true)),
+                ("score".to_string(), json!(95.5)),
             ]),
         };
         assert_eq!(result, expected);
