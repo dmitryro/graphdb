@@ -468,8 +468,8 @@ impl Database {
         Ok(storage)
     }
 
-    pub fn get_storage_engine(&self) -> Arc<dyn StorageEngine + Send + Sync> {
-        Arc::clone(&self.storage) as Arc<dyn StorageEngine + Send + Sync>
+    pub fn get_storage_engine(&self) -> Arc<dyn GraphStorageEngine + Send + Sync> {
+        Arc::clone(&self.storage)
     }
 
     pub fn get_storage_engine_type(&self) -> StorageEngineType {

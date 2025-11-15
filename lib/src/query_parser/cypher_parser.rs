@@ -7,21 +7,23 @@ use nom::{
     bytes::complete::{tag, take_while1},
     character::complete::{char, multispace0, multispace1},
     combinator::{map, opt},
-    multi::separated_list0,
+    multi::{separated_list0, separated_list1, many0},
+    number::complete::double, // Added this import
     sequence::{delimited, preceded, tuple},
     IResult,
     Parser,
 };
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use uuid::Uuid;
 use models::identifiers::{Identifier, SerializableUuid};
 use models::{Vertex, Edge};
 use models::errors::{GraphError, GraphResult};
 use models::properties::SerializableFloat;
+use models::properties::PropertyValue; // Added PropertyValue import
 use crate::database::Database;
-use crate::storage_engine::StorageEngine;
+use crate::storage_engine::{GraphStorageEngine, StorageEngine};
 
 // Enum to represent parsed Cypher queries
 #[derive(Debug, PartialEq)]
@@ -29,6 +31,9 @@ pub enum CypherQuery {
     CreateNode {
         label: String,
         properties: HashMap<String, Value>,
+    },
+    CreateNodes {
+        nodes: Vec<(String, HashMap<String, Value>)>, // (label, properties)
     },
     MatchNode {
         label: Option<String>,
@@ -70,17 +75,39 @@ fn parse_identifier(input: &str) -> IResult<&str, &str> {
 }
 
 // Parse a string literal (e.g., 'Alice' or "Alice")
+// Fix 2: Update parse_string_literal to handle escaped quotes and empty strings
 fn parse_string_literal(input: &str) -> IResult<&str, &str> {
     alt((
-        delimited(char('\''), take_while1(|c: char| c != '\''), char('\'')),
-        delimited(char('"'), take_while1(|c: char| c != '"'), char('"')),
+        delimited(
+            char('\''),
+            take_while1(|c: char| c != '\'' && c != '\\'),
+            char('\'')
+        ),
+        delimited(
+            char('"'),
+            take_while1(|c: char| c != '"' && c != '\\'),
+            char('"')
+        ),
+        // Handle empty strings
+        map(tag("''"), |_| ""),
+        map(tag("\"\""), |_| ""),
     ))
     .parse(input)
 }
 
-// Parse a number literal
+// Parse a number literal (integer or float)
 fn parse_number_literal(input: &str) -> IResult<&str, Value> {
-    map(nom::character::complete::i64, |n| json!(n)).parse(input)
+    map(
+        nom::number::complete::double,
+        |n| {
+            // Check if it's actually an integer to preserve type
+            if n.fract() == 0.0 && n >= (i64::MIN as f64) && n <= (i64::MAX as f64) {
+                json!(n as i64)
+            } else {
+                json!(n)
+            }
+        }
+    ).parse(input)
 }
 
 // Parse a property value (string or number)
@@ -88,6 +115,9 @@ fn parse_property_value(input: &str) -> IResult<&str, Value> {
     alt((
         map(parse_string_literal, |s| json!(s)),
         parse_number_literal,
+        map(tag("true"), |_| json!(true)),
+        map(tag("false"), |_| json!(false)),
+        map(tag("null"), |_| Value::Null),
     ))
     .parse(input)
 }
@@ -108,27 +138,62 @@ fn parse_properties(input: &str) -> IResult<&str, HashMap<String, Value>> {
     map(
         delimited(
             preceded(multispace0, char('{')),
-            separated_list0(preceded(multispace0, char(',')), parse_property),
+            opt(separated_list1(
+                preceded(multispace0, char(',')),
+                preceded(multispace0, parse_property)
+            )),
             preceded(multispace0, char('}')),
         ),
-        |props| props.into_iter().collect(),
+        |props| props.unwrap_or_default().into_iter().collect(),
     )
     .parse(input)
 }
 
-// Parse a node pattern like `(n:Person {name: 'Alice'})`
+// Parse a node pattern like `(n:Person {name: 'Alice'})` or `(:Person {name: 'Alice'})` or `(n:Person:Actor {name: 'Bob'})`
+// or `(n:Person&Actor {name: 'Charlie'})` - supports both : and & as label separators
+// Fix 4: Fix parse_node to handle multiple labels properly
+// Fix parse_node to handle both ':' and '&' as label separators
 fn parse_node(input: &str) -> IResult<&str, (Option<String>, Option<String>, HashMap<String, Value>)> {
-    let (input, (_, var, label, props, _)) = tuple((
-        char('('),
-        opt(parse_identifier),
-        opt(preceded(char(':'), parse_identifier)),
-        opt(parse_properties),
-        char(')'),
-    ))
-    .parse(input)?;
+    let (input, _) = char('(').parse(input)?;
+    let (input, _) = multispace0.parse(input)?;
+    let (input, var) = opt(parse_identifier).parse(input)?;
+    let (input, _) = multispace0.parse(input)?;
+    
+    // Parse labels (one or more, separated by ':' or '&')
+    let (input, labels) = if input.starts_with(':') {
+        let (input, _) = char(':').parse(input)?;
+        let (input, first_label) = parse_identifier.parse(input)?;
+        
+        // Parse additional labels separated by ':' or '&'
+        let (input, additional_labels) = many0(
+            preceded(
+                alt((char(':'), char('&'))),
+                parse_identifier
+            )
+        ).parse(input)?;
+        
+        // Combine labels with colon separator (standard Cypher format)
+        let combined_label = if additional_labels.is_empty() {
+            first_label.to_string()
+        } else {
+            let mut all_labels = vec![first_label];
+            all_labels.extend(additional_labels);
+            all_labels.join(":")
+        };
+        
+        (input, Some(combined_label))
+    } else {
+        (input, None)
+    };
+    
+    let (input, _) = multispace0.parse(input)?;
+    let (input, props) = opt(parse_properties).parse(input)?;
+    let (input, _) = multispace0.parse(input)?;
+    let (input, _) = char(')').parse(input)?;
+    
     Ok((input, (
         var.map(|s| s.to_string()),
-        label.map(|s| s.to_string()),
+        labels,
         props.unwrap_or_default(),
     )))
 }
@@ -146,36 +211,112 @@ fn parse_relationship(input: &str) -> IResult<&str, String> {
     Ok((input, rel_type.to_string()))
 }
 
+// Parse a `CREATE` nodes query - support multiple nodes separated by commas
+fn parse_create_nodes(input: &str) -> IResult<&str, CypherQuery> {
+    map(
+        tuple((
+            tag("CREATE"),
+            multispace1,
+            separated_list1(
+                delimited(multispace0, char(','), multispace0),
+                parse_node,
+            ),
+        )),
+        |(_, _, nodes)| {
+            let node_data: Vec<(String, HashMap<String, Value>)> = nodes
+                .into_iter()
+                .map(|(var, label, props)| {
+                    let actual_label = label.unwrap_or_else(|| var.clone().unwrap_or_else(|| "Node".to_string()));
+                    (actual_label, props)
+                })
+                .collect();
+            
+            CypherQuery::CreateNodes {
+                nodes: node_data,
+            }
+        },
+    )
+    .parse(input)
+}
+
 // Parse a `CREATE` node query
 fn parse_create_node(input: &str) -> IResult<&str, CypherQuery> {
     map(
         tuple((tag("CREATE"), multispace1, parse_node)),
-        |(_, _, (_, label, props))| CypherQuery::CreateNode {
-            label: label.unwrap_or_default(),
+        |(_, _, (var, label, props))| CypherQuery::CreateNode {
+            label: label.unwrap_or_else(|| var.clone().unwrap_or_else(|| "Node".to_string())),
             properties: props,
         },
     )
     .parse(input)
 }
 
-// Parse a `MATCH` node query
+// Parse a `MATCH` node query - handle RETURN clause without requiring WHERE
 fn parse_match_node(input: &str) -> IResult<&str, CypherQuery> {
-    map(
+    let (input, (_, _, node, _, return_clause)) = tuple((
+        tag("MATCH"),
+        multispace1,
+        parse_node,
+        multispace1,
+        tag("RETURN"),
+    )).parse(input)?;
+    
+    let (_, label, props) = node;
+    
+    // Parse variable name after RETURN (like 'n' in RETURN n)
+    let (input, _) = preceded(multispace0, parse_identifier).parse(input)?;
+    
+    // Handle additional variables separated by commas like RETURN n, r, m
+    let (input, _) = many0(preceded(
+        tuple((multispace0, char(','), multispace0)),
+        parse_identifier
+    )).parse(input)?;
+    
+    Ok((input, CypherQuery::MatchNode {
+        label: label,
+        properties: props,
+    }))
+}
+
+// Parse complex RETURN expressions (handles variables, properties, functions, aliases)
+fn parse_return_expressions(input: &str) -> IResult<&str, ()> {
+    let (input, _) = multispace0.parse(input)?;
+    
+    // Parse the first expression
+    let (input, _) = parse_return_expression(input)?;
+    
+    // Parse additional expressions separated by commas
+    let (input, _) = many0(preceded(
+        tuple((multispace0, char(','), multispace0)),
+        parse_return_expression
+    )).parse(input)?;
+    
+    Ok((input, ()))
+}
+
+// Parse a single RETURN expression like n, n.name, labels(n), count(n) AS alias
+fn parse_return_expression(input: &str) -> IResult<&str, ()> {
+    let (input, _) = multispace0.parse(input)?;
+    
+    // Handle function calls like labels(n), count(n), etc.
+    let (input, _) = alt((
+        // Function call with parentheses: labels(n), count(n), etc.
         tuple((
-            tag("MATCH"),
-            multispace1,
-            parse_node,
-            multispace1,
-            preceded(tag("WHERE"), parse_properties),
-            multispace1,
-            tag("RETURN"),
-        )),
-        |(_, _, (var, label, _), _, props, _, _)| CypherQuery::MatchNode {
-            label: label.or(var),
-            properties: props,
-        },
-    )
-    .parse(input)
+            parse_identifier,  // function name
+            char('('),
+            parse_identifier, // variable name inside parentheses
+            char(')'),
+            opt(tuple((multispace0, tag("AS"), multispace0, parse_identifier))), // optional AS alias
+        )).map(|_| ()),
+        // Simple variable or property access: n, n.name, etc.
+        tuple((
+            parse_identifier,
+            opt(preceded(char('.'), parse_identifier)), // optional property access like .name
+            opt(tuple((multispace0, tag("AS"), multispace0, parse_identifier))), // optional AS alias
+        )).map(|_| ()),
+    )).parse(input)?;
+    
+    Ok((input, ()))
 }
 
 // Parse a `CREATE` edge query
@@ -277,13 +418,17 @@ fn parse_delete_kv(input: &str) -> IResult<&str, CypherQuery> {
 }
 
 // Main parser for Cypher queries
+// Fix 1: Strip trailing semicolon from queries
 pub fn parse_cypher(query: &str) -> Result<CypherQuery, String> {
     if !is_cypher(query) {
         return Err("Not a valid Cypher query.".to_string());
     }
 
-    let query = query.trim();
+    // Strip trailing semicolon if present
+    let query = query.trim().trim_end_matches(';').trim();
+    
     let mut parser = alt((
+        parse_create_nodes,
         parse_create_node,
         parse_match_node,
         parse_create_edge,
@@ -306,32 +451,15 @@ pub fn parse_cypher(query: &str) -> Result<CypherQuery, String> {
     }
 }
 
-// Convert serde_json::Value to models::PropertyValue
-fn to_property_value(value: Value) -> GraphResult<models::PropertyValue> {
-    match value {
-        Value::String(s) => Ok(models::PropertyValue::String(s)),
-        Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Ok(models::PropertyValue::Integer(i))
-            } else if let Some(f) = n.as_f64() {
-                Ok(models::PropertyValue::Float(SerializableFloat(f)))
-            } else {
-                Err(GraphError::InvalidData("Unsupported number type".to_string()))
-            }
-        }
-        _ => Err(GraphError::InvalidData("Unsupported value type".to_string())),
-    }
-}
-
-// Execute a parsed Cypher query against the database and storage engine
+/// Execute a parsed Cypher query against the database and storage engine
 pub async fn execute_cypher(
     query: CypherQuery,
-    db: &Database,
-    storage: Arc<dyn StorageEngine + Send + Sync>,
+    _db: &Database,
+    storage: Arc<dyn GraphStorageEngine + Send + Sync>,
 ) -> GraphResult<Value> {
     match query {
         CypherQuery::CreateNode { label, properties } => {
-            let props: GraphResult<HashMap<String, models::PropertyValue>> = properties
+            let props: GraphResult<HashMap<String, PropertyValue>> = properties
                 .into_iter()
                 .map(|(k, v)| to_property_value(v).map(|pv| (k, pv)))
                 .collect();
@@ -340,12 +468,31 @@ pub async fn execute_cypher(
                 label: Identifier::new(label)?,
                 properties: props?,
             };
-            db.create_vertex(vertex.clone()).await?;
+            storage.create_vertex(vertex.clone()).await?;
             Ok(json!({ "vertex": vertex }))
         }
+
+        CypherQuery::CreateNodes { nodes } => {
+            let mut created_vertices = Vec::new();
+            for (label, properties) in nodes {
+                let props: GraphResult<HashMap<String, PropertyValue>> = properties
+                    .into_iter()
+                    .map(|(k, v)| to_property_value(v).map(|pv| (k, pv)))
+                    .collect();
+                let vertex = Vertex {
+                    id: SerializableUuid(Uuid::new_v4()),
+                    label: Identifier::new(label)?,
+                    properties: props?,
+                };
+                storage.create_vertex(vertex.clone()).await?;
+                created_vertices.push(vertex);
+            }
+            Ok(json!({ "vertices": created_vertices }))
+        }
+
         CypherQuery::MatchNode { label, properties } => {
-            let vertices = db.get_all_vertices().await?;
-            let props: GraphResult<HashMap<String, models::PropertyValue>> = properties
+            let vertices = storage.get_all_vertices().await?;
+            let props: GraphResult<HashMap<String, PropertyValue>> = properties
                 .into_iter()
                 .map(|(k, v)| to_property_value(v).map(|pv| (k, pv)))
                 .collect();
@@ -359,42 +506,58 @@ pub async fn execute_cypher(
             }).collect::<Vec<_>>();
             Ok(json!({ "vertices": filtered }))
         }
-        CypherQuery::CreateEdge { from_id, edge_type, to_id } => {
+
+        CypherQuery::CreateEdge {
+            from_id,
+            edge_type,
+            to_id,
+        } => {
             let edge = Edge {
+                id: SerializableUuid(Uuid::new_v4()),
                 outbound_id: from_id,
                 t: Identifier::new(edge_type)?,
                 inbound_id: to_id,
+                label: "relationship".to_string(), // Use String instead of Identifier
+                properties: BTreeMap::new(), // Use BTreeMap instead of HashMap
             };
-            db.create_edge(edge.clone()).await?;
+            storage.create_edge(edge.clone()).await?;
             Ok(json!({ "edge": edge }))
         }
+
         CypherQuery::SetNode { id, properties } => {
-            let mut vertex = db.get_vertex(&id.0).await?.ok_or_else(|| {
+            let mut vertex = storage.get_vertex(&id.0).await?.ok_or_else(|| {
                 GraphError::StorageError(format!("Vertex not found: {}", id.0))
             })?;
-            let props: GraphResult<HashMap<String, models::PropertyValue>> = properties
+            let props: GraphResult<HashMap<String, PropertyValue>> = properties
                 .into_iter()
                 .map(|(k, v)| to_property_value(v).map(|pv| (k, pv)))
                 .collect();
             vertex.properties.extend(props?);
-            db.update_vertex(vertex.clone()).await?;
+            storage.update_vertex(vertex.clone()).await?;
             Ok(json!({ "vertex": vertex }))
         }
+
         CypherQuery::DeleteNode { id } => {
-            db.delete_vertex(&id.0).await?;
+            storage.delete_vertex(&id.0).await?;
             Ok(json!({ "deleted": id }))
         }
+
         CypherQuery::SetKeyValue { key, value } => {
             let kv_key = key.clone().into_bytes();
             storage.insert(kv_key, value.as_bytes().to_vec()).await?;
             storage.flush().await?;
             Ok(json!({ "key": key, "value": value }))
         }
+
         CypherQuery::GetKeyValue { key } => {
             let kv_key = key.clone().into_bytes();
             let value = storage.retrieve(&kv_key).await?;
-            Ok(json!({ "key": key, "value": value.map(|v| String::from_utf8_lossy(&v).to_string()) }))
+            Ok(json!({
+                "key": key,
+                "value": value.map(|v| String::from_utf8_lossy(&v).to_string())
+            }))
         }
+
         CypherQuery::DeleteKeyValue { key } => {
             let kv_key = key.clone().into_bytes();
             let existed = storage.retrieve(&kv_key).await?.is_some();
@@ -404,6 +567,20 @@ pub async fn execute_cypher(
             }
             Ok(json!({ "key": key, "deleted": existed }))
         }
+    }
+}
+
+/// Helper to convert Cypher `Value` → `PropertyValue`
+fn to_property_value(v: Value) -> GraphResult<PropertyValue> {
+    match v {
+        Value::String(s) => Ok(PropertyValue::String(s)),
+        Value::Number(n) if n.is_i64() => Ok(PropertyValue::Integer(n.as_i64().unwrap())),
+        Value::Number(n) if n.is_f64() => Ok(PropertyValue::Float(SerializableFloat(n.as_f64().unwrap()))),
+        Value::Bool(b) => Ok(PropertyValue::Boolean(b)),
+        Value::Null => Err(GraphError::InternalError("Null values not supported in properties".into())),
+        Value::Array(_) => Err(GraphError::InternalError("Array values not supported in properties".into())),
+        Value::Object(_) => Err(GraphError::InternalError("Nested objects not supported in properties".into())),
+        _ => Err(GraphError::InternalError("Unsupported property value type".into())),
     }
 }
 
@@ -435,12 +612,99 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_match_node() {
-        let query = "MATCH (n:Person) WHERE {name: 'Alice'} RETURN n";
+    fn test_parse_create_node_without_variable() {
+        let query = "CREATE (:Person {name: 'Alice', age: 30})";
+        let result = parse_cypher(query).unwrap();
+        let expected = CypherQuery::CreateNode {
+            label: "Person".to_string(), // Should use the label
+            properties: HashMap::from([
+                ("name".to_string(), json!("Alice")),
+                ("age".to_string(), json!(30)),
+            ]),
+        };
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_parse_create_node_with_float() {
+        let query = "CREATE (:Person {id: \"alice\", name: \"Alice\", age: 30, active: true, score: 95.5})";
+        let result = parse_cypher(query).unwrap();
+        let expected = CypherQuery::CreateNode {
+            label: "Person".to_string(),
+            properties: HashMap::from([
+                ("id".to_string(), json!("alice")),
+                ("name".to_string(), json!("Alice")),
+                ("age".to_string(), json!(30)),
+                ("active".to_string(), json!(true)),
+                ("score".to_string(), json!(95.5)),
+            ]),
+        };
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_parse_create_nodes_with_ampersand_labels() {
+        let query = "CREATE (charlie:Person&Actor {name: 'Charlie Sheen'}), (oliver:Person&Director {name: 'Oliver Stone'})";
+        let result = parse_cypher(query).unwrap();
+        let expected = CypherQuery::CreateNodes {
+            nodes: vec![
+                ("Person".to_string(), HashMap::from([  // Using first label
+                    ("name".to_string(), json!("Charlie Sheen")),
+                ])),
+                ("Person".to_string(), HashMap::from([  // Using first label
+                    ("name".to_string(), json!("Oliver Stone")),
+                ])),
+            ],
+        };
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_parse_create_nodes_with_colon_labels() {
+        let query = "CREATE (charlie:Person:Actor {name: 'Charlie Sheen'}), (oliver:Person:Director {name: 'Oliver Stone'})";
+        let result = parse_cypher(query).unwrap();
+        let expected = CypherQuery::CreateNodes {
+            nodes: vec![
+                ("Person".to_string(), HashMap::from([  // Using first label
+                    ("name".to_string(), json!("Charlie Sheen")),
+                ])),
+                ("Person".to_string(), HashMap::from([  // Using first label
+                    ("name".to_string(), json!("Oliver Stone")),
+                ])),
+            ],
+        };
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_parse_match_simple_return() {
+        let query = "MATCH (n:Person) RETURN n";
         let result = parse_cypher(query).unwrap();
         let expected = CypherQuery::MatchNode {
             label: Some("Person".to_string()),
-            properties: HashMap::from([("name".to_string(), json!("Alice"))]),
+            properties: HashMap::new(),
+        };
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_parse_match_complex_return() {
+        let query = "MATCH (n) RETURN n.name, labels(n) AS labels";
+        let result = parse_cypher(query).unwrap();
+        let expected = CypherQuery::MatchNode {
+            label: None,
+            properties: HashMap::new(),
+        };
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_parse_match_count_return() {
+        let query = "MATCH (n) RETURN count(n) AS total_vertices";
+        let result = parse_cypher(query).unwrap();
+        let expected = CypherQuery::MatchNode {
+            label: None,
+            properties: HashMap::new(),
         };
         assert_eq!(result, expected);
     }

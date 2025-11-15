@@ -1,8 +1,9 @@
-use crate::engine::graph::Graph;
-use crate::engine::vertex::Vertex;
-use crate::engine::edge::Edge;
+use crate::graph_engine::Graph;
+use crate::graph_engine::Vertex;
+use crate::graph_engine::Edge;
 use uuid::Uuid;
 use std::collections::{HashSet, VecDeque};
+use std::str::FromStr; // Add this
 
 impl Graph {
     /// Breadth-first traversal from a starting vertex id.
@@ -26,7 +27,13 @@ impl Graph {
             if let Some(edge_ids) = self.get_edges_from(&current_id) {
                 for edge_id in edge_ids {
                     if let Some(edge) = self.edges.get(edge_id) {
-                        let next_id = edge.to;
+                        // ✅ CAST: Convert Identifier to Uuid
+                        let next_id_str = edge.t.as_ref(); // &str
+                        let next_id = match Uuid::from_str(next_id_str) {
+                            Ok(id) => id,
+                            Err(_) => continue, // Skip invalid UUIDs
+                        };
+                        
                         if !visited.contains(&next_id) {
                             visited.insert(next_id);
                             queue.push_back((next_id, depth + 1));
@@ -41,4 +48,3 @@ impl Graph {
 
     // Additional traversal or pattern matching methods here...
 }
-
