@@ -1463,7 +1463,7 @@ impl RocksDBStorage {
         println!("========================== USING DIRECT DB ACCESS TO ADD EDGE ========================");
         drop(guard);
         
-        let edge_key = create_edge_key(&edge.outbound_id, &edge.t, &edge.inbound_id)
+        let edge_key = create_edge_key(&edge.outbound_id, &edge.edge_type, &edge.inbound_id)
             .map_err(|e| {
                 error!("Failed to create edge key: {}", e);
                 println!("===> ERROR: FAILED TO CREATE EDGE KEY");

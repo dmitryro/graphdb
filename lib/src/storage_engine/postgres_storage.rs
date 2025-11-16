@@ -224,7 +224,7 @@ impl GraphStorageEngine for PostgresStorage {
         client
             .execute(
                 "INSERT INTO edges (outbound_id, edge_type, inbound_id) VALUES ($1, $2, $3)",
-                &[&edge.outbound_id.0, &edge.t.to_string(), &edge.inbound_id.0],
+                &[&edge.outbound_id.0, &edge.edge_type.to_string(), &edge.inbound_id.0],
             )
             .await
             .map_err(|e| GraphError::StorageError(e.to_string()))?;
@@ -242,7 +242,7 @@ impl GraphStorageEngine for PostgresStorage {
             .map_err(|e| GraphError::StorageError(e.to_string()))?;
         Ok(rows.into_iter().next().map(|_| Edge {
             outbound_id: SerializableUuid(*outbound_id),
-            t: edge_type.clone(),
+            edge_type: edge_type.clone(),
             inbound_id: SerializableUuid(*inbound_id),
         }))
     }
@@ -252,7 +252,7 @@ impl GraphStorageEngine for PostgresStorage {
         client
             .execute(
                 "UPDATE edges SET edge_type = $1 WHERE outbound_id = $2 AND inbound_id = $3",
-                &[&edge.t.to_string(), &edge.outbound_id.0, &edge.inbound_id.0],
+                &[&edge.edge_type.to_string(), &edge.outbound_id.0, &edge.inbound_id.0],
             )
             .await
             .map_err(|e| GraphError::StorageError(e.to_string()))?;

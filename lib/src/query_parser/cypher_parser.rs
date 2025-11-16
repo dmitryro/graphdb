@@ -515,7 +515,7 @@ pub async fn execute_cypher(
             let edge = Edge {
                 id: SerializableUuid(Uuid::new_v4()),
                 outbound_id: from_id,
-                t: Identifier::new(edge_type)?,
+                edge_type: Identifier::new(edge_type)?,
                 inbound_id: to_id,
                 label: "relationship".to_string(), // Use String instead of Identifier
                 properties: BTreeMap::new(), // Use BTreeMap instead of HashMap

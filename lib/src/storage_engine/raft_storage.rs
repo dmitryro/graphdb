@@ -202,7 +202,7 @@ impl GraphStorageEngine for RaftStorage {
     async fn create_edge(&self, edge: Edge) -> Result<(), GraphError> {
         let mut edges = self.edges.lock().await;
         edges.insert(
-            (edge.outbound_id.into(), edge.t.clone(), edge.inbound_id.into()),
+            (edge.outbound_id.into(), edge.edge_type.clone(), edge.inbound_id.into()),
             edge,
         );
         Ok(())

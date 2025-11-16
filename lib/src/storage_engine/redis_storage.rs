@@ -157,7 +157,7 @@ impl GraphStorageEngine for RedisStorage {
 
     async fn create_edge(&self, edge: Edge) -> GraphResult<()> {
         let mut conn = self.connection.lock().await;
-        let edge_key = format!("edge:{}:{}:{}", edge.outbound_id.0, edge.t, edge.inbound_id.0);
+        let edge_key = format!("edge:{}:{}:{}", edge.outbound_id.0, edge.edge_type, edge.inbound_id.0);
         let value = to_vec(&edge)
             .map_err(|e| GraphError::SerializationError(e.to_string()))?;
         conn.set(edge_key, value).await

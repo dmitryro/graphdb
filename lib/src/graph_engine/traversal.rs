@@ -28,7 +28,7 @@ impl Graph {
                 for edge_id in edge_ids {
                     if let Some(edge) = self.edges.get(edge_id) {
                         // ✅ CAST: Convert Identifier to Uuid
-                        let next_id_str = edge.t.as_ref(); // &str
+                        let next_id_str = edge.edge_type.as_ref(); // &str
                         let next_id = match Uuid::from_str(next_id_str) {
                             Ok(id) => id,
                             Err(_) => continue, // Skip invalid UUIDs
