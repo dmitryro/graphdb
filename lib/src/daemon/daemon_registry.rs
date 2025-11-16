@@ -1,3 +1,4 @@
+/// lib/src/daemon/daemon_registry.rs
 use anyhow::Result;
 use serde::{Serialize, Deserialize};
 use std::path::{Path, PathBuf};

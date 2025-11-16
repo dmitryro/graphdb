@@ -160,7 +160,7 @@ impl GraphStorageEngine for InMemoryStorage {
 
     async fn create_edge(&self, edge: Edge) -> GraphResult<()> {
         let mut edges = self.edges.lock().await;
-        edges.insert((edge.outbound_id.0, edge.t.clone(), edge.inbound_id.0), edge);
+        edges.insert((edge.outbound_id.0, edge.edge_type.clone(), edge.inbound_id.0), edge);
         Ok(())
     }
 

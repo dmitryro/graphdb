@@ -60,7 +60,7 @@ impl Database {
                             port: Some(port),
                             cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
                             temporary: false,
-                            use_compression: true,
+                            use_compression: false,
                         }
                     };
                     // Check for existing daemon
@@ -94,7 +94,7 @@ impl Database {
                             port: Some(port),
                             cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
                             temporary: false,
-                            use_compression: true,
+                            use_compression: false,
                             use_raft_for_scale: false,
                             max_background_jobs: Some(1000),
                         }
@@ -188,7 +188,7 @@ impl Database {
                                     port: Some(port),
                                     cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
                                     temporary: false,
-                                    use_compression: true,
+                                    use_compression: false,
                                 };
                                 // Check for existing daemon
                                 if is_storage_daemon_running(port).await {
@@ -215,7 +215,7 @@ impl Database {
                                     port: Some(port),
                                     cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
                                     temporary: false,
-                                    use_compression: true,
+                                    use_compression: false,
                                     use_raft_for_scale: false,
                                     max_background_jobs: Some(1000),
                                 };
@@ -280,7 +280,7 @@ impl Database {
                         port: Some(port),
                         cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
                         temporary: false,
-                        use_compression: true,
+                        use_compression: false,
                     };
                     // Check for existing daemon
                     if is_storage_daemon_running(port).await {
@@ -307,7 +307,7 @@ impl Database {
                         port: Some(port),
                         cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
                         temporary: false,
-                        use_compression: true,
+                        use_compression: false,
                         use_raft_for_scale: false,
                         max_background_jobs: Some(1000),
                     };
@@ -397,7 +397,7 @@ impl Database {
                                     port: Some(port),
                                     cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
                                     temporary: false,
-                                    use_compression: true,
+                                    use_compression: false,
                                 };
                                 // Check for existing daemon
                                 if is_storage_daemon_running(port).await {
@@ -424,7 +424,7 @@ impl Database {
                                     port: Some(port),
                                     cache_capacity: Some(1024 * 1024 * 1024), // 1GB default
                                     temporary: false,
-                                    use_compression: true,
+                                    use_compression: false,
                                     use_raft_for_scale: false,
                                     max_background_jobs: Some(1000),
                                 };

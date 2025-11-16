@@ -594,7 +594,7 @@ impl SledStorage {
             .map_err(|_| GraphError::StorageError("Timeout acquiring Sled database lock".to_string()))?;
 
         let edges = db_lock.db.open_tree("edges").map_err(|e| GraphError::StorageError(e.to_string()))?;
-        let edge_key = create_edge_key(&SerializableUuid(edge.outbound_id.0), &edge.t, &SerializableUuid(edge.inbound_id.0))?;
+        let edge_key = create_edge_key(&SerializableUuid(edge.outbound_id.0), &edge.edge_type, &SerializableUuid(edge.inbound_id.0))?;
         edges.insert(&edge_key, serialize_edge(&edge)?)
             .map_err(|e| GraphError::StorageError(e.to_string()))?;
         db_lock.db.flush_async().await.map_err(|e| GraphError::StorageError(e.to_string()))?;
