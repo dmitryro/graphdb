@@ -580,8 +580,8 @@ impl RocksDBClient {
         });
         let response = self.send_zmq_request(port, request).await?;
         if response.get("status").and_then(|s| s.as_str()) == Some("success") {
-            info!("ZMQ create_edge successful for port {}: {} -> {} [{}]", port, edge.outbound_id, edge.inbound_id, edge.t);
-            println!("===> ZMQ create_edge successful for port {}: {} -> {} [{}]", port, edge.outbound_id, edge.inbound_id, edge.t);
+            info!("ZMQ create_edge successful for port {}: {} -> {} [{}]", port, edge.outbound_id, edge.inbound_id, edge.edge_type);
+            println!("===> ZMQ create_edge successful for port {}: {} -> {} [{}]", port, edge.outbound_id, edge.inbound_id, edge.edge_type);
             Ok(())
         } else {
             let error_msg = response.get("message").and_then(|m| m.as_str()).unwrap_or("Unknown error");
@@ -697,7 +697,7 @@ impl RocksDBClient {
             Some(RocksDBClientMode::Direct) => {
                 let key = create_edge_key(
                     &SerializableUuid(edge.outbound_id.0),
-                    &edge.t,
+                    &edge.edge_type,
                     &SerializableUuid(edge.inbound_id.0)
                 )?;
                 let value = serialize_edge(&edge)?;

@@ -231,11 +231,11 @@ pub fn should_delete_indexed_edge_with_property_value<D: Datastore>(db: &Databas
 fn check_edge_range(range: &[models::Edge], expected_outbound_id: Uuid, expected_length: usize) -> Result<(), Error> {
     assert_eq!(range.len(), expected_length);
     let mut covered_ids: HashSet<Uuid> = HashSet::new();
-    let t = models::Identifier::new("test_edge_type")?;
+    let edge_type = models::Identifier::new("test_edge_type")?;
 
     for edge in range {
         assert_eq!(edge.outbound_id, expected_outbound_id);
-        assert_eq!(edge.t, t);
+        assert_eq!(edge.edge_type, edge_type);
         assert!(!covered_ids.contains(&edge.inbound_id));
         covered_ids.insert(edge.inbound_id);
     }

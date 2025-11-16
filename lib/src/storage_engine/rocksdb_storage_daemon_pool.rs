@@ -1514,7 +1514,7 @@ impl<'a> RocksDBDaemon<'a> {
                             "create_edge" | "update_edge" => {
                                 let edge: Edge = serde_json::from_value(request["edge"].clone())
                                     .map_err(|e| GraphError::StorageError(format!("Invalid edge: {}", e)))?;
-                                let key = create_edge_key(&edge.outbound_id, &edge.t, &edge.inbound_id)?;
+                                let key = create_edge_key(&edge.outbound_id, &edge.edge_type, &edge.inbound_id)?;
                                 let value = serialize_edge(&edge)?;
                                 RocksDBWalOperation::Put {
                                     cf: "edges".to_string(),
@@ -1758,7 +1758,7 @@ impl<'a> RocksDBDaemon<'a> {
                 for item in iterator {
                     let (_, value) = item?;
                     let e = deserialize_edge(&value)?;
-                    if e.t == edge_type {
+                    if e.edge_type == edge_type {
                         vec.push(e);
                     }
                 }
@@ -2042,7 +2042,7 @@ impl<'a> RocksDBDaemon<'a> {
         edge: &Edge,
     ) -> GraphResult<()> {
         let key = handle_rocksdb_op!(
-            create_edge_key(&edge.outbound_id, &edge.t, &edge.inbound_id),
+            create_edge_key(&edge.outbound_id, &edge.edge_type, &edge.inbound_id),
             "Failed to create edge key"
         )?;
         let value = handle_rocksdb_op!(
@@ -2078,11 +2078,11 @@ impl<'a> RocksDBDaemon<'a> {
         cf: &Arc<BoundColumnFamily<'static>>,
         db_path: &Path,
         outbound_id: &SerializableUuid,
-        t: &Identifier,
+        edge_type: &Identifier,
         inbound_id: &SerializableUuid,
     ) -> GraphResult<()> {
         let key = handle_rocksdb_op!(
-            create_edge_key(outbound_id, t, inbound_id),
+            create_edge_key(outbound_id, edge_type, inbound_id),
             "Failed to create edge key"
         )?;
         Self::delete_static(db, cf, db_path, &key).await
@@ -2095,7 +2095,7 @@ impl<'a> RocksDBDaemon<'a> {
         edge: &Edge,
     ) -> GraphResult<()> {
         let key = handle_rocksdb_op!(
-            create_edge_key(&edge.outbound_id, &edge.t, &edge.inbound_id),
+            create_edge_key(&edge.outbound_id, &edge.edge_type, &edge.inbound_id),
             "Failed to create edge key"
         )?;
         let value = handle_rocksdb_op!(
@@ -2216,7 +2216,7 @@ impl<'a> RocksDBDaemon<'a> {
                 deserialize_edge(&value),
                 format!("Failed to deserialize edge for DB at {:?}", db_path)
             )?;
-            if edge.t == *edge_type {
+            if edge.edge_type == *edge_type {
                 edges.push(edge);
             }
         }
@@ -2435,11 +2435,11 @@ impl<'a> RocksDBDaemon<'a> {
         }
     }
 
-    pub async fn get_edge(&self, outbound_id: &SerializableUuid, t: &Identifier, inbound_id: &SerializableUuid) -> GraphResult<Option<Edge>> {
+    pub async fn get_edge(&self, outbound_id: &SerializableUuid, edge_type: &Identifier, inbound_id: &SerializableUuid) -> GraphResult<Option<Edge>> {
         let request = json!({
             "command": "get_edge",
             "outbound_id": outbound_id,
-            "t": t,
+            "edge_type": edge_type,
             "inbound_id": inbound_id
         });
         let response = self.send_zmq_request(&request).await?;
@@ -2477,11 +2477,11 @@ impl<'a> RocksDBDaemon<'a> {
         }
     }
 
-    pub async fn delete_edge(&self, outbound_id: &SerializableUuid, t: &Identifier, inbound_id: &SerializableUuid) -> GraphResult<()> {
+    pub async fn delete_edge(&self, outbound_id: &SerializableUuid, edge_type: &Identifier, inbound_id: &SerializableUuid) -> GraphResult<()> {
         let request = json!({
             "command": "delete_edge",
             "outbound_id": outbound_id,
-            "t": t,
+            "edge_type": edge_type,
             "inbound_id": inbound_id
         });
         let response = self.send_zmq_request(&request).await?;

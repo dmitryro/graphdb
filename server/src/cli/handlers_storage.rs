@@ -13,6 +13,7 @@ use tokio::io::{self, AsyncReadExt}; // Add this import at the top of the file
 use std::io::ErrorKind;
 use fs2::FileExt;
 use chrono::Utc;
+use glob::glob;
 use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::{self, sleep, timeout, Duration as TokioDuration};
@@ -1127,7 +1128,7 @@ pub async fn stop_storage_interactive(
     let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
 
     // === GET TARGET PORTS: SPECIFIC OR ALL STORAGE DAEMONS ===
-    let target_ports = match port {
+    let mut target_ports: Vec<u16> = match port {
         Some(p) => vec![p],
         None => daemon_registry
             .list_storage_daemons()
@@ -1137,6 +1138,33 @@ pub async fn stop_storage_interactive(
             .map(|d| d.port)
             .collect::<Vec<u16>>(),
     };
+
+    // === SCAN FOR UNREGISTERED STORAGE DAEMONS ===
+    // Check all IPC sockets for running storage daemons not in registry
+    if port.is_none() {
+        let socket_pattern = "/tmp/graphdb-*.ipc";
+        if let Ok(entries) = glob::glob(socket_pattern) {
+            for entry in entries.flatten() {
+                if let Some(filename) = entry.file_name().and_then(|n| n.to_str()) {
+                    // Extract port from filename like "graphdb-8051.ipc"
+                    if let Some(port_str) = filename.strip_prefix("graphdb-").and_then(|s| s.strip_suffix(".ipc")) {
+                        if let Ok(found_port) = port_str.parse::<u16>() {
+                            // Check if this port is running but not in our target list
+                            if !target_ports.contains(&found_port) {
+                                if let Some(pid) = find_pid_by_port(found_port).await {
+                                    if pid != std::process::id() && check_pid_validity(pid).await {
+                                        info!("Found unregistered storage daemon on port {} (PID {})", found_port, pid);
+                                        println!("===> FOUND UNREGISTERED STORAGE DAEMON ON PORT {} (PID {})", found_port, pid);
+                                        target_ports.push(found_port);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     if target_ports.is_empty() && port.is_none() {
         info!("No storage daemons found in registry to stop.");
@@ -1169,6 +1197,7 @@ pub async fn stop_storage_interactive(
             .as_ref()
             .and_then(|d| d.data_dir.clone())
             .unwrap_or_else(|| {
+                // Try to determine engine type from running process or default to sled
                 PathBuf::from(DEFAULT_DATA_DIRECTORY)
                     .join("sled")
                     .join(port.to_string())
@@ -1181,7 +1210,7 @@ pub async fn stop_storage_interactive(
         };
 
         // === STOP DAEMON ===
-        match &daemon {  // Use reference to avoid moving
+        match &daemon {
             Some(d) if d.pid != 0 && d.pid != std::process::id() => {
                 if check_pid_validity(d.pid).await {
                     info!("Attempting to stop Storage Daemon on port {} (PID {})...", port, d.pid);
@@ -1203,38 +1232,32 @@ pub async fn stop_storage_interactive(
             Some(d) if d.pid == std::process::id() => {
                 warn!("PID {} for port {} matches CLI process. Skipping shutdown.", d.pid, port);
                 println!("===> WARNING: PID {} for port {} matches CLI process. Skipping shutdown.", d.pid, port);
-                // Don't treat this as an error - it means the daemon is the CLI process itself
                 info!("Port {} matches CLI process, treating as already handled.", port);
                 println!("===> PORT {} MATCHES CLI PROCESS, TREATING AS ALREADY HANDLED", port);
-                // Continue with cleanup but don't try to stop the daemon
             }
-            Some(_) => {
-                warn!("No valid PID found for Storage Daemon on port {}. Checking for stray processes...", port);
-                println!("===> NO VALID PID FOUND FOR STORAGE DAEMON ON PORT {}. CHECKING FOR STRAY PROCESSES...", port);
-            }
-            None => {
-                info!("No Storage Daemon found on port {} in registry. Checking for stray processes...", port);
-                println!("===> NO STORAGE DAEMON FOUND ON PORT {} IN REGISTRY. CHECKING FOR STRAY PROCESSES...", port);
+            Some(_) | None => {
+                // No valid daemon in registry OR no daemon at all - check for running process
+                info!("No valid daemon found in registry for port {}. Checking for running processes...", port);
+                println!("===> NO VALID DAEMON IN REGISTRY FOR PORT {}. CHECKING FOR RUNNING PROCESSES...", port);
 
                 if let Some(new_pid) = find_pid_by_port(port).await {
                     if new_pid != std::process::id() && check_pid_validity(new_pid).await {
-                        info!("Found stray process (PID {}) on port {}. Stopping...", new_pid, port);
-                        println!("===> Found stray process (PID {}) on port {}. Stopping...", new_pid, port);
+                        info!("Found unregistered process (PID {}) on port {}. Stopping...", new_pid, port);
+                        println!("===> FOUND UNREGISTERED PROCESS (PID {}) ON PORT {}. STOPPING...", new_pid, port);
                         if let Err(e) = stop_specific_storage_daemon(port, true).await {
-                            warn!("Failed to stop stray process on port {} (PID {}): {}", port, new_pid, e);
-                            println!("===> WARNING: Failed to stop stray process on port {} (PID {}): {}", port, new_pid, e);
-                            failed_ports.push(format!("Failed to stop stray process on port {}: {}", port, e));
-                        }
-                    } else {
-                        warn!("Stray PID {} on port {} is invalid or matches CLI. Skipping.", new_pid, port);
-                        println!("===> WARNING: Stray PID {} on port {} is invalid or matches CLI. Skipping.", new_pid, port);
-                        // Don't add to failed_ports if it matches CLI process, only if it's an invalid PID
-                        if new_pid == std::process::id() {
-                            info!("Stray PID {} matches CLI process on port {}, treating as handled.", new_pid, port);
-                            println!("===> STRAY PID {} MATCHES CLI PROCESS ON PORT {}, TREATING AS HANDLED", new_pid, port);
+                            warn!("Failed to stop unregistered process on port {} (PID {}): {}", port, new_pid, e);
+                            println!("===> WARNING: Failed to stop unregistered process on port {} (PID {}): {}", port, new_pid, e);
+                            failed_ports.push(format!("Failed to stop unregistered process on port {}: {}", port, e));
                         } else {
-                            failed_ports.push(format!("Stray PID {} on port {} is invalid", new_pid, port));
+                            info!("Successfully stopped unregistered process on port {} (PID {}).", port, new_pid);
+                            println!("===> Successfully stopped unregistered process on port {} (PID {}).", port, new_pid);
                         }
+                    } else if new_pid == std::process::id() {
+                        warn!("Process on port {} is CLI itself. Skipping.", port);
+                        println!("===> PROCESS ON PORT {} IS CLI ITSELF. SKIPPING.", port);
+                    } else {
+                        warn!("Process PID {} on port {} is invalid. Skipping.", new_pid, port);
+                        println!("===> PROCESS PID {} ON PORT {} IS INVALID. SKIPPING.", new_pid, port);
                     }
                 }
             }
@@ -1252,7 +1275,6 @@ pub async fn stop_storage_interactive(
                     println!("===> SUCCESSFULLY CLEANED UP LOCK FILE AT {:?}", lock_path);
                 }
             } else {
-                // Sled: just remove db.lck
                 if let Err(e) = std::fs::remove_file(&lock_path) {
                     warn!("Failed to remove Sled lock file at {:?}: {}", lock_path, e);
                     println!("===> WARNING: Failed to remove lock file at {:?}", lock_path);
@@ -1265,7 +1287,6 @@ pub async fn stop_storage_interactive(
         }
 
         // === UNREGISTER FROM REGISTRY ===
-        // Only unregister if the daemon wasn't the CLI process
         if daemon.as_ref().map_or(true, |d| d.pid != std::process::id()) {
             if let Err(e) = daemon_registry.unregister_daemon(port).await {
                 warn!("Failed to remove daemon on port {} from registry: {}", port, e);
@@ -1280,7 +1301,7 @@ pub async fn stop_storage_interactive(
             println!("===> DAEMON ON PORT {} WAS CLI PROCESS, SKIPPING REGISTRY REMOVAL", port);
         }
 
-        // === CLEANUP: ZMQ SOCKET (only if daemon wasn't CLI process) ===
+        // === CLEANUP: ZMQ SOCKET ===
         if daemon.as_ref().map_or(true, |d| d.pid != std::process::id()) {
             if Path::new(&socket_path).exists() && !is_socket_used_by_cli(&socket_path).await.unwrap_or(false) {
                 if let Err(e) = std::fs::remove_file(&socket_path) {
@@ -1311,10 +1332,9 @@ pub async fn stop_storage_interactive(
                     let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
                     sleep(TokioDuration::from_millis(1000)).await;
                 } else if pid == std::process::id() {
-                    // If the port is still in use by the CLI process, that's expected and not an error
                     info!("Port {} still in use by CLI process, which is expected.", port);
                     println!("===> PORT {} STILL IN USE BY CLI PROCESS, WHICH IS EXPECTED", port);
-                    break; // Exit the retry loop since this is expected behavior
+                    break;
                 }
             }
             sleep(TokioDuration::from_millis(1000)).await;
@@ -1325,7 +1345,6 @@ pub async fn stop_storage_interactive(
             info!("Port {} is now free.", port);
             println!("===> PORT {} IS NOW FREE", port);
         } else if find_pid_by_port(port).await.map_or(false, |pid| pid == std::process::id()) {
-            // If port is still in use by CLI process, that's expected and not an error
             info!("Port {} still in use by CLI process, which is expected.", port);
             println!("===> PORT {} STILL IN USE BY CLI PROCESS, WHICH IS EXPECTED", port);
         } else {
@@ -2799,43 +2818,60 @@ pub async fn handle_migrate_interactive(
     Ok(())
 }
 
-/// Handles the `use storage <engine> [--permanent] [--migrate]` command.
-/// The command **only** changes the *default* engine and the *default* port.
-/// All existing storage daemons stay alive and stay registered.
-/// **Never stops any daemon** – only changes the *default* engine/port.
+/// Handles `use storage <engine> [--permanent] [--migrate]`  
+/// Changes **only** the default engine and default port.  
+/// **Never stops any daemon.**  
+/// Starts new daemon **asynchronously** (fire-and-forget).  
+/// Safe to call from within existing Tokio runtime.
 pub async fn handle_use_storage_command(
     engine: StorageEngineType,
     permanent: bool,
-    migrate: bool,
+    _migrate: bool,
 ) -> Result<(), anyhow::Error> {
     let start_time = Instant::now();
-    info!("=== handle_use_storage_command engine:{:?} permanent:{} migrate:{} ===", engine, permanent, migrate);
+    info!(
+        "=== handle_use_storage_command engine:{:?} permanent:{} ===",
+        engine, permanent
+    );
 
     // -----------------------------------------------------------------
-    // 1. Load config
+    // 1. Load current config
     // -----------------------------------------------------------------
     let cwd = std::env::current_dir()?;
     let config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
     let absolute_config_path = cwd.join(&config_path);
-    let mut current_config: StorageConfig = load_storage_config_from_yaml(Some(absolute_config_path.clone()))
-        .await
-        .unwrap_or_default();
 
-    let config_root_directory = current_config.config_root_directory.as_ref()
+    let mut current_config: StorageConfig =
+        load_storage_config_from_yaml(Some(absolute_config_path.clone()))
+            .await
+            .unwrap_or_default();
+
+    let config_root_directory = current_config
+        .config_root_directory
+        .as_ref()
         .ok_or_else(|| anyhow!("'config_root_directory' is missing"))?;
 
     // -----------------------------------------------------------------
-    // 2. Load TiKV PD port
+    // 2. Load TiKV PD port (for conflict check)
     // -----------------------------------------------------------------
     let tikv_pd_port = {
-        let tikv_config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_TIKV);
-        if tikv_config_path.exists() {
-            match std::fs::read_to_string(&tikv_config_path) {
+        let tikv_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_TIKV);
+        if tikv_path.exists() {
+            match std::fs::read_to_string(&tikv_path) {
                 Ok(content) => match serde_yaml::from_str::<TiKVConfigWrapper>(&content) {
-                    Ok(wrapper) => wrapper.storage.pd_endpoints.and_then(|pd| pd.split(':').last().and_then(|p| p.parse::<u16>().ok())),
-                    Err(e) => { warn!("Failed to parse TiKV config: {}", e); None }
+                    Ok(wrapper) => wrapper
+                        .storage
+                        .pd_endpoints
+                        .and_then(|pd| pd.split(':').last().and_then(|p| p.parse::<u16>().ok())),
+                    Err(e) => {
+                        warn!("Failed to parse TiKV config: {}", e);
+                        None
+                    }
                 },
-                Err(e) => { warn!("Failed to read TiKV config: {}", e); None }
+                Err(e) => {
+                    warn!("Failed to read TiKV config: {}", e);
+                    None
+                }
             }
         } else {
             None
@@ -2843,55 +2879,25 @@ pub async fn handle_use_storage_command(
     };
 
     // -----------------------------------------------------------------
-    // 3. Load engine-specific config → HashMap
+    // 3. Build engine-specific config map
     // -----------------------------------------------------------------
-    let engine_specific_config = if engine == StorageEngineType::TiKV {
-        let tikv_config_path = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_TIKV);
-        if tikv_config_path.exists() {
-            let content = std::fs::read_to_string(&tikv_config_path)?;
-            match serde_yaml::from_str::<TiKVConfigWrapper>(&content) {
-                Ok(wrapper) => {
-                    let mut map = HashMap::new();
-                    map.insert("storage_engine_type".to_string(), Value::String("tikv".to_string()));
-                    if let Some(path) = wrapper.storage.path { map.insert("path".to_string(), Value::String(path.to_string_lossy().to_string())); }
-                    if let Some(host) = wrapper.storage.host { map.insert("host".to_string(), Value::String(host)); }
-                    if let Some(port) = wrapper.storage.port { map.insert("port".to_string(), Value::Number(port.into())); }
-                    if let Some(pd) = wrapper.storage.pd_endpoints { map.insert("pd_endpoints".to_string(), Value::String(pd)); }
-                    if let Some(user) = wrapper.storage.username { map.insert("username".to_string(), Value::String(user)); }
-                    if let Some(pass) = wrapper.storage.password { map.insert("password".to_string(), Value::String(pass)); }
-                    map
-                },
-                Err(e) => {
-                    warn!("TiKV config parse error: {}. Using defaults.", e);
-                    let mut map = HashMap::new();
-                    map.insert("storage_engine_type".to_string(), Value::String("tikv".to_string()));
-                    map.insert("path".to_string(), Value::String("/opt/graphdb/storage_data/tikv".to_string()));
-                    map.insert("host".to_string(), Value::String("127.0.0.1".to_string()));
-                    map.insert("port".to_string(), Value::Number(2380.into()));
-                    map.insert("pd_endpoints".to_string(), Value::String("127.0.0.1:2379".to_string()));
-                    map
-                }
-            }
-        } else {
-            let mut map = HashMap::new();
-            map.insert("storage_engine_type".to_string(), Value::String("tikv".to_string()));
-            map.insert("path".to_string(), Value::String("/opt/graphdb/storage_data/tikv".to_string()));
-            map.insert("host".to_string(), Value::String("127.0.0.1".to_string()));
-            map.insert("port".to_string(), Value::Number(2380.into()));
-            map.insert("pd_endpoints".to_string(), Value::String("127.0.0.1:2379".to_string()));
-            map
-        }
+    let engine_specific_config: HashMap<String, Value> = if engine == StorageEngineType::TiKV {
+        default_tikv_map()
     } else {
-        let config = lib::config::load_engine_specific_config(engine.clone(), config_root_directory)?;
-        let mut map = selected_storage_config_to_hashmap(&config);
-        map.insert("storage_engine_type".to_string(), Value::String(engine.to_string().to_lowercase()));
+        let cfg = lib::config::load_engine_specific_config(engine.clone(), config_root_directory)?;
+        let mut map = selected_storage_config_to_hashmap(&cfg);
+        map.insert(
+            "storage_engine_type".to_string(),
+            Value::String(engine.to_string().to_lowercase()),
+        );
         map
     };
 
     // -----------------------------------------------------------------
-    // 4. Extract port
+    // 4. Determine new port
     // -----------------------------------------------------------------
-    let new_port = engine_specific_config.get("port")
+    let new_port = engine_specific_config
+        .get("port")
         .and_then(|v| match v {
             Value::Number(n) => n.as_u64().map(|p| p as u16),
             Value::String(s) => s.parse::<u16>().ok(),
@@ -2901,15 +2907,15 @@ pub async fn handle_use_storage_command(
             if engine == StorageEngineType::TiKV {
                 2380
             } else if engine == StorageEngineType::RocksDB {
-                current_config.default_port  // ← EXISTS
+                current_config.default_port
             } else {
                 8052
             }
         });
 
     if engine != StorageEngineType::TiKV {
-        if let Some(pd_port) = tikv_pd_port {
-            if new_port == pd_port {
+        if let Some(pd) = tikv_pd_port {
+            if new_port == pd {
                 return Err(anyhow!("Port {} is reserved for TiKV PD", new_port));
             }
         }
@@ -2918,15 +2924,22 @@ pub async fn handle_use_storage_command(
     // -----------------------------------------------------------------
     // 5. Build path
     // -----------------------------------------------------------------
-    let path = engine_specific_config.get("path")
+    let path = engine_specific_config
+        .get("path")
         .and_then(|v| v.as_str())
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(format!("/opt/graphdb/storage_data/{}/{}", engine.to_string().to_lowercase(), new_port)));
+        .unwrap_or_else(|| {
+            PathBuf::from(format!(
+                "/opt/graphdb/storage_data/{}/{}",
+                engine.to_string().to_lowercase(),
+                new_port
+            ))
+        });
 
     // -----------------------------------------------------------------
     // 6. Build SelectedStorageConfig
     // -----------------------------------------------------------------
-    let engine_config = SelectedStorageConfig {
+    let engine_cfg = SelectedStorageConfig {
         storage_engine_type: engine.clone(),
         storage: StorageConfigInner {
             path: Some(path.clone()),
@@ -2946,15 +2959,15 @@ pub async fn handle_use_storage_command(
     };
 
     // -----------------------------------------------------------------
-    // 7. Update config
+    // 7. Update in-memory config
     // -----------------------------------------------------------------
     let mut new_config = current_config.clone();
     new_config.storage_engine_type = engine.clone();
-    new_config.default_port = new_port;  // ← EXISTS, REQUIRED
-    new_config.engine_specific_config = Some(engine_config.clone());
+    new_config.default_port = new_port;
+    new_config.engine_specific_config = Some(engine_cfg.clone());
 
     // -----------------------------------------------------------------
-    // 8. Save if permanent
+    // 8. Persist if --permanent
     // -----------------------------------------------------------------
     if permanent {
         new_config.save().await?;
@@ -2962,57 +2975,83 @@ pub async fn handle_use_storage_command(
     }
 
     // -----------------------------------------------------------------
-    // 9. STOP ONLY DAEMONS ON new_port
+    // 9. Just print message - don't update global manager here
+    //    The spawned task will handle everything
     // -----------------------------------------------------------------
-    let all_daemons = GLOBAL_DAEMON_REGISTRY.get_all_daemon_metadata().await?;
-    for daemon in all_daemons {
-        if daemon.service_type == "storage" && daemon.port == new_port {
-            println!("Stopping storage daemon on port {}...", daemon.port);
-            stop_storage_interactive(
-                Some(daemon.port),
-                Arc::new(TokioMutex::new(None)),
-                Arc::new(TokioMutex::new(None)),
-                Arc::new(TokioMutex::new(None)),
-            ).await.ok();
+    println!(
+        "Switching to {} on port {} (persisted: {})...",
+        engine, new_port, permanent
+    );
+
+    // -----------------------------------------------------------------
+    // 10. Fire-and-forget: Start daemon on new port
+    //     This task will also update the global manager
+    // -----------------------------------------------------------------
+    let port_specific_cfg = {
+        let mut cfg = new_config.clone();
+        if let Some(ref mut ec) = cfg.engine_specific_config {
+            ec.storage.port = Some(new_port);
+            ec.storage.path = Some(path);
         }
-    }
+        cfg
+    };
 
-    // -----------------------------------------------------------------
-    // 10. Start daemon → singleton reused
-    // -----------------------------------------------------------------
-    let mut port_specific_config = new_config.clone();
-    if let Some(ref mut ec) = port_specific_config.engine_specific_config {
-        ec.storage.port = Some(new_port);
-        ec.storage.path = Some(path);
-    }
+    let abs_path = absolute_config_path.clone();
+    let engine_clone = engine.clone();
+    
+    tokio::spawn(async move {
+        let socket_path = format!("/tmp/graphdb-{}.ipc", new_port);
+        let _ = tokio::fs::remove_file(&socket_path).await;
 
-    let socket_path = format!("/opt/graphdb/graphdb-{}.ipc", new_port);
-    if tokio_fs::metadata(&socket_path).await.is_ok() {
-        tokio_fs::remove_file(&socket_path).await.ok();
-    }
+        // Update global manager inside the spawned task
+        if GLOBAL_STORAGE_ENGINE_MANAGER.get().is_none() {
+            match StorageEngineManager::new(
+                engine_clone.clone(),
+                &abs_path,
+                permanent,
+                Some(new_port),
+            ).await {
+                Ok(manager) => {
+                    if let Err(e) = GLOBAL_STORAGE_ENGINE_MANAGER.set(Arc::new(AsyncStorageEngineManager::from_manager(manager))) {
+                        error!("Failed to set storage engine manager: {:?}", e);
+                        return;
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to create storage engine manager: {}", e);
+                    return;
+                }
+            }
+        } else {
+            let async_mgr = GLOBAL_STORAGE_ENGINE_MANAGER.get().unwrap();
+            if let Err(e) = async_mgr.use_storage(port_specific_cfg.clone(), permanent, false).await {
+                error!("Failed to update storage engine manager: {}", e);
+                return;
+            }
+        }
 
-    start_storage_interactive(
-        Some(new_port),
-        Some(absolute_config_path.clone()),
-        Some(port_specific_config),
-        Some("skip_manager_set".to_string()),
-        Arc::new(TokioMutex::new(None)),
-        Arc::new(TokioMutex::new(None)),
-        Arc::new(TokioMutex::new(None)),
-    ).await?;
+        // Now start the daemon
+        if let Err(e) = start_storage_interactive(
+            Some(new_port),
+            Some(abs_path),
+            Some(port_specific_cfg),
+            Some("skip_manager_set".to_string()),
+            Arc::new(TokioMutex::new(None)),
+            Arc::new(TokioMutex::new(None)),
+            Arc::new(TokioMutex::new(None)),
+        )
+        .await
+        {
+            error!("Failed to start daemon on port {}: {}", new_port, e);
+        } else {
+            println!("Successfully switched to {} on port {}", engine_clone, new_port);
+        }
+    });
 
-    // -----------------------------------------------------------------
-    // 11. Update manager
-    // -----------------------------------------------------------------
-    if GLOBAL_STORAGE_ENGINE_MANAGER.get().is_none() {
-        let manager = StorageEngineManager::new(engine.clone(), &absolute_config_path, permanent, Some(new_port)).await?;
-        GLOBAL_STORAGE_ENGINE_MANAGER.set(Arc::new(AsyncStorageEngineManager::from_manager(manager)))?;
-    } else {
-        let async_manager = GLOBAL_STORAGE_ENGINE_MANAGER.get().unwrap();
-        async_manager.use_storage(new_config.clone(), permanent, migrate).await?;
-    }
+    // Give the task a moment to start
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-    println!("Switched to {} on port {} (persisted: {})", engine, new_port, permanent);
+    println!("Storage engine switch initiated in background.");
     info!("=== Completed in {}ms ===", start_time.elapsed().as_millis());
     Ok(())
 }

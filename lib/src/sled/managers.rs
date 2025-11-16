@@ -119,7 +119,7 @@ impl SledManager {
     // --- Edge Operations ---
     pub fn add_edge(&self, edge: &Edge) -> Result<IVec> {
         let key = util::build(&[
-            util::Component::Identifier(edge.t.clone()),
+            util::Component::Identifier(edge.edge_type.clone()),
             util::Component::Uuid(edge.outbound_id.into()),
             util::Component::Uuid(edge.inbound_id.into()),
         ]);
@@ -129,7 +129,7 @@ impl SledManager {
         batch.insert(IVec::from(key), value_json.as_slice());
         self.tree.apply_batch(batch)?;
         Ok(IVec::from(util::build(&[
-            util::Component::Identifier(edge.t.clone()),
+            util::Component::Identifier(edge.edge_type.clone()),
             util::Component::Uuid(edge.outbound_id.into()),
             util::Component::Uuid(edge.inbound_id.into()),
         ])))
@@ -153,7 +153,7 @@ impl SledManager {
 
     pub fn update_edge(&self, edge: &Edge) -> Result<IVec> {
         let key = util::build(&[
-            util::Component::Identifier(edge.t.clone()),
+            util::Component::Identifier(edge.edge_type.clone()),
             util::Component::Uuid(edge.outbound_id.into()),
             util::Component::Uuid(edge.inbound_id.into()),
         ]);
@@ -163,7 +163,7 @@ impl SledManager {
         batch.insert(IVec::from(key), value_json.as_slice());
         self.tree.apply_batch(batch)?;
         Ok(IVec::from(util::build(&[
-            util::Component::Identifier(edge.t.clone()),
+            util::Component::Identifier(edge.edge_type.clone()),
             util::Component::Uuid(edge.outbound_id.into()),
             util::Component::Uuid(edge.inbound_id.into()),
         ])))

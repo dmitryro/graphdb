@@ -227,7 +227,7 @@ impl GraphStorageEngine for MySQLStorage {
         let mut conn = self.client.lock().await;
         conn.exec_drop(
             "INSERT INTO edges (outbound_id, edge_type, inbound_id) VALUES (?, ?, ?)",
-            (edge.outbound_id.0.to_string(), edge.t.to_string(), edge.inbound_id.0.to_string()),
+            (edge.outbound_id.0.to_string(), edge.edge_type.to_string(), edge.inbound_id.0.to_string()),
         ).await
             .map_err(|e| GraphError::StorageError(e.to_string()))?;
         Ok(())
@@ -243,7 +243,7 @@ impl GraphStorageEngine for MySQLStorage {
             .map_err(|e| GraphError::StorageError(e.to_string()))?;
         Ok(rows.into_iter().next().map(|_| Edge {
             outbound_id: SerializableUuid(*outbound_id),
-            t: edge_type.clone(),
+            edge_type: edge_type.clone(),
             inbound_id: SerializableUuid(*inbound_id),
         }))
     }
@@ -252,7 +252,7 @@ impl GraphStorageEngine for MySQLStorage {
         let mut conn = self.client.lock().await;
         conn.exec_drop(
             "UPDATE edges SET edge_type = ? WHERE outbound_id = ? AND inbound_id = ?",
-            (edge.t.to_string(), edge.outbound_id.0.to_string(), edge.inbound_id.0.to_string()),
+            (edge.edge_type.to_string(), edge.outbound_id.0.to_string(), edge.inbound_id.0.to_string()),
         ).await
             .map_err(|e| GraphError::StorageError(e.to_string()))?;
         Ok(())
