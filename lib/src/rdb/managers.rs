@@ -234,7 +234,7 @@ impl<'a> EdgeRangeManager<'a> {
         util::build(&[
             // FIX: Use util::Component variants
             util::Component::Uuid(edge.outbound_id),
-            util::Component::Identifier(edge.t),
+            util::Component::Identifier(edge.edge_type),
             util::Component::Uuid(edge.inbound_id),
         ])
     }
@@ -441,7 +441,7 @@ impl<'a> EdgePropertyManager<'a> {
         util::build(&[
             // FIX: Use util::Component variants
             util::Component::Uuid(edge.outbound_id),
-            util::Component::Identifier(edge.t),
+            util::Component::Identifier(edge.edge_type),
             util::Component::Uuid(edge.inbound_id),
             util::Component::Identifier(name), // Changed from FixedLengthString
         ])
@@ -454,7 +454,7 @@ impl<'a> EdgePropertyManager<'a> {
         let prefix = util::build(&[
             // FIX: Use util::Component variants
             util::Component::Uuid(edge.outbound_id),
-            util::Component::Identifier(edge.t),
+            util::Component::Identifier(edge.edge_type),
             util::Component::Uuid(edge.inbound_id),
         ]);
 
@@ -472,7 +472,7 @@ impl<'a> EdgePropertyManager<'a> {
             debug_assert_eq!(edge_property_out_id, edge.outbound_id);
 
             let edge_property_t = unsafe { util::read_identifier(&mut cursor)? }; // FIX: unsafe block
-            debug_assert_eq!(edge_property_t, edge.t);
+            debug_assert_eq!(edge_property_t, edge.edge_type);
 
             let edge_property_in_id = unsafe { util::read_uuid(&mut cursor)? }; // FIX: unsafe block
             debug_assert_eq!(edge_property_in_id, edge.inbound_id);
@@ -654,7 +654,7 @@ impl<'a> EdgePropertyValueManager<'a> {
             util::Component::Identifier(property_name),
             util::Component::Json(property_value),
             util::Component::Uuid(edge.outbound_id),
-            util::Component::Identifier(edge.t),
+            util::Component::Identifier(edge.edge_type),
             util::Component::Uuid(edge.inbound_id),
         ])
     }

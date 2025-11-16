@@ -944,7 +944,7 @@ impl SledClient {
                 let db = db_guard.as_ref();
                 let key = create_edge_key(
                     &SerializableUuid(edge.outbound_id.0),
-                    &edge.t,
+                    &edge.edge_type,
                     &SerializableUuid(edge.inbound_id.0)
                 )?;
                 let value = serialize_edge(&edge)?;

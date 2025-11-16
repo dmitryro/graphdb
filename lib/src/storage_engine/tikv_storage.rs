@@ -394,7 +394,7 @@ impl GraphStorageEngine for TikvStorage {
     }
 
     async fn create_edge(&self, edge: Edge) -> Result<(), GraphError> {
-        let key = create_edge_key(&edge.outbound_id, &edge.t, &edge.inbound_id);
+        let key = create_edge_key(&edge.outbound_id, &edge.edge_type, &edge.inbound_id);
         let value = serialize_edge(&edge)?;
         debug!("Creating edge with key: {:?}", String::from_utf8_lossy(&key));
         let mut txn = self.client.begin_optimistic().await

@@ -41,7 +41,7 @@ impl Pattern {
 
     pub fn matches_edge(&self, edge: &Edge) -> bool {
         match self {
-            Pattern::EdgeType(t) => edge.t.to_string() == *t,
+            Pattern::EdgeType(t) => edge.edge_type.to_string() == *t,
             // WARNING: The models::Edge struct does NOT have a 'properties' field.
             // This 'PropertyEquals' pattern cannot be matched against an Edge.
             // It will always return false here.

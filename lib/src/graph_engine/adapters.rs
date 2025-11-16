@@ -40,7 +40,7 @@ pub fn edge_to_engine(e: &ModelEdge) -> ModelEdge {
     ModelEdge {
         id: e.id,
         outbound_id: e.outbound_id,
-        t: e.t.clone(),
+        edge_type: e.edge_type.clone(),
         inbound_id: e.inbound_id,
         label: e.label.clone(),
         properties: e.properties.iter()
@@ -54,7 +54,7 @@ pub fn edge_from_engine(e: &ModelEdge) -> ModelEdge {
     ModelEdge {
         id: e.id,
         outbound_id: e.outbound_id,
-        t: e.t.clone(),
+        edge_type: e.edge_type.clone(),
         inbound_id: e.inbound_id,
         label: e.label.clone(),
         properties: e.properties.iter()

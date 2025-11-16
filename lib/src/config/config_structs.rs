@@ -306,7 +306,7 @@ pub struct SledDbWithPath {
 }
 
 /// Sled daemon configuration
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SledDaemon {
     pub port: u16,
     pub db_path: PathBuf,
@@ -316,6 +316,7 @@ pub struct SledDaemon {
     pub kv_pairs: Tree,
     pub wal_manager: Arc<SledWalManager>,  // Add WAL manager
     pub running: Arc<TokioMutex<bool>>,
+    pub zmq_thread: Option<std::thread::JoinHandle<()>>,  // Changed to store thread handle
     #[cfg(feature = "with-openraft-sled")]
     pub raft_storage: Arc<openraft_sled::SledRaftStorage<TypeConfig>>,
     #[cfg(feature = "with-openraft-sled")]
