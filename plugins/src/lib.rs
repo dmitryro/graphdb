@@ -1,14 +1,22 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
+/ models/src/lib.rs
+
+// Declare all top-level modules within the 'models' crate
+pub mod discovery;
+pub mod hooks;
+pub mod notifications;
+pub mod compatibility;
+pub mod plugins_api;
+
+pub struct PluginMetadata {
+    pub id: String,
+    pub path: PathBuf,
+    // ... other fields
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
+pub fn scan_for_plugins(plugin_dir: &Path) -> Vec<PluginMetadata> {
+    // 1. Iterate through subdirectories in plugin_dir
+    // 2. Look for 'plugin.toml' in each subdirectory
+    // 3. Parse the TOML and validate required fields
+    // 4. Return a list of valid PluginMetadata
+    /* ... */
 }

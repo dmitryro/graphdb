@@ -1,0 +1,18 @@
+# plugin.toml
+[plugin]
+name = "GraphDB Extension"
+id = "com.example.graphdb.extension"
+version = "1.0.0"
+author = "Dmitry Roitman"
+type = "native" # Can be 'native' (Rust) or 'script' (Lua)
+
+[native]
+# The name of the dynamic library file to load
+entry_point_file = "first_plugin.so"
+# The symbol (function name) the host app will look for
+init_symbol = "plugin_initialize"
+
+[script]
+# Only for Lua plugins
+entry_point_script = "main.lua"
+
