@@ -313,7 +313,12 @@ impl SledClient {
 
         let reply = socket.recv_bytes(0)
             .map_err(|e| {
-                error!("Failed to receive initialize response from {}: {}", addr, e);
+                error!(
+                    "Failed to receive initialize response from {}: {}. \
+                     This usually means the Sled daemon is not running or ZMQ server failed to bind.",
+                     addr, e
+                );
+
                 println!("===> ERROR: FAILED TO RECEIVE INITIALIZE RESPONSE FROM {}: {}", addr, e);
                 GraphError::StorageError(format!("Failed to receive initialize response: {}", e))
             })?;
