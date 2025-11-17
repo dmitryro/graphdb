@@ -28,7 +28,7 @@ rand = "0.8.5"
 actix-web = "4.11.0"
 actix-rt = "2.10.0"
 dotenv = "0.15.0"
-dashmap = { version = "6.1.0", optional = true}
+dashmap = { version = "6.1.0"}
 rdkafka = "0.38.0"
 raft = { version = "0.7.0" }
 openraft = { version = "0.9.21", features = ["serde"] }
@@ -117,7 +117,7 @@ rocksdb-datastore = ["rocksdb"]
 redis-datastore = ["redis"]
 postgres-datastore = ["sqlx"]
 mysql-datastore = ["mysql"]
-in-memory-datastore = ["dashmap"]
+in-memory-datastore = []
 test-suite = []
 bench-suite = []
 with-rocksdb = ["rocksdb"]

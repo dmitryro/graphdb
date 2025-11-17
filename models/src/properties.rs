@@ -50,6 +50,15 @@ pub enum PropertyValue {
     Uuid(crate::identifiers::SerializableUuid),
 }
 
+impl PropertyValue {
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            PropertyValue::String(s) => Some(s),
+            _ => None,
+        }
+    }
+}
+
 impl From<String> for PropertyValue {
     fn from(s: String) -> Self { PropertyValue::String(s) }
 }

@@ -20,6 +20,8 @@ members = [
     "validation_service", 
     "observability_service", 
     "compliance_service", 
+    "indexing_service",
     "logging_service", 
+    "graph_engine", 
 ]
 

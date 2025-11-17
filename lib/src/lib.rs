@@ -6,6 +6,7 @@ pub mod durability;
 pub mod query_parser;
 pub mod graph_engine;
 pub mod graph_evolution;
+pub mod graph_indexing;
 pub mod network_interfaces;
 pub mod plugin_system;
 pub mod database;
@@ -32,6 +33,8 @@ pub use models::queries::{Query, QueryOutputValue};
 pub use models::medical::{Login, User};
 pub use commands::*;
 pub use daemon::*;
+pub use graph_indexing::*;
+pub use graph_engine::*;
 
 #[cfg(feature = "bench-suite")]
 extern crate test;

@@ -1,4 +1,4 @@
-use lib::storage_engine::GraphStorageEngine;
+use crate::storage_engine::{GraphStorageEngine};
 use models::errors::GraphError;
 use caching::Cache;
 use models::Vertex;
