@@ -56,6 +56,8 @@ pub use crate::cli::handlers_main::{display_daemon_status, handle_daemon_command
                                     stop_daemon_instance_interactive, handle_show_main_config_command}; 
 pub use crate::cli::handlers_queries::{handle_interactive_query, handle_unified_query, handle_kv_command, 
                                        handle_exec_command, handle_query_command};
+pub use crate::cli::handlers_graph::handle_graph_command;
+pub use crate::cli::handlers_index::handle_index_command;
 
 use daemon_api::{stop_daemon, start_daemon};
 use lib::daemon::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};                                    

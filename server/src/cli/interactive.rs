@@ -17,6 +17,8 @@ use lib::commands::{
     CommandType, DaemonCliCommand, RestCliCommand, StorageAction, StatusArgs, StopArgs,
     ReloadArgs, ReloadAction, StartAction, RestartArgs, RestartAction, HelpArgs, ShowAction,
     ConfigAction, parse_kv_operation, parse_storage_engine, KvAction, MigrateAction,
+    // NEW: Graph & Index domain actions
+    GraphAction, IndexAction,
 };
 use crate::cli::handlers;
 use crate::cli::help_display::{
@@ -148,6 +150,8 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
         "start", "stop", "status", "auth", "authenticate", "register", "version", "health",
         "reload", "restart", "clear", "help", "exit", "daemon", "rest", "storage", "use",
         "quit", "q", "clean", "save", "show", "kv", "query", "exec", "migrate",
+        // NEW: Add graph and index for tab-completion & fuzzy help
+        "graph", "index",
     ];
     const FUZZY_MATCH_THRESHOLD: usize = 2;
 
@@ -1547,6 +1551,149 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
                 })
             }
         }
+        // === NEW: Graph Domain Commands ===
+        "graph" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: graph <insert-person|medical|delete|load> [args...]");
+                CommandType::Unknown
+            } else {
+                match remaining_args[0].to_lowercase().as_str() {
+                    "insert-person" => {
+                        let mut name = None;
+                        let mut age = None;
+                        let mut city = None;
+                        let mut i = 1;
+                        while i < remaining_args.len() {
+                            match remaining_args[i].as_str() {
+                                "name" | "name=" => {
+                                    if let Some(val) = remaining_args.get(i + 1) {
+                                        name = Some(val.clone());
+                                        i += 2;
+                                    } else { i += 1; }
+                                }
+                                "age" | "age=" => {
+                                    if let Some(val) = remaining_args.get(i + 1) {
+                                        age = val.parse::<i32>().ok();
+                                        i += 2;
+                                    } else { i += 1; }
+                                }
+                                "city" | "city=" => {
+                                    if let Some(val) = remaining_args.get(i + 1) {
+                                        city = Some(val.clone());
+                                        i += 2;
+                                    } else { i += 1; }
+                                }
+                                _ => i += 1,
+                            }
+                        }
+                        CommandType::Graph(GraphAction::InsertPerson { name, age, city })
+                    }
+                    "medical" => {
+                        let mut patient_name = None;
+                        let mut patient_age = None;
+                        let mut diagnosis_code = None;
+                        let mut i = 1;
+                        while i < remaining_args.len() {
+                            match remaining_args[i].as_str() {
+                                "patient_name" | "patient_name=" => {
+                                    if let Some(val) = remaining_args.get(i + 1) {
+                                        patient_name = Some(val.clone());
+                                        i += 2;
+                                    } else { i += 1; }
+                                }
+                                "patient_age" | "patient_age=" => {
+                                    if let Some(val) = remaining_args.get(i + 1) {
+                                        patient_age = val.parse::<i32>().ok();
+                                        i += 2;
+                                    } else { i += 1; }
+                                }
+                                "diagnosis_code" | "diagnosis_code=" => {
+                                    if let Some(val) = remaining_args.get(i + 1) {
+                                        diagnosis_code = Some(val.clone());
+                                        i += 2;
+                                    } else { i += 1; }
+                                }
+                                _ => i += 1,
+                            }
+                        }
+                        CommandType::Graph(GraphAction::MedicalRecord { patient_name, patient_age, diagnosis_code })
+                    }
+                    "delete" => {
+                        if remaining_args.len() > 1 {
+                            CommandType::Graph(GraphAction::DeleteNode { id: remaining_args[1].clone() })
+                        } else {
+                            eprintln!("Usage: graph delete <node_id>");
+                            CommandType::Unknown
+                        }
+                    }
+                    "load" => {
+                        if remaining_args.len() > 1 {
+                            CommandType::Graph(GraphAction::LoadData { path: remaining_args[1].clone().into() })
+                        } else {
+                            eprintln!("Usage: graph load <path/to/data.json>");
+                            CommandType::Unknown
+                        }
+                    }
+                    _ => {
+                        eprintln!("Unknown graph action: {}. Use insert-person, medical, delete, load", remaining_args[0]);
+                        CommandType::Unknown
+                    }
+                }
+            }
+        }
+        // === NEW: Index & Full-Text Search Commands ===
+        "index" => {
+            if remaining_args.is_empty() {
+                eprintln!("Usage: index <create|search|rebuild|list|stats> [args...]");
+                CommandType::Unknown
+            } else {
+                match remaining_args[0].to_lowercase().as_str() {
+                    "create" => {
+                        if remaining_args.len() >= 3 {
+                            CommandType::Index(IndexAction::Create {
+                                label: remaining_args[1].clone(),
+                                property: remaining_args[2].clone(),
+                            })
+                        } else {
+                            eprintln!("Usage: index create <Label> <property>");
+                            CommandType::Unknown
+                        }
+                    }
+                    "search" => {
+                        let mut query = None;
+                        let mut top_k = None;
+                        let mut i = 1;
+                        while i < remaining_args.len() {
+                            if query.is_none() && !remaining_args[i].starts_with("--") {
+                                query = Some(remaining_args[i].clone());
+                                i += 1;
+                            } else if remaining_args[i] == "--top" {
+                                if i + 1 < remaining_args.len() {
+                                    top_k = remaining_args[i + 1].parse::<usize>().ok();
+                                    i += 2;
+                                } else { i += 1; }
+                            } else {
+                                i += 1;
+                            }
+                        }
+                        if let Some(q) = query {
+                            // FIXED: Use 'term' instead of 'query' and 'top' instead of 'top_k'
+                            CommandType::Index(IndexAction::Search { term: q, top: top_k })
+                        } else {
+                            eprintln!("Usage: index search \"query text\" [--top N]");
+                            CommandType::Unknown
+                        }
+                    }
+                    "rebuild" => CommandType::Index(IndexAction::Rebuild),
+                    "list" => CommandType::Index(IndexAction::List),
+                    "stats" => CommandType::Index(IndexAction::Stats),
+                    _ => {
+                        eprintln!("Unknown index action. Use: create, search, rebuild, list, stats");
+                        CommandType::Unknown
+                    }
+                }
+            }
+        }
         _ => CommandType::Unknown,
     };
 
@@ -2097,6 +2244,16 @@ pub async fn handle_interactive_command(
                 state.storage_daemon_handle.clone(),
                 state.storage_daemon_port_arc.clone(),
             ).await?;
+            Ok(())
+        }
+        CommandType::Graph(action) => {
+            let engine = ensure_query_engine(state).await?;
+            crate::cli::handlers_graph::handle_graph_command(engine, action).await?;
+            Ok(())
+        }
+        CommandType::Index(action) => {
+            let engine = ensure_query_engine(state).await?;
+            crate::cli::handlers_index::handle_index_command(engine, action).await?;
             Ok(())
         }
     }

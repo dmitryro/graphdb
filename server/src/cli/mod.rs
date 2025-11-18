@@ -14,6 +14,8 @@ pub mod handlers_storage;
 pub mod handlers_rest;
 pub mod handlers_all;
 pub mod handlers_queries;
+pub mod handlers_index;
+pub mod handlers_graph;
 pub mod query_classifier;
 /*
 pub mod serializers;
@@ -88,6 +90,12 @@ pub use handlers_queries::{
     handle_unified_query,
     handle_exec_command,
     handle_query_command,
+};
+pub use handlers_index::{
+    handle_index_command,
+};
+pub use handlers_graph::{
+    handle_graph_command,
 };
 pub use handlers_main::{
     DaemonArgs,

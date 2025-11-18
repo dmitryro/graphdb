@@ -16,6 +16,20 @@ use uuid::Uuid;
 // Re-export StorageEngineType to make it accessible to `interactive.rs`
 pub use crate::config::StorageEngineType;
 
+// Helper structs for variants that need Args implementation
+#[derive(Args, Debug, PartialEq, Clone)]
+pub struct PortArgs {
+    /// Port number
+    #[arg(short, long)]
+    pub port: Option<u16>,
+}
+
+#[derive(Debug, PartialEq, Clone, Args)]
+pub struct HelpArgs {
+    pub filter_command: Option<String>,
+    pub command_path: Vec<String>,
+}
+
 /// Custom parser for storage engine to accept many aliases (rocksdb, rocks-db, postgres, postgresql, postgre-sql, mysql, my-sql, inmemory, in-memory).
 pub fn parse_storage_engine(engine: &str) -> Result<StorageEngineType, String> {
     match engine.to_lowercase().as_str() {
@@ -50,7 +64,6 @@ pub struct UnifiedQuery {
     pub query: String,
     pub language: Option<String>, // None → infer
 }
-
 /// Enum representing the parsed command type in interactive mode.
 #[derive(Debug, PartialEq, Clone)]
 pub enum CommandType {
@@ -93,7 +106,6 @@ pub enum CommandType {
     StatusStorage(Option<u16>),
     StatusCluster,
     StatusRaft(Option<u16>),
-    //ShowStorage,
     // Authentication and User Management
     Auth { username: String, password: String },
     Authenticate { username: String, password: String },
@@ -135,13 +147,66 @@ pub enum CommandType {
     Migrate(MigrateAction),
     /// Unified query command (used by `query`, `exec`, `-q`, `-c`, and bare strings)
     Query { query: String, language: Option<String> },
+    // Graph and Index commands - plain variants, no attributes
+    Graph(GraphAction),
+    Index(IndexAction),
 }
 
-#[derive(Debug, PartialEq, Clone, Args)]
-pub struct HelpArgs {
-    pub filter_command: Option<String>,
-    pub command_path: Vec<String>,
+// lib/src/commands.rs
+
+// BEFORE (your current code):
+// pub enum GraphAction { ... }
+
+// AFTER — this is the ONLY change you need:
+#[derive(Debug, Clone, PartialEq, Subcommand)]
+pub enum GraphAction {
+    #[command(about = "Insert a new Person node")]
+    InsertPerson {
+        #[arg(long, help = "Name of the person")]
+        name: Option<String>,
+
+        #[arg(long, help = "Age of the person")]
+        age: Option<i32>,
+
+        #[arg(long, help = "City of residence")]
+        city: Option<String>,
+    },
+
+    #[command(about = "Create a medical record (patient + diagnosis)")]
+    MedicalRecord {
+        #[arg(long, help = "Patient name")]
+        patient_name: Option<String>,
+
+        #[arg(long, help = "Patient age")]
+        patient_age: Option<i32>,
+
+        #[arg(long, help = "ICD diagnosis code")]
+        diagnosis_code: Option<String>,
+    },
+
+    #[command(about = "Delete node by ID")]
+    DeleteNode {
+        #[arg(help = "Node ID (UUID)")]
+        id: String,
+    },
+
+    #[command(about = "Bulk load data from JSON/CSV")]
+    LoadData {
+        #[arg(help = "Path to data file")]
+        path: std::path::PathBuf,
+    },
 }
+
+#[derive(Debug, Clone, PartialEq, Subcommand)]
+pub enum IndexAction {
+    Create { label: String, property: String },
+    Search { term: String, top: Option<usize> },
+    Rebuild,
+    List,
+    Stats,
+    Drop { label: String, property: String }
+}
+
 
 /// Arguments for the unified query command.
 #[derive(Args, Debug, PartialEq, Clone)]
@@ -287,6 +352,14 @@ pub enum Commands {
     /// Migrates one store to another.
     #[clap(alias = "m")]
     Migrate(MigrateAction),
+
+    /// Graph engine domain-specific operations (insert, medical, delete, load)
+    #[clap(subcommand)]
+    Graph(GraphAction),
+
+    /// Full-text and indexing operations
+    #[clap(subcommand)]
+    Index(IndexAction),
 }
 
 #[derive(Subcommand, Debug, PartialEq, Clone)]

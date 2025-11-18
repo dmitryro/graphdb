@@ -21,7 +21,7 @@ use std::future::Future;
 use lib::commands::{
     parse_kv_operation, ConfigAction, DaemonCliCommand, HelpArgs, ReloadAction, RestartAction,
     RestCliCommand, SaveAction, ShowAction, StartAction, StatusAction, StopAction, StorageAction,
-    StatusArgs, StopArgs, ReloadArgs, RestartArgs, UseAction, MigrateAction,
+    StatusArgs, StopArgs, ReloadArgs, RestartArgs, UseAction, MigrateAction, GraphAction, IndexAction,
 };
 use lib::config::{
     self, load_storage_config_from_yaml, SelectedStorageConfig, StorageConfig,
@@ -45,6 +45,9 @@ use crate::cli::handlers_queries::{
     handle_sql_query,
     handle_graphql_query,
 };
+
+pub use crate::cli::handlers_graph::handle_graph_command;
+pub use crate::cli::handlers_index::handle_index_command;
 use lib::database::Database;
 use lib::query_parser::config::KeyValueStore;
 use lib::query_parser::{parse_query_from_string, QueryType};
@@ -269,6 +272,15 @@ pub enum Commands {
         key: String,
     },
     Migrate(MigrateAction),
+    
+    /// Graph domain actions: insert person, medical records, delete, load
+    #[clap(subcommand)]
+    Graph(GraphAction),
+
+    /// Full-text search and index management
+    #[clap(subcommand)]
+    Index(IndexAction),
+
 }
 
 // Use a TokioMutex to manage the singleton instance of the QueryExecEngine.
@@ -890,6 +902,21 @@ pub async fn run_single_command(
                 storage_daemon_handle.clone(),
                 storage_daemon_port_arc.clone(),
             ).await?;
+        }
+        // === NEW: Graph Domain Commands ===
+        Commands::Graph(action) => {
+            info!("Executing graph domain command: {:?}", action);
+            println!("===> Executing graph domain command: {:?}", action);
+            let engine = get_query_engine_singleton().await?;
+            handle_graph_command(engine, action).await?;
+        }
+
+        // === NEW: Index & Full-Text Search Commands ===
+        Commands::Index(action) => {
+            info!("Executing index command: {:?}", action);
+            println!("===> Executing index command: {:?}", action);
+            let engine = get_query_engine_singleton().await?;
+            handle_index_command(engine, action).await?;
         }
     }
     if env_var_set {
