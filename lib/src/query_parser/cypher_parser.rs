@@ -69,6 +69,10 @@ pub enum CypherQuery {
     DeleteKeyValue {
         key: String,
     },
+    CreateIndex {
+        label: String,
+        properties: Vec<String>,
+    },
 }
 
 // Checks if a query is likely a Cypher query
@@ -265,6 +269,71 @@ fn parse_create_nodes(input: &str) -> IResult<&str, CypherQuery> {
         },
     )
     .parse(input)
+}
+
+// Parse a `CREATE INDEX` query - handle Cypher index syntax: CREATE INDEX FOR (n:Label) ON (n.property)
+fn parse_create_index(input: &str) -> IResult<&str, CypherQuery> {
+    let (input, (_, _, _, _, _, _, node_pattern, _, _, _, prop_pattern)) = tuple((
+        tag("CREATE"),
+        multispace1,
+        tag("INDEX"),
+        multispace1,
+        tag("FOR"),
+        multispace1,
+        parse_node, // Parse the node pattern like (n:Person)
+        multispace1,
+        tag("ON"),
+        multispace1,
+        parse_property_pattern, // Parse the property pattern like (n.name)
+    )).parse(input)?;
+    
+    let (_, label, _) = node_pattern;
+    // Extract just the property names (without the variable prefix like 'n.')
+    let property_names: Vec<String> = prop_pattern.iter()
+        .map(|prop| {
+            prop.split('.').nth(1).unwrap_or(prop).to_string()
+        })
+        .collect();
+    
+    Ok((input, CypherQuery::CreateIndex {
+        label: label.unwrap_or_default(),
+        properties: property_names,
+    }))
+}
+
+// Parse a property pattern like (n.name) or (n.age, n.city) - used in CREATE INDEX ON (n.property)
+fn parse_property_pattern(input: &str) -> IResult<&str, Vec<String>> {
+    let (input, _) = char('(').parse(input)?;
+    let (input, _) = multispace0.parse(input)?;
+    
+    // Parse property access like n.name
+    let (input, first_prop) = parse_property_access(input)?;
+    
+    let (input, additional_props) = many0(
+        preceded(
+            tuple((multispace0, char(','), multispace0)),
+            parse_property_access
+        )
+    ).parse(input)?;
+    
+    let (input, _) = multispace0.parse(input)?;
+    let (input, _) = char(')').parse(input)?;
+    
+    let mut props = vec![first_prop];
+    props.extend(additional_props);
+    
+    Ok((input, props))
+}
+
+// Parse property access like n.name or m.age
+fn parse_property_access(input: &str) -> IResult<&str, String> {
+    let (input, (var, _, prop)) = tuple((
+        parse_identifier,
+        char('.'),
+        parse_identifier,
+    )).parse(input)?;
+    
+    Ok((input, format!("{}.{}", var, prop)))
 }
 
 // Parse complex CREATE patterns with relationships
@@ -531,6 +600,7 @@ fn parse_delete_kv(input: &str) -> IResult<&str, CypherQuery> {
     .parse(input)
 }
 
+
 // Main parser for Cypher queries - support multi-statement queries by taking the first valid statement
 pub fn parse_cypher(query: &str) -> Result<CypherQuery, String> {
     if !is_cypher(query) {
@@ -575,6 +645,19 @@ pub fn parse_cypher(query: &str) -> Result<CypherQuery, String> {
                     continue;
                 }
             } else if upper_stmt.starts_with("CREATE") {
+                // Check if it's CREATE INDEX first
+                if upper_stmt.starts_with("CREATE INDEX") {
+                    if let Ok((remaining, parsed_query)) = parse_create_index.parse(trimmed_stmt) {
+                        if remaining.trim().is_empty() {
+                            info!("Parsed CREATE INDEX statement from multi-statement query: {}", trimmed_stmt);
+                            println!("===> PARSED CREATE INDEX STATEMENT FROM MULTI-STATEMENT QUERY: {}", trimmed_stmt);
+                            return Ok(parsed_query);
+                        }
+                        warn!("CREATE INDEX statement parsed but remaining text: '{}'", remaining);
+                        continue;
+                    }
+                }
+                
                 // Try CREATE patterns - complex patterns first, then simple
                 let mut create_parser = alt((
                     parse_create_nodes,  // Try multiple nodes first
@@ -621,9 +704,10 @@ pub fn parse_cypher(query: &str) -> Result<CypherQuery, String> {
     let query_to_parse = query.trim_end_matches(';').trim();
     
     let mut parser = alt((
-        parse_create_nodes,  // Try multiple nodes first
+        parse_create_index,        // Try CREATE INDEX first
+        parse_create_nodes,        // Try multiple nodes first
         parse_create_node,
-        parse_match_multiple_nodes,  // Try multiple nodes first
+        parse_match_multiple_nodes, // Try multiple nodes first
         parse_match_node,
         parse_create_edge,
         parse_set_node,
@@ -816,6 +900,13 @@ pub async fn execute_cypher(
                 storage.flush().await?;
             }
             Ok(json!({ "key": key, "deleted": existed }))
+        }
+
+        CypherQuery::CreateIndex { label, properties } => {
+            // For now, just return a success response indicating index creation is not implemented
+            warn!("CREATE INDEX command is not implemented yet. Index for label '{}' on properties {:?} ignored.", label, properties);
+            println!("===> WARNING: CREATE INDEX COMMAND NOT IMPLEMENTED YET. INDEX FOR LABEL '{}' ON PROPERTIES {:?} IGNORED.", label, properties);
+            Ok(json!({ "status": "success", "message": "Index creation not implemented", "label": label, "properties": properties }))
         }
     }
 }
