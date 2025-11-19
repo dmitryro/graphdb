@@ -77,9 +77,9 @@ pub fn is_cypher(query: &str) -> bool {
     cypher_keywords.iter().any(|kw| query.trim().to_uppercase().starts_with(kw))
 }
 
-// Parse a Cypher identifier (e.g., variable name or label)
+// Parse a Cypher identifier (e.g., variable name or label) - now includes '&' for multi-label syntax
 fn parse_identifier(input: &str) -> IResult<&str, &str> {
-    take_while1(|c: char| c.is_alphanumeric() || c == '_').parse(input)
+    take_while1(|c: char| c.is_alphanumeric() || c == '_' || c == '&').parse(input)
 }
 
 // Parse a string literal (e.g., 'Alice' or "Alice")
@@ -155,6 +155,7 @@ fn parse_properties(input: &str) -> IResult<&str, HashMap<String, Value>> {
     )
     .parse(input)
 }
+
 
 // Parse a node pattern like `(n:Person {name: 'Alice'})` or `(:Person {name: 'Alice'})` or `(n:Person:Actor {name: 'Bob'})`
 // or `(n:Person&Actor {name: 'Charlie'})` - supports both : and & as label separators
@@ -242,16 +243,14 @@ fn parse_relationship(input: &str) -> IResult<&str, (String, HashMap<String, Val
     )).parse(input)
 }
 
+
 // Parse a `CREATE` nodes query - support multiple nodes separated by commas
 fn parse_create_nodes(input: &str) -> IResult<&str, CypherQuery> {
     map(
         tuple((
             tag("CREATE"),
             multispace1,
-            separated_list1(
-                delimited(multispace0, char(','), multispace0),
-                parse_node,
-            ),
+            parse_multiple_nodes,  // Use the multiple nodes parser
         )),
         |(_, _, nodes)| {
             let node_data: Vec<(String, HashMap<String, Value>)> = nodes
@@ -261,10 +260,8 @@ fn parse_create_nodes(input: &str) -> IResult<&str, CypherQuery> {
                     (actual_label, props)
                 })
                 .collect();
-            
-            CypherQuery::CreateNodes {
-                nodes: node_data,
-            }
+
+            CypherQuery::CreateNodes { nodes: node_data }
         },
     )
     .parse(input)
@@ -342,24 +339,30 @@ fn parse_create_node(input: &str) -> IResult<&str, CypherQuery> {
 
 // Parse a `MATCH` with multiple nodes
 fn parse_match_multiple_nodes(input: &str) -> IResult<&str, CypherQuery> {
-    let (input, _) = tag("MATCH").parse(input)?;
-    let (input, _) = multispace1.parse(input)?;
-    let (input, nodes) = parse_multiple_nodes(input)?;
-    
-    // Check if there's a RETURN clause
-    let (input, _) = if input.trim_start().to_uppercase().starts_with("RETURN") {
-        let (input, _) = multispace0.parse(input)?;
-        let (input, _) = tag("RETURN").parse(input)?;
-        let (input, _) = multispace0.parse(input)?;
-        let (input, _) = parse_return_expressions(input)?;
-        (input, ())
-    } else {
-        (input, ())
-    };
-    
-    Ok((input, CypherQuery::MatchMultipleNodes {
-        nodes,
-    }))
+    map(
+        tuple((
+            tag("MATCH"),
+            multispace1,
+            separated_list1(
+                delimited(multispace0, char(','), multispace0),
+                parse_node,
+            ),
+            opt(preceded(
+                tuple((multispace1, tag("RETURN"), multispace1)),
+                parse_return_expressions,
+            )),
+        )),
+        |(_, _, nodes, _)| {
+            // For now, use the first node's label and properties for matching
+            // In a full implementation, this would match all nodes in the pattern
+            let (_, label, props) = &nodes[0];
+            CypherQuery::MatchNode {
+                label: label.clone(),
+                properties: props.clone(),
+            }
+        },
+    )
+    .parse(input)
 }
 
 // Parse a `MATCH` node query - handle both with and without RETURN clause
@@ -538,7 +541,7 @@ pub fn parse_cypher(query: &str) -> Result<CypherQuery, String> {
     
     // Handle multi-statement queries by splitting on newlines and semicolons and taking the first valid statement
     let statements: Vec<&str> = query
-        .split(&['\n', ';'])
+        .split(&['\n', ';'])  // Split on both newlines and semicolons
         .map(|line| line.trim())
         .filter(|line| !line.is_empty())
         .collect();
@@ -546,7 +549,8 @@ pub fn parse_cypher(query: &str) -> Result<CypherQuery, String> {
     if statements.len() > 1 {
         // Multi-statement query - parse the first statement that matches our supported patterns
         for stmt in &statements {
-            let trimmed_stmt = stmt.trim();
+            // Strip trailing semicolons from each statement fragment
+            let trimmed_stmt = stmt.trim().trim_end_matches(';').trim();
             if trimmed_stmt.is_empty() {
                 continue;
             }
@@ -573,8 +577,7 @@ pub fn parse_cypher(query: &str) -> Result<CypherQuery, String> {
             } else if upper_stmt.starts_with("CREATE") {
                 // Try CREATE patterns - complex patterns first, then simple
                 let mut create_parser = alt((
-                    parse_create_complex_pattern,
-                    parse_create_nodes,
+                    parse_create_nodes,  // Try multiple nodes first
                     parse_create_node,
                     parse_create_edge,
                 ));
@@ -586,6 +589,7 @@ pub fn parse_cypher(query: &str) -> Result<CypherQuery, String> {
                         return Ok(parsed_query);
                     }
                     // If there's remaining text, continue to next statement
+                    warn!("CREATE statement parsed but remaining text: '{}'", remaining);
                     continue;
                 }
             } else if upper_stmt.starts_with("SET") {
@@ -613,12 +617,13 @@ pub fn parse_cypher(query: &str) -> Result<CypherQuery, String> {
         // If no statement in the multi-line query was valid, try to parse the whole query as a single statement
     }
 
-    // Single statement or fallback to whole query - use the original parser with new patterns first
+    // Single statement or fallback to whole query - strip trailing semicolon before parsing
+    let query_to_parse = query.trim_end_matches(';').trim();
+    
     let mut parser = alt((
-        parse_create_complex_pattern,  // Try complex CREATE patterns first
-        parse_match_multiple_nodes,     // Try multiple nodes in MATCH
-        parse_create_nodes,
+        parse_create_nodes,  // Try multiple nodes first
         parse_create_node,
+        parse_match_multiple_nodes,  // Try multiple nodes first
         parse_match_node,
         parse_create_edge,
         parse_set_node,
@@ -628,10 +633,10 @@ pub fn parse_cypher(query: &str) -> Result<CypherQuery, String> {
         parse_delete_kv,
     ));
 
-    match parser.parse(query) {
+    match parser.parse(query_to_parse) {
         Ok((remaining, parsed_query)) => {
             if !remaining.trim().is_empty() {
-                Err(format!("Failed to fully consume input, remaining: {:?}", remaining))
+                Err(format!("Failed to fully consume input, remaining: {:?}", remaining.trim()))
             } else {
                 Ok(parsed_query)
             }
@@ -687,7 +692,17 @@ pub async fn execute_cypher(
                 .collect();
             let props = props?;
             let filtered = vertices.into_iter().filter(|v| {
-                let matches_label = label.as_ref().map_or(true, |l| v.label.as_ref() == l);
+                // Check if the vertex label matches the query label
+                // For hierarchical labels like "Person:Director", check if the query label is a prefix
+                let matches_label = if let Some(query_label) = &label {
+                    let vertex_label_str = v.label.as_ref();
+                    // Check for exact match or if vertex label starts with query label followed by ':'
+                    vertex_label_str == query_label || 
+                    vertex_label_str.starts_with(&format!("{}:", query_label))
+                } else {
+                    true // If no label specified in query, match all
+                };
+                
                 let matches_props = props.iter().all(|(k, expected_val)| {
                     v.properties.get(k).map_or(false, |actual_val| actual_val == expected_val)
                 });

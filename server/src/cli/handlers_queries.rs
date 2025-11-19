@@ -419,6 +419,21 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
                     recovery_port, e
                 )
             })?;
+            // --- NEW: wait until the daemon says it is ready -------------
+            let registry   = GLOBAL_DAEMON_REGISTRY.get().await;
+            let mut ready  = false;
+            for _ in 0..20 {                          // 10 s total
+                if let Ok(Some(meta)) = registry.get_daemon_metadata(recovery_port).await {
+                    if meta.zmq_ready {
+                        ready = true;
+                        break;
+                    }
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            }
+            if !ready {
+                return Err(anyhow!("Daemon on port {} never became ready", recovery_port));
+            }
         } else {
             warn!("Daemon on port {} (PID {}) is running but IPC socket is missing, attempting to verify daemon state", recovery_port, daemon_metadata.pid);
             

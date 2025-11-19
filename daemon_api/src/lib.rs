@@ -471,53 +471,36 @@ pub async fn start_daemon(
         }
 
         // ---------- PARENT PROCESS ----------
-        // ✅ FIX: Use spawn_blocking for parent process port checks
-        // This prevents "runtime within runtime" errors in interactive mode
-        let socket_addr_clone = socket_addr;
-        let daemon_type_str = daemon_type.to_string();
+        // ✅ FIX: Keep everything async, don't use spawn_blocking with nested runtime
+        let mut confirmed_pid = 0;
+        let mut last_error: Option<std::io::Error> = None;
         
-        let (confirmed_pid, last_error) = tokio::task::spawn_blocking(move || {
-            let mut confirmed_pid = 0;
-            let mut last_error: Option<std::io::Error> = None;
-            
-            for attempt in 0..max_port_check_attempts {
-                // ✅ Use std::thread::sleep instead of tokio::time::sleep
-                std::thread::sleep(std::time::Duration::from_millis(port_check_interval_ms));
+        for attempt in 0..max_port_check_attempts {
+            // Use async sleep instead of blocking sleep
+            tokio::time::sleep(tokio::time::Duration::from_millis(port_check_interval_ms)).await;
 
-                match TcpStream::connect(&socket_addr_clone) {
-                    Ok(_) => {
-                        debug!("[Parent] Connected to {} on port {}", daemon_type_str, current_port);
-                        // ✅ find_pid_by_port is async, but we're in spawn_blocking
-                        // Create a new runtime for this single async operation
-                        // This is safe because we're in a blocking context
-                        match tokio::runtime::Runtime::new() {
-                            Ok(rt) => {
-                                confirmed_pid = rt.block_on(async {
-                                    find_pid_by_port(current_port).await.unwrap_or(0)
-                                });
-                                if confirmed_pid != 0 {
-                                    info!(
-                                        "{} daemon started on port {} with PID {}",
-                                        daemon_type_str, current_port, confirmed_pid
-                                    );
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                error!("Failed to create runtime for PID check: {}", e);
-                                // Continue trying other attempts
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        debug!("[Parent] Connect attempt {} failed: {}", attempt + 1, e);
-                        last_error = Some(e);
+            // Use async TcpStream check
+            match tokio::net::TcpStream::connect(&socket_addr).await {
+                Ok(_) => {
+                    debug!("[Parent] Connected to {} on port {}", daemon_type, current_port);
+                    
+                    // find_pid_by_port is already async, just await it
+                    confirmed_pid = find_pid_by_port(current_port).await.unwrap_or(0);
+                    
+                    if confirmed_pid != 0 {
+                        info!(
+                            "{} daemon started on port {} with PID {}",
+                            daemon_type, current_port, confirmed_pid
+                        );
+                        break;
                     }
                 }
+                Err(e) => {
+                    debug!("[Parent] Connect attempt {} failed: {}", attempt + 1, e);
+                    last_error = Some(e);
+                }
             }
-            
-            (confirmed_pid, last_error)
-        }).await.map_err(|e| DaemonError::GeneralError(format!("Join error: {}", e)))?;
+        }
 
         if confirmed_pid == 0 {
             error!(

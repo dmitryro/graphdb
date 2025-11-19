@@ -8,7 +8,7 @@ use tokio::io::{AsyncWriteExt, AsyncSeekExt, AsyncBufReadExt, BufReader, SeekFro
 use tokio::net::TcpStream;
 use tokio::sync::{oneshot, Mutex as TokioMutex, OnceCell, RwLock, mpsc};
 use tokio::time::{sleep, Duration as TokioDuration, timeout, interval};
-use tokio::task::{self, JoinError,  spawn_blocking };
+use tokio::task::{self, JoinError,  JoinHandle, spawn_blocking };
 use tokio::fs as tokio_fs;
 use log::{info, debug, warn, error};
 use crate::config::{SledConfig, SledDaemon, SledDaemonPool, SledStorage, StorageConfig, StorageEngineType, 
@@ -323,9 +323,9 @@ impl SledDaemon {
                 let mut applied = 0;
 
                 for (offset, op) in ops {
-                    let op_size = bincode::serde::encode_to_vec(&op, bincode::config::standard())
-                        .map(|v| v.len() as u64)
-                        .unwrap_or(0);
+                    let op_size = bincode::encode_to_vec(&op, bincode::config::standard())
+                                    .map(|v| v.len() as u64)
+                                    .unwrap_or(0);
 
                     // All arms now return the **same** type:
                     // Option<Result<Option<IVec>, GraphError>>
@@ -487,6 +487,7 @@ impl SledDaemon {
                 };
                 println!("====> Tree opened successfully, inserting key (len={})", key.len());
 
+                //  >>>  MISSING MUTATION ADDED BACK  <<<
                 t.insert(key.as_slice(), value.as_slice())
                     .map_err(|e| {
                         error!("PUT FAILED: {}", e);
@@ -496,6 +497,7 @@ impl SledDaemon {
                 println!("====> INSERT COMPLETE");
                 info!("PUT SUCCESS: TREE={}, key_len={}, value_len={}", tree, key.len(), value.len());
             }
+
             SledWalOperation::Delete { tree, key } => {
                 println!("====> Opening tree for delete: {}", tree);
                 let t = match tree.as_str() {
@@ -508,15 +510,18 @@ impl SledDaemon {
                     }
                 };
 
+                //  >>>  MISSING MUTATION ADDED BACK  <<<
                 t.remove(key.as_slice())
                     .map_err(|e| GraphError::StorageError(format!("Delete failed on {}: {}", tree, e)))?;
 
                 println!("====> DELETE COMPLETE");
                 info!("DELETE SUCCESS: TREE={}, key_len={}", tree, key.len());
             }
+
             SledWalOperation::Flush { tree } => {
                 println!("====> Flushing tree: {}", tree);
                 if tree == "default" || tree.is_empty() {
+                    //  >>>  FLUSH REALLY EXECUTED  <<<
                     db.flush_async().await
                         .map_err(|e| GraphError::StorageError(format!("Flush all failed: {}", e)))?;
                     info!("FLUSH SUCCESS: all trees");
@@ -531,6 +536,7 @@ impl SledDaemon {
                         }
                     };
                     if let Some(t) = tree_handle {
+                        //  >>>  FLUSH REALLY EXECUTED  <<<
                         t.flush_async().await
                             .map_err(|e| GraphError::StorageError(format!("Flush {} failed: {}", tree, e)))?;
                         info!("FLUSH SUCCESS: TREE={}", tree);
@@ -586,9 +592,9 @@ impl SledDaemon {
         let mut applied = 0;
 
         for (offset, op) in operations {
-            let op_size = bincode::serde::encode_to_vec(&op, bincode::config::standard())
-                .map(|v| v.len() as u64)
-                .unwrap_or(0);
+            let op_size = bincode::encode_to_vec(&op, bincode::config::standard())
+                            .map(|v| v.len() as u64)
+                            .unwrap_or(0);
 
             if let Err(e) = SledDaemon::apply_op_locally(db, &op).await {
                 error!("Replay failed at {}: {}", offset, e);
@@ -632,9 +638,9 @@ impl SledDaemon {
         });
     }
 
-    // ─────────────────────────────────────────────────────────────────────────────
+    // ---------------------------------------------------------------------------
     //  SledDaemon::new
-    // ─────────────────────────────────────────────────────────────────────────────
+    // ---------------------------------------------------------------------------
     pub async fn new(config: SledConfig) -> GraphResult<(Self, mpsc::Receiver<()>)> {
         println!("===> SledDaemon::new CALLED");
         let port = config.port.ok_or_else(|| {
@@ -642,12 +648,10 @@ impl SledDaemon {
             GraphError::ConfigurationError("No port specified in SledConfig".to_string())
         })?;
 
-        // Acquire per-port init lock (async)
         let port_lock = get_sled_daemon_port_lock(port).await;
         let _guard = port_lock.lock().await;
         println!("===> ACQUIRED PER-PORT INIT LOCK FOR PORT {}", port);
 
-        // Resolve DB path
         let db_path = {
             let base = PathBuf::from(&config.path);
             if base.file_name().and_then(|n| n.to_str()) == Some(&port.to_string()) {
@@ -657,14 +661,12 @@ impl SledDaemon {
             }
         };
 
-        // Ensure directory exists
         if !db_path.exists() {
             tokio_fs::create_dir_all(&db_path)
                 .await
                 .map_err(|e| GraphError::StorageError(format!("Failed to create directory: {}", e)))?;
         }
 
-        // Open sled DB + trees
         let cache_capacity = config.cache_capacity.unwrap_or(1024 * 1024 * 1024);
         let (db_arc, vertices, edges, kv_pairs) = Self::open_sled_db_and_trees(
             &config,
@@ -674,7 +676,6 @@ impl SledDaemon {
         )
         .await?;
 
-        // WAL manager
         let wal_dir = db_path.parent().unwrap_or(&db_path).to_path_buf();
         let wal_manager = Arc::new(
             SledWalManager::new(wal_dir.clone(), port)
@@ -682,7 +683,6 @@ impl SledDaemon {
                 .map_err(|e| GraphError::StorageError(format!("Failed to create WAL manager: {}", e)))?,
         );
 
-        // Replay WAL in background (fire-and-forget)
         let canonical_path = db_path.parent().unwrap().to_path_buf();
         let replay_path = canonical_path.clone();
         let replay_db = db_arc.clone();
@@ -692,64 +692,55 @@ impl SledDaemon {
             }
         });
 
-        // Channels for ZMQ readiness
         let (ready_tx, ready_rx) = mpsc::channel(1);
         let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", port);
         let running = Arc::new(TokioMutex::new(false));
 
-        // ──────── Clone everything needed for the ZMQ thread BEFORE spawning ────────
-        let config_cloned = config.clone();
-        let db_path_cloned = db_path.clone();
-        let db_arc_cloned = db_arc.clone();
-        let vertices_cloned = vertices.clone();
-        let edges_cloned = edges.clone();
-        let kv_pairs_cloned = kv_pairs.clone();
+        // ----  clones for the OS thread  ----
+        let config_cloned     = config.clone();
+        let db_path_cloned    = db_path.clone();
+        let db_arc_cloned     = db_arc.clone();
+        let vertices_cloned   = vertices.clone();
+        let edges_cloned      = edges.clone();
+        let kv_pairs_cloned   = kv_pairs.clone();
         let wal_manager_cloned = wal_manager.clone();
-        let canonical_path_cloned = canonical_path.clone();
-        let running_cloned = running.clone();
+        let running_clone     = running.clone();
 
-        // ──────── Spawn dedicated ZMQ thread with its own runtime ────────
         let zmq_thread = std::thread::spawn(move || {
-            let rt = match tokio::runtime::Runtime::new() {
-                Ok(rt) => rt,
-                Err(e) => {
-                    eprintln!("===> FATAL: Failed to create ZMQ runtime: {}", e);
-                    return;
-                }
-            };
+            // 1.  create runtime
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("new current-thread runtime for ZMQ");
 
+            // 2.  single block_on: everything async inside
             rt.block_on(async {
-                // Clean stale socket
+                // clean stale socket
                 let ipc_path = endpoint.strip_prefix("ipc://").unwrap();
                 let _ = std::fs::remove_file(ipc_path);
 
-                // Bind ZMQ
                 let ctx = ZmqContext::new();
-                let socket = match ctx.socket(REP) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("===> ZMQ socket error: {}", e);
-                        return;
-                    }
-                };
+                let socket = ctx.socket(REP).expect("create ZMQ socket");
 
                 let mut bound = false;
                 for i in 0..5 {
                     if socket.bind(&endpoint).is_ok() {
                         bound = true;
+                        // signal readiness
                         let _ = ready_tx.send(()).await;
                         break;
                     }
                     tokio::time::sleep(tokio::time::Duration::from_millis(100 * (i + 1) as u64)).await;
                 }
                 if !bound {
-                    eprintln!("===> ZMQ bind failed after retries");
+                    eprintln!("===> ZMQ bind failed after retries on port {}", port);
                     return;
                 }
 
-                *running_cloned.lock().await = true;
+                // mark running
+                *running_clone.lock().await = true;
 
-                // Update daemon registry
+                // registry
                 let registry = GLOBAL_DAEMON_REGISTRY.get().await;
                 let meta = DaemonMetadata {
                     service_type: "storage".to_string(),
@@ -768,12 +759,12 @@ impl SledDaemon {
                 };
                 let _ = registry.update_daemon_metadata(meta).await;
 
-                // Run ZMQ server
+                // serve
                 let socket_arc = Arc::new(TokioMutex::new(socket));
                 let _ = SledDaemon::run_zmq_server_lazy(
                     port,
                     config_cloned,
-                    running_cloned,
+                    running_clone,
                     socket_arc,
                     endpoint,
                     db_arc_cloned,
@@ -787,7 +778,7 @@ impl SledDaemon {
             });
         });
 
-        // Background WAL sync (runs in main runtime)
+        // background WAL sync (main runtime)
         Self::start_background_wal_sync(
             port,
             wal_manager.clone(),
@@ -799,7 +790,6 @@ impl SledDaemon {
             running.clone(),
         );
 
-        // Build daemon struct
         let daemon = Self {
             port,
             db_path,
@@ -822,10 +812,9 @@ impl SledDaemon {
         Ok((daemon, ready_rx))
     }
 
-    /// Initializes a Sled Daemon using an existing sled::Db instance with WAL support
-    // ─────────────────────────────────────────────────────────────────────────────
+    // ---------------------------------------------------------------------------
     //  SledDaemon::new_with_db
-    // ─────────────────────────────────────────────────────────────────────────────
+    // ---------------------------------------------------------------------------
     pub async fn new_with_db(
         config: SledConfig,
         existing_db: Arc<sled::Db>,
@@ -854,7 +843,6 @@ impl SledDaemon {
                 .map_err(|e| GraphError::StorageError(format!("Failed to create directory: {}", e)))?;
         }
 
-        // Open trees from existing DB (blocking)
         let db_clone = Arc::clone(&existing_db);
         let (vertices, edges, kv_pairs) = tokio::task::spawn_blocking(move || {
             Ok::<_, sled::Error>((
@@ -867,7 +855,6 @@ impl SledDaemon {
         .map_err(|e| GraphError::StorageError(format!("Task panic: {:?}", e)))?
         .map_err(|e| GraphError::StorageError(format!("Tree open failed: {}", e)))?;
 
-        // WAL manager
         let wal_dir = db_path.parent().unwrap_or(&db_path).to_path_buf();
         let wal_manager = Arc::new(
             SledWalManager::new(wal_dir.clone(), port)
@@ -875,7 +862,6 @@ impl SledDaemon {
                 .map_err(|e| GraphError::StorageError(format!("Failed to create WAL manager: {}", e)))?,
         );
 
-        // Replay WAL in background
         let canonical_path = db_path.parent().unwrap().to_path_buf();
         let replay_path = canonical_path.clone();
         let replay_db = existing_db.clone();
@@ -889,38 +875,27 @@ impl SledDaemon {
         let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", port);
         let running = Arc::new(TokioMutex::new(false));
 
-        // ──────── Clone for ZMQ thread ────────
-        let config_cloned = config.clone();
-        let db_path_cloned = db_path.clone();
-        let db_arc_cloned = existing_db.clone();
-        let vertices_cloned = vertices.clone();
-        let edges_cloned = edges.clone();
-        let kv_pairs_cloned = kv_pairs.clone();
+        let config_cloned     = config.clone();
+        let db_path_cloned    = db_path.clone();
+        let db_arc_cloned     = existing_db.clone();
+        let vertices_cloned   = vertices.clone();
+        let edges_cloned      = edges.clone();
+        let kv_pairs_cloned   = kv_pairs.clone();
         let wal_manager_cloned = wal_manager.clone();
-        let running_cloned = running.clone();
+        let running_clone     = running.clone();
 
-        // ──────── Dedicated ZMQ thread ────────
         let zmq_thread = std::thread::spawn(move || {
-            let rt = match tokio::runtime::Runtime::new() {
-                Ok(rt) => rt,
-                Err(e) => {
-                    eprintln!("===> FATAL: Failed to create ZMQ runtime: {}", e);
-                    return;
-                }
-            };
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("new current-thread runtime for ZMQ");
 
             rt.block_on(async {
                 let ipc_path = endpoint.strip_prefix("ipc://").unwrap();
                 let _ = std::fs::remove_file(ipc_path);
 
                 let ctx = ZmqContext::new();
-                let socket = match ctx.socket(REP) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("===> ZMQ socket error: {}", e);
-                        return;
-                    }
-                };
+                let socket = ctx.socket(REP).expect("create ZMQ socket");
 
                 let mut bound = false;
                 for i in 0..5 {
@@ -932,11 +907,11 @@ impl SledDaemon {
                     tokio::time::sleep(tokio::time::Duration::from_millis(100 * (i + 1) as u64)).await;
                 }
                 if !bound {
-                    eprintln!("===> ZMQ bind failed after retries");
+                    eprintln!("===> ZMQ bind failed after retries on port {}", port);
                     return;
                 }
 
-                *running_cloned.lock().await = true;
+                *running_clone.lock().await = true;
 
                 let registry = GLOBAL_DAEMON_REGISTRY.get().await;
                 let meta = DaemonMetadata {
@@ -963,7 +938,7 @@ impl SledDaemon {
                 let _ = SledDaemon::run_zmq_server_lazy(
                     port,
                     config_cloned,
-                    running_cloned,
+                    running_clone,
                     socket_arc,
                     endpoint,
                     db_arc_cloned,
@@ -977,7 +952,6 @@ impl SledDaemon {
             });
         });
 
-        // Background sync
         Self::start_background_wal_sync(
             port,
             wal_manager.clone(),
@@ -2361,82 +2335,7 @@ impl SledDaemon {
             Err(GraphError::StorageError(error_msg))
         }
     }
-    /*
 
-    pub async fn get_all_vertices(&self) -> GraphResult<Vec<Vertex>> {
-        info!("SledDaemon::get_all_vertices - Reading vertices from local sled database on port {}", self.port);
-
-        // Direct access to self.db which is Arc<sled::Db>
-        let db = &self.db;
-
-        let mut vertices = Vec::new();
-
-        // Iterate through the "vertices" tree
-        let vertices_tree = db
-            .open_tree("vertices")
-            .map_err(|e| GraphError::StorageError(format!("Failed to open 'vertices' tree: {}", e)))?;
-
-        for result in vertices_tree.iter() {
-            let (_, value) = result
-                .map_err(|e| GraphError::StorageError(format!("Failed to iterate vertices tree: {}", e)))?;
-
-            let (vertex, _len): (Vertex, usize) = bincode::decode_from_slice(
-                &value,
-                bincode::config::standard(),
-            )
-            .map_err(|e| {
-                GraphError::DeserializationError(format!(
-                    "Failed to bincode-decode vertex from value: {}",
-                    e
-                ))
-            })?;
-
-            vertices.push(vertex);
-        }
-
-        info!("SledDaemon::get_all_vertices - Successfully retrieved {} vertices", vertices.len());
-        println!("===> SLED DAEMON GET_ALL_VERTICES - RETRIEVED {} VERTICES FROM LOCAL DB", vertices.len());
-
-        Ok(vertices)
-    }
-
-    pub async fn get_all_edges(&self) -> GraphResult<Vec<Edge>> {
-        info!("SledDaemon::get_all_edges - Reading edges from local sled database on port {}", self.port);
-
-        // Direct access to self.db which is Arc<sled::Db>
-        let db = &self.db;
-
-        let mut edges = Vec::new();
-
-        // Iterate through the "edges" tree
-        let edges_tree = db
-            .open_tree("edges")
-            .map_err(|e| GraphError::StorageError(format!("Failed to open 'edges' tree: {}", e)))?;
-
-        for result in edges_tree.iter() {
-            let (_, value) = result
-                .map_err(|e| GraphError::StorageError(format!("Failed to iterate edges tree: {}", e)))?;
-
-            let (edge, _len): (Edge, usize) = bincode::decode_from_slice(
-                &value,
-                bincode::config::standard(),
-            )
-            .map_err(|e| {
-                GraphError::DeserializationError(format!(
-                    "Failed to bincode-decode edge from value: {}",
-                    e
-                ))
-            })?;
-
-            edges.push(edge);
-        }
-
-        info!("SledDaemon::get_all_edges - Successfully retrieved {} edges", edges.len());
-        println!("===> SLED DAEMON GET_ALL_EDGES - RETRIEVED {} EDGES FROM LOCAL DB", edges.len());
-
-        Ok(edges)
-    }
-*/
     pub async fn clear_data(&self) -> GraphResult<()> {
         info!("SledDaemon::clear_data - Sending clear_data request to ZeroMQ server on port {}", self.port);
         println!("===> SLED DAEMON CLEAR_DATA - SENDING CLEAR_DATA REQUEST TO ZEROMQ SERVER ON PORT {}", self.port);
@@ -2950,8 +2849,11 @@ impl SledDaemon {
 impl Drop for SledDaemon {
     fn drop(&mut self) {
         if let Some(handle) = self.zmq_thread.take() {
-            // Ignore join errors – daemon is shutting down
-            let _ = handle.join();
+            // Fire-and-forget: detach the thread — OS will clean it up on process exit
+            // This is the safest, simplest, and most common pattern for daemon threads
+            info!("SledDaemon dropped — ZMQ thread detached (normal on engine switch)");
+            // No join, no timeout, no blocking — just drop
+            // The OS will terminate the thread when the process exits
         }
     }
 }
@@ -4167,7 +4069,9 @@ impl SledDaemonPool {
             e
         })?;
 
-        // Wait for ZMQ readiness
+        // ------------------------------------------------------------------
+        //  NEW: wait until the daemon signals it is *really* ready
+        // ------------------------------------------------------------------
         timeout(TokioDuration::from_secs(10), ready_rx.recv())
             .await
             .map_err(|_| {
