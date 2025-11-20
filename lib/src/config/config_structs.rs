@@ -357,6 +357,7 @@ impl Clone for SledDaemonPool {
 #[derive(Debug, Clone)]
 pub struct SledStorage {
     pub pool: Arc<TokioMutex<SledDaemonPool>>,
+    pub db: Arc<sled::Db>, // <-- Add this field
 }
 
 /// Struct to hold rocksdb::DB and its path
@@ -586,6 +587,8 @@ pub struct RocksDBStorage {
     pub pool: Arc<TokioMutex<RocksDBDaemonPool>>,
     #[cfg(feature = "with-openraft-rocksdb")]
     pub raft: Option<openraft::Raft<TypeConfig>>,
+    // Add the actual RocksDB instance
+    pub db: Arc<DB>,
 }
 
 /// Engine type configuration

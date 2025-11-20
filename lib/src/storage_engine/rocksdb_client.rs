@@ -1210,7 +1210,6 @@ impl StorageEngine for RocksDBClient {
         self.flush().await
     }
 }
-
 #[async_trait]
 impl GraphStorageEngine for RocksDBClient {
     async fn start(&self) -> Result<(), GraphError> {
@@ -1218,11 +1217,13 @@ impl GraphStorageEngine for RocksDBClient {
         println!("===> Starting RocksDBClient");
         Ok(())
     }
+
     async fn stop(&self) -> Result<(), GraphError> {
         info!("Stopping RocksDBClient");
         println!("===> Stopping RocksDBClient");
         Ok(())
     }
+
     fn get_type(&self) -> &'static str {
         match &self.mode {
             Some(RocksDBClientMode::Direct) => "rocksdb_client",
@@ -1230,9 +1231,11 @@ impl GraphStorageEngine for RocksDBClient {
             None => "rocksdb_client",
         }
     }
+
     async fn is_running(&self) -> bool {
         *self.is_running.lock().await
     }
+
     async fn query(&self, query_string: &str) -> Result<Value, GraphError> {
         match &self.mode {
             Some(RocksDBClientMode::ZMQ(port)) => {
@@ -1258,39 +1261,51 @@ impl GraphStorageEngine for RocksDBClient {
             }
         }
     }
+
     async fn create_vertex(&self, vertex: Vertex) -> Result<(), GraphError> {
         self.create_vertex(vertex).await
     }
+
     async fn get_vertex(&self, id: &Uuid) -> Result<Option<Vertex>, GraphError> {
         self.get_vertex(id).await
     }
+
     async fn update_vertex(&self, vertex: Vertex) -> Result<(), GraphError> {
         self.update_vertex(vertex).await
     }
+
     async fn delete_vertex(&self, id: &Uuid) -> Result<(), GraphError> {
         self.delete_vertex(id).await
     }
+
     async fn get_all_vertices(&self) -> Result<Vec<Vertex>, GraphError> {
         self.get_all_vertices().await
     }
+
     async fn create_edge(&self, edge: Edge) -> Result<(), GraphError> {
         self.create_edge(edge).await
     }
+
     async fn get_edge(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> Result<Option<Edge>, GraphError> {
         self.get_edge(outbound_id, edge_type, inbound_id).await
     }
+
     async fn update_edge(&self, edge: Edge) -> Result<(), GraphError> {
         self.update_edge(edge).await
     }
+
     async fn delete_edge(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> Result<(), GraphError> {
         self.delete_edge(outbound_id, edge_type, inbound_id).await
     }
+
     async fn get_all_edges(&self) -> Result<Vec<Edge>, GraphError> {
         self.get_all_edges().await
     }
+
     async fn clear_data(&self) -> Result<(), GraphError> {
         self.clear_data().await
     }
+
     async fn execute_query(&self, query_plan: QueryPlan) -> Result<QueryResult, GraphError> {
         match &self.mode {
             Some(RocksDBClientMode::ZMQ(port)) => {
@@ -1321,12 +1336,142 @@ impl GraphStorageEngine for RocksDBClient {
             }
         }
     }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
+
     async fn close(&self) -> Result<(), GraphError> {
         info!("Closing RocksDBClient");
         println!("===> Closing RocksDBClient");
         Ok(())
+    }
+
+    // === INDEX METHODS (forward to daemon via ZMQ) ===
+    async fn create_index(&self, label: &str, property: &str) -> GraphResult<()> {
+        match &self.mode {
+            Some(RocksDBClientMode::ZMQ(port)) => {
+                let request = json!({
+                    "command": "index_create",
+                    "label": label,
+                    "property": property
+                });
+                let response = self.send_zmq_request(*port, request).await?;
+                if response.get("status").and_then(|s| s.as_str()) == Some("success") {
+                    Ok(())
+                } else {
+                    let msg = response.get("message").and_then(|m| m.as_str()).unwrap_or("Unknown error");
+                    Err(GraphError::StorageError(format!("index_create failed: {}", msg)))
+                }
+            }
+            _ => Err(GraphError::StorageError("index_create not supported in direct mode".into()))
+        }
+    }
+
+    async fn drop_index(&self, label: &str, property: &str) -> GraphResult<()> {
+        match &self.mode {
+            Some(RocksDBClientMode::ZMQ(port)) => {
+                let request = json!({
+                    "command": "index_drop",
+                    "label": label,
+                    "property": property
+                });
+                let response = self.send_zmq_request(*port, request).await?;
+                if response.get("status").and_then(|s| s.as_str()) == Some("success") {
+                    Ok(())
+                } else {
+                    let msg = response.get("message").and_then(|m| m.as_str()).unwrap_or("Unknown error");
+                    Err(GraphError::StorageError(format!("index_drop failed: {}", msg)))
+                }
+            }
+            _ => Err(GraphError::StorageError("index_drop not supported in direct mode".into()))
+        }
+    }
+
+    async fn list_indexes(&self) -> GraphResult<Vec<(String, String)>> {
+        match &self.mode {
+            Some(RocksDBClientMode::ZMQ(port)) => {
+                let request = json!({
+                    "command": "index_list"
+                });
+                let response = self.send_zmq_request(*port, request).await?;
+                if response.get("status").and_then(|s| s.as_str()) == Some("success") {
+                    let array = response["indexes"]
+                        .as_array()
+                        .ok_or(GraphError::StorageError("Invalid indexes response format".into()))?;
+
+                    let mut indexes = Vec::with_capacity(array.len());
+                    for item in array {
+                        let arr = item.as_array()
+                            .ok_or(GraphError::StorageError("Index item must be an array".into()))?;
+                        if arr.len() == 2 {
+                            let label = arr[0].as_str()
+                                .ok_or(GraphError::StorageError("Label must be string".into()))?
+                                .to_owned();
+                            let property = arr[1].as_str()
+                                .ok_or(GraphError::StorageError("Property must be string".into()))?
+                                .to_owned();
+                            indexes.push((label, property));
+                        }
+                    }
+                    Ok(indexes)
+                } else {
+                    let msg = response.get("message")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("Unknown error");
+                    Err(GraphError::StorageError(format!("index_list failed: {}", msg)))
+                }
+            }
+            _ => Ok(vec![]),
+        }
+    }
+
+    async fn fulltext_search(&self, query: &str, limit: usize) -> GraphResult<Vec<(String, String)>> {
+        match &self.mode {
+            Some(RocksDBClientMode::ZMQ(port)) => {
+                let request = json!({
+                    "command": "fulltext_search",
+                    "query": query,
+                    "limit": limit
+                });
+                let response = self.send_zmq_request(*port, request).await?;
+                if response.get("status").and_then(|s| s.as_str()) == Some("success") {
+                    let results = response["results"]
+                        .as_array()
+                        .ok_or(GraphError::StorageError("Invalid fulltext results".into()))?
+                        .iter()
+                        .filter_map(|v| {
+                            let obj = v.as_object()?;
+                            let id = obj.get("id")?.as_str()?.to_string();
+                            let content = obj.get("content")?.as_str()?.to_string();
+                            Some((id, content))
+                        })
+                        .collect();
+                    Ok(results)
+                } else {
+                    let msg = response.get("message").and_then(|m| m.as_str()).unwrap_or("Unknown error");
+                    Err(GraphError::StorageError(format!("fulltext_search failed: {}", msg)))
+                }
+            }
+            _ => Ok(vec![])
+        }
+    }
+
+    async fn fulltext_rebuild(&self) -> GraphResult<()> {
+        match &self.mode {
+            Some(RocksDBClientMode::ZMQ(port)) => {
+                let request = json!({
+                    "command": "fulltext_rebuild"
+                });
+                let response = self.send_zmq_request(*port, request).await?;
+                if response.get("status").and_then(|s| s.as_str()) == Some("success") {
+                    Ok(())
+                } else {
+                    let msg = response.get("message").and_then(|m| m.as_str()).unwrap_or("Unknown error");
+                    Err(GraphError::StorageError(format!("fulltext_rebuild failed: {}", msg)))
+                }
+            }
+            _ => Ok(())
+        }
     }
 }

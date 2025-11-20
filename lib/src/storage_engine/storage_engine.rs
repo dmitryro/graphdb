@@ -15,6 +15,7 @@ use std::sync::{Arc, LazyLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use once_cell::sync::Lazy;
 use surrealdb::engine::local::{Db, Mem, RocksDb};
 use tikv_client::{Config, Transaction, TransactionClient as TiKvClient, RawClient as KvClient};
 use surrealdb::Surreal;
@@ -118,6 +119,25 @@ static ROCKSDB_INIT_LOCK: LazyLock<TokioMutex<()>> = LazyLock::new(|| TokioMutex
 
 lazy_static::lazy_static! {
     static ref MIGRATION_COMPLETE: Arc<TokioMutex<bool>> = Arc::new(TokioMutex::new(false));
+}
+
+// Tantivy full-text index — async-safe OnceCell
+static FULLTEXT_INDEX: OnceCell<Arc<indexing_service::fulltext::FullTextIndex>> = OnceCell::const_new();
+
+async fn get_fulltext_index() -> Arc<indexing_service::fulltext::FullTextIndex> {
+    FULLTEXT_INDEX.get_or_init(|| async {
+        let index_dir = PathBuf::from("/opt/graphdb/indexes/fulltext");
+        std::fs::create_dir_all(&index_dir).expect("Failed to create fulltext index directory");
+        Arc::new(indexing_service::fulltext::FullTextIndex::new(&index_dir).expect("Failed to initialize Tantivy index"))
+    }).await.clone()
+}
+
+pub static GLOBAL_STORAGE_REGISTRY: OnceCell<RwLock<HashMap<u16, Arc<dyn GraphStorageEngine + Send + Sync>>>> = OnceCell::const_new();
+
+pub async fn get_global_storage_registry() -> &'static RwLock<HashMap<u16, Arc<dyn GraphStorageEngine + Send + Sync>>> {
+    GLOBAL_STORAGE_REGISTRY.get_or_init(|| async {
+        RwLock::new(HashMap::new())
+    }).await
 }
 
 const MAX_RETRIES: u32 = 5;
@@ -454,6 +474,10 @@ impl StorageEngine for SurrealdbGraphStorage {
 
 #[async_trait]
 impl GraphStorageEngine for SurrealdbGraphStorage {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     async fn start(&self) -> Result<(), GraphError> {
         info!("SurrealDB store started.");
         Ok(())
@@ -470,6 +494,9 @@ impl GraphStorageEngine for SurrealdbGraphStorage {
             StorageEngineType::RocksDB => "rocksdb",
             StorageEngineType::TiKV => "tikv",
             StorageEngineType::InMemory => "in-memory",
+            StorageEngineType::MySQL => "mysql",
+            StorageEngineType::Redis => "redis",
+            StorageEngineType::PostgreSQL => "postgres",
             _ => "unknown",
         }
     }
@@ -478,40 +505,32 @@ impl GraphStorageEngine for SurrealdbGraphStorage {
         true
     }
 
-    /// Executes a raw SurrealQL query and returns a JSON value.
     async fn query(&self, query_string: &str) -> Result<Value, GraphError> {
         debug!("Executing query: {}", query_string);
         let mut result = self.db.query(query_string).await
             .map_err(|e| GraphError::QueryError(e.to_string()))?;
-        
-        // The `take` method with an index returns a Result<Vec<Value>, _>
-        // for that specific query statement.
+
         let values: Vec<Value> = result.take(0)
             .map_err(|e| GraphError::QueryError(e.to_string()))?;
-        
-        // We get the first value from the returned vector.
+
         let value = values.into_iter().next()
             .ok_or_else(|| GraphError::QueryError("Query returned no values".to_string()))?;
-        
+
         Ok(value)
     }
 
-
-    async fn execute_query(&self, query_plan: QueryPlan) -> Result<QueryResult, GraphError> {
-        info!("Executing query on Surreal (returning null as not implemented)");
-        Ok(QueryResult::Null)
-    }       
+    async fn execute_query(&self, _query_plan: QueryPlan) -> Result<QueryResult, GraphError> {
+        Err(GraphError::StorageError("execute_query not supported on SurrealDB backend".into()))
+    }
 
     async fn create_vertex(&self, vertex: Vertex) -> Result<(), GraphError> {
         let created: Option<Vertex> = self.db.create(("vertices", vertex.id.0.to_string()))
             .content(vertex)
             .await
             .map_err(|e| GraphError::StorageError(e.to_string()))?;
-
         if created.is_none() {
             return Err(GraphError::StorageError("Failed to create vertex".to_string()));
         }
-        
         trace!("Created vertex: {:?}", created);
         Ok(())
     }
@@ -520,7 +539,6 @@ impl GraphStorageEngine for SurrealdbGraphStorage {
         let result: Option<Vertex> = self.db.select(("vertices", id.to_string()))
             .await
             .map_err(|e| GraphError::StorageError(e.to_string()))?;
-
         Ok(result)
     }
 
@@ -529,11 +547,9 @@ impl GraphStorageEngine for SurrealdbGraphStorage {
             .content(vertex)
             .await
             .map_err(|e| GraphError::StorageError(e.to_string()))?;
-
         if updated.is_none() {
             return Err(GraphError::StorageError("Failed to update vertex".to_string()));
         }
-
         trace!("Updated vertex: {:?}", updated);
         Ok(())
     }
@@ -542,7 +558,6 @@ impl GraphStorageEngine for SurrealdbGraphStorage {
         let deleted: Option<Vertex> = self.db.delete(("vertices", id.to_string()))
             .await
             .map_err(|e| GraphError::StorageError(e.to_string()))?;
-        
         trace!("Deleted vertex: {:?}", deleted);
         Ok(())
     }
@@ -556,53 +571,43 @@ impl GraphStorageEngine for SurrealdbGraphStorage {
 
     async fn create_edge(&self, edge: Edge) -> Result<(), GraphError> {
         let edge_id_str = format!("{}:{}:{}", edge.outbound_id.0, edge.edge_type, edge.inbound_id.0);
-        
         let created: Option<Edge> = self.db.create(("edges", edge_id_str))
             .content(edge)
             .await
             .map_err(|e| GraphError::StorageError(e.to_string()))?;
-
         if created.is_none() {
             return Err(GraphError::StorageError("Failed to create edge".to_string()));
         }
-
         trace!("Created edge: {:?}", created);
         Ok(())
     }
 
     async fn get_edge(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> Result<Option<Edge>, GraphError> {
         let edge_id_str = format!("{}:{}:{}", outbound_id, edge_type, inbound_id);
-
         let result: Option<Edge> = self.db.select(("edges", &edge_id_str))
             .await
             .map_err(|e| GraphError::StorageError(e.to_string()))?;
-
         Ok(result)
     }
 
     async fn update_edge(&self, edge: Edge) -> Result<(), GraphError> {
         let edge_id_str = format!("{}:{}:{}", edge.outbound_id.0, edge.edge_type, edge.inbound_id.0);
-
         let updated: Option<Edge> = self.db.update(("edges", edge_id_str))
             .content(edge)
             .await
             .map_err(|e| GraphError::StorageError(e.to_string()))?;
-
         if updated.is_none() {
             return Err(GraphError::StorageError("Failed to update edge".to_string()));
         }
-
         trace!("Updated edge: {:?}", updated);
         Ok(())
     }
 
     async fn delete_edge(&self, outbound_id: &Uuid, edge_type: &Identifier, inbound_id: &Uuid) -> Result<(), GraphError> {
         let edge_id_str = format!("{}:{}:{}", outbound_id, edge_type, inbound_id);
-        
         let deleted: Option<Edge> = self.db.delete(("edges", &edge_id_str))
             .await
             .map_err(|e| GraphError::StorageError(e.to_string()))?;
-
         trace!("Deleted edge: {:?}", deleted);
         Ok(())
     }
@@ -611,7 +616,6 @@ impl GraphStorageEngine for SurrealdbGraphStorage {
         let results: Vec<Edge> = self.db.select("edges")
             .await
             .map_err(|e| GraphError::StorageError(e.to_string()))?;
-
         Ok(results)
     }
 
@@ -623,11 +627,71 @@ impl GraphStorageEngine for SurrealdbGraphStorage {
         Ok(())
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
+    async fn close(&self) -> Result<(), GraphError> {
+        Ok(())
     }
 
-    async fn close(&self) -> Result<(), GraphError> {
+    // === INDEX METHODS (SurrealDB supports native indexes) ===
+    async fn create_index(&self, label: &str, property: &str) -> GraphResult<()> {
+        let query = format!("DEFINE INDEX idx_{label}_{property} ON TABLE {label} FIELDS {property} UNIQUE");
+        self.db.query(&query).await
+            .map_err(|e| GraphError::StorageError(format!("Failed to create index: {}", e)))?;
+        info!("Created SurrealDB index idx_{label}_{property} on {label}.{property}");
+        Ok(())
+    }
+
+    async fn drop_index(&self, label: &str, property: &str) -> GraphResult<()> {
+        let query = format!("REMOVE INDEX idx_{label}_{property} ON TABLE {label}");
+        self.db.query(&query).await
+            .map_err(|e| GraphError::StorageError(format!("Failed to drop index: {}", e)))?;
+        info!("Dropped SurrealDB index idx_{label}_{property}");
+        Ok(())
+    }
+
+    async fn list_indexes(&self) -> GraphResult<Vec<(String, String)>> {
+        let result: Vec<Value> = self.db.query("INFO FOR DB").await
+            .map_err(|e| GraphError::StorageError(e.to_string()))?
+            .take(0)
+            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+
+        let mut indexes = Vec::new();
+        if let Some(info) = result.first() {
+            if let Some(tables) = info.get("tables") {
+                if let Some(obj) = tables.as_object() {
+                    for (table_name, table_info) in obj {
+                        if let Some(indexes_info) = table_info.get("indexes") {
+                            if let Some(arr) = indexes_info.as_array() {
+                                for index_def in arr {
+                                    if let Some(def_str) = index_def.as_str() {
+                                        if let Some(prop) = def_str.split(" FIELDS ").nth(1) {
+                                            indexes.push((table_name.clone(), prop.to_string()));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(indexes)
+    }
+
+    // === FULLTEXT SEARCH (Tantivy via global index) ===
+    async fn fulltext_search(&self, query: &str, limit: usize) -> GraphResult<Vec<(String, String)>> {
+        let index = get_fulltext_index().await;
+        index.search(query, limit)
+            .map_err(|e| GraphError::StorageError(e.to_string()))
+    }
+
+    async fn fulltext_rebuild(&self) -> GraphResult<()> {
+        let index = get_fulltext_index().await;
+        tokio::spawn({
+            let index = index.clone();
+            async move {
+                let _ = index.commit().await;
+            }
+        });
         Ok(())
     }
 }
@@ -1259,6 +1323,14 @@ pub trait GraphStorageEngine: StorageEngine + Send + Sync + Debug + 'static {
     async fn execute_query(&self, query_plan: QueryPlan) -> Result<QueryResult, GraphError>;
     fn as_any(&self) -> &dyn Any;
     async fn close(&self) -> Result<(), GraphError>;
+    // === INDEX METHODS ===
+    async fn create_index(&self, label: &str, property: &str) -> GraphResult<()>;
+    async fn drop_index(&self, label: &str, property: &str) -> GraphResult<()>;
+    async fn list_indexes(&self) -> GraphResult<Vec<(String, String)>>;
+
+    // === FULLTEXT METHODS (Tantivy) ===
+    async fn fulltext_search(&self, query: &str, limit: usize) -> GraphResult<Vec<(String, String)>>;
+    async fn fulltext_rebuild(&self) -> GraphResult<()>;
 }
 
 #[derive(Debug)]

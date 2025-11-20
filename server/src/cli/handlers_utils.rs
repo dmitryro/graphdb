@@ -30,7 +30,7 @@ use crossterm::style::{self, Stylize};
 use crossterm::terminal::{Clear, ClearType, size as terminal_size};
 use crossterm::execute;
 use crossterm::cursor::MoveTo;
-use lib::daemon::daemon_registry::{DaemonMetadata};
+use lib::daemon::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
 
 
 /// Helper to get the path to the current executable.
@@ -488,4 +488,95 @@ pub fn map_engine_type_str(engine_str: &str) -> StorageEngineType {
             StorageEngineType::Sled
         }
     }
+}
+
+/// Returns the current active storage daemon port from the registry.
+/// Prioritizes healthy (zmq_ready + engine_synced) storage daemons.
+/// Falls back gracefully if nothing is perfect.
+pub async fn get_current_storage_port() -> u16 {
+    // GLOBAL_DAEMON_REGISTRY.get().await returns &AsyncRegistryWrapper
+    let registry = GLOBAL_DAEMON_REGISTRY.get().await;
+    
+    let all_daemons = match registry.get_all_daemon_metadata().await {
+        Ok(daemons) => daemons,
+        Err(e) => {
+            warn!("Failed to read daemon metadata: {} — using fallback port 8052", e);
+            return 8052;
+        }
+    };
+    
+    // 1. Prefer fully healthy storage daemon
+    for meta in &all_daemons {
+        if meta.service_type == "storage" && meta.zmq_ready && meta.engine_synced {
+            info!("Using healthy storage daemon on port {} (ZMQ+sync ready)", meta.port);
+            return meta.port;
+        }
+    }
+    
+    // 2. Fallback: any running storage daemon
+    for meta in &all_daemons {
+        if meta.service_type == "storage" && meta.pid > 0 {
+            info!("Using running storage daemon on port {} (fallback)", meta.port);
+            return meta.port;
+        }
+    }
+    
+    // 3. Ultimate fallback
+    warn!("No storage daemon found in registry — defaulting to port 8052");
+    8052
+}
+
+/// Sync version for Lazy — safe, no block_on on current runtime
+/// Sync version — safe to call from Lazy, no nested runtime
+pub fn get_current_storage_port_sync() -> u16 {
+    use std::sync::OnceLock;
+    static CACHED_PORT: OnceLock<u16> = OnceLock::new();
+    
+    // Fast path — return cached value
+    if let Some(port) = CACHED_PORT.get() {
+        return *port;
+    }
+    
+    // Slow path — spawn a temporary runtime
+    let port = std::thread::spawn(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let registry = GLOBAL_DAEMON_REGISTRY.get().await;
+                
+                let all = match registry.get_all_daemon_metadata().await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        warn!("Failed to get daemon metadata: {} — using fallback port 8052", e);
+                        return 8052;
+                    }
+                };
+                
+                // Prefer healthy storage daemon
+                for meta in &all {
+                    if meta.service_type == "storage" && meta.zmq_ready && meta.engine_synced {
+                        info!("Using healthy storage daemon on port {}", meta.port);
+                        return meta.port;
+                    }
+                }
+                
+                // Fallback to any storage daemon
+                for meta in &all {
+                    if meta.service_type == "storage" {
+                        info!("Using storage daemon on port {} (fallback)", meta.port);
+                        return meta.port;
+                    }
+                }
+                
+                warn!("No storage daemon found — using default port 8052");
+                8052
+            })
+    })
+    .join()
+    .unwrap_or(8052);
+    
+    let _ = CACHED_PORT.set(port);
+    port
 }

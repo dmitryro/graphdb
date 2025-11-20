@@ -23,6 +23,8 @@ pub enum GraphError {
     StorageError(String), // General storage operation error
     #[error("ZMQ error: {0}")]
     ZmqError(String), // General ZMQ error
+    #[error("Invalid Request: {0}")]
+    InvalidRequest(String),
     #[error("Timeout error: {0}")]
     TimeoutError(String),
     #[error("Daemon error: {0}")]

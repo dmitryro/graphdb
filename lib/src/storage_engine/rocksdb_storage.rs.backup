@@ -147,173 +147,15 @@ impl RocksDBStorage {
     pub async fn new(config: &RocksDBConfig, storage_config: &StorageConfig) -> GraphResult<Self> {
         let start = Instant::now();
         let port = config.port.unwrap_or(DEFAULT_STORAGE_PORT);
-
-        // ------------------------------------------------------------------
-        //  0.  make sure the config we pass around has the FINAL port
-        // ------------------------------------------------------------------
-        let mut final_config = config.clone();
-        final_config.port = Some(port);
-
         let base = storage_config.data_directory
                           .clone()
                           .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY));
         let db_path = base.join("rocksdb").join(port.to_string());
 
-        // === 1. Check global registry first ===
-        {
-            let registry = get_global_storage_registry().await;
-            let registry_guard = registry.read().await;
-            if registry_guard.contains_key(&port) {
-                info!("RocksDBStorage already initialized for port {} — reusing from global registry", port);
-                println!("===> REUSING RocksDBStorage FROM GLOBAL REGISTRY FOR PORT {}", port);
-                let pool_map = ROCKSDB_POOL_MAP.get_or_init(|| async {
-                    TokioMutex::new(HashMap::new())
-                }).await;
-                let pool_map_guard = timeout(TokioDuration::from_secs(5), pool_map.lock()).await?;
-                if let Some(pool) = pool_map_guard.get(&port) {
-                    let pool_guard = pool.lock().await;
-                    let daemon = pool_guard.daemons.values().next()
-                        .ok_or(GraphError::StorageError("No daemon in pool".into()))?;
-                    let db = daemon.db.clone();
-                    return Ok(Self {
-                        pool: pool.clone(),
-                        use_raft_for_scale: final_config.use_raft_for_scale,
-                        db,
-                        #[cfg(feature = "with-openraft-rocksdb")]
-                        raft: None,
-                    });
-                }
-            }
-        }
-
-        // 2. directories / lock
+        // 1. directories / lock
         fs::create_dir_all(&db_path).await?;
         Self::ensure_single_instance(&db_path).await?;
         Self::force_unlock(&db_path).await?;
-
-        // 3. pool singleton
-        let pool_map = ROCKSDB_POOL_MAP.get_or_init(|| async {
-            TokioMutex::new(HashMap::new())
-        }).await;
-        let pool = {
-            let mut g = timeout(TokioDuration::from_secs(5), pool_map.lock()).await?;
-            g.entry(port)
-             .or_insert_with(|| Arc::new(TokioMutex::new(RocksDBDaemonPool::new())))
-             .clone()
-        };
-
-        // 4. open the real DB
-        let mut opts = Options::default();
-        opts.create_if_missing(true);
-        opts.create_missing_column_families(true);
-        let db = Arc::new(DB::open_cf(&opts, &db_path,
-                                      &["default","vertices","edges","kv_pairs","indexes"])?);
-
-        // 5. create storage instance
-        let storage = Self {
-            pool: pool.clone(),
-            use_raft_for_scale: final_config.use_raft_for_scale,
-            db: db.clone(),
-            #[cfg(feature = "with-openraft-rocksdb")]
-            raft: None,
-        };
-
-        // 6. register storage **before** starting daemon
-        {
-            let reg = get_global_storage_registry().await;
-            reg.write().await.insert(port, Arc::new(storage.clone()) as Arc<dyn GraphStorageEngine + Send + Sync>);
-        }
-
-        // 7. start daemon cluster  (use the SAME config)
-        {
-            let mut g = timeout(TokioDuration::from_secs(10), pool.lock()).await?;
-            timeout(TokioDuration::from_secs(30),
-                    g.initialize_cluster(storage_config, &final_config, Some(port))).await??;
-        }
-
-        // 8. wait for IPC
-        let ipc = format!("/tmp/graphdb-{}.ipc", port);
-        for _ in 0..20 {
-            if Path::new(&ipc).exists() { break; }
-            tokio::time::sleep(TokioDuration::from_millis(250)).await;
-        }
-        if !Path::new(&ipc).exists() {
-            return Err(GraphError::StorageError("IPC not created".into()));
-        }
-
-        // 9. ZMQ client for singleton
-        let (client, socket) = RocksDBClient::connect_zmq_client(port).await?;
-
-        // 10. singleton
-        let single = ROCKSDB_DB.get_or_init(|| async {
-            let tmp = tempfile::tempdir().unwrap();
-            let mut o = Options::default();
-            o.create_if_missing(true);
-            let db = DB::open_cf(&o, tmp.path(), &["default"]).unwrap();
-            TokioMutex::new(RocksDBWithPath { db: Arc::new(db), path: db_path.clone(), client: None })
-        }).await;
-        single.lock().await.client = Some((client, socket));
-
-        // 11. daemon metadata
-        let daemon_reg = GLOBAL_DAEMON_REGISTRY.get().await;
-        let meta = DaemonMetadata {
-            service_type: "storage".into(),
-            ip_address: final_config.host.clone().unwrap_or_else(|| "127.0.0.1".into()),
-            data_dir: Some(db_path),
-            config_path: storage_config.config_root_directory.clone().map(PathBuf::from),
-            engine_type: Some("rocksdb".into()),
-            zmq_ready: true,
-            engine_synced: true,
-            last_seen_nanos: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64,
-            pid: std::process::id(),
-            port,
-        };
-        daemon_reg.register_daemon(meta).await?;
-
-        info!("RocksDBStorage initialised in {} ms", start.elapsed().as_millis());
-        Ok(storage)
-    }
-
-    pub async fn new_with_db(
-        config: &RocksDBConfig,
-        storage_config: &StorageConfig,
-        existing_db: Arc<DB>,
-    ) -> GraphResult<Self> {
-        let port = config.port.unwrap_or(DEFAULT_STORAGE_PORT);
-
-        // ------------------------------------------------------------------
-        //  0.  pin the port once and reuse the SAME config
-        // ------------------------------------------------------------------
-        let mut final_config = config.clone();
-        final_config.port = Some(port);
-
-        let base = storage_config.data_directory
-                          .clone()
-                          .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY));
-        let db_path = base.join("rocksdb").join(port.to_string());
-
-        // === 1. Check global registry first ===
-        {
-            let registry = get_global_storage_registry().await;
-            let registry_guard = registry.read().await;
-            if registry_guard.contains_key(&port) {
-                info!("RocksDBStorage already initialized for port {} — reusing from global registry", port);
-                println!("===> REUSING RocksDBStorage FROM GLOBAL REGISTRY FOR PORT {}", port);
-                let pool_map = ROCKSDB_POOL_MAP.get_or_init(|| async {
-                    TokioMutex::new(HashMap::new())
-                }).await;
-                let pool_map_guard = timeout(TokioDuration::from_secs(5), pool_map.lock()).await?;
-                if let Some(pool) = pool_map_guard.get(&port) {
-                    return Ok(Self {
-                        pool: pool.clone(),
-                        use_raft_for_scale: final_config.use_raft_for_scale,
-                        db: existing_db,
-                        #[cfg(feature = "with-openraft-rocksdb")]
-                        raft: None,
-                    });
-                }
-            }
-        }
 
         // 2. pool singleton
         let pool_map = ROCKSDB_POOL_MAP.get_or_init(|| async {
@@ -326,30 +168,31 @@ impl RocksDBStorage {
              .clone()
         };
 
-        // 3. create storage instance
-        let storage = Self {
+        // 3. open the real DB
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        let db = Arc::new(DB::open_cf(&opts, &db_path,
+                                      &["default","vertices","edges","kv_pairs","indexes"])?);
+
+        // 4. register storage **before** starting the daemon
+        let storage = Arc::new(Self {
             pool: pool.clone(),
-            use_raft_for_scale: final_config.use_raft_for_scale,
-            db: existing_db.clone(),
+            use_raft_for_scale: config.use_raft_for_scale,
+            db: db.clone(),
             #[cfg(feature = "with-openraft-rocksdb")]
             raft: None,
-        };
-
-        // 4. register storage **before** daemon
+        });
         {
             let reg = get_global_storage_registry().await;
-            reg.write().await.insert(port, Arc::new(storage.clone()) as Arc<dyn GraphStorageEngine + Send + Sync>);
+            reg.write().await.insert(port, storage.clone() as Arc<dyn GraphStorageEngine + Send + Sync>);
         }
 
-        // 5. start daemon  (use the SAME config)
-        let db_for_daemon = existing_db.clone();   // clone for the closure
+        // 5. start daemon cluster
         {
             let mut g = timeout(TokioDuration::from_secs(10), pool.lock()).await?;
-            timeout(
-                TokioDuration::from_secs(10),
-                g.initialize_cluster_with_db(storage_config, &final_config, Some(port), existing_db),
-            )
-            .await??;
+            timeout(TokioDuration::from_secs(30),
+                    g.initialize_cluster(storage_config, config, Some(port))).await??;
         }
 
         // 6. wait for IPC
@@ -362,13 +205,105 @@ impl RocksDBStorage {
             return Err(GraphError::StorageError("IPC not created".into()));
         }
 
-        // 7. ZMQ client
+        // 7. ZMQ client for singleton
         let (client, socket) = RocksDBClient::connect_zmq_client(port).await?;
 
-        // 8. singleton
+        // 8. store in singleton
+        let single = ROCKSDB_DB.get_or_init(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut o = Options::default();
+            o.create_if_missing(true);
+            let db = DB::open_cf(&o, tmp.path(), &["default"]).unwrap();
+            TokioMutex::new(RocksDBWithPath { db: Arc::new(db), path: db_path.clone(), client: None })
+        }).await;
+        single.lock().await.client = Some((client, socket));
+
+        // 9. daemon metadata
+        let daemon_reg = GLOBAL_DAEMON_REGISTRY.get().await;
+        let meta = DaemonMetadata {
+            service_type: "storage".into(),
+            ip_address: config.host.clone().unwrap_or_else(|| "127.0.0.1".into()),
+            data_dir: Some(db_path),
+            config_path: storage_config.config_root_directory.clone().map(PathBuf::from),
+            engine_type: Some("rocksdb".into()),
+            zmq_ready: true,
+            engine_synced: true,
+            last_seen_nanos: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64,
+            pid: std::process::id(),
+            port,
+        };
+        daemon_reg.register_daemon(meta).await?;
+
+        info!("RocksDBStorage initialised in {} ms", start.elapsed().as_millis());
+        Ok(Arc::try_unwrap(storage).unwrap())
+    }
+    
+    pub async fn new_with_db(
+        config: &RocksDBConfig,
+        storage_config: &StorageConfig,
+        existing_db: Arc<DB>,
+    ) -> GraphResult<Self> {
+        let port = config.port.unwrap_or(DEFAULT_STORAGE_PORT);
+        let base = storage_config
+            .data_directory
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIRECTORY));
+        let db_path = base.join("rocksdb").join(port.to_string());
+
+        // 1. pool singleton
+        let pool_map = ROCKSDB_POOL_MAP.get_or_init(|| async {
+            TokioMutex::new(HashMap::new())
+        }).await;
+        let pool = {
+            let mut g = timeout(TokioDuration::from_secs(5), pool_map.lock()).await?;
+            g.entry(port)
+             .or_insert_with(|| Arc::new(TokioMutex::new(RocksDBDaemonPool::new())))
+             .clone()
+        };
+
+        // 2. register storage **before** starting daemon
+        let storage = Arc::new(Self {
+            pool: pool.clone(),
+            use_raft_for_scale: config.use_raft_for_scale,
+            db: existing_db.clone(),
+            #[cfg(feature = "with-openraft-rocksdb")]
+            raft: None,
+        });
+        {
+            let reg = get_global_storage_registry().await;
+            reg.write().await.insert(port, storage.clone() as Arc<dyn GraphStorageEngine + Send + Sync>);
+        }
+
+        // 3. start daemon cluster with existing DB
+        let db_clone = existing_db.clone();          // extra clone for singleton closure
+        {
+            let mut g = timeout(TokioDuration::from_secs(10), pool.lock()).await?;
+            timeout(
+                TokioDuration::from_secs(10),
+                g.initialize_cluster_with_db(storage_config, config, Some(port), existing_db),
+            )
+            .await??;
+        }
+
+        // 4. wait for IPC
+        let ipc = format!("/tmp/graphdb-{}.ipc", port);
+        for _ in 0..20 {
+            if Path::new(&ipc).exists() {
+                break;
+            }
+            tokio::time::sleep(TokioDuration::from_millis(250)).await;
+        }
+        if !Path::new(&ipc).exists() {
+            return Err(GraphError::StorageError("IPC not created".into()));
+        }
+
+        // 5. ZMQ client
+        let (client, socket) = RocksDBClient::connect_zmq_client(port).await?;
+
+        // 6. singleton
         let single = ROCKSDB_DB.get_or_try_init(|| async move {
             Ok::<_, GraphError>(TokioMutex::new(RocksDBWithPath {
-                db: db_for_daemon,
+                db: db_clone,
                 path: db_path,
                 client: None,
             }))
@@ -376,7 +311,7 @@ impl RocksDBStorage {
         single.lock().await.client = Some((client, socket));
 
         info!("RocksDBStorage (with existing DB) initialised");
-        Ok(storage)
+        Ok(Arc::try_unwrap(storage).unwrap())
     }
 
     // Assuming other necessary imports like fs, PathBuf, log, GraphError, DaemonMetadata, etc. are defined earlier

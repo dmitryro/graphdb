@@ -28,13 +28,16 @@ pub use crate::config::{
     daemon_api_storage_engine_type_to_string,
 }; 
 use crate::storage_engine::rocksdb_client::{ZmqSocketWrapper};
-use crate::storage_engine::storage_engine::{GraphStorageEngine, ApplicationStateMachine as RocksDBStateMachine};
+use crate::storage_engine::storage_engine::{GraphStorageEngine, ApplicationStateMachine as RocksDBStateMachine, get_global_storage_registry};
 pub use crate::storage_engine::rocksdb_wal_manager::{ RocksDBWalManager, RocksDBWalOperation };
 use crate::storage_engine::storage_utils::{create_edge_key, deserialize_edge, deserialize_vertex, serialize_edge, serialize_vertex};
+use crate::query_parser::cypher_parser::execute_cypher_from_string;
+use crate::query_exec_engine::query_exec_engine::QueryExecEngine;
 use models::{Edge, Identifier, Vertex};
 use models::errors::{GraphError, GraphResult};
 use models::identifiers::SerializableUuid;
 use serde_json::{json, Value};
+use crate::database::Database;
 use crate::daemon::daemon_registry::{GLOBAL_DAEMON_REGISTRY, DaemonMetadata};
 use crate::daemon::db_daemon_registry::{GLOBAL_DB_DAEMON_REGISTRY, DBDaemonMetadata};
 use crate::daemon::daemon_management::{parse_cluster_range, find_pid_by_port,
@@ -60,6 +63,13 @@ use lazy_static::lazy_static;
 // Add these imports at the top of the file
 use bincode::{Encode, Decode};
 use bincode::config::standard;
+use indexing_service::fulltext::FullTextIndex;
+
+pub static FULLTEXT_INDEX: Lazy<Arc<FullTextIndex>> = Lazy::new(|| {
+    let index_dir = std::path::PathBuf::from("/opt/graphdb/indexes/fulltext");
+    std::fs::create_dir_all(&index_dir).expect("Failed to create fulltext index directory");
+    Arc::new(FullTextIndex::new(&index_dir).expect("Failed to initialize Tantivy full-text index"))
+});
 
 // The placeholder logic for BoundColumnFamily using raw pointers is removed 
 // because it causes E0423 due to the private fields of the tuple struct.
@@ -75,6 +85,9 @@ type StaticBoundColumnFamily = BoundColumnFamily<'static>;
 // Singleton to track active RocksDBDaemon instances and their database handles per port
 pub static ROCKSDB_DAEMON_REGISTRY: LazyLock<OnceCell<TokioMutex<HashMap<u16, (Arc<DB>, Arc<BoundColumnFamily<'static>>, Arc<BoundColumnFamily<'static>>, Arc<BoundColumnFamily<'static>>, u32)>>>> = 
     LazyLock::new(|| OnceCell::new());
+
+static PROCESSED_REQUESTS: Lazy<TokioMutex<HashSet<String>>> = 
+    Lazy::new(|| TokioMutex::new(HashSet::new()));
 
 // A static map to hold Semaphores for each RocksDB daemon port.
 // We use a Semaphore with 1 permit to act as a port-specific Mutex,
@@ -825,26 +838,22 @@ impl<'a> RocksDBDaemon<'a> {
         }
     }
 
-    /// Opens DB immediately under per-port lock, binds ZMQ in background — returns instantly
-    pub async fn new(
-        config: RocksDBConfig,
-    ) -> GraphResult<(RocksDBDaemon<'static>, mpsc::Receiver<()>)> {
+    /// Called when we are starting a fresh daemon – opens DB **once** under lock
+    pub async fn new(config: RocksDBConfig) -> GraphResult<(Self, mpsc::Receiver<()>)> {
         println!("===> RocksDBDaemon::new() CALLED");
-        let port = config.port.unwrap_or(DEFAULT_STORAGE_PORT);
+        let port = config.port.ok_or_else(|| {
+            GraphError::ConfigurationError("No port specified in RocksDBConfig".into())
+        })?;
+
         let _guard = get_rocksdb_daemon_port_lock(port).await;
         println!("===> ACQUIRED PER-PORT INIT LOCK FOR PORT {}", port);
-        let db_path = PathBuf::from(config.path.clone());
-        let db_path_clone = db_path.clone();
-        info!("Initializing RocksDBDaemon at {:?}", db_path);
-        println!("===> INITIALIZING ROCKSDB DAEMON AT {:?}", db_path);
-        tokio_fs::create_dir_all(&db_path)
-            .await
-            .map_err(|e| {
-                error!("Failed to create directory at {:?}: {}", db_path, e);
-                println!("===> ERROR: FAILED TO CREATE DIRECTORY AT {:?}: {}", db_path, e);
-                GraphError::StorageError(format!("Failed to create dir: {}", e))
-            })?;
 
+        let db_path = PathBuf::from(config.path.clone()).join(port.to_string());
+        tokio_fs::create_dir_all(&db_path).await.map_err(|e| {
+            GraphError::StorageError(format!("Failed to create directory: {}", e))
+        })?;
+
+        // Open DB **once** here — no second open in new_with_db
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
@@ -871,161 +880,155 @@ impl<'a> RocksDBDaemon<'a> {
                 .collect()
         };
 
-        let db = DB::open_cf_descriptors(&opts, &db_path, cf_descriptors)
-            .map_err(|e| GraphError::StorageError(format!("Failed to open DB with CFs: {}", e)))?;
-        let db = Arc::new(db);
+        let db = Arc::new(DB::open_cf_descriptors(&opts, &db_path, cf_descriptors)
+            .map_err(|e| GraphError::StorageError(format!("Failed to open DB with CFs: {}", e)))?);
 
-        // Correct: Arc<BoundColumnFamily<'static>>
+        // Reuse the same open DB — no temp, no double open
+        Self::new_with_db(config, db).await
+    }
+
+    /// Reused by `new()` and `initialize_cluster()` — receives **already opened** DB
+    pub async fn new_with_db(
+        config: RocksDBConfig,
+        existing_db: Arc<DB>,
+    ) -> GraphResult<(RocksDBDaemon<'static>, mpsc::Receiver<()>)> {
+        info!("RocksDBDaemon::new_with_db called – using supplied DB");
+        let port = config.port.ok_or_else(|| {
+            GraphError::ConfigurationError("No port specified in RocksDBConfig".into())
+        })?;
+
+        let db_path = PathBuf::from(config.path.clone()).join(port.to_string());
+
+
+        // Safe transmute with explicit types
         let kv_pairs: Arc<BoundColumnFamily<'static>> = unsafe {
-            std::mem::transmute(db.cf_handle("kv_pairs").ok_or_else(|| {
-                GraphError::StorageError("CF kv_pairs missing".into())
-            })?)
-        };
-        let vertices: Arc<BoundColumnFamily<'static>> = unsafe {
-            std::mem::transmute(db.cf_handle("vertices").ok_or_else(|| {
-                GraphError::StorageError("CF vertices missing".into())
-            })?)
-        };
-        let edges: Arc<BoundColumnFamily<'static>> = unsafe {
-            std::mem::transmute(db.cf_handle("edges").ok_or_else(|| {
-                GraphError::StorageError("CF edges missing".into())
-            })?)
+            std::mem::transmute(
+                existing_db.cf_handle("kv_pairs")
+                    .ok_or_else(|| GraphError::StorageError("CF kv_pairs missing".into()))?
+            )
         };
 
-        info!("ROCKSDB AND COLUMN FAMILIES SUCCESSFULLY OPENED AT {:?}", db_path);
-        println!("===> ROCKSDB AND COLUMN FAMILIES SUCCESSFULLY OPENED AT {:?}", db_path);
-        let canonical_path = db_path.parent().unwrap().to_path_buf();
+        let vertices: Arc<BoundColumnFamily<'static>> = unsafe {
+            std::mem::transmute(
+                existing_db.cf_handle("vertices")
+                    .ok_or_else(|| GraphError::StorageError("CF vertices missing".into()))?
+            )
+        };
+
+        let edges: Arc<BoundColumnFamily<'static>> = unsafe {
+            std::mem::transmute(
+                existing_db.cf_handle("edges")
+                    .ok_or_else(|| GraphError::StorageError("CF edges missing".into()))?
+            )
+        };
+
+        let cfs = (kv_pairs.clone(), vertices.clone(), edges.clone());
+
         let wal_manager = Arc::new(
-            RocksDBWalManager::new(canonical_path.clone(), port)
-                .await
-                .map_err(|e| GraphError::StorageError(format!("Failed to create RocksDB WAL manager: {}", e)))?
+            RocksDBWalManager::new(db_path.parent().unwrap().to_path_buf(), port).await?
         );
-        // REPLAY WAL ON STARTUP
-        RocksDBDaemon::replay_from_all_wals(&canonical_path, port, &db, &kv_pairs, &vertices, &edges).await?;
-        // ──────────────────────────────────────────────────────────────
-        // LEADER ELECTION ON STARTUP
-        // ──────────────────────────────────────────────────────────────
-        let _ = become_wal_leader(&canonical_path, port).await;
-        let (ready_tx, ready_rx) = mpsc::channel::<()>(1);
+
+
+        RocksDBDaemon::replay_from_all_wals(
+            &db_path.parent().unwrap().to_path_buf(),
+            port,
+            &existing_db,
+            &cfs.0,
+            &cfs.1,
+            &cfs.2,
+        ).await?;
+
+        let (ready_tx, mut ready_rx) = mpsc::channel(1);
         let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", port);
-        let ipc_path = endpoint.strip_prefix("ipc://").unwrap_or(&endpoint);
-        if Path::new(ipc_path).exists() {
-            let _ = tokio::fs::remove_file(ipc_path).await;
-            info!("Removed stale IPC socket at {}", ipc_path);
-            println!("===> REMOVED STALE IPC SOCKET AT {}", ipc_path);
-        }
-        let zmq_context = Arc::new(ZmqContext::new());
+
         let running = Arc::new(TokioMutex::new(true));
         let running_clone = running.clone();
-        let zmq_thread_handle = {
-            let zmq_context_thread = zmq_context.clone();
+
+        let zmq_thread = {
             let endpoint_thread = endpoint.clone();
-            let config_thread = config.clone();
-            let ready_tx = ready_tx.clone();
-            let db_path_thread = db_path.clone();
-            let db_clone = db.clone();
+            let ready_tx_thread = ready_tx.clone();
+            let db_clone = existing_db.clone();
             let kv_clone = kv_pairs.clone();
             let vert_clone = vertices.clone();
             let edge_clone = edges.clone();
-            let wal_manager_clone = wal_manager.clone();
-            let canonical_path_thread = canonical_path.clone();
+            let wal_clone = wal_manager.clone();
+            let db_path_clone = db_path.clone();
+
             std::thread::spawn(move || -> GraphResult<()> {
-                let rt = tokio::runtime::Runtime::new()
-                    .expect("Failed to create runtime for ZMQ thread");
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("ZMQ runtime");
+
                 rt.block_on(async {
-                    let socket_raw = zmq_context_thread
-                        .socket(REP)
-                        .map_err(|e| GraphError::StorageError(format!("ZMQ socket create failed: {}", e)))?;
+                    let _ = std::fs::remove_file(endpoint_thread.strip_prefix("ipc://").unwrap());
+
+                    let ctx = ZmqContext::new();
+                    let socket = ctx.socket(REP)?;
+
                     let mut bound = false;
-                    for i in 0..5 {
-                        match socket_raw.bind(&endpoint_thread) {
-                            Ok(_) => {
-                                bound = true;
-                                info!("ZMQ socket bound successfully on attempt {}", i + 1);
-                                println!("===> ZMQ SOCKET BOUND SUCCESSFULLY ON ATTEMPT {}", i + 1);
-                                break;
-                            }
-                            Err(e) => {
-                                warn!("ZMQ bind attempt {} failed: {}", i + 1, e);
-                                println!("===> WARNING: ZMQ BIND ATTEMPT {} FAILED: {}", i + 1, e);
-                                if i < 4 {
-                                    tokio::time::sleep(TokioDuration::from_millis(100 * (i + 1) as u64)).await;
-                                }
-                            }
+                    for i in 0..10 {
+                        if socket.bind(&endpoint_thread).is_ok() {
+                            bound = true;
+                            let _ = ready_tx_thread.try_send(());
+                            break;
                         }
+                        tokio::time::sleep(TokioDuration::from_millis(200 * (i + 1) as u64)).await;
                     }
-                    if bound {
-                        let _ = ready_tx.send(()).await;
-                    } else {
-                        let _ = ready_tx.send(()).await;
-                        return Err(GraphError::StorageError("ZMQ failed to bind after retries".to_string()));
+                    if !bound {
+                        return Err(GraphError::StorageError("ZMQ bind failed after retries".into()));
                     }
-                    info!("ZMQ server bound successfully at {}", endpoint_thread);
-                    println!("===> ZMQ SERVER BOUND SUCCESSFULLY AT {}", endpoint_thread);
-                    let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
-                    let metadata = DaemonMetadata {
+
+                    let registry = GLOBAL_DAEMON_REGISTRY.get().await;
+                    let meta = DaemonMetadata {
                         service_type: "storage".to_string(),
                         port,
                         pid: std::process::id(),
-                        ip_address: config_thread.host.clone().unwrap_or("127.0.0.1".to_string()),
-                        data_dir: Some(db_path_thread.clone()),
+                        ip_address: config.host.clone().unwrap_or("127.0.0.1".to_string()),
+                        data_dir: Some(db_path_clone.clone()),
                         config_path: None,
                         engine_type: Some("rocksdb".to_string()),
-                        last_seen_nanos: SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .map(|d| d.as_nanos() as i64)
-                            .unwrap_or(0),
+                        last_seen_nanos: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64,
                         zmq_ready: true,
                         engine_synced: true,
                     };
-                    if let Err(e) = daemon_registry.update_daemon_metadata(metadata).await {
-                        warn!("Failed to update daemon registry with zmq_ready=true: {}", e);
-                        println!("===> WARNING: FAILED TO UPDATE DAEMON REGISTRY WITH ZMQ_READY=TRUE: {}", e);
-                    } else {
-                        info!("Updated daemon registry: zmq_ready=true, engine_synced=true");
-                        println!("===> UPDATED DAEMON REGISTRY: ZMQ_READY=TRUE, ENGINE_SYNCED=TRUE");
-                    }
-                    let zmq_socket = Arc::new(TokioMutex::new(socket_raw));
-                    // START BACKGROUND SYNC
-                    RocksDBDaemon::start_background_wal_sync(
-                        port,
-                        wal_manager_clone.clone(),
-                        &canonical_path_thread,
-                        db_clone.clone(),
-                        kv_clone.clone(),
-                        vert_clone.clone(),
-                        edge_clone.clone(),
-                        running_clone.clone(),
-                    );
+                    let _ = registry.update_daemon_metadata(meta).await;
+
+                    let socket_arc = Arc::new(TokioMutex::new(socket));
                     RocksDBDaemon::run_zmq_server_lazy(
                         port,
-                        config_thread,
+                        config,
                         running_clone,
-                        zmq_socket,
+                        socket_arc,
                         endpoint_thread,
                         db_clone,
                         kv_clone,
                         vert_clone,
                         edge_clone,
-                        wal_manager_clone,
-                        db_path_thread,
+                        wal_clone,
+                        db_path_clone,
                     ).await
                 })
             })
         };
-        let (shutdown_tx, _) = mpsc::channel::<()>(1);
+
+        // Wait for ZMQ ready
+        ready_rx.recv().await.ok_or_else(|| {
+            GraphError::StorageError("ZMQ server failed to start".into())
+        })?;
+
         let daemon = RocksDBDaemon {
             port,
-            db_path: db_path_clone,
-            db,
+            db_path,
+            db: existing_db,
             kv_pairs,
             vertices,
             edges,
             wal_manager,
-            running: running.clone(),
-            shutdown_tx,
-            zmq_context: zmq_context.clone(),
-            zmq_thread: Arc::new(TokioMutex::new(Some(zmq_thread_handle))),
+            running,
+            shutdown_tx: mpsc::channel(1).0,
+            zmq_context: Arc::new(ZmqContext::new()),
+            zmq_thread: Arc::new(TokioMutex::new(Some(zmq_thread))),
             #[cfg(feature = "with-openraft-rocksdb")]
             raft: None,
             #[cfg(feature = "with-openraft-rocksdb")]
@@ -1033,218 +1036,11 @@ impl<'a> RocksDBDaemon<'a> {
             #[cfg(feature = "with-openraft-rocksdb")]
             node_id: port as u64,
         };
-        info!("RocksDBDaemon initialized on port {} (real DB in ZMQ thread)", port);
-        println!("===> ROCKSDB DAEMON INITIALIZED ON PORT {} (REAL DB IN ZMQ THREAD)", port);
-        Ok((daemon, ready_rx))
+
+        info!("RocksDBDaemon fully initialized on port {}", port);
+        Ok((daemon, mpsc::channel(1).1))
     }
 
-    /// Initializes a RocksDB daemon using an **already-opened** `rocksdb::DB`.
-    /// The DB must contain the three column families: `"kv_pairs"`, `"vertices"`, `"edges"`.
-    /// WAL replay is performed using the **same DB + CF handles** that the daemon will use.
-    pub async fn new_with_db(
-        config: RocksDBConfig,
-        existing_db: Arc<DB>,
-    ) -> GraphResult<(RocksDBDaemon<'static>, mpsc::Receiver<()>)> {
-        info!("RocksDBDaemon::new_with_db called – using supplied DB");
-        let config_port = config.port.unwrap_or(DEFAULT_STORAGE_PORT);
-        let global_registry = GLOBAL_DAEMON_REGISTRY.get().await;
-        let free_daemon_metadata = global_registry.find_free_storage_daemon().await?;
-        let port: u16 = if let Some(metadata) = free_daemon_metadata {
-            info!("Reusing uninitialized storage daemon port {} (registry).", metadata.port);
-            metadata.port
-        } else {
-            info!("Using config port {}.", config_port);
-            config_port
-        };
-        let base_db_path = PathBuf::from(config.path.clone());
-        let db_path = base_db_path.join(port.to_string());
-        info!("RocksDBDaemon using port {} at path {:?}", port, db_path);
-        let lock_path = db_path.join("LOCK");
-        if lock_path.exists() {
-            if let Ok(Some(metadata)) = GLOBAL_DAEMON_REGISTRY.find_daemon_by_port(port).await {
-                let system = System::new_with_specifics(
-                    RefreshKind::nothing().with_processes(ProcessRefreshKind::everything()),
-                );
-                if system.process(Pid::from_u32(metadata.pid)).is_none() {
-                    info!("Removing stale lock file at {:?}", lock_path);
-                    handle_rocksdb_op!(
-                        tokio::fs::remove_file(&lock_path).await,
-                        format!("Failed to remove stale lock file at {:?}", lock_path)
-                    )?;
-                }
-            }
-        }
-
-        // Correct: transmute raw handle to 'static
-        let kv_pairs: Arc<BoundColumnFamily<'static>> = unsafe {
-            std::mem::transmute(existing_db.cf_handle("kv_pairs").ok_or_else(|| {
-                GraphError::StorageError("CF kv_pairs missing".into())
-            })?)
-        };
-        let vertices: Arc<BoundColumnFamily<'static>> = unsafe {
-            std::mem::transmute(existing_db.cf_handle("vertices").ok_or_else(|| {
-                GraphError::StorageError("CF vertices missing".into())
-            })?)
-        };
-        let edges: Arc<BoundColumnFamily<'static>> = unsafe {
-            std::mem::transmute(existing_db.cf_handle("edges").ok_or_else(|| {
-                GraphError::StorageError("CF edges missing".into())
-            })?)
-        };
-
-        // === WAL MANAGER & REPLAY ===
-        let wal_manager = Arc::new(RocksDBWalManager::new(db_path.parent().unwrap().to_path_buf(), port).await
-            .map_err(|e| GraphError::StorageError(format!("Failed to create RocksDB WAL manager: {}", e)))?);
-        let canonical_path = db_path.parent().unwrap().to_path_buf();
-        RocksDBDaemon::replay_from_all_wals(&canonical_path, port, &existing_db, &kv_pairs, &vertices, &edges).await?;
-        let node_id = port as u64;
-        #[cfg(feature = "with-openraft-rocksdb")]
-        let (raft, raft_storage) = {
-            let raft_db_path = db_path.join("raft");
-            handle_rocksdb_op!(
-                tokio::fs::create_dir_all(&raft_db_path).await,
-                format!("Failed to create Raft DB directory at {:?}", raft_db_path)
-            )?;
-            let raft_storage = RocksDBRaftStorage::new(&raft_db_path).await?;
-            let raft_config = Arc::new(RaftConfig {
-                cluster_name: "graphdb-cluster".to_string(),
-                heartbeat_interval: 250,
-                election_timeout_min: 1000,
-                election_timeout_max: 2000,
-                ..Default::default()
-            });
-            let raft = Raft::new(
-                node_id,
-                raft_config,
-                Arc::new(raft_storage.clone()),
-                Arc::new(RaftTcpNetwork {}),
-            );
-            (Some(Arc::new(raft)), Some(Arc::new(raft_storage)))
-        };
-        #[cfg(not(feature = "with-openraft-rocksdb"))]
-        let (raft, raft_storage): (Option<Arc<Raft<TypeConfig>>>, Option<Arc<RocksDBRaftStorage>>) =
-            (None, None);
-        let (ready_tx, mut ready_rx) = mpsc::channel::<()>(1);
-        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
-        let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", port);
-        let ipc_path = endpoint.strip_prefix("ipc://").unwrap_or(&endpoint);
-        if Path::new(ipc_path).exists() {
-            warn!("Stale IPC socket at {}. Removing.", ipc_path);
-            let _ = tokio::fs::remove_file(ipc_path).await;
-        }
-        let running = Arc::new(TokioMutex::new(true));
-        let daemon = RocksDBDaemon {
-            port,
-            db_path: db_path.clone(),
-            db: existing_db.clone(),
-            kv_pairs: kv_pairs.clone(),
-            vertices: vertices.clone(),
-            edges: edges.clone(),
-            wal_manager: wal_manager.clone(),
-            running: running.clone(),
-            shutdown_tx: shutdown_tx.clone(),
-            zmq_context: Arc::new(ZmqContext::new()),
-            zmq_thread: Arc::new(TokioMutex::new(None)),
-            #[cfg(feature = "with-openraft-rocksdb")]
-            raft,
-            #[cfg(feature = "with-openraft-rocksdb")]
-            raft_storage,
-            #[cfg(feature = "with-openraft-rocksdb")]
-            node_id,
-        };
-        let initial_metadata = DaemonMetadata {
-            port,
-            service_type: "storage".to_string(),
-            ip_address: "127.0.0.1".to_string(),
-            config_path: Some(db_path.clone()),
-            data_dir: Some(db_path.clone()),
-            engine_type: Some(StorageEngineType::RocksDB.to_string()),
-            pid: std::process::id() as u32,
-            last_seen_nanos: SystemTime::now()
-                .duration_since(UNIX_EPOCH)?
-                .as_nanos() as i64,
-            zmq_ready: false,
-            engine_synced: true,
-        };
-        GLOBAL_DAEMON_REGISTRY
-            .register_daemon(initial_metadata.clone())
-            .await
-            .map_err(|e| GraphError::StorageError(format!("Failed to register daemon on port {}: {}", port, e)))?;
-        let zmq_context_thread = daemon.zmq_context.clone();
-        let endpoint_thread = endpoint.clone();
-        let config_thread = config.clone();
-        let ready_tx_thread = ready_tx.clone();
-        let db_path_thread = db_path.clone();
-        let db_clone = existing_db.clone();
-        let kv_clone = kv_pairs.clone();
-        let vert_clone = vertices.clone();
-        let edge_clone = edges.clone();
-        let running_clone = running.clone();
-        let wal_manager_clone = wal_manager.clone();
-        let zmq_thread_handle = std::thread::spawn(move || -> GraphResult<()> {
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(async {
-                let socket_raw = zmq_context_thread.socket(REP).map_err(|e| {
-                    GraphError::StorageError(format!("Failed to create ZMQ REP socket: {}", e))
-                })?;
-                let mut bound = false;
-                for i in 0..5 {
-                    match socket_raw.bind(&endpoint_thread) {
-                        Ok(()) => {
-                            bound = true;
-                            info!("ZMQ bound on attempt {}", i + 1);
-                            break;
-                        }
-                        Err(e) => {
-                            warn!("ZMQ bind attempt {} failed: {}", i + 1, e);
-                            if i < 4 {
-                                tokio::time::sleep(TokioDuration::from_millis(100 * (i + 1) as u64)).await;
-                            }
-                        }
-                    }
-                }
-                let _ = ready_tx_thread.send(()).await;
-                if !bound {
-                    return Err(GraphError::StorageError("ZMQ failed to bind after retries".into()));
-                }
-                let metadata = DaemonMetadata {
-                    zmq_ready: true,
-                    ..initial_metadata
-                };
-                let _ = GLOBAL_DAEMON_REGISTRY.get().await.update_daemon_metadata(metadata).await;
-                let zmq_socket = Arc::new(TokioMutex::new(socket_raw));
-                RocksDBDaemon::run_zmq_server_lazy(
-                    port,
-                    config_thread,
-                    running_clone,
-                    zmq_socket,
-                    endpoint_thread,
-                    db_clone,
-                    kv_clone,
-                    vert_clone,
-                    edge_clone,
-                    wal_manager_clone,
-                    db_path_thread,
-                )
-                .await
-            })
-        });
-        *daemon.zmq_thread.lock().await = Some(zmq_thread_handle);
-        info!("Waiting for ZMQ readiness on port {}...", port);
-        match tokio::time::timeout(TokioDuration::from_secs(10), ready_rx.recv()).await {
-            Ok(Some(_)) => {
-                info!("ZMQ readiness confirmed on port {}", port);
-            }
-            Ok(None) => {
-                warn!("ZMQ readiness channel closed on port {}", port);
-            }
-            Err(_) => {
-                warn!("ZMQ readiness timeout on port {}", port);
-            }
-        }
-        info!("RocksDB daemon fully initialized on port {}", port);
-        Ok((daemon, shutdown_rx))
-    }
 
     /* -------------------------------------------------------------
         new_with_client — CLIENT MODE (READ-ONLY)
@@ -1338,8 +1134,6 @@ impl<'a> RocksDBDaemon<'a> {
         Ok(daemon)
     }
 
-    /// ZMQ server – DB is already opened in `RocksDBDaemon::new()`
-    /// All original commands are preserved.
     async fn run_zmq_server_lazy(
         port: u16,
         _config: RocksDBConfig,
@@ -1356,17 +1150,21 @@ impl<'a> RocksDBDaemon<'a> {
         info!("===> STARTING ZMQ SERVER FOR PORT {} (DB ALREADY OPEN)", port);
         println!("===> STARTING ZMQ SERVER FOR PORT {} (DB ALREADY OPEN)", port);
 
-        let mut socket = zmq_socket.lock().await;
-        socket.set_linger(1000)?;
-        socket.set_rcvtimeo(SOCKET_TIMEOUT_MS)?;
-        socket.set_sndtimeo(SOCKET_TIMEOUT_MS)?;
-        socket.set_maxmsgsize(MAX_MESSAGE_SIZE as i64)?;
-        drop(socket);
+        // Configure socket once
+        {
+            let mut socket = zmq_socket.lock().await;
+            socket.set_linger(1000)?;
+            socket.set_rcvtimeo(SOCKET_TIMEOUT_MS)?;
+            socket.set_sndtimeo(SOCKET_TIMEOUT_MS)?;
+            socket.set_maxmsgsize(MAX_MESSAGE_SIZE as i64)?;
+            drop(socket);
+        }
 
         info!("ZeroMQ server configured for port {}", port);
         println!("===> ZEROMQ SERVER CONFIGURED FOR PORT {}", port);
 
         let mut consecutive_errors = 0;
+
         while *running.lock().await {
             let msg_result = {
                 let s = zmq_socket.lock().await;
@@ -1415,269 +1213,369 @@ impl<'a> RocksDBDaemon<'a> {
                 }
             };
 
-            let command = request.get("command").and_then(|c| c.as_str());
+            let request_id = request
+                .get("request_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-            macro_rules! send_resp {
-                ($resp:expr) => {{
+            {
+                let mut processed = PROCESSED_REQUESTS.lock().await;
+                if processed.contains(&request_id) {
+                    debug!("Duplicate request_id {} on port {} – skipping", request_id, port);
+                    let resp = json!({"status": "success", "note": "idempotent", "request_id": request_id});
                     let s = zmq_socket.lock().await;
-                    Self::send_zmq_response_static(&s, &$resp, port).await?;
+                    Self::send_zmq_response_static(&s, &resp, port).await?;
                     continue;
-                }};
+                }
+                processed.insert(request_id.clone());
             }
 
-            let response = match command {
-                Some("initialize") => json!({
-                    "status": "success",
-                    "message": "ZMQ server is bound and DB is open.",
-                    "port": port,
-                    "ipc_path": &endpoint
-                }),
-
-                Some("status") => json!({"status":"success","port":port,"db_open":true}),
-
-                Some("ping") => json!({
-                    "status": "pong",
-                    "message": "ZMQ server is bound and DB is open.",
-                    "port": port,
-                    "ipc_path": &endpoint,
-                    "db_open":true
-                }),
-
-                Some("force_unlock") => match Self::force_unlock_static(&db_path).await {
-                    Ok(_) => json!({"status":"success"}),
-                    Err(e) => json!({"status":"error","message":e.to_string()}),
-                },
-
-                // ──────────────────────────────────────────────────────────────
-                // MUTATING COMMANDS – WAL + LEADER ELECTION + FORWARDING
-                // ──────────────────────────────────────────────────────────────
-                Some(cmd) if [
-                    "set_key","delete_key",
-                    "create_vertex","update_vertex","delete_vertex",
-                    "create_edge","update_edge","delete_edge",
-                    "flush"
-                ].contains(&cmd) => {
-                    let canonical = db_path.parent().unwrap().to_path_buf();
-                    let is_leader = become_wal_leader(&canonical, port).await
-                        .map_err(|e| GraphError::StorageError(e.to_string()))?;
-                    println!("====> IN run_zmq_server_lazy - command {:?}", cmd);
-                    if is_leader {
-                        // ---------- BUILD WAL OPERATION ----------
-                        let op = match cmd {
-                            "set_key" => {
-                                let cf = request["cf"].as_str().unwrap_or("kv_pairs").to_string();
-                                let key = request["key"]
-                                    .as_str()
-                                    .ok_or_else(|| GraphError::StorageError("missing key".into()))?
-                                    .as_bytes()
-                                    .to_vec();
-                                let value = request["value"]
-                                    .as_str()
-                                    .ok_or_else(|| GraphError::StorageError("missing value".into()))?
-                                    .as_bytes()
-                                    .to_vec();
-                                RocksDBWalOperation::Put { cf, key, value }
-                            }
-                            "delete_key" => {
-                                let cf = request["cf"].as_str().unwrap_or("kv_pairs").to_string();
-                                let key = request["key"]
-                                    .as_str()
-                                    .ok_or_else(|| GraphError::StorageError("missing key".into()))?
-                                    .as_bytes()
-                                    .to_vec();
-                                RocksDBWalOperation::Delete { cf, key }
-                            }
-
-                            // ---------- VERTEX ----------
-                            "create_vertex" | "update_vertex" => {
-                                let vertex: Vertex = serde_json::from_value(request["vertex"].clone())
-                                    .map_err(|e| GraphError::StorageError(format!("Invalid vertex: {}", e)))?;
-                                let key = vertex.id.as_bytes().to_vec();
-                                let value = serialize_vertex(&vertex)?;
-                                RocksDBWalOperation::Put {
-                                    cf: "vertices".to_string(),
-                                    key,
-                                    value,
-                                }
-                            }
-                            "delete_vertex" => {
-                                let id: Identifier = serde_json::from_value(request["id"].clone())
-                                    .map_err(|e| GraphError::StorageError(format!("Invalid id: {}", e)))?;
-                                let uuid = SerializableUuid::from(id.as_ref())?;
-                                RocksDBWalOperation::Delete {
-                                    cf: "vertices".to_string(),
-                                    key: uuid.as_bytes().to_vec(),
-                                }
-                            }
-
-                            // ---------- EDGE ----------
-                            "create_edge" | "update_edge" => {
-                                let edge: Edge = serde_json::from_value(request["edge"].clone())
-                                    .map_err(|e| GraphError::StorageError(format!("Invalid edge: {}", e)))?;
-                                let key = create_edge_key(&edge.outbound_id, &edge.edge_type, &edge.inbound_id)?;
-                                let value = serialize_edge(&edge)?;
-                                RocksDBWalOperation::Put {
-                                    cf: "edges".to_string(),
-                                    key,
-                                    value,
-                                }
-                            }
-                            "delete_edge" => {
-                                let from: Identifier = serde_json::from_value(request["from"].clone())
-                                    .map_err(|e| GraphError::StorageError(format!("Invalid from: {}", e)))?;
-                                let to: Identifier = serde_json::from_value(request["to"].clone())
-                                    .map_err(|e| GraphError::StorageError(format!("Invalid to: {}", e)))?;
-                                let t: Identifier = serde_json::from_value(request["type"].clone())
-                                    .map_err(|e| GraphError::StorageError(format!("Invalid type: {}", e)))?;
-                                let from_uuid = SerializableUuid::from(from.as_ref())?;
-                                let to_uuid   = SerializableUuid::from(to.as_ref())?;
-                                let key = create_edge_key(&from_uuid, &t, &to_uuid)?;
-                                RocksDBWalOperation::Delete {
-                                    cf: "edges".to_string(),
-                                    key,
-                                }
-                            }
-
-                            "flush" => {
-                                let cf = request["cf"].as_str().unwrap_or("default").to_string();
-                                RocksDBWalOperation::Flush { cf }
-                            }
-                            _ => unreachable!(),
-                        };
-
-                        // ---------- APPLY ----------
-                        let lsn = wal_manager.append(&op).await
-                            .map_err(|e| GraphError::StorageError(e.to_string()))?;
-                        let cfs = (kv_pairs.clone(), vertices.clone(), edges.clone());
-                        RocksDBDaemon::apply_op_locally(&db, &cfs, &op).await
-                            .map_err(|e| GraphError::StorageError(e.to_string()))?;
-
-                        let offset_key = format!("__wal_offset_port_{}", port);
-                        db.put(offset_key.as_bytes(), lsn.to_string().as_bytes())?;
-                        db.flush()?;
-
-                        json!({"status":"success", "offset": lsn, "leader": true})
-                    } else {
-                        // ---------- FORWARD TO LEADER ----------
-                        let leader_port = match get_leader_port(&canonical).await {
-                            Ok(Some(p)) => p,
-                            Ok(None) => {
-                                send_resp!(json!({"status":"error","message":"No leader found"}));
-                                continue;
-                            }
-                            Err(e) => {
-                                send_resp!(json!({"status":"error","message":format!("Leader lookup failed: {}", e)}));
-                                continue;
-                            }
-                        };
-                        if leader_port == 0 {
-                            send_resp!(json!({"status":"error","message":"Leader election in progress"}));
-                            continue;
-                        }
-
-                        let context = zmq::Context::new();
-                        let client = context.socket(zmq::REQ)
-                            .map_err(|e| GraphError::StorageError(format!("ZMQ socket error: {}", e)))?;
-                        client.connect(&format!("ipc:///tmp/graphdb-{}.ipc", leader_port))
-                            .map_err(|_| GraphError::StorageError(format!("Failed to connect to leader {}", leader_port)))?;
-                        client.set_sndtimeo(5000).ok();
-                        client.set_rcvtimeo(5000).ok();
-
-                        let mut forward_req = request.clone();
-                        forward_req["forwarded_from"] = json!(port);
-                        forward_req["command"] = json!(cmd);
-                        let payload = serde_json::to_vec(&forward_req)
-                            .map_err(|e| GraphError::StorageError(format!("JSON serialize error: {}", e)))?;
-
-                        client.send(&payload, 0)
-                            .map_err(|_| GraphError::StorageError("ZMQ send failed".into()))?;
-                        let resp_msg = client.recv_bytes(0)
-                            .map_err(|e| GraphError::StorageError(format!("ZMQ recv error: {}", e)))?;
-                        let resp: Value = serde_json::from_slice(&resp_msg)
-                            .map_err(|e| GraphError::StorageError(format!("Leader response parse error: {}", e)))?;
-
-                        info!("Forwarded write to leader port {} to {:?}", leader_port, resp);
-                        resp
+            // ------------------------------------------------------------------
+            //  Helper: grab storage or send error response and continue
+            // ------------------------------------------------------------------
+            let storage = {
+                let reg = get_global_storage_registry().await;
+                let g   = reg.read().await;
+                match g.get(&port).cloned() {
+                    Some(s) => s,
+                    None    => {
+                        let resp = json!({"status":"error","message":"Storage not registered","request_id": request_id});
+                        let s = zmq_socket.lock().await;
+                        Self::send_zmq_response_static(&s, &resp, port).await?;
+                        continue;
                     }
                 }
+            };
 
-                // ──────────────────────────────────────────────────────────────
-                // READ-ONLY COMMANDS (delegated)
-                // ──────────────────────────────────────────────────────────────
-                Some(cmd) if [
-                    "get_key",
-                    "get_vertex","get_edge",
-                    "get_all_vertices","get_all_edges",
-                    "get_all_vertices_by_type","get_all_edges_by_type"
-                ].contains(&cmd) => {
-                    match Self::execute_db_command(
-                        cmd,
-                        &request,
-                        &db,
-                        &kv_pairs,
-                        &vertices,
-                        &edges,
-                        port,
-                        &db_path,
-                        &endpoint,
-                    ).await {
-                        Ok(r) => r,
-                        Err(e) => json!({"status":"error","message":e.to_string()}),
-                    }
+            let command = request.get("command").and_then(|c| c.as_str());
+
+            let response = if let Some(cypher) = request.get("query").and_then(|q| q.as_str()) {
+                info!("Executing Cypher query via ZMQ: {}", cypher);
+                match crate::query_parser::cypher_parser::execute_cypher_from_string(cypher, storage).await {
+                    Ok(result) => json!({"status": "success", "data": result, "request_id": request_id}),
+                    Err(e)      => json!({"status": "error",   "message": e.to_string(), "request_id": request_id}),
                 }
+            } else if let Some(cmd) = command {
+                match cmd {
+                    "initialize" => json!({
+                        "status": "success",
+                        "message": "ZMQ server is bound and DB is open.",
+                        "port": port,
+                        "ipc_path": &endpoint,
+                        "request_id": request_id
+                    }),
+                    "status" => json!({"status":"success","port":port,"db_open":true,"request_id": request_id}),
+                    "ping" => json!({
+                        "status": "pong",
+                        "message": "ZMQ server is bound and DB is open.",
+                        "port": port,
+                        "ipc_path": &endpoint,
+                        "db_open":true,
+                        "request_id": request_id
+                    }),
+                    "force_unlock" => match Self::force_unlock_static(&db_path).await {
+                        Ok(_) => json!({"status":"success","request_id": request_id}),
+                        Err(e)=> json!({"status":"error","message":e.to_string(),"request_id": request_id}),
+                    },
 
-                // ──────────────────────────────────────────────────────────────
-                // DATA CLEAR / RESET
-                // ──────────────────────────────────────────────────────────────
-                Some("clear_data") | Some("force_reset") => {
-                    match Self::execute_db_command(
-                        command.unwrap(),
-                        &request,
-                        &db,
-                        &kv_pairs,
-                        &vertices,
-                        &edges,
-                        port,
-                        &db_path,
-                        &endpoint,
-                    ).await {
-                        Ok(r) => r,
-                        Err(e) => json!({"status":"error","message":e.to_string()}),
-                    }
-                }
-
-                Some("force_ipc_init") => {
-                    info!("Received force_ipc_init command for port {}", port);
-                    println!("===> FORCING IPC INITIALIZATION FOR PORT {}", port);
-                    let ipc_path = format!("/tmp/graphdb-{}.ipc", port);
-                    match tokio::fs::metadata(&ipc_path).await {
-                        Ok(_) => json!({
-                            "status": "success",
-                            "message": "IPC socket already exists",
-                            "ipc_path": &ipc_path
-                        }),
-                        Err(_) => {
-                            error!(
-                                "IPC socket missing at {} even though ZMQ server is running",
-                                ipc_path
-                            );
-                            json!({
-                                "status": "error",
-                                "message": "IPC socket missing - server restart required",
-                                "ipc_path": &ipc_path
-                            })
+                    // --- INDEX COMMANDS ------------------------------------------------
+                    "index_create" => {
+                        let label    = request["label"].as_str().unwrap_or("");
+                        let property = request["property"].as_str().unwrap_or("");
+                        if label.is_empty() || property.is_empty() {
+                            json!({"status":"error","message":"missing label or property","request_id": request_id})
+                        } else {
+                            match storage.create_index(label, property).await {
+                                Ok(_)  => json!({"status": "success", "message": format!("Index created on {}.{}", label, property), "request_id": request_id}),
+                                Err(e) => json!({"status":"error","message":e.to_string(),"request_id": request_id})
+                            }
                         }
                     }
-                }
+                    "index_drop" => {
+                        let label    = request["label"].as_str().unwrap_or("");
+                        let property = request["property"].as_str().unwrap_or("");
+                        if label.is_empty() || property.is_empty() {
+                            json!({"status":"error","message":"missing label or property","request_id": request_id})
+                        } else {
+                            match storage.drop_index(label, property).await {
+                                Ok(_)  => json!({"status": "success", "message": format!("Index dropped on {}.{}", label, property), "request_id": request_id}),
+                                Err(e) => json!({"status":"error","message":e.to_string(),"request_id": request_id})
+                            }
+                        }
+                    }
+                    "index_list" => {
+                        match storage.list_indexes().await {
+                            Ok(indexes) => json!({"status": "success", "indexes": indexes, "request_id": request_id}),
+                            Err(e)      => json!({"status":"error","message":e.to_string(),"request_id": request_id})
+                        }
+                    }
 
-                Some(cmd) => {
-                    error!("Unsupported command: {}", cmd);
-                    json!({"status":"error","message":format!("Unsupported command: {}",cmd)})
+                    // --- FULLTEXT SEARCH -----------------------------------------------
+                    "fulltext_search" => {
+                        let query = request["query"].as_str().unwrap_or("");
+                        let limit = request["limit"].as_u64().unwrap_or(10) as usize;
+                        if query.is_empty() {
+                            json!({"status":"error","message":"missing query","request_id": request_id})
+                        } else {
+                            match FULLTEXT_INDEX.search(query, limit) {
+                                Ok(results) => {
+                                    let formatted = results.into_iter()
+                                        .map(|(id, content)| json!({"id": id, "content": content, "score": 1.0}))
+                                        .collect::<Vec<_>>();
+                                    json!({"status": "success", "results": formatted, "request_id": request_id})
+                                }
+                                Err(e) => json!({"status":"error","message":e.to_string(),"request_id": request_id})
+                            }
+                        }
+                    }
+                    "fulltext_rebuild" => {
+                        tokio::spawn({
+                            let idx = FULLTEXT_INDEX.clone();
+                            async move { let _ = idx.commit().await; }
+                        });
+                        json!({"status": "success", "message": "Full-text index rebuild started", "request_id": request_id})
+                    }
+
+                    // --- MUTATING COMMANDS (WAL + LEADER) ------------------------------
+                    cmd if [
+                        "set_key","delete_key",
+                        "create_vertex","update_vertex","delete_vertex",
+                        "create_edge","update_edge","delete_edge",
+                        "flush"
+                    ].contains(&cmd) =>
+                    {
+                        let canonical = db_path.parent().unwrap().to_path_buf();
+                        let is_leader = become_wal_leader(&canonical, port).await
+                            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+                        println!("====> IN run_zmq_server_lazy - command {:?}, is_leader: {}", cmd, is_leader);
+
+                        if is_leader {
+                            let op = match cmd {
+                                "set_key" => {
+                                    let cf = request["cf"].as_str().unwrap_or("kv_pairs").to_string();
+                                    let key = request["key"]
+                                        .as_str()
+                                        .ok_or_else(|| GraphError::StorageError("missing key".into()))?
+                                        .as_bytes()
+                                        .to_vec();
+                                    let value = request["value"]
+                                        .as_str()
+                                        .ok_or_else(|| GraphError::StorageError("missing value".into()))?
+                                        .as_bytes()
+                                        .to_vec();
+                                    RocksDBWalOperation::Put { cf, key, value }
+                                }
+                                "delete_key" => {
+                                    let cf = request["cf"].as_str().unwrap_or("kv_pairs").to_string();
+                                    let key = request["key"]
+                                        .as_str()
+                                        .ok_or_else(|| GraphError::StorageError("missing key".into()))?
+                                        .as_bytes()
+                                        .to_vec();
+                                    RocksDBWalOperation::Delete { cf, key }
+                                }
+                                "create_vertex" | "update_vertex" => {
+                                    let vertex: Vertex = serde_json::from_value(request["vertex"].clone())
+                                        .map_err(|e| GraphError::StorageError(format!("Invalid vertex: {}", e)))?;
+                                    let key = vertex.id.as_bytes().to_vec();
+                                    let value = serialize_vertex(&vertex)?;
+                                    RocksDBWalOperation::Put { cf: "vertices".to_string(), key, value }
+                                }
+                                "delete_vertex" => {
+                                    let id: Identifier = serde_json::from_value(request["id"].clone())
+                                        .map_err(|e| GraphError::StorageError(format!("Invalid id: {}", e)))?;
+                                    let uuid = SerializableUuid::from(id.as_ref())?;
+                                    RocksDBWalOperation::Delete { cf: "vertices".to_string(), key: uuid.as_bytes().to_vec() }
+                                }
+                                "create_edge" | "update_edge" => {
+                                    let edge: Edge = serde_json::from_value(request["edge"].clone())
+                                        .map_err(|e| GraphError::StorageError(format!("Invalid edge: {}", e)))?;
+                                    let key = create_edge_key(&edge.outbound_id, &edge.edge_type, &edge.inbound_id)?;
+                                    let value = serialize_edge(&edge)?;
+                                    RocksDBWalOperation::Put { cf: "edges".to_string(), key, value }
+                                }
+                                "delete_edge" => {
+                                    let from: Identifier = serde_json::from_value(request["from"].clone())
+                                        .map_err(|e| GraphError::StorageError(format!("Invalid from: {}", e)))?;
+                                    let to: Identifier = serde_json::from_value(request["to"].clone())
+                                        .map_err(|e| GraphError::StorageError(format!("Invalid to: {}", e)))?;
+                                    let t: Identifier = serde_json::from_value(request["type"].clone())
+                                        .map_err(|e| GraphError::StorageError(format!("Invalid type: {}", e)))?;
+                                    let from_uuid = SerializableUuid::from(from.as_ref())?;
+                                    let to_uuid   = SerializableUuid::from(to.as_ref())?;
+                                    let key = create_edge_key(&from_uuid, &t, &to_uuid)?;
+                                    RocksDBWalOperation::Delete { cf: "edges".to_string(), key }
+                                }
+                                "flush" => {
+                                    let cf = request["cf"].as_str().unwrap_or("default").to_string();
+                                    RocksDBWalOperation::Flush { cf }
+                                }
+                                _ => unreachable!(),
+                            };
+                            let lsn = wal_manager.append(&op).await
+                                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+                            let cfs = (kv_pairs.clone(), vertices.clone(), edges.clone());
+                            RocksDBDaemon::apply_op_locally(&db, &cfs, &op).await
+                                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+                            let offset_key = format!("__wal_offset_port_{}", port);
+                            db.put(offset_key.as_bytes(), lsn.to_string().as_bytes())?;
+                            db.flush()?;
+                            json!({"status":"success", "offset": lsn, "leader": true, "request_id": request_id})
+                        } else {
+                            // ---- FOLLOWER: forward to leader ----
+                          
+                            // ---- FOLLOWER: forward to leader ----
+                            let canonical = db_path.parent().unwrap().to_path_buf();
+                            let leader_port: u16 = match get_leader_port(&canonical).await {
+                                Ok(Some(p)) => p,
+                                Ok(None) => {
+                                    // send error response and keep going
+                                    let resp = json!({"status":"error","message":"No leader found","request_id": request_id});
+                                    let socket = zmq_socket.lock().await;
+                                    let _ = Self::send_zmq_response_static(&socket, &resp, port).await;
+                                    continue;                       // <-- skip to next message
+                                }
+                                Err(e) => {
+                                    let resp = json!({"status":"error","message":format!("Leader lookup failed: {}", e),"request_id": request_id});
+                                    let socket = zmq_socket.lock().await;
+                                    let _ = Self::send_zmq_response_static(&socket, &resp, port).await;
+                                    continue;                       // <-- skip to next message
+                                }
+                            };
+
+                            if leader_port == 0 {
+                                json!({"status":"error","message":"Leader election in progress","request_id": request_id})
+                            } else {
+                                let context = zmq::Context::new();
+                                let client = match context.socket(zmq::REQ) {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        // send error response and skip to next message
+                                        let resp = json!({"status":"error","message":format!("ZMQ socket error: {}", e),"request_id": request_id});
+                                        let socket = zmq_socket.lock().await;
+                                        let _ = Self::send_zmq_response_static(&socket, &resp, port).await;
+                                        continue;
+                                    }
+                                };
+                                if client.connect(&format!("ipc:///tmp/graphdb-{}.ipc", leader_port)).is_err() {
+                                    let resp = json!({"status":"error","message":format!("Failed to connect to leader {}", leader_port),"request_id": request_id});
+                                    let socket = zmq_socket.lock().await;
+                                    let _ = Self::send_zmq_response_static(&socket, &resp, port).await;
+                                    continue;
+                                }
+                                client.set_sndtimeo(5000).ok();
+                                client.set_rcvtimeo(5000).ok();
+
+                                let mut forward_req = request.clone();
+                                forward_req["forwarded_from"] = json!(port);
+                                forward_req["command"] = json!(cmd);
+                                forward_req["request_id"] = json!(request_id);
+                                let payload = match serde_json::to_vec(&forward_req) {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        let resp = json!({"status":"error","message":format!("JSON serialize error: {}", e),"request_id": request_id});
+                                        let socket = zmq_socket.lock().await;
+                                        let _ = Self::send_zmq_response_static(&socket, &resp, port).await;
+                                        continue;
+                                    }
+                                };
+                                if client.send(&payload, 0).is_err() {
+                                    let resp = json!({"status":"error","message":"ZMQ send failed","request_id": request_id});
+                                    let socket = zmq_socket.lock().await;
+                                    let _ = Self::send_zmq_response_static(&socket, &resp, port).await;
+                                    continue;
+                                }
+
+                                let resp_msg: Vec<u8> = match client.recv_bytes(0) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        let resp = json!({"status":"error","message":format!("ZMQ recv error: {}", e),"request_id": request_id});
+                                        let socket = zmq_socket.lock().await;
+                                        let _ = Self::send_zmq_response_static(&socket, &resp, port).await;
+                                        continue;
+                                    }
+                                };
+                                let resp: Value = match serde_json::from_slice(&resp_msg) {
+                                    Ok(v) => v,
+                                    Err(e) => json!({"status":"error","message":format!("Leader response parse error: {}", e),"request_id": request_id}),
+                                };
+                                info!("Forwarded write to leader port {} to {:?}", leader_port, resp);
+                                resp
+                            }
+                        }
+                    }
+
+                    // --- READ-ONLY COMMANDS ------------------------------------------
+                    cmd if [
+                        "get_key","get_vertex","get_edge",
+                        "get_all_vertices","get_all_edges",
+                        "get_all_vertices_by_type","get_all_edges_by_type"
+                    ].contains(&cmd) =>
+                    {
+                        match Self::execute_db_command(
+                            cmd,
+                            &request,
+                            &db,
+                            &kv_pairs,
+                            &vertices,
+                            &edges,
+                            port,
+                            &db_path,
+                            &endpoint,
+                        ).await {
+                            Ok(r) => r,
+                            Err(e) => json!({"status":"error","message":e.to_string()}),
+                        }
+                    }
+                    "clear_data" | "force_reset" => {
+                        match Self::execute_db_command(
+                            cmd,
+                            &request,
+                            &db,
+                            &kv_pairs,
+                            &vertices,
+                            &edges,
+                            port,
+                            &db_path,
+                            &endpoint,
+                        ).await {
+                            Ok(r) => r,
+                            Err(e) => json!({"status":"error","message":e.to_string()}),
+                        }
+                    }
+                    "force_ipc_init" => {
+                        info!("Received force_ipc_init command for port {}", port);
+                        println!("===> FORCING IPC INITIALIZATION FOR PORT {}", port);
+                        let ipc_path = format!("/tmp/graphdb-{}.ipc", port);
+                        match tokio::fs::metadata(&ipc_path).await {
+                            Ok(_) => json!({
+                                "status": "success",
+                                "message": "IPC socket already exists",
+                                "ipc_path": &ipc_path,
+                                "request_id": request_id
+                            }),
+                            Err(_) => {
+                                error!(
+                                    "IPC socket missing at {} even though ZMQ server is running",
+                                    ipc_path
+                                );
+                                json!({
+                                    "status": "error",
+                                    "message": "IPC socket missing - server restart required",
+                                    "ipc_path": &ipc_path,
+                                    "request_id": request_id
+                                })
+                            }
+                        }
+                    }
+                    cmd => {
+                        error!("Unsupported command: {}", cmd);
+                        json!({"status":"error","message":format!("Unsupported command: {}",cmd),"request_id": request_id})
+                    }
                 }
-                None => {
-                    error!("No command specified in request");
-                    json!({"status":"error","message":"No command specified"})
-                }
+            } else {
+                json!({"status":"error","message":"No command or query field","request_id": request_id})
             };
 
             let socket = zmq_socket.lock().await;

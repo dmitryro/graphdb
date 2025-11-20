@@ -2253,7 +2253,7 @@ pub async fn handle_interactive_command(
         }
         CommandType::Index(action) => {
             let engine = ensure_query_engine(state).await?;
-            crate::cli::handlers_index::handle_index_command(engine, action).await?;
+            crate::cli::handlers_index::handle_index_command(action).await?;
             Ok(())
         }
     }

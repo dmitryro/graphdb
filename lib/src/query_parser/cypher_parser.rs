@@ -24,6 +24,8 @@ use models::properties::SerializableFloat;
 use models::properties::PropertyValue;
 use crate::database::Database;
 use crate::storage_engine::{GraphStorageEngine, StorageEngine};
+use crate::query_exec_engine::query_exec_engine::QueryExecEngine;
+use crate::config::StorageConfig;
 
 // Enum to represent parsed Cypher queries
 #[derive(Debug, PartialEq)]
@@ -727,6 +729,20 @@ pub fn parse_cypher(query: &str) -> Result<CypherQuery, String> {
         }
         Err(e) => Err(format!("Failed to parse Cypher query: {:?}", e)),
     }
+}
+
+/// Execute a raw Cypher string using a QueryExecEngine instance
+pub async fn execute_cypher_from_string(
+    query: &str,
+    storage: Arc<dyn GraphStorageEngine + Send + Sync>,
+) -> GraphResult<Value> {
+    let parsed = parse_cypher(query).map_err(|e| GraphError::StorageError(e))?;
+    // Create a minimal Database wrapper — config is unused in execute_cypher
+    let db = Arc::new(Database {
+        storage: storage.clone(),
+        config: StorageConfig::default(),
+    });
+    execute_cypher(parsed, &db, storage).await
 }
 
 /// Execute a parsed Cypher query against the database and storage engine

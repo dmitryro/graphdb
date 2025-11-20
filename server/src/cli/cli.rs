@@ -916,7 +916,7 @@ pub async fn run_single_command(
             info!("Executing index command: {:?}", action);
             println!("===> Executing index command: {:?}", action);
             let engine = get_query_engine_singleton().await?;
-            handle_index_command(engine, action).await?;
+            handle_index_command(action).await?;
         }
     }
     if env_var_set {

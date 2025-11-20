@@ -94,6 +94,7 @@ simplelog = "0.12.2"
 password-hash = { version = "0.5", features = ["rand_core"] }
 moka = { version = "0.12.10", features = ["sync", "future"] }
 thiserror = "2.0.12"
+indexing_service = { path = "../indexing_service" }
 models = { path = "../models", features = ["rocksdb-errors", "sled-errors", "bincode-errors"] }
 caching = { path = "../caching" }
 bcrypt = "0.15.1"

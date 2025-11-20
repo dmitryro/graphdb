@@ -9,12 +9,11 @@ use async_trait::async_trait;
 use std::any::Any;
 use std::path::PathBuf;
 use std::sync::Arc;
-use models::errors::GraphError;
 use models::{Edge, Identifier, Vertex};
 use serde_json::Value;
 use uuid::Uuid;
 use log::{info, debug, error, warn};
-
+use models::errors::{GraphError, GraphResult};
 use crate::storage_engine::{GraphStorageEngine, StorageEngine};
 use crate::storage_engine::inmemory_storage::InMemoryStorage;
 use crate::config::config::{StorageConfig, StorageEngineType, QueryResult, QueryPlan,};
@@ -122,9 +121,8 @@ impl GraphStorageEngine for HybridStorage {
     }
 
     async fn execute_query(&self, query_plan: QueryPlan) -> Result<QueryResult, GraphError> {
-        info!("Executing query on SledStorage (returning null as not implemented)");
-        println!("===> EXECUTING QUERY ON HYBRID STORAGE (NOT IMPLEMENTED)");
-        Ok(QueryResult::Null)
+        info!("Executing query on HybridStorage (delegating to persistent layer)");
+        self.persistent.execute_query(query_plan).await
     }
 
     async fn create_vertex(&self, vertex: Vertex) -> Result<(), GraphError> {
@@ -139,7 +137,7 @@ impl GraphStorageEngine for HybridStorage {
         } else {
             let vertex = self.persistent.get_vertex(id).await?;
             if let Some(v) = &vertex {
-                self.inmemory.create_vertex(v.clone()).await?;
+                let _ = self.inmemory.create_vertex(v.clone()).await; // Cache miss → warm up
             }
             Ok(vertex)
         }
@@ -160,7 +158,7 @@ impl GraphStorageEngine for HybridStorage {
     async fn get_all_vertices(&self) -> Result<Vec<Vertex>, GraphError> {
         let vertices = self.persistent.get_all_vertices().await?;
         for vertex in &vertices {
-            self.inmemory.create_vertex(vertex.clone()).await?;
+            let _ = self.inmemory.create_vertex(vertex.clone()).await; // Warm cache
         }
         Ok(vertices)
     }
@@ -177,7 +175,7 @@ impl GraphStorageEngine for HybridStorage {
         } else {
             let edge = self.persistent.get_edge(outbound_id, edge_type, inbound_id).await?;
             if let Some(e) = &edge {
-                self.inmemory.create_edge(e.clone()).await?;
+                let _ = self.inmemory.create_edge(e.clone()).await;
             }
             Ok(edge)
         }
@@ -198,7 +196,7 @@ impl GraphStorageEngine for HybridStorage {
     async fn get_all_edges(&self) -> Result<Vec<Edge>, GraphError> {
         let edges = self.persistent.get_all_edges().await?;
         for edge in &edges {
-            self.inmemory.create_edge(edge.clone()).await?;
+            let _ = self.inmemory.create_edge(edge.clone()).await;
         }
         Ok(edges)
     }
@@ -219,5 +217,27 @@ impl GraphStorageEngine for HybridStorage {
         let mut running = self.running.lock().await;
         *running = false;
         Ok(())
+    }
+
+    // === INDEX METHODS (delegate to persistent layer) ===
+    async fn create_index(&self, label: &str, property: &str) -> GraphResult<()> {
+        self.persistent.create_index(label, property).await
+    }
+
+    async fn drop_index(&self, label: &str, property: &str) -> GraphResult<()> {
+        self.persistent.drop_index(label, property).await
+    }
+
+    async fn list_indexes(&self) -> GraphResult<Vec<(String, String)>> {
+        self.persistent.list_indexes().await
+    }
+
+    // === FULLTEXT SEARCH (Tantivy via persistent layer) ===
+    async fn fulltext_search(&self, query: &str, limit: usize) -> GraphResult<Vec<(String, String)>> {
+        self.persistent.fulltext_search(query, limit).await
+    }
+
+    async fn fulltext_rebuild(&self) -> GraphResult<()> {
+        self.persistent.fulltext_rebuild().await
     }
 }

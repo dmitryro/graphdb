@@ -83,6 +83,8 @@ pub use handlers_utils::{
     storage_engine_type_to_str,
     parse_show_command,
     parse_storage_engine,
+    get_current_storage_port,
+    get_current_storage_port_sync,
 };
 pub use handlers_queries::{
     handle_interactive_query,

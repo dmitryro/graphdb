@@ -1,67 +1,89 @@
-use lib::storage_engine::GraphStorageEngine;
-use models::errors::GraphError;
-use caching::Cache;
-use models::Vertex;
+// indexing_service/src/index.rs
 use anyhow::Result;
-use dashmap::DashMap;
-use async_trait::async_trait;
-use std::sync::Arc;
+use serde_json::{json, Value};
+use crate::adapters::send_zmq_command;
 
-use crate::fulltext::FullTextIndex;
-
-#[async_trait]
-pub trait IndexingServiceTrait: Send + Sync {
-    async fn index_node(&self, vertex: &Vertex) -> Result<(), GraphError>;
-    async fn search_text(&self, query: &str, top: usize) -> Result<Vec<String>, GraphError>;
-}
-
+#[derive(Clone)]
 pub struct IndexingService {
-    kv_index: DashMap<String, String>,
-    storage: Arc<dyn GraphStorageEngine>,
-    cache: Cache,
-    ft_index: Arc<FullTextIndex>,
-}
-
-#[async_trait]
-impl IndexingServiceTrait for IndexingService {
-    async fn index_node(&self, vertex: &Vertex) -> Result<(), GraphError> {
-        if let Some(patient_id) = vertex.properties.get("patient_id").and_then(|pv| pv.as_str()) {
-            self.kv_index.insert(patient_id.to_string(), vertex.id.to_string());
-            self.cache
-                .insert(vertex.id.to_string(), serde_json::to_value(vertex)?)
-                .await?;
-
-            let doc_id   = vertex.id.to_string();
-            let text_content = vertex.properties
-                                      .get("notes")
-                                      .and_then(|pv| pv.as_str())
-                                      .unwrap_or_default();
-
-            self.ft_index.index_document(&doc_id, text_content).await?;
-        }
-        Ok(())
-    }
-
-    async fn search_text(&self, query: &str, top: usize) -> Result<Vec<String>, GraphError> {
-        Ok(self.ft_index
-               .search(query, top)?
-               .into_iter()
-               .map(|(id, _txt)| id)
-               .collect())
-    }
+    daemon_port: u16,
 }
 
 impl IndexingService {
-    pub fn new(
-        storage: Arc<dyn GraphStorageEngine>,
-        cache: Cache,
-        ft_index: Arc<FullTextIndex>,
-    ) -> Self {
-        IndexingService {
-            kv_index: DashMap::new(),
-            storage,
-            cache,
-            ft_index,
-        }
+    pub fn new(daemon_port: u16) -> Self {
+        Self { daemon_port }
+    }
+
+    /// index create Person name
+    pub async fn create_index(&self, label: &str, property: &str) -> Result<Value> {
+        let payload = json!({
+            "command": "index_create",
+            "label": label,
+            "property": property
+        });
+        send_zmq_command(self.daemon_port, &payload.to_string()).await
+    }
+
+    /// index drop Person name
+    pub async fn drop_index(&self, label: &str, property: &str) -> Result<Value> {
+        let payload = json!({
+            "command": "index_drop",
+            "label": label,
+            "property": property
+        });
+        send_zmq_command(self.daemon_port, &payload.to_string()).await
+    }
+
+    /// index list
+    pub async fn list_indexes(&self) -> Result<Value> {
+        let payload = json!({
+            "command": "index_list"
+        });
+        send_zmq_command(self.daemon_port, &payload.to_string()).await
+    }
+
+    /// index create-fulltext notesIndex Note content Document text
+    pub async fn create_fulltext_index(&self, name: &str, labels: &[&str], properties: &[&str]) -> Result<Value> {
+        let payload = json!({
+            "command": "fulltext_create",
+            "name": name,
+            "labels": labels,
+            "properties": properties
+        });
+        send_zmq_command(self.daemon_port, &payload.to_string()).await
+    }
+
+    /// index drop-fulltext notesIndex
+    pub async fn drop_fulltext_index(&self, name: &str) -> Result<Value> {
+        let payload = json!({
+            "command": "fulltext_drop",
+            "name": name
+        });
+        send_zmq_command(self.daemon_port, &payload.to_string()).await
+    }
+
+    /// index search "Oliver Stone" [top N]
+    pub async fn fulltext_search(&self, query: &str, limit: usize) -> Result<Value> {
+        let payload = json!({
+            "command": "fulltext_search",
+            "query": query,
+            "limit": limit
+        });
+        send_zmq_command(self.daemon_port, &payload.to_string()).await
+    }
+
+    /// index rebuild
+    pub async fn rebuild_indexes(&self) -> Result<Value> {
+        let payload = json!({
+            "command": "fulltext_rebuild"
+        });
+        send_zmq_command(self.daemon_port, &payload.to_string()).await
+    }
+
+    /// index stats (optional)
+    pub async fn index_stats(&self) -> Result<Value> {
+        let payload = json!({
+            "command": "index_stats"
+        });
+        send_zmq_command(self.daemon_port, &payload.to_string()).await
     }
 }
