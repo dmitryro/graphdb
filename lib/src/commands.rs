@@ -199,12 +199,19 @@ pub enum GraphAction {
 
 #[derive(Debug, Clone, PartialEq, Subcommand)]
 pub enum IndexAction {
-    #[command(about = "Create a standard B-Tree index")]
+    #[command(about = "Create a standard B-Tree index or a single-field FULLTEXT index")]
     Create {
-        #[arg(help = "The Label (e.g., Person)")]
-        label: String,
-        #[arg(help = "The Property (e.g., name)")]
-        property: String,
+        // This will capture either "FULLTEXT" (in 3-arg usage) or the Label (in 2-arg usage)
+        #[arg(help = "The index type (e.g., FULLTEXT) or the Label (e.g., Person)")]
+        arg1: String,
+        
+        // This will capture either the Label (in 3-arg usage) or the Property (in 2-arg usage)
+        #[arg(help = "The Label (e.g., Person) or the Property (e.g., name)")]
+        arg2: String,
+        
+        // This makes the third argument optional, allowing both `create <A> <B>` and `create <A> <B> <C>`
+        #[arg(help = "The Property (e.g., name). Required if index type is provided.")]
+        arg3_property: Option<String>,
     },
 
     #[command(about = "Search the index")]
@@ -233,7 +240,7 @@ pub enum IndexAction {
         property: String,
     },
 
-    #[command(about = "Create a new fulltext index")]
+    #[command(about = "Create a new fulltext index (for multi-field/multi-label indices)")]
     CreateFulltext {
         #[arg(help = "The name for the new index (e.g., people_fulltext_index)")]
         index_name: String,

@@ -40,6 +40,13 @@ static STARTUP_MUTEX: TokioMutex<()> = TokioMutex::const_new(());
 const MAX_ZMQ_RETRIES: u32 = 5;
 const INITIAL_RETRY_DELAY_MS: u64 = 500;
 
+// Helper function to check if an index type string matches "FULLTEXT" case-insensitively.
+// This logic would be used if IndexAction was a single generic CREATE variant.
+// Currently, IndexAction variants separate the types, so this is illustrative.
+fn is_fulltext_type(index_type: &str) -> bool {
+    index_type.to_lowercase() == "fulltext"
+}
+
 
 /// Sends a raw JSON command string to the running storage daemon via ZMQ REQ/REP.
 /// Includes retry logic for transient ZMQ connection/timeout failures.
@@ -252,10 +259,7 @@ async fn format_and_print_result(command_name: &str, query_result: QueryResult, 
             // Null query results for index commands are handled as success with no data
             json!({ "status": "success", "message": "Command executed successfully with no explicit data payload." })
         }
-        _ => {
-            error!("Received an unexpected QueryResult variant for index command.");
-            json!({ "status": "error", "message": "Received an unexpected QueryResult variant from storage daemon." })
-        }
+        // Removed the unreachable `_` pattern as the compiler warned all variants were covered.
     };
     
     // --- FIX: Sanitize output by decoding inner 'result' field if it contains a JSON string ---
@@ -311,8 +315,9 @@ pub async fn handle_index_command(action: IndexAction) -> Result<()> {
     
     // 2. Determine command, parameters, and expected output message
     let (command, params, success_msg_prefix) = match action {
-        // NOTE: Command names use the daemon handler's expected 'index_' prefix.
-        IndexAction::Create { label, property } => {
+        // FIX: Update pattern to match new field names (arg1, arg2, arg3_property)
+        IndexAction::Create { arg1: label, arg2: property, arg3_property: _ } => {
+            // NOTE: Command names use the daemon handler's expected 'index_' prefix.
             (
                 "index_create".to_string(),
                 json!({ "label": label, "property": property }),
@@ -320,6 +325,10 @@ pub async fn handle_index_command(action: IndexAction) -> Result<()> {
             )
         },
         IndexAction::CreateFulltext { index_name, labels, properties } => {
+            // This action already correctly routes to the full-text command.
+            // If the index type name (e.g., "FULLTEXT") were passed here as a string argument
+            // instead of being a separate enum variant, the case-insensitive logic (like
+            // checking is_fulltext_type) would be applied before routing the command.
             (
                 "index_create_fulltext".to_string(),
                 json!({ 

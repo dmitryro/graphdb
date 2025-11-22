@@ -1644,158 +1644,161 @@ pub fn parse_command(parts: &[String]) -> (CommandType, Vec<String>) {
         // === NEW: Index & Full-Text Search Commands ===
         "index" => {
             if remaining_args.is_empty() {
-                eprintln!("Usage: index <create|drop|search|rebuild|list|stats> [args...]");
+                eprintln!("Usage: index <create|drop|search|rebuild|list|stats|createfulltext|dropfulltext> [args...]");
                 CommandType::Unknown
             } else {
                 match remaining_args[0].to_lowercase().as_str() {
+
+                    // 1. Standard Index Creation: index create <L> <P> OR index create FULLTEXT <L> <P>
                     "create" => {
-                        if remaining_args.len() >= 3 {
-                            let action = remaining_args[1].to_lowercase();
-                            if action == "fulltext" {
-                                // Fulltext creation requires: index create fulltext <name> --labels <L1,L2> --props <P1,P2>
-                                let mut index_name = None;
-                                let mut labels = Vec::new();
-                                let mut properties = Vec::new();
-
-                                let mut i = 2; // Start after "index create fulltext"
-                                while i < remaining_args.len() {
-                                    if index_name.is_none() && !remaining_args[i].starts_with("--") {
-                                        index_name = Some(remaining_args[i].clone());
-                                        i += 1;
-                                    } else if remaining_args[i] == "--labels" {
-                                        if i + 1 < remaining_args.len() {
-                                            labels = remaining_args[i + 1]
-                                                .split(',')
-                                                .map(|s| s.trim().to_string())
-                                                .collect();
-                                            i += 2;
-                                        } else { i += 1; }
-                                    } else if remaining_args[i] == "--props" {
-                                        if i + 1 < remaining_args.len() {
-                                            properties = remaining_args[i + 1]
-                                                .split(',')
-                                                .map(|s| s.trim().to_string())
-                                                .collect();
-                                            i += 2;
-                                        } else { i += 1; }
-                                    } else {
-                                        i += 1;
-                                    }
-                                }
-
-                                if let Some(name) = index_name {
-                                    if labels.is_empty() || properties.is_empty() {
-                                        eprintln!("Usage: index create fulltext <name> --labels <L1,L2> --props <P1,P2>");
-                                        CommandType::Unknown
-                                    } else {
-                                        CommandType::Index(IndexAction::CreateFulltext {
-                                            index_name: name,
-                                            labels,
-                                            properties,
-                                        })
-                                    }
-                                } else {
-                                    eprintln!("Usage: index create fulltext <name> --labels <L1,L2> --props <P1,P2>");
-                                    CommandType::Unknown
-                                }
-
-                            } else {
-                                // Standard index creation: index create <Label> <property>
-                                if remaining_args.len() >= 3 {
-                                    CommandType::Index(IndexAction::Create {
-                                        label: remaining_args[1].clone(),
-                                        property: remaining_args[2].clone(),
-                                    })
-                                } else {
-                                    eprintln!("Usage: index create <Label> <property>");
-                                    CommandType::Unknown
-                                }
-                            }
-
+                        // Needs at least two arguments: <arg1> <arg2>
+                        if remaining_args.len() < 3 {
+                            eprintln!("Usage: index create <Label> <property> (Standard B-Tree)");
+                            eprintln!("Usage: index create FULLTEXT <Label> <property> (Single-field Fulltext)");
+                            CommandType::Unknown
                         } else {
-                            eprintln!("Usage: index create <Label> <property> | index create fulltext <name> --labels <L1,L2> --props <P1,P2>");
+                            // Map the arguments directly to the flexible IndexAction::Create variant
+                            CommandType::Index(IndexAction::Create {
+                                arg1: remaining_args[1].clone(),
+                                arg2: remaining_args[2].clone(),
+                                arg3_property: remaining_args.get(3).cloned(),
+                            })
+                        }
+                    }
+
+                    // 2. Dedicated Multi-field Fulltext Creation: index createfulltext <name> --labels <L1,L2> --props <P1,P2>
+                    "createfulltext" => {
+                        // Check for index name presence
+                        let index_name = remaining_args.get(1).cloned();
+
+                        // Use the original flag parsing logic for labels/properties
+                        let mut labels = Vec::new();
+                        let mut properties = Vec::new();
+
+                        let mut i = 2; // Start after "index createfulltext <name>"
+                        while i < remaining_args.len() {
+                            let current_arg_lower = remaining_args[i].to_lowercase();
+
+                            if current_arg_lower == "--labels" && i + 1 < remaining_args.len() {
+                                labels = remaining_args[i + 1]
+                                    .split(',')
+                                    .map(|s| s.trim().to_string())
+                                    .filter(|s| !s.is_empty())
+                                    .collect();
+                                i += 2;
+                            } else if current_arg_lower == "--props" && i + 1 < remaining_args.len() {
+                                properties = remaining_args[i + 1]
+                                    .split(',')
+                                    .map(|s| s.trim().to_string())
+                                    .filter(|s| !s.is_empty())
+                                    .collect();
+                                i += 2;
+                            } else {
+                                i += 1;
+                            }
+                        }
+
+                        if let Some(name) = index_name {
+                            if labels.is_empty() || properties.is_empty() {
+                                eprintln!("Usage: index createfulltext <name> --labels <L1,L2> --props <P1,P2>");
+                                CommandType::Unknown
+                            } else {
+                                CommandType::Index(IndexAction::CreateFulltext {
+                                    index_name: name,
+                                    labels,
+                                    properties,
+                                })
+                            }
+                        } else {
+                            eprintln!("Usage: index createfulltext <name> --labels <L1,L2> --props <P1,P2>");
                             CommandType::Unknown
                         }
                     }
+
+                    // 3. Drop Index Logic: index drop <L> <P> OR index drop fulltext <N>
                     "drop" => {
-                        if remaining_args.len() >= 2 {
-                            let action = remaining_args[1].to_lowercase();
-                            if action == "fulltext" {
-                                // Drop fulltext: index drop fulltext <name>
-                                if remaining_args.len() >= 3 {
-                                    CommandType::Index(IndexAction::DropFulltext {
-                                        index_name: remaining_args[2].clone(),
-                                    })
-                                } else {
-                                    eprintln!("Usage: index drop fulltext <name>");
-                                    CommandType::Unknown
-                                }
-                            } else {
-                                // Standard index drop: index drop <Label> <property>
-                                if remaining_args.len() >= 3 {
-                                    CommandType::Index(IndexAction::Drop {
-                                        label: remaining_args[1].clone(),
-                                        property: remaining_args[2].clone(),
-                                    })
-                                } else {
-                                    eprintln!("Usage: index drop <Label> <property>");
-                                    CommandType::Unknown
-                                }
-                            }
-                        } else {
-                            eprintln!("Usage: index drop <Label> <property> | index drop fulltext <name>");
+                        if remaining_args.len() < 3 {
+                            eprintln!("Usage: index drop <Label> <property> OR index drop fulltext <name>");
                             CommandType::Unknown
+                        } else {
+                            let arg1 = remaining_args[1].to_lowercase();
+                            if arg1 == "fulltext" {
+                                // Fulltext drop: index drop fulltext <name>
+                                CommandType::Index(IndexAction::DropFulltext {
+                                    index_name: remaining_args[2].clone(),
+                                })
+                            } else {
+                                // Standard drop: index drop <Label> <property>
+                                CommandType::Index(IndexAction::Drop {
+                                    label: remaining_args[1].clone(),
+                                    property: remaining_args[2].clone(),
+                                })
+                            }
                         }
                     }
-                    "search" => {
-                        // index search "query" [--top N | --bottom N | --head N | --tail N | top N | bottom N | head N | tail N]
+                    
+                    // 4. Dedicated Drop Fulltext: index dropfulltext <name>
+                    "dropfulltext" => {
                         if remaining_args.len() < 2 {
-                            eprintln!("Usage: index search \"query\" [--top|--bottom|--head|--tail|top|bottom|head|tail <N>]");
-                            return (CommandType::Unknown, Vec::new()); // FIX 1: Return full tuple
+                            eprintln!("Usage: index dropfulltext <name>");
+                            CommandType::Unknown
+                        } else {
+                            CommandType::Index(IndexAction::DropFulltext {
+                                index_name: remaining_args[1].clone(),
+                            })
+                        }
+                    }
+
+                    // 5. Search Logic: index search "query" [top|bottom N]
+                    "search" => {
+                        if remaining_args.len() < 2 {
+                            eprintln!("Usage: index search \"query\" [top|bottom|head|tail <N>]");
+                            return (CommandType::Unknown, Vec::new());
                         }
 
                         let term = remaining_args[1].clone();
+                        let mut order = None;
 
-                        // Check for order specification (either flag-style or subcommand-style)
-                        let order = if remaining_args.len() >= 4 {
-                            let order_arg = remaining_args[2].to_lowercase();
-                            let count_result = remaining_args[3].parse::<usize>();
-
-                            match (order_arg.as_str(), count_result) {
-                                ("--top" | "top", Ok(n)) => Some(SearchOrder::Top { count: n }),
-                                ("--head" | "head", Ok(n)) => Some(SearchOrder::Head { count: n }),
-                                ("--bottom" | "bottom", Ok(n)) => Some(SearchOrder::Bottom { count: n }),
-                                ("--tail" | "tail", Ok(n)) => Some(SearchOrder::Tail { count: n }),
-                                _ => {
-                                    eprintln!("Invalid order type or count. Use: --top|--bottom|--head|--tail|top|bottom|head|tail <N>");
-                                    return (CommandType::Unknown, Vec::new()); // FIX 2: Return full tuple
+                        // Check for order specification: <order_type> <N> (4 args total)
+                        if remaining_args.len() >= 4 {
+                            let order_type = remaining_args[2].to_lowercase();
+                            if let Ok(n) = remaining_args[3].parse::<usize>() {
+                                match order_type.as_str() {
+                                    "top" | "--top" | "head" | "--head" => order = Some(SearchOrder::Top { count: n }),
+                                    "bottom" | "--bottom" | "tail" | "--tail" => order = Some(SearchOrder::Bottom { count: n }),
+                                    _ => {
+                                        eprintln!("Invalid order type: {}. Use: top, bottom, head, or tail.", remaining_args[2]);
+                                        return (CommandType::Unknown, Vec::new());
+                                    }
                                 }
+                            } else {
+                                eprintln!("Invalid count provided for search order.");
+                                return (CommandType::Unknown, Vec::new());
                             }
                         } else if remaining_args.len() == 3 {
                             // Check for single-arg flag style like "--top=5"
                             let arg = remaining_args[2].to_lowercase();
-                            if let Some(stripped) = arg.strip_prefix("--top=").or_else(|| arg.strip_prefix("top=")) {
-                                stripped.parse::<usize>().ok().map(|n| SearchOrder::Top { count: n })
-                            } else if let Some(stripped) = arg.strip_prefix("--head=").or_else(|| arg.strip_prefix("head=")) {
-                                stripped.parse::<usize>().ok().map(|n| SearchOrder::Head { count: n })
-                            } else if let Some(stripped) = arg.strip_prefix("--bottom=").or_else(|| arg.strip_prefix("bottom=")) {
-                                stripped.parse::<usize>().ok().map(|n| SearchOrder::Bottom { count: n })
-                            } else if let Some(stripped) = arg.strip_prefix("--tail=").or_else(|| arg.strip_prefix("tail=")) {
-                                stripped.parse::<usize>().ok().map(|n| SearchOrder::Tail { count: n })
-                            } else {
-                                None
+                            if let Some(stripped) = arg.strip_prefix("top=").or_else(|| arg.strip_prefix("--top=")) {
+                                order = stripped.parse::<usize>().ok().map(|n| SearchOrder::Top { count: n });
+                            } else if let Some(stripped) = arg.strip_prefix("head=").or_else(|| arg.strip_prefix("--head=")) {
+                                order = stripped.parse::<usize>().ok().map(|n| SearchOrder::Head { count: n });
+                            } else if let Some(stripped) = arg.strip_prefix("bottom=").or_else(|| arg.strip_prefix("--bottom=")) {
+                                order = stripped.parse::<usize>().ok().map(|n| SearchOrder::Bottom { count: n });
+                            } else if let Some(stripped) = arg.strip_prefix("tail=").or_else(|| arg.strip_prefix("--tail=")) {
+                                order = stripped.parse::<usize>().ok().map(|n| SearchOrder::Tail { count: n });
                             }
-                        } else {
-                            None
-                        };
+                        }
 
                         CommandType::Index(IndexAction::Search { term, order })
                     }
+                    
+                    // 6. Simple Actions
                     "rebuild" => CommandType::Index(IndexAction::Rebuild),
                     "list" => CommandType::Index(IndexAction::List),
                     "stats" => CommandType::Index(IndexAction::Stats),
+                    
                     _ => {
-                        eprintln!("Unknown index action. Use: create, drop, search, rebuild, list, stats");
+                        eprintln!("Unknown index action. Use: create, drop, search, rebuild, list, stats, createfulltext, dropfulltext");
                         CommandType::Unknown
                     }
                 }
