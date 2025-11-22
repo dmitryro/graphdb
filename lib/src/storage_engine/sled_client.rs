@@ -79,6 +79,59 @@ impl SledClient {
             zmq_socket: Some(socket_arc), // Store the connected ZMQ socket
         }
     }
+
+    /// This public, associated function performs the entire ZMQ request 
+    /// cycle (socket creation, connect, send, recv, close) in a single, blocking
+    /// operation on a separate thread, satisfying the requirement to *not* use 
+    /// persistent state on the SledClient instance.
+    pub async fn execute_one_shot_zmq_request(port: u16, request: Value) -> GraphResult<Value> {
+        let request_data = serde_json::to_vec(&request)
+            .map_err(|e| GraphError::SerializationError(format!("JSON serialize failed: {}", e)))?;
+
+        // ZMQ I/O must be run in spawn_blocking
+        let response_bytes = spawn_blocking(move || {
+            let context = ZmqContext::new();
+            
+            // 1. CREATE FRESH SOCKET FOR THIS REQUEST
+            let socket = context.socket(zmq::REQ)
+                .map_err(|e| GraphError::StorageError(format!("socket creation: {}", e)))?;
+            
+            // Configure socket for a clean exit (linger 0) and timeout
+            socket.set_linger(0)
+                .map_err(|e| GraphError::StorageError(format!("set_linger: {}", e)))?;
+            socket.set_sndtimeo(5000)
+                .map_err(|e| GraphError::StorageError(format!("set_sndtimeo: {}", e)))?;
+            socket.set_rcvtimeo(5000)
+                .map_err(|e| GraphError::StorageError(format!("set_rcvtimeo: {}", e)))?;
+            
+            // 2. Connect
+            let endpoint = format!("ipc:///tmp/graphdb-{}.ipc", port);
+            socket.connect(&endpoint)
+                .map_err(|e| GraphError::StorageError(format!("connect to {}: {}", endpoint, e)))?;
+            
+            // 3. Send (blocking is OK, we're in spawn_blocking)
+            socket.send(&request_data, 0)
+                .map_err(|e| GraphError::StorageError(format!("send: {}", e)))?;
+            
+            // 4. Receive (blocking is OK)
+            let msg = socket.recv_bytes(0)
+                .map_err(|e| GraphError::StorageError(format!("recv: {}", e)))?;
+            
+            // 5. Socket is automatically dropped here - clean state for next request
+            // The ZmqContext is also dropped here, which cleans up resources associated 
+            // with this specific, one-shot connection.
+            Ok::<Vec<u8>, GraphError>(msg)
+        })
+        .await
+        .map_err(|e| GraphError::InternalError(format!("Internal task failure during ZMQ request: {}", e)))??; // Propagate join error and inner GraphError
+
+        // 6. Parse the response
+        let response: Value = serde_json::from_slice(&response_bytes)
+            .map_err(|e| GraphError::DeserializationError(format!("ZMQ response parse error: {}", e)))?;
+
+        Ok(response)
+    }
+    
     // Unchanged: new, new_with_db (they already set inner to Some)
     pub async fn new(db_path: PathBuf) -> GraphResult<Self> {
         info!("Opening Sled database at {:?}", db_path);
@@ -1496,6 +1549,27 @@ impl GraphStorageEngine for SledClient {
 
     async fn clear_data(&self) -> GraphResult<()> {
         self.clear_data().await
+    }
+
+    async fn execute_index_command(&self, command: &str, params: Value) -> GraphResult<QueryResult> {
+        let request = json!({
+            "command": command,
+            "params": params, // Pass params directly
+        });
+
+        let port = match &self.mode {
+            Some(SledClientMode::ZMQ(port)) => *port,
+            _ => DEFAULT_STORAGE_PORT,
+        };
+
+        // FIX: 'port' is now passed as an argument to this function.
+        let response_json = self.send_zmq_request(port, request).await?;
+
+        // Deserialize the response JSON into your QueryResult type
+        let result: QueryResult = serde_json::from_value(response_json)
+            .map_err(|e| GraphError::DeserializationError(format!("Failed to parse ZMQ index response: {}", e)))?;
+
+        Ok(result)
     }
 
     async fn execute_query(&self, query_plan: QueryPlan) -> GraphResult<QueryResult> {

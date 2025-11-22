@@ -204,9 +204,17 @@ pub enum IndexAction {
     Rebuild,
     List,
     Stats,
-    Drop { label: String, property: String }
+    Drop { label: String, property: String },
+    // FIX: Added explicit types (name: Type) for all fields in struct variants.
+    CreateFulltext { 
+        index_name: String, 
+        labels: Vec<String>, 
+        properties: Vec<String> 
+    },
+    DropFulltext { 
+        index_name: String 
+    }
 }
-
 
 /// Arguments for the unified query command.
 #[derive(Args, Debug, PartialEq, Clone)]

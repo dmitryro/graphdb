@@ -93,6 +93,7 @@ use lib::daemon::daemon_management::{
     stop_specific_storage_daemon,
     sync_daemon_registry_with_manager,
     stop_storage_daemon_by_port,
+    check_pid_validity_sync,
 };
 use lib::query_parser::{parse_query_from_string, QueryType};
 
@@ -2848,23 +2849,21 @@ pub async fn handle_use_storage_command(
         engine, permanent
     );
 
-    // --------------------------------------------------------------------- //
-    // 1. Load current config + root directory
-    // --------------------------------------------------------------------- //
+    // ------------------------------------------------------------------ //
+    // 1.  load current config
+    // ------------------------------------------------------------------ //
     let cwd = std::env::current_dir()?;
     let cfg_path = cwd.join(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
-    let mut cfg: StorageConfig =
-        load_storage_config_from_yaml(Some(cfg_path.clone())).await.unwrap_or_default();
-
+    let mut cfg = StorageConfig::load(&cfg_path).await?;
     let config_root = cfg
         .config_root_directory
         .as_ref()
         .ok_or_else(|| anyhow!("config_root_directory missing"))?
         .clone();
 
-    // --------------------------------------------------------------------- //
-    // 2. Load TiKV PD port (conflict guard) – async file read
-    // --------------------------------------------------------------------- //
+    // ------------------------------------------------------------------ //
+    // 2.  TiKV PD port conflict guard
+    // ------------------------------------------------------------------ //
     let tikv_pd_port: Option<u16> = async {
         let p = PathBuf::from(DEFAULT_STORAGE_CONFIG_PATH_TIKV);
         if !p.exists() {
@@ -2890,14 +2889,10 @@ pub async fn handle_use_storage_command(
     }
     .await;
 
-    // --------------------------------------------------------------------- //
-    // 3. Load engine-specific config
-    // --------------------------------------------------------------------- //
+    // ------------------------------------------------------------------ //
+    // 3.  engine-specific defaults
+    // ------------------------------------------------------------------ //
     let engine_specific = load_engine_specific_config(engine.clone(), &config_root)?;
-
-    // --------------------------------------------------------------------- //
-    // 4. Desired port (from engine-specific config or defaults)
-    // --------------------------------------------------------------------- //
     let desired_port = engine_specific
         .storage
         .port
@@ -2907,29 +2902,77 @@ pub async fn handle_use_storage_command(
             _ => 8052,
         });
 
-    // --------------------------------------------------------------------- //
-    // 5. Resolve final port – reuse existing daemon **only if same engine**
-    // --------------------------------------------------------------------- //
+    // ------------------------------------------------------------------ //
+    // 4.  FINAL PORT – inherit running daemon first, config second
+    // ------------------------------------------------------------------ //
     let final_port = {
         let registry = GLOBAL_DAEMON_REGISTRY.get().await;
-        let daemons = registry.list_storage_daemons().await.unwrap_or_default();
+        let all_daemons = registry.get_all_daemon_metadata().await.unwrap_or_default();
+        
+        // Filter for storage daemons only
+        let storage_daemons: Vec<_> = all_daemons
+            .iter()
+            .filter(|d| d.service_type == "storage")
+            .collect();
 
-        // 5a – exact same engine already running?
-        if let Some(meta) = daemons.iter().find(|m| {
-            m.engine_type.as_deref() == Some(&engine.to_string())
-        }) {
+        // Debug logging: show all storage daemons found
+        info!("Found {} total storage daemons in registry", storage_daemons.len());
+        println!("===> FOUND {} TOTAL STORAGE DAEMONS IN REGISTRY", storage_daemons.len());
+        for d in &storage_daemons {
             info!(
-                "Re-using existing {} daemon on port {} (PID {})",
-                engine, meta.port, meta.pid
+                "  Daemon: port={}, pid={}, engine={:?}, service={}, zmq_ready={}",
+                d.port, d.pid, d.engine_type, d.service_type, d.zmq_ready
+            );
+            println!(
+                "===> DAEMON: port={}, pid={}, engine={:?}, service={}, zmq_ready={}",
+                d.port, d.pid, d.engine_type, d.service_type, d.zmq_ready
+            );
+        }
+
+        // 4a – inherit **any** live storage daemon port (regardless of engine type)
+        //      This allows sled to take over rocksdb's port, etc.
+        //      Check: service_type == "storage", pid > 0, and EITHER zmq_ready OR valid PID
+        let inherited = storage_daemons.iter().find(|m| {
+            if m.service_type != "storage" || m.pid <= 0 {
+                return false;
+            }
+            
+            // Accept daemon if zmq_ready is true OR if the PID is actually valid
+            let is_valid = m.zmq_ready || check_pid_validity_sync(m.pid);
+            
+            if is_valid {
+                info!("Found candidate daemon on port {} for inheritance (zmq_ready={}, pid_valid={})", 
+                      m.port, m.zmq_ready, check_pid_validity_sync(m.pid));
+                println!("===> FOUND CANDIDATE DAEMON ON PORT {} FOR INHERITANCE (zmq_ready={}, pid_valid={})", 
+                         m.port, m.zmq_ready, check_pid_validity_sync(m.pid));
+            }
+            is_valid
+        });
+
+        if let Some(meta) = inherited {
+            let old_engine = meta.engine_type.as_deref().unwrap_or("unknown");
+            info!(
+                "Inheriting port {} from running {} daemon (PID {}), switching to {}",
+                meta.port, old_engine, meta.pid, engine
+            );
+            println!(
+                "===> INHERITING PORT {} FROM RUNNING {} DAEMON (PID {}), SWITCHING TO {}",
+                meta.port, old_engine, meta.pid, engine
             );
             meta.port
         } else {
-            // 5b – pick a free port not in the registry
+            // 4b – nothing running: fall back to config / pick free port
+            info!("No live storage daemon found, selecting port from config");
+            println!("===> NO LIVE STORAGE DAEMON FOUND, SELECTING PORT FROM CONFIG");
+
             let mut candidate = desired_port;
             loop {
-                if is_port_free(candidate).await
-                    && !daemons.iter().any(|m| m.port == candidate)
-                {
+                let port_available = is_port_free(candidate).await
+                    && !storage_daemons.iter().any(|m| m.port == candidate)
+                    && Some(candidate) != tikv_pd_port;
+                if port_available {
+                    info!("Selected new port {} for {} daemon", candidate, engine);
+                    println!("===> SELECTED NEW PORT {} FOR {} DAEMON", candidate, engine);
                     break candidate;
                 }
                 candidate = candidate.saturating_add(1);
@@ -2940,50 +2983,71 @@ pub async fn handle_use_storage_command(
         }
     };
 
-    // --------------------------------------------------------------------- //
-    // 6. Build **engine-specific** data path – THIS IS THE FIX
-    // --------------------------------------------------------------------- //
+    // ------------------------------------------------------------------ //
+    // 5.  build engine-specific data path
+    // ------------------------------------------------------------------ //
     let data_path = PathBuf::from(format!(
         "/opt/graphdb/storage_data/{}/{}",
         engine.to_string().to_lowercase(),
         final_port
     ));
 
-    // --------------------------------------------------------------------- //
-    // 7. Build SelectedStorageConfig with the correct path
-    // --------------------------------------------------------------------- //
+    // ------------------------------------------------------------------ //
+    // 6.  build SelectedStorageConfig with the *effective* port
+    // ------------------------------------------------------------------ //
     let selected_cfg = SelectedStorageConfig {
         storage_engine_type: engine.clone(),
         storage: StorageConfigInner {
             path: Some(data_path.clone()),
             host: engine_specific.storage.host.clone(),
-            port: Some(final_port),
+            port: Some(final_port),          // <-- inherited port
             database: engine_specific.storage.database.clone(),
             username: engine_specific.storage.username.clone(),
             password: engine_specific.storage.password.clone(),
             pd_endpoints: engine_specific.storage.pd_endpoints.clone(),
-            cache_capacity: Some(1 << 30), // 1 GiB
+            cache_capacity: Some(1 << 30),
             use_compression: false,
             temporary: false,
             use_raft_for_scale: false,
         },
     };
 
-    // --------------------------------------------------------------------- //
-    // 8. Update in-memory config
-    // --------------------------------------------------------------------- //
-    let mut new_cfg = cfg.clone();
+    // ------------------------------------------------------------------ //
+    // 7.  update in-memory config
+    // ------------------------------------------------------------------ //
+    let mut new_cfg = cfg;
     new_cfg.storage_engine_type = engine.clone();
     new_cfg.default_port = final_port;
-    new_cfg.engine_specific_config = Some(selected_cfg.clone());
+    new_cfg.engine_specific_config = Some(selected_cfg);
 
-    // --------------------------------------------------------------------- //
-    // 9. Persist if `--permanent`
-    // --------------------------------------------------------------------- //
-    if permanent {
-        println!("===> Saving configuration to disk...");
-        new_cfg.save().await?;
-        println!("Configuration saved successfully.");
+    // ------------------------------------------------------------------ //
+    // 8.  **ALWAYS** persist the effective port  (THE FIX)
+    // ------------------------------------------------------------------ //
+    new_cfg.save().await?;
+    println!("===> Saving configuration to disk...");
+    println!("Configuration saved successfully.");
+
+    // ------------------------------------------------------------------ //
+    // 9.  update the manager **synchronously** before we spawn
+    // ------------------------------------------------------------------ //
+    if GLOBAL_STORAGE_ENGINE_MANAGER.get().is_none() {
+        let manager = StorageEngineManager::new(
+            engine.clone(),
+            &cfg_path,
+            permanent,
+            Some(final_port),
+        )
+        .await
+        .context("Failed to create StorageEngineManager")?;
+
+        GLOBAL_STORAGE_ENGINE_MANAGER
+            .set(Arc::new(AsyncStorageEngineManager::from_manager(manager)))
+            .map_err(|_| anyhow!("GLOBAL_STORAGE_ENGINE_MANAGER already set"))?;
+    } else {
+        let mgr = GLOBAL_STORAGE_ENGINE_MANAGER.get().unwrap();
+        mgr.use_storage(new_cfg.clone(), permanent, false)
+            .await
+            .context("Failed to update existing StorageEngineManager")?;
     }
 
     println!(
@@ -2991,55 +3055,23 @@ pub async fn handle_use_storage_command(
         engine, final_port, permanent
     );
 
-    // --------------------------------------------------------------------- //
-    // 10. Fire-and-forget daemon start + manager init/update
-    // --------------------------------------------------------------------- //
+    // ------------------------------------------------------------------ //
+    // 10. fire-and-forget daemon start (only if needed)
+    // ------------------------------------------------------------------ //
     let engine_clone = engine.clone();
     let cfg_path_clone = cfg_path.clone();
-    let port_cfg = {
-        let mut c = new_cfg.clone();
-        if let Some(ref mut ec) = c.engine_specific_config {
-            ec.storage.port = Some(final_port);
-            ec.storage.path = Some(data_path.clone());
-        }
-        c
-    };
+    let port_cfg_clone = new_cfg.clone();
 
     tokio::spawn(async move {
-        // 10a – clean stale IPC socket
-        // Clean stale IPC socket using tokio::fs
-        let _ = tokio_fs::remove_file(format!("/tmp/graphdb-{}.ipc", final_port))
-            .await
-            .ok();
+        // clean stale IPC socket
+        let _ = tokio_fs::remove_file(format!("/tmp/graphdb-{}.ipc", final_port)).await;
 
-        // 10b – initialise / update global manager
-        if GLOBAL_STORAGE_ENGINE_MANAGER.get().is_none() {
-            let manager = StorageEngineManager::new(
-                engine_clone.clone(),
-                &cfg_path_clone,
-                permanent,
-                Some(final_port),
-            )
-            .await
-            .context("Failed to create StorageEngineManager")
-            .expect("manager creation failed");
-
-            GLOBAL_STORAGE_ENGINE_MANAGER
-                .set(Arc::new(AsyncStorageEngineManager::from_manager(manager)))
-                .expect("GLOBAL_STORAGE_ENGINE_MANAGER already set");
-        } else {
-            let mgr = GLOBAL_STORAGE_ENGINE_MANAGER.get().unwrap();
-            mgr.use_storage(port_cfg.clone(), permanent, false)
-                .await
-                .expect("Failed to update existing StorageEngineManager");
-        }
-
-        // 10c – start the daemon (fire-and-forget)
+        // start daemon only if no inherited daemon exists
         if let Err(e) = start_storage_interactive(
             Some(final_port),
             Some(cfg_path_clone),
-            Some(port_cfg),
-            Some("skip_manager_set".to_string()),
+            Some(port_cfg_clone),
+            Some("skip_manager_set".to_string()), // manager already updated above
             Arc::new(TokioMutex::new(None)),
             Arc::new(TokioMutex::new(None)),
             Arc::new(TokioMutex::new(None)),

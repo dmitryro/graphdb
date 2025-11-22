@@ -1,7 +1,35 @@
 // indexing_service/src/index.rs
+use std::sync::Arc;
 use anyhow::Result;
 use serde_json::{json, Value};
+use tokio::sync::{Mutex as TokioMutex, OnceCell};
 use crate::adapters::send_zmq_command;
+
+type Service = Arc<TokioMutex<IndexingService>>;
+
+static SINGLETON: OnceCell<Service> = OnceCell::const_new();
+
+/* ---------- public helpers ---------- */
+
+/// Called **once** when the storage engine starts.
+/// `port` is the daemon port that the ZMQ adapter will talk to.
+pub async fn init_indexing_service(port: u16) -> Result<()> {
+    SINGLETON
+        .get_or_init(|| async { Arc::new(TokioMutex::new(IndexingService::new(port))) })
+        .await;
+    Ok(())
+}
+
+/// Cheap clone of the already-built service.
+/// Panics if called before `init_indexing_service`.
+pub fn indexing_service() -> Service {
+    SINGLETON
+        .get()
+        .expect("IndexingService not initialised – start storage first")
+        .clone()
+}
+
+/* ---------- the service itself ---------- */
 
 #[derive(Clone)]
 pub struct IndexingService {
@@ -13,7 +41,8 @@ impl IndexingService {
         Self { daemon_port }
     }
 
-    /// index create Person name
+    /* all business methods stay identical */
+
     pub async fn create_index(&self, label: &str, property: &str) -> Result<Value> {
         let payload = json!({
             "command": "index_create",
@@ -23,7 +52,6 @@ impl IndexingService {
         send_zmq_command(self.daemon_port, &payload.to_string()).await
     }
 
-    /// index drop Person name
     pub async fn drop_index(&self, label: &str, property: &str) -> Result<Value> {
         let payload = json!({
             "command": "index_drop",
@@ -33,16 +61,17 @@ impl IndexingService {
         send_zmq_command(self.daemon_port, &payload.to_string()).await
     }
 
-    /// index list
     pub async fn list_indexes(&self) -> Result<Value> {
-        let payload = json!({
-            "command": "index_list"
-        });
+        let payload = json!({"command": "index_list"});
         send_zmq_command(self.daemon_port, &payload.to_string()).await
     }
 
-    /// index create-fulltext notesIndex Note content Document text
-    pub async fn create_fulltext_index(&self, name: &str, labels: &[&str], properties: &[&str]) -> Result<Value> {
+    pub async fn create_fulltext_index(
+        &self,
+        name: &str,
+        labels: &[&str],
+        properties: &[&str],
+    ) -> Result<Value> {
         let payload = json!({
             "command": "fulltext_create",
             "name": name,
@@ -52,7 +81,6 @@ impl IndexingService {
         send_zmq_command(self.daemon_port, &payload.to_string()).await
     }
 
-    /// index drop-fulltext notesIndex
     pub async fn drop_fulltext_index(&self, name: &str) -> Result<Value> {
         let payload = json!({
             "command": "fulltext_drop",
@@ -61,7 +89,6 @@ impl IndexingService {
         send_zmq_command(self.daemon_port, &payload.to_string()).await
     }
 
-    /// index search "Oliver Stone" [top N]
     pub async fn fulltext_search(&self, query: &str, limit: usize) -> Result<Value> {
         let payload = json!({
             "command": "fulltext_search",
@@ -71,19 +98,13 @@ impl IndexingService {
         send_zmq_command(self.daemon_port, &payload.to_string()).await
     }
 
-    /// index rebuild
     pub async fn rebuild_indexes(&self) -> Result<Value> {
-        let payload = json!({
-            "command": "fulltext_rebuild"
-        });
+        let payload = json!({"command": "fulltext_rebuild"});
         send_zmq_command(self.daemon_port, &payload.to_string()).await
     }
 
-    /// index stats (optional)
     pub async fn index_stats(&self) -> Result<Value> {
-        let payload = json!({
-            "command": "index_stats"
-        });
+        let payload = json!({"command": "index_stats"});
         send_zmq_command(self.daemon_port, &payload.to_string()).await
     }
 }

@@ -1,5 +1,5 @@
 // --- Constants ---
-pub const DAEMON_REGISTRY_DB_PATH: &str = "./daemon_registry_db";
+pub const DAEMON_REGISTRY_DB_PATH: &str = "/opt/graphdb/run/daemon_registry_db";
 pub const DEFAULT_DAEMON_PORT: u16 = 9001;
 pub const DEFAULT_REST_API_PORT: u16 = 8081;
 pub const DEFAULT_REST_PORT: u16 = 8081;

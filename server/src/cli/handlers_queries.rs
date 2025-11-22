@@ -37,6 +37,7 @@ use lib::config::{StorageConfig, MAX_SHUTDOWN_RETRIES, SHUTDOWN_RETRY_DELAY_MS, 
 use lib::database::Database;
 use lib::query_parser::{cypher_parser, sql_parser, graphql_parser};
 use crate::cli::handlers_storage::{start_storage_interactive};
+use crate::cli::handlers_utils::{ StartStorageFn, StopStorageFn };
 use models::errors::{GraphError, GraphResult};
 use daemon_api::{start_daemon, stop_port_daemon};
 use lib::storage_engine::sled_client::SledClient;
@@ -246,50 +247,60 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
     const RECEIVE_TIMEOUT_SECS: u64 = 15;
     const MAX_RETRIES: u32 = 3;
     const BASE_RETRY_DELAY_MS: u64 = 500;
+    
     info!("Starting ZMQ KV operation: {} for key: {}", operation, key);
+    
     // -----------------------------------------------------------------
     // 1. Find a daemon with verified IPC socket, or recover
     // -----------------------------------------------------------------
     let registry = GLOBAL_DAEMON_REGISTRY.get().await;
+    let engine_type_lower = StorageEngineType::Sled.to_string().to_lowercase();
+    
     let mut daemons = registry
         .get_all_daemon_metadata()
         .await
         .map_err(|e| anyhow!("Failed to retrieve daemon meta {}", e))?
         .into_iter()
         .filter(|metadata| {
-            metadata.engine_type == Some(StorageEngineType::Sled.to_string())
+            metadata.service_type == "storage"
+                && metadata.engine_type.as_deref().map(|e| e.to_lowercase()) == Some(engine_type_lower.clone())
                 && metadata.pid > 0
                 && check_pid_validity_sync(metadata.pid)
         })
         .collect::<Vec<_>>();
+    
     if daemons.is_empty() {
         error!("No running Sled daemon found");
         return Err(anyhow!(
             "No running Sled daemon found. Please start a daemon with 'storage start'"
         ));
     }
+    
+    info!("Found {} Sled daemon(s)", daemons.len());
+    
     // Sort by port (highest first) to prefer the default
     daemons.sort_by_key(|m| std::cmp::Reverse(m.port));
     
     // First, try to find a daemon with a valid IPC socket
     let mut selected_daemon: Option<DaemonMetadata> = None;
-    let mut daemon_with_process_no_ipc: Option<DaemonMetadata> = None; // Daemon running but no IPC
+    let mut daemon_with_process_no_ipc: Option<DaemonMetadata> = None;
     let mut broken_daemons: Vec<u16> = Vec::new();
    
     for daemon in &daemons {
         let socket_path = format!("/tmp/graphdb-{}.ipc", daemon.port);
+        
         if tokio::fs::metadata(&socket_path).await.is_ok() {
             selected_daemon = Some(daemon.clone());
             info!("Selected daemon on port {} with verified IPC socket", daemon.port);
             break;
         } else {
-            // Check if process is running but IPC is missing (likely race condition)
+            // Check if process is running but IPC is missing
             if check_pid_validity_sync(daemon.pid) {
                 warn!(
                     "Daemon on port {} exists (PID {}) but IPC socket {} is missing",
                     daemon.port, daemon.pid, socket_path
                 );
-                // Wait a bit more to see if IPC socket appears (race condition)
+                // Wait a bit to see if IPC socket appears
                 for attempt in 0..5 {
                     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                     if tokio::fs::metadata(&socket_path).await.is_ok() {
@@ -299,11 +310,9 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
                     }
                 }
                 if selected_daemon.is_none() {
-                    // Process is running but IPC is consistently missing
                     daemon_with_process_no_ipc = Some(daemon.clone());
                 }
             } else {
-                // Process is not running at all
                 warn!(
                     "Daemon on port {} has no running process, marking as broken",
                     daemon.port
@@ -316,17 +325,14 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
     // If no daemon with IPC, prioritize daemon that's running but missing IPC
     if selected_daemon.is_none() {
         if let Some(daemon_metadata) = daemon_with_process_no_ipc {
-            warn!("Found daemon on port {} with running process but missing IPC, attempting to use it", daemon_metadata.port);
+            warn!("Found daemon on port {} with running process but missing IPC, attempting extended wait", daemon_metadata.port);
             
-            // The daemon is running but IPC is missing - this could be a race condition or the daemon needs to be restarted
-            // Try to wait a bit longer for the IPC to appear
             let socket_path = format!("/tmp/graphdb-{}.ipc", daemon_metadata.port);
             let mut ipc_ready = false;
             for attempt in 0..10 {
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                 if tokio::fs::metadata(&socket_path).await.is_ok() {
                     info!("IPC socket found after extended wait (attempt {})", attempt + 1);
-                    println!("===> IPC SOCKET FOUND AFTER EXTENDED WAIT (ATTEMPT {})", attempt + 1);
                     selected_daemon = Some(daemon_metadata.clone());
                     ipc_ready = true;
                     break;
@@ -334,18 +340,11 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
             }
             
             if !ipc_ready {
-                // IPC still not ready, but daemon is running - this suggests the daemon needs to be restarted
-                // However, let's try the recovery approach on the running daemon
-                warn!("Daemon on port {} is running but IPC still not available, will try recovery", daemon_metadata.port);
-                println!("===> WARNING: No daemon with IPC found - attempting recovery on port {}", daemon_metadata.port);
+                warn!("Daemon on port {} is running but IPC still not available", daemon_metadata.port);
                 
-                // Refresh daemon metadata to make sure we have the latest info
                 if let Ok(Some(refreshed_metadata)) = registry.get_daemon_metadata(daemon_metadata.port).await {
-                    // The daemon is running, just missing IPC - try to ensure it's properly initialized
-                    // This might be a case where the daemon was started but the IPC server didn't fully initialize
                     selected_daemon = Some(refreshed_metadata);
                 } else {
-                    // Daemon no longer exists, treat as broken
                     broken_daemons.push(daemon_metadata.port);
                 }
             }
@@ -355,36 +354,24 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
     // If still no daemon selected and we have broken daemons, attempt recovery
     if selected_daemon.is_none() && !broken_daemons.is_empty() {
         let recovery_port = broken_daemons[0];
-        warn!(
-            "No Sled daemon has valid IPC - attempting recovery on port {}",
-            recovery_port
-        );
-        println!(
-            "===> WARNING: No daemon with IPC found - attempting recovery on port {}",
-            recovery_port
-        );
+        warn!("No Sled daemon has valid IPC - attempting recovery on port {}", recovery_port);
         
-        // First, verify the daemon is actually running and get its metadata
         let daemon_metadata = registry.get_daemon_metadata(recovery_port).await
             .map_err(|e| anyhow!("Failed to get daemon metadata for port {}: {}", recovery_port, e))?
             .ok_or_else(|| anyhow!("No daemon found for port {} during recovery", recovery_port))?;
         
-        // Check if the daemon process is still running
         if !check_pid_validity_sync(daemon_metadata.pid) {
             warn!("Daemon on port {} (PID {}) is not running, will restart", recovery_port, daemon_metadata.pid);
             
-            // Load config for restart
             let config = load_storage_config_from_yaml(None).await.map_err(|e| {
                 anyhow!("Failed to load config for daemon restart: {}", e)
             })?;
             
-            // Stop the broken daemon if it exists
             if let Err(e) = stop_storage_daemon_by_port(recovery_port).await {
                 warn!("Failed to stop broken daemon on port {}: {}", recovery_port, e);
             }
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             
-            // Start fresh daemon
             let cwd = std::env::current_dir().context("Failed to get current working directory")?;
             let config_path = cwd.join(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
            
@@ -400,9 +387,11 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
                     .to_string();
                 ec.storage.path = Some(PathBuf::from(format!("{}/sled/{}", base_dir, recovery_port)));
             }
+            
             let shutdown_tx = Arc::new(TokioMutex::new(None));
             let handle = Arc::new(TokioMutex::new(None));
             let port_arc = Arc::new(TokioMutex::new(None));
+            
             start_storage_interactive(
                 Some(recovery_port),
                 Some(config_path),
@@ -419,10 +408,10 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
                     recovery_port, e
                 )
             })?;
-            // --- NEW: wait until the daemon says it is ready -------------
-            let registry   = GLOBAL_DAEMON_REGISTRY.get().await;
-            let mut ready  = false;
-            for _ in 0..20 {                          // 10 s total
+            
+            let registry = GLOBAL_DAEMON_REGISTRY.get().await;
+            let mut ready = false;
+            for _ in 0..20 {
                 if let Ok(Some(meta)) = registry.get_daemon_metadata(recovery_port).await {
                     if meta.zmq_ready {
                         ready = true;
@@ -435,17 +424,13 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
                 return Err(anyhow!("Daemon on port {} never became ready", recovery_port));
             }
         } else {
-            warn!("Daemon on port {} (PID {}) is running but IPC socket is missing, attempting to verify daemon state", recovery_port, daemon_metadata.pid);
+            warn!("Daemon on port {} (PID {}) is running but IPC socket is missing", recovery_port, daemon_metadata.pid);
             
-            // The daemon is running but IPC is missing - this could be a race condition
-            // Wait a bit and check again
             for attempt in 0..10 {
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                 let socket_path = format!("/tmp/graphdb-{}.ipc", recovery_port);
                 if tokio::fs::metadata(&socket_path).await.is_ok() {
                     info!("IPC socket found after waiting (attempt {})", attempt + 1);
-                    println!("===> IPC SOCKET FOUND AFTER WAITING (ATTEMPT {})", attempt + 1);
-                    // Refresh daemon metadata
                     if let Ok(Some(daemon_meta)) = registry.get_daemon_metadata(recovery_port).await {
                         selected_daemon = Some(daemon_meta);
                     }
@@ -454,7 +439,6 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
             }
         }
         
-        // After recovery attempt, check if IPC exists
         let socket_path = format!("/tmp/graphdb-{}.ipc", recovery_port);
         let mut ipc_ready = false;
         for attempt in 0..30 {
@@ -462,7 +446,6 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
             if tokio::fs::metadata(&socket_path).await.is_ok() {
                 ipc_ready = true;
                 info!("IPC ready on port {} (attempt {})", recovery_port, attempt + 1);
-                println!("===> IPC READY ON PORT {}", recovery_port);
                 break;
             }
         }
@@ -474,7 +457,6 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
             ));
         }
         
-        // Refresh daemon metadata
         if let Ok(Some(daemon_meta)) = registry.get_daemon_metadata(recovery_port).await {
             selected_daemon = Some(daemon_meta);
         } else {
@@ -491,11 +473,12 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
             "Sled daemons found but none have valid IPC sockets and recovery failed. Try 'start-storage'."
         )
     })?;
+    
     info!("Selected Sled daemon on port: {}", daemon.port);
-    println!("===> Selected daemon on port: {}", daemon.port);
+    
     let socket_path = format!("/tmp/graphdb-{}.ipc", daemon.port);
     let addr = format!("ipc://{}", socket_path);
-    // Final verification
+    
     if !tokio::fs::metadata(&socket_path).await.is_ok() {
         error!(
             "IPC socket file {} does not exist after all recovery attempts. Daemon port: {}.",
@@ -506,6 +489,7 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
             socket_path
         ));
     }
+    
     // -----------------------------------------------------------------
     // 2. Build the request (Base64 encoding)
     // -----------------------------------------------------------------
@@ -538,8 +522,10 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
             return Err(anyhow!("Unsupported operation: {}", operation));
         }
     };
+    
     let request_data = serde_json::to_vec(&request)
         .map_err(|e| anyhow!("Failed to serialize request: {}", e))?;
+    
     // -----------------------------------------------------------------
     // 3. Send the request with retries
     // -----------------------------------------------------------------
@@ -554,6 +540,7 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
             }),
         )
         .await;
+        
         match response_result {
             Ok(Ok(response)) => {
                 let response_value = response?;
@@ -634,12 +621,14 @@ async fn handle_kv_sled_zmq(key: String, value: Option<String>, operation: &str)
                 warn!("Attempt {}/{} timed out", attempt, MAX_RETRIES);
             }
         }
+        
         if attempt < MAX_RETRIES {
             let delay = BASE_RETRY_DELAY_MS * 2u64.pow(attempt - 1);
             debug!("Retrying after {}ms", delay);
             tokio::time::sleep(TokioDuration::from_millis(delay)).await;
         }
     }
+    
     Err(last_error.unwrap_or_else(|| {
         anyhow!(
             "Failed to complete ZMQ operation after {} attempts",
@@ -654,69 +643,125 @@ async fn handle_kv_rocksdb_zmq(key: String, value: Option<String>, operation: &s
     const RECEIVE_TIMEOUT_SECS: u64 = 15;
     const MAX_RETRIES: u32 = 3;
     const BASE_RETRY_DELAY_MS: u64 = 500;
+    
     info!("Starting ZMQ KV operation: {} for key: {}", operation, key);
+    
     // -----------------------------------------------------------------
     // 1. Find a daemon with verified IPC socket, or recover
     // -----------------------------------------------------------------
     let registry = GLOBAL_DAEMON_REGISTRY.get().await;
+    let engine_type_lower = StorageEngineType::RocksDB.to_string().to_lowercase();
+    
     let mut daemons = registry
         .get_all_daemon_metadata()
         .await
         .map_err(|e| anyhow!("Failed to retrieve daemon metadata: {}", e))?
         .into_iter()
         .filter(|metadata| {
-            metadata.engine_type == Some(StorageEngineType::RocksDB.to_string())
+            metadata.service_type == "storage"
+                && metadata.engine_type.as_deref().map(|e| e.to_lowercase()) == Some(engine_type_lower.clone())
                 && metadata.pid > 0
                 && check_pid_validity_sync(metadata.pid)
         })
         .collect::<Vec<_>>();
+    
     if daemons.is_empty() {
         error!("No running RocksDB daemon found");
         return Err(anyhow!(
             "No running RocksDB daemon found. Please start a daemon with 'storage start'"
         ));
     }
+    
+    info!("Found {} RocksDB daemon(s)", daemons.len());
+    println!("===> FOUND {} ROCKSDB DAEMON(S)", daemons.len());
+    
     // Sort by port (highest first) to prefer the default
     daemons.sort_by_key(|m| std::cmp::Reverse(m.port));
+    
     // Try to find a daemon with a valid IPC socket
     let mut selected_daemon: Option<DaemonMetadata> = None;
+    let mut daemon_with_process_no_ipc: Option<DaemonMetadata> = None;
     let mut broken_daemons: Vec<u16> = Vec::new();
    
     for daemon in &daemons {
         let socket_path = format!("/tmp/graphdb-{}.ipc", daemon.port);
+        println!("===> CHECKING DAEMON ON PORT {} FOR IPC AT {}", daemon.port, socket_path);
+        
         if tokio::fs::metadata(&socket_path).await.is_ok() {
             selected_daemon = Some(daemon.clone());
             info!("Selected daemon on port {} with verified IPC socket", daemon.port);
+            println!("===> SELECTED DAEMON ON PORT {} WITH VERIFIED IPC SOCKET", daemon.port);
             break;
         } else {
-            warn!(
-                "Daemon on port {} exists but IPC socket {} is missing",
-                daemon.port, socket_path
-            );
-            broken_daemons.push(daemon.port);
+            // Check if process is running but IPC is missing
+            if check_pid_validity_sync(daemon.pid) {
+                warn!(
+                    "Daemon on port {} exists (PID {}) but IPC socket {} is missing",
+                    daemon.port, daemon.pid, socket_path
+                );
+                // Wait a bit to see if IPC socket appears
+                for attempt in 0..5 {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                    if tokio::fs::metadata(&socket_path).await.is_ok() {
+                        info!("IPC socket found after waiting (attempt {})", attempt + 1);
+                        selected_daemon = Some(daemon.clone());
+                        break;
+                    }
+                }
+                if selected_daemon.is_none() {
+                    daemon_with_process_no_ipc = Some(daemon.clone());
+                }
+            } else {
+                warn!(
+                    "Daemon on port {} has no running process, marking as broken",
+                    daemon.port
+                );
+                broken_daemons.push(daemon.port);
+            }
         }
     }
+    
+    // If no daemon with IPC, prioritize daemon that's running but missing IPC
+    if selected_daemon.is_none() {
+        if let Some(daemon_metadata) = daemon_with_process_no_ipc {
+            warn!("Found daemon on port {} with running process but missing IPC, attempting extended wait", daemon_metadata.port);
+            println!("===> DAEMON ON PORT {} HAS NO IPC, ATTEMPTING EXTENDED WAIT", daemon_metadata.port);
+            
+            let socket_path = format!("/tmp/graphdb-{}.ipc", daemon_metadata.port);
+            let mut ipc_ready = false;
+            for attempt in 0..10 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                if tokio::fs::metadata(&socket_path).await.is_ok() {
+                    info!("IPC socket found after extended wait (attempt {})", attempt + 1);
+                    println!("===> IPC SOCKET FOUND AFTER EXTENDED WAIT (ATTEMPT {})", attempt + 1);
+                    selected_daemon = Some(daemon_metadata.clone());
+                    ipc_ready = true;
+                    break;
+                }
+            }
+            
+            if !ipc_ready {
+                warn!("Daemon on port {} is running but IPC still not available", daemon_metadata.port);
+                broken_daemons.push(daemon_metadata.port);
+            }
+        }
+    }
+    
     // If no daemon has IPC, attempt recovery on the first broken one
     if selected_daemon.is_none() && !broken_daemons.is_empty() {
         let recovery_port = broken_daemons[0];
-        warn!(
-            "No RocksDB daemon has valid IPC - attempting recovery on port {}",
-            recovery_port
-        );
-        println!(
-            "===> WARNING: No daemon with IPC found - attempting recovery on port {}",
-            recovery_port
-        );
-        // Load config for recovery
+        warn!("No RocksDB daemon has valid IPC - attempting recovery on port {}", recovery_port);
+        println!("===> WARNING: No daemon with IPC found - attempting recovery on port {}", recovery_port);
+        
         let config = load_storage_config_from_yaml(None).await.map_err(|e| {
             anyhow!("Failed to load config for IPC recovery: {}", e)
         })?;
-        // Stop the broken daemon
+        
         if let Err(e) = stop_storage_daemon_by_port(recovery_port).await {
             warn!("Failed to stop broken daemon on port {}: {}", recovery_port, e);
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        // Start fresh daemon with IPC
+        
         let cwd = std::env::current_dir().context("Failed to get current working directory")?;
         let config_path = cwd.join(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
        
@@ -732,9 +777,11 @@ async fn handle_kv_rocksdb_zmq(key: String, value: Option<String>, operation: &s
                 .to_string();
             ec.storage.path = Some(PathBuf::from(format!("{}/rocksdb/{}", base_dir, recovery_port)));
         }
+        
         let shutdown_tx = Arc::new(TokioMutex::new(None));
         let handle = Arc::new(TokioMutex::new(None));
         let port_arc = Arc::new(TokioMutex::new(None));
+        
         start_storage_interactive(
             Some(recovery_port),
             Some(config_path),
@@ -751,7 +798,7 @@ async fn handle_kv_rocksdb_zmq(key: String, value: Option<String>, operation: &s
                 recovery_port, e
             )
         })?;
-        // Wait for IPC to be ready
+        
         let mut ipc_ready = false;
         for attempt in 0..30 {
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -763,13 +810,14 @@ async fn handle_kv_rocksdb_zmq(key: String, value: Option<String>, operation: &s
                 break;
             }
         }
+        
         if !ipc_ready {
             return Err(anyhow!(
                 "Failed to recover IPC on port {} after daemon restart",
                 recovery_port
             ));
         }
-        // Refresh daemon metadata
+        
         if let Ok(Some(daemon_meta)) = registry.get_daemon_metadata(recovery_port).await {
             selected_daemon = Some(daemon_meta);
         } else {
@@ -779,17 +827,20 @@ async fn handle_kv_rocksdb_zmq(key: String, value: Option<String>, operation: &s
             ));
         }
     }
+    
     let daemon = selected_daemon.ok_or_else(|| {
         error!("No RocksDB daemon has a valid IPC socket and recovery failed");
         anyhow!(
             "RocksDB daemons found but none have valid IPC sockets and recovery failed. Try 'start-storage'."
         )
     })?;
+    
     info!("Selected RocksDB daemon on port: {}", daemon.port);
-    println!("===> Selected daemon on port: {}", daemon.port);
+    println!("===> SELECTED DAEMON ON PORT: {}", daemon.port);
+    
     let socket_path = format!("/tmp/graphdb-{}.ipc", daemon.port);
     let addr = format!("ipc://{}", socket_path);
-    // Final verification
+    
     if !tokio::fs::metadata(&socket_path).await.is_ok() {
         error!(
             "IPC socket file {} does not exist after all recovery attempts. Daemon port: {}.",
@@ -800,7 +851,9 @@ async fn handle_kv_rocksdb_zmq(key: String, value: Option<String>, operation: &s
             socket_path
         ));
     }
+    
     debug!("Connecting to RocksDB daemon at: {}", addr);
+    
     // -----------------------------------------------------------------
     // 2. Build the request (plain text, no Base64)
     // -----------------------------------------------------------------
@@ -818,15 +871,19 @@ async fn handle_kv_rocksdb_zmq(key: String, value: Option<String>, operation: &s
         "clear" => json!({ "command": "clear_data" }),
         _ => return Err(anyhow!("Unsupported operation: {}", operation)),
     };
+    
     debug!("Sending request: {:?}", request);
     let request_data = serde_json::to_vec(&request)
         .map_err(|e| anyhow!("Failed to serialize request: {}", e))?;
+    
     // -----------------------------------------------------------------
     // 3. Send the request with retries
     // -----------------------------------------------------------------
     let mut last_error: Option<anyhow::Error> = None;
+    
     for attempt in 1..=MAX_RETRIES {
         debug!("Attempt {}/{} to send ZMQ request", attempt, MAX_RETRIES);
+        
         let response_result = tokio::time::timeout(
             TokioDuration::from_secs(CONNECT_TIMEOUT_SECS + REQUEST_TIMEOUT_SECS + RECEIVE_TIMEOUT_SECS),
             tokio::task::spawn_blocking({
@@ -836,6 +893,7 @@ async fn handle_kv_rocksdb_zmq(key: String, value: Option<String>, operation: &s
             })
         )
         .await;
+        
         match response_result {
             Ok(Ok(response)) => {
                 let response_value = response?;
@@ -872,32 +930,54 @@ async fn handle_kv_rocksdb_zmq(key: String, value: Option<String>, operation: &s
                         return Ok(());
                     }
                     Some("error") => {
-                        let message = response_value.get("message").and_then(|m| m.as_str()).unwrap_or("Unknown error");
+                        let message = response_value
+                            .get("message")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("Unknown error");
                         error!("Daemon error: {}", message);
                         last_error = Some(anyhow!("Daemon error: {}", message));
                     }
                     _ => {
                         error!("Invalid response: {:?}", response_value);
-                        last_error = Some(anyhow!("Invalid response from {}: {:?}", addr, response_value));
+                        last_error = Some(anyhow!(
+                            "Invalid response from {}: {:?}",
+                            addr,
+                            response_value
+                        ));
                     }
                 }
             }
             Ok(Err(e)) => {
                 last_error = Some(e.into());
-                warn!("Attempt {}/{} failed: {}", attempt, MAX_RETRIES, last_error.as_ref().unwrap());
+                warn!(
+                    "Attempt {}/{} failed: {}",
+                    attempt,
+                    MAX_RETRIES,
+                    last_error.as_ref().unwrap()
+                );
             }
             Err(_) => {
-                last_error = Some(anyhow!("ZMQ operation timed out after {} seconds", CONNECT_TIMEOUT_SECS + REQUEST_TIMEOUT_SECS + RECEIVE_TIMEOUT_SECS));
+                last_error = Some(anyhow!(
+                    "ZMQ operation timed out after {} seconds",
+                    CONNECT_TIMEOUT_SECS + REQUEST_TIMEOUT_SECS + RECEIVE_TIMEOUT_SECS
+                ));
                 warn!("Attempt {}/{} timed out", attempt, MAX_RETRIES);
             }
         }
+        
         if attempt < MAX_RETRIES {
             let delay = BASE_RETRY_DELAY_MS * 2u64.pow(attempt - 1);
             debug!("Retrying after {}ms", delay);
             tokio::time::sleep(TokioDuration::from_millis(delay)).await;
         }
     }
-    Err(last_error.unwrap_or_else(|| anyhow!("Failed to complete ZMQ operation after {} attempts", MAX_RETRIES)))
+    
+    Err(last_error.unwrap_or_else(|| {
+        anyhow!(
+            "Failed to complete ZMQ operation after {} attempts",
+            MAX_RETRIES
+        )
+    }))
 }
 
 pub async fn handle_kv_command(engine: Arc<QueryExecEngine>, operation: String, key: String, value: Option<String>) -> Result<()> {
@@ -973,22 +1053,6 @@ pub async fn handle_kv_command(engine: Arc<QueryExecEngine>, operation: String, 
     }
 }
 
-type StartStorageFn = fn(
-    Option<u16>,
-    Option<PathBuf>,
-    Option<StorageConfig>,
-    Option<String>,
-    Arc<TokioMutex<Option<tokio::sync::oneshot::Sender<()>>>>,
-    Arc<TokioMutex<Option<tokio::task::JoinHandle<()>>>>,
-    Arc<TokioMutex<Option<u16>>>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), anyhow::Error>> + Send>>;
-type StopStorageFn = fn(
-    Option<u16>,
-    Arc<TokioMutex<Option<tokio::sync::oneshot::Sender<()>>>>,
-    Arc<TokioMutex<Option<tokio::task::JoinHandle<()>>>>,
-    Arc<TokioMutex<Option<u16>>>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), anyhow::Error>> + Send>>;
-
 pub async fn initialize_storage_for_query(
     start_storage_interactive: StartStorageFn,
     _stop_storage_interactive: StopStorageFn,
@@ -996,36 +1060,17 @@ pub async fn initialize_storage_for_query(
     static INIT_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _guard = INIT_MUTEX.lock().await;
 
-    let config = match load_storage_config_from_yaml(None).await {
-        Ok(c) => {
-            info!("Loaded storage config: {:?}", c);
-            println!("===> SUCCESSFULLY LOADED STORAGE CONFIG");
-            c
-        }
-        Err(e) => {
-            warn!("Failed to load config, using default: {}", e);
-            StorageConfig::default()
-        }
-    };
+    // 1. load config
+    let cwd = std::env::current_dir().context("cwd")?;
+    let cfg_path = cwd.join(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
+    let config = StorageConfig::load(&cfg_path).await?;
 
-    let canonical_port = config
-        .engine_specific_config
-        .as_ref()
-        .and_then(|esc| esc.storage.port)
-        .unwrap_or(config.default_port);
-
-    let cwd = std::env::current_dir()
-        .context("Failed to get current working directory")?;
-    let config_path = cwd.join(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE);
-
+    // 2. reuse manager if it already serves the correct engine
     if let Some(manager) = GLOBAL_STORAGE_ENGINE_MANAGER.get() {
         let engine = manager.get_persistent_engine().await;
-        if engine.get_type() == config.storage_engine_type.to_string() {
+        if engine.get_type().to_lowercase() == config.storage_engine_type.to_string().to_lowercase() {
             info!("StorageEngineManager already initialized. Reusing.");
             println!("===> STORAGE ENGINE MANAGER ALREADY INITIALIZED. REUSING.");
-
-            // Use TokioMutex for graph
-            let graph = Arc::new(TokioMutex::new(Graph::new()));
 
             let db = Database {
                 storage: engine,
@@ -1035,40 +1080,68 @@ pub async fn initialize_storage_for_query(
         }
     }
 
-    info!(
-        "Finding daemon with working IPC for engine {:?}",
-        config.storage_engine_type
-    );
-    println!(
-        "===> FINDING DAEMON WITH WORKING IPC FOR ENGINE {:?}",
-        config.storage_engine_type
-    );
+    // 3. FIRST: look for ANY running daemon of the correct engine type
+    let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
+    let engine_type_lower = config.storage_engine_type.to_string().to_lowercase();
+    
+    let running_daemons = daemon_registry
+        .get_all_daemon_metadata()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|m| {
+            m.service_type == "storage"
+                && m.engine_type.as_deref().map(|e| e.to_lowercase()) == Some(engine_type_lower.clone())
+                && m.pid > 0
+                && check_pid_validity_sync(m.pid)
+        })
+        .collect::<Vec<_>>();
 
-    // Look for available daemons in order of preference:
-    // 1. Daemons with working IPC
-    // 2. Daemons running but missing IPC (try to make them have IPC)
-    // 3. Start new daemon if none available
+    info!("Found {} running daemon(s) for engine type {}", running_daemons.len(), config.storage_engine_type);
+    println!("===> FOUND {} RUNNING DAEMON(S) FOR ENGINE TYPE {}", running_daemons.len(), config.storage_engine_type);
+
+    // Determine canonical port: prefer a running daemon's port, fallback to config
+    let canonical_port = if !running_daemons.is_empty() {
+        // Sort by port (highest first) to prefer higher ports
+        let mut sorted = running_daemons.clone();
+        sorted.sort_by_key(|m| std::cmp::Reverse(m.port));
+        
+        let selected_port = sorted[0].port;
+        info!("Using port {} from running daemon", selected_port);
+        println!("===> USING PORT {} FROM RUNNING DAEMON", selected_port);
+        selected_port
+    } else {
+        let fallback_port = config
+            .engine_specific_config
+            .as_ref()
+            .and_then(|esc| esc.storage.port)
+            .unwrap_or(config.default_port);
+        info!("No running daemon found, using canonical port from config: {}", fallback_port);
+        println!("===> NO RUNNING DAEMON FOUND, USING CANONICAL PORT FROM CONFIG: {}", fallback_port);
+        fallback_port
+    };
+
+    // 4. ensure a daemon with working IPC exists on that exact port
     let working_port = find_or_create_working_daemon(
         config.storage_engine_type.clone(),
         &config,
         canonical_port,
         start_storage_interactive,
-        config_path.clone(),
+        cfg_path,
     )
     .await?;
 
-    // Verify and wait for IPC to be fully ready
     if !verify_and_wait_for_ipc(working_port).await {
         return Err(anyhow!("IPC not ready after verification for port {}", working_port));
     }
 
-    // Create manager for the working port
+    // 5. create / reuse manager
     let manager = if let Some(m) = GLOBAL_STORAGE_ENGINE_MANAGER.get() {
         m.clone()
     } else {
         let manager = StorageEngineManager::new(
             config.storage_engine_type.clone(),
-            &config_path,
+            &cwd.join(DEFAULT_STORAGE_CONFIG_PATH_RELATIVE),
             false,
             Some(working_port),
         )
@@ -1089,10 +1162,6 @@ pub async fn initialize_storage_for_query(
     };
 
     let engine = manager.get_persistent_engine().await;
-
-    // Use TokioMutex for graph
-    let graph = Arc::new(TokioMutex::new(Graph::new()));
-
     let db = Database {
         storage: engine,
         config: config.clone(),
@@ -1101,7 +1170,128 @@ pub async fn initialize_storage_for_query(
     Ok(Arc::new(QueryExecEngine::new(Arc::new(db))))
 }
 
-async fn verify_and_wait_for_ipc(port: u16) -> bool {
+pub async fn find_or_create_working_daemon(
+    engine_type: StorageEngineType,
+    config: &StorageConfig,
+    canonical_port: u16,
+    start_storage_interactive: StartStorageFn,
+    config_path: PathBuf,
+) -> Result<u16, anyhow::Error> {
+    let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
+    let engine_type_lower = engine_type.to_string().to_lowercase();
+
+    // 1. list running daemons of this engine
+    let mut daemons = daemon_registry
+        .get_all_daemon_metadata()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|m| {
+            m.service_type == "storage"
+                && m.engine_type.as_deref().map(|e| e.to_lowercase()) == Some(engine_type_lower.clone())
+                && m.pid > 0
+                && check_pid_validity_sync(m.pid)
+        })
+        .collect::<Vec<_>>();
+
+    info!("Found {} daemon(s) for engine type {}", daemons.len(), engine_type);
+    println!("===> FOUND {} DAEMON(S) FOR ENGINE TYPE {}", daemons.len(), engine_type);
+
+    // 2. sort: canonical_port first, otherwise descending (prefer higher ports)
+    daemons.sort_by(|a, b| {
+        if a.port == canonical_port {
+            std::cmp::Ordering::Less
+        } else if b.port == canonical_port {
+            std::cmp::Ordering::Greater
+        } else {
+            b.port.cmp(&a.port)  // descending order
+        }
+    });
+
+    // 3. try to find a daemon that already has working IPC
+    for daemon in &daemons {
+        info!("Checking daemon on port {} for IPC", daemon.port);
+        println!("===> CHECKING DAEMON ON PORT {} FOR IPC", daemon.port);
+
+        if check_ipc_socket_exists(daemon.port).await && is_zmq_reachable(daemon.port).await {
+            info!("Found daemon on port {} with working IPC", daemon.port);
+            println!("===> FOUND DAEMON ON PORT {} WITH WORKING IPC", daemon.port);
+            return Ok(daemon.port);
+        }
+        warn!("Daemon on port {} has no working IPC (exists: {}, reachable: {})",
+              daemon.port,
+              check_ipc_socket_exists(daemon.port).await,
+              is_zmq_reachable(daemon.port).await);
+        println!("===> DAEMON ON PORT {} HAS NO WORKING IPC", daemon.port);
+    }
+
+    // 4. if we have daemons but none with IPC, try to wait for the canonical port
+    if !daemons.is_empty() {
+        warn!("Found {} daemon(s) but none have working IPC, waiting for port {}", daemons.len(), canonical_port);
+        println!("===> FOUND {} DAEMON(S) BUT NONE HAVE WORKING IPC, WAITING FOR PORT {}", daemons.len(), canonical_port);
+        
+        // Wait up to 15 seconds for IPC to appear
+        for attempt in 0..30 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            if check_ipc_socket_exists(canonical_port).await && is_zmq_reachable(canonical_port).await {
+                info!("IPC appeared on port {} after waiting", canonical_port);
+                println!("===> IPC APPEARED ON PORT {} AFTER WAITING (ATTEMPT {})", canonical_port, attempt + 1);
+                return Ok(canonical_port);
+            }
+        }
+    }
+
+    // 5. none usable – start a fresh daemon on the canonical port
+    warn!("No suitable daemon found, starting new daemon on port {}", canonical_port);
+    println!("===> NO HEALTHY DAEMON FOUND - STARTING NEW ON PORT {}", canonical_port);
+
+    if let Ok(Some(meta)) = daemon_registry.get_daemon_metadata(canonical_port).await {
+        if check_pid_validity(meta.pid).await {
+            let _ = stop_storage_daemon_by_port(canonical_port).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        }
+    }
+
+    let shutdown_tx = Arc::new(TokioMutex::new(None));
+    let handle = Arc::new(TokioMutex::new(None));
+    let port_arc = Arc::new(TokioMutex::new(None));
+
+    start_storage_interactive(
+        Some(canonical_port),
+        Some(config_path),
+        Some(config.clone()),
+        Some("force_port".to_string()),
+        shutdown_tx,
+        handle,
+        port_arc,
+    )
+    .await
+    .map_err(|e| anyhow!("Failed to start daemon: {}", e))?;
+
+    // wait until IPC is ready
+    let mut ready = false;
+    for attempt in 0..30 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        if check_ipc_socket_exists(canonical_port).await && is_zmq_reachable(canonical_port).await {
+            ready = true;
+            println!("===> NEW DAEMON IPC READY ON PORT {} (ATTEMPT {})", canonical_port, attempt + 1);
+            break;
+        }
+        if attempt > 0 && attempt % 5 == 0 {
+            println!("===> WAITING FOR NEW DAEMON IPC ON PORT {} (ATTEMPT {})", canonical_port, attempt + 1);
+        }
+    }
+
+    if !ready {
+        return Err(anyhow!("New daemon on {} not ready with IPC after 30 attempts", canonical_port));
+    }
+
+    info!("New daemon started successfully on port {}", canonical_port);
+    println!("===> NEW DAEMON STARTED SUCCESSFULLY ON PORT {}", canonical_port);
+    Ok(canonical_port)
+}
+
+pub async fn verify_and_wait_for_ipc(port: u16) -> bool {
     // Verify IPC socket exists and is accessible
     for attempt in 0..30 {
         if check_ipc_socket_exists(port).await && is_zmq_reachable(port).await {
@@ -1119,115 +1309,6 @@ async fn verify_and_wait_for_ipc(port: u16) -> bool {
     
     warn!("IPC not ready after verification attempts for port {}", port);
     false
-}
-
-async fn find_or_create_working_daemon(
-    engine_type: StorageEngineType,
-    config: &StorageConfig,
-    canonical_port: u16,
-    start_storage_interactive: StartStorageFn,
-    config_path: PathBuf,
-) -> Result<u16, anyhow::Error> {
-    let daemon_registry = GLOBAL_DAEMON_REGISTRY.get().await;
-    
-    // First, get all daemons for this engine type
-    let all_daemons = daemon_registry
-        .get_all_daemon_metadata()
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|metadata| {
-            metadata.engine_type == Some(engine_type.to_string())
-                && metadata.pid > 0
-                && check_pid_validity_sync(metadata.pid)
-        })
-        .collect::<Vec<_>>();
-
-    // Sort by port (highest first) to prefer the default
-    let mut daemons = all_daemons;
-    daemons.sort_by_key(|m| std::cmp::Reverse(m.port));
-
-    // 1. First, look for daemon with working IPC
-    for daemon in &daemons {
-        if check_ipc_socket_exists(daemon.port).await && is_zmq_reachable(daemon.port).await {
-            info!("Found daemon on port {} with working IPC", daemon.port);
-            println!("===> FOUND DAEMON ON PORT {} WITH WORKING IPC", daemon.port);
-            return Ok(daemon.port);
-        }
-    }
-
-    // 2. Next, look for daemon that's running but missing IPC (try to make it work)
-    for daemon in &daemons {
-        if check_pid_validity_sync(daemon.pid) {
-            warn!("Found daemon on port {} with running process but missing IPC, attempting to use it", daemon.port);
-            println!("===> FOUND DAEMON ON PORT {} WITH RUNNING PROCESS BUT MISSING IPC", daemon.port);
-            
-            // Wait a bit to see if IPC appears (race condition)
-            for attempt in 0..15 {
-                tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-                if check_ipc_socket_exists(daemon.port).await && is_zmq_reachable(daemon.port).await {
-                    info!("IPC now available on port {} after waiting", daemon.port);
-                    println!("===> IPC NOW AVAILABLE ON PORT {} AFTER WAITING", daemon.port);
-                    return Ok(daemon.port);
-                }
-            }
-            
-            // IPC still not ready, but daemon is running - return this port for recovery
-            info!("Daemon on port {} is running, will proceed with recovery", daemon.port);
-            println!("===> DAEMON ON PORT {} IS RUNNING, WILL PROCEED WITH RECOVERY", daemon.port);
-            return Ok(daemon.port);
-        }
-    }
-
-    // 3. No suitable daemon found, start a new one on canonical port
-    warn!("No suitable daemon found, starting new daemon on port {}", canonical_port);
-    println!("===> NO HEALTHY DAEMON FOUND - STARTING NEW ON PORT {}", canonical_port);
-
-    if let Ok(Some(meta)) = daemon_registry.get_daemon_metadata(canonical_port).await {
-        if check_pid_validity(meta.pid).await {
-            let _ = stop_storage_daemon_by_port(canonical_port).await;
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        }
-    }
-
-    let shutdown_tx = Arc::new(TokioMutex::new(None));
-    let handle = Arc::new(TokioMutex::new(None));
-    let port_arc = Arc::new(TokioMutex::new(None));
-
-    start_storage_interactive(
-        Some(canonical_port),
-        Some(config_path.clone()),
-        Some(config.clone()),
-        Some("force_port".to_string()),
-        shutdown_tx,
-        handle,
-        port_arc,
-    )
-    .await
-    .map_err(|e| anyhow!("Failed to start daemon: {}", e))?;
-
-    // Wait for the daemon to be fully ready with IPC
-    let mut ready = false;
-    for attempt in 0..30 {
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        if check_ipc_socket_exists(canonical_port).await && is_zmq_reachable(canonical_port).await {
-            ready = true;
-            println!("===> NEW DAEMON IPC READY ON PORT {} (ATTEMPT {})", canonical_port, attempt + 1);
-            break;
-        }
-        
-        if attempt > 0 && attempt % 5 == 0 {
-            println!("===> WAITING FOR NEW DAEMON IPC ON PORT {} (ATTEMPT {})", canonical_port, attempt + 1);
-        }
-    }
-    
-    if !ready {
-        return Err(anyhow!("New daemon on {} not ready with IPC after 30 attempts", canonical_port));
-    }
-    
-    info!("New daemon started successfully on port {}", canonical_port);
-    println!("===> NEW DAEMON STARTED SUCCESSFULLY ON PORT {}", canonical_port);
-    Ok(canonical_port)
 }
 
 pub async fn execute_query(

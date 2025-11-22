@@ -1,10 +1,17 @@
 use anyhow::{anyhow, Result};
 use serde_json::Value;
 use std::sync::Arc;
+use log::{info, debug, warn};
+
 use crate::database::Database;
 use models::errors::GraphError;
 use crate::query_parser::cypher_parser::{is_cypher, parse_cypher, execute_cypher};
-use log::{info, debug, warn};
+
+// --- Added Imports for Index Command Handling ---
+// Assuming these types are defined in the project configuration and storage engine modules.
+use crate::config::QueryResult;
+use crate::storage_engine::storage_engine::GraphStorageEngine;
+// -----------------------------------------------
 
 pub struct QueryExecEngine {
     db: Arc<Database>,
@@ -14,6 +21,39 @@ impl QueryExecEngine {
     pub fn new(db: Arc<Database>) -> Self {
         Self { db }
     }
+
+    /// Executes a generic index command by routing it to the underlying storage 
+    /// engine's ZMQ client for daemon execution (SledDaemon/RocksDBDaemon).
+    /// 
+    /// This method delegates the ZMQ communication to the concrete 
+    /// `GraphStorageEngine` implementation (SledStorage or RocksDBStorage), 
+    /// which in turn uses its respective client to send the ZMQ request 
+    /// to the daemon's `run_zmq_server_lazy`.
+    ///
+    /// # Arguments
+    /// * `command` - The name of the index command (e.g., "create_index", "fulltext_rebuild").
+    /// * `params` - A `serde_json::Value` containing command-specific parameters.
+    pub async fn execute_index_command(
+        &self, 
+        command: &str, 
+        params: Value
+    ) -> Result<QueryResult> {
+        info!("Executing index command: {} with params: {}", command, params);
+
+        let storage = self.db.get_storage_engine();
+
+        // DELEGATE TO THE STORAGE ENGINE
+        // This relies on the GraphStorageEngine trait being updated to include 
+        // the `execute_index_command` method which wraps the ZMQ client call.
+        storage.execute_index_command(command, params).await
+            .map_err(|e: GraphError| {
+                warn!("Index command '{}' failed on storage engine: {}", command, e);
+                // Convert GraphError to anyhow::Error for consistency with other public methods
+                anyhow!(e)
+            })
+    }
+
+    // --- Existing Methods ---
 
     pub async fn execute(&self, query: &str) -> Result<Value> {
         let trimmed_query = query.trim();

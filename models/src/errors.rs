@@ -87,6 +87,12 @@ pub enum GraphError {
     Storage(String),
 }
 
+// Implement the From trait for &str
+impl From<&str> for GraphError {
+    fn from(error: &str) -> Self {
+        GraphError::InvalidRequest(error.to_string())
+    }
+}
 
 impl From<tokio::time::error::Elapsed> for GraphError {
     fn from(_: tokio::time::error::Elapsed) -> Self {

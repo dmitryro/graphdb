@@ -13,3 +13,5 @@ pub use errors::*;
 
 // Re-export the main service
 pub use index::IndexingService;
+pub use index::indexing_service;
+pub use index::init_indexing_service;

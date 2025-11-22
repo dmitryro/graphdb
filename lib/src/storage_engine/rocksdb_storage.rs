@@ -2302,6 +2302,70 @@ impl GraphStorageEngine for RocksDBStorage {
         });
         Ok(())
     }
+
+    /// Executes an index-related command by routing it to the RocksDBDaemon via ZMQ.
+    ///
+    /// This method calls the internal `RocksDBClient` which handles the ZMQ request/response.
+    /// Executes an index-related command by routing it to a load-balanced daemon via ZMQ.
+    ///
+    /// This method leverages the internal daemon pool to select an available port, 
+    /// ensuring no persistent port state is stored on the struct.
+    async fn execute_index_command(&self, command: &str, params: Value) -> GraphResult<QueryResult> {
+        info!("RocksDBStorage received index command: {}", command);
+
+        // 1. Construct the complete JSON payload for the daemon.
+        let request = json!({
+            "command": command,
+            "params": params, 
+        });
+
+        // 2. Use the pool (the correct component for load balancing) to select a port.
+        let pool_guard = self.pool.lock().await;
+        
+        // Await the async function 'select_daemon()' and use ok_or_else 
+        // to handle the resulting Option<u16>.
+        let port_option = pool_guard.select_daemon().await;
+
+        let port_number = port_option
+            .ok_or_else(|| {
+                error!("Failed to select daemon port from pool: Daemon pool is empty or unavailable.");
+                GraphError::StorageError("Daemon pool selection error: No available port.".to_string())
+            })?;
+        
+        drop(pool_guard); // Release the lock immediately after selection
+
+        // 3. Delegate the ZMQ communication using the selected port number 
+        //    via the static one-shot SledClient function.
+        let response_value = RocksDBClient::execute_one_shot_zmq_request(port_number, request).await
+            .map_err(|e| {
+                error!("ZMQ index command execution failed for {}: {:?}", command, e);
+                e
+            })?;
+
+        // 4. Deserialize the JSON response (Value) into the expected QueryResult struct.
+        match response_value.get("result") {
+            Some(result_val) => {
+                let query_result: QueryResult = serde_json::from_value(result_val.clone())
+                    .map_err(|e| {
+                        error!("Failed to deserialize query result: {}", e);
+                        GraphError::DeserializationError(format!("Failed to parse QueryResult: {}", e))
+                    })?;
+                
+                info!("Successfully executed index command: {}", command);
+                Ok(query_result)
+            },
+            None => {
+                // If the response doesn't contain a 'result' field, check for an 'error' field
+                if let Some(error_msg) = response_value.get("error").and_then(|e| e.as_str()) {
+                     error!("Daemon execution error for {}: {}", command, error_msg);
+                     Err(GraphError::StorageError(format!("Daemon error: {}", error_msg)))
+                } else {
+                    error!("Unexpected response format from daemon for {}: {:?}", command, response_value);
+                    Err(GraphError::StorageError(format!("Unexpected daemon response for {}: {:?}", command, response_value)))
+                }
+            }
+        }
+    }
 }
 
 #[tokio::test]

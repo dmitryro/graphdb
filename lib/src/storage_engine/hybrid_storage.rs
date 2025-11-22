@@ -240,4 +240,10 @@ impl GraphStorageEngine for HybridStorage {
     async fn fulltext_rebuild(&self) -> GraphResult<()> {
         self.persistent.fulltext_rebuild().await
     }
+
+    // === REQUIRED INDEX COMMAND DELEGATION (Fix for E0046) ===
+    async fn execute_index_command(&self, command: &str, params: Value) -> GraphResult<QueryResult> {
+        info!("Executing index command '{}' on HybridStorage (delegating to persistent layer)", command);
+        self.persistent.execute_index_command(command, params).await
+    }
 }

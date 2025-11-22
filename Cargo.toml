@@ -22,6 +22,6 @@ members = [
     "compliance_service", 
     "indexing_service",
     "logging_service", 
-    "graph_engine", 
+    "graph_engine", "query_exec_engine", "query_parser", "database", 
 ]
 
