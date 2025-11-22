@@ -199,21 +199,84 @@ pub enum GraphAction {
 
 #[derive(Debug, Clone, PartialEq, Subcommand)]
 pub enum IndexAction {
-    Create { label: String, property: String },
-    Search { term: String, top: Option<usize> },
-    Rebuild,
-    List,
-    Stats,
-    Drop { label: String, property: String },
-    // FIX: Added explicit types (name: Type) for all fields in struct variants.
-    CreateFulltext { 
-        index_name: String, 
-        labels: Vec<String>, 
-        properties: Vec<String> 
+    #[command(about = "Create a standard B-Tree index")]
+    Create {
+        #[arg(help = "The Label (e.g., Person)")]
+        label: String,
+        #[arg(help = "The Property (e.g., name)")]
+        property: String,
     },
-    DropFulltext { 
-        index_name: String 
+
+    #[command(about = "Search the index")]
+    Search {
+        #[arg(help = "The term to search for (e.g., \"Oliver Stone\")")]
+        term: String,
+        
+        #[clap(subcommand)]
+        order: Option<SearchOrder>,
+    },
+
+    #[command(about = "Rebuild all existing indexes")]
+    Rebuild,
+
+    #[command(about = "List all existing indexes")]
+    List,
+
+    #[command(about = "Show statistics about all indexes")]
+    Stats,
+
+    #[command(about = "Drop a standard index")]
+    Drop {
+        #[arg(help = "The Label (e.g., Person)")]
+        label: String,
+        #[arg(help = "The Property (e.g., name)")]
+        property: String,
+    },
+
+    #[command(about = "Create a new fulltext index")]
+    CreateFulltext {
+        #[arg(help = "The name for the new index (e.g., people_fulltext_index)")]
+        index_name: String,
+
+        #[arg(required = true, help = "List of Labels to include (e.g., Person Movie)", num_args = 1..)]
+        labels: Vec<String>,
+
+        #[arg(required = true, help = "List of Properties to index (e.g., name title)", num_args = 1..)]
+        properties: Vec<String>
+    },
+
+    #[command(about = "Drop a fulltext index")]
+    DropFulltext {
+        #[arg(help = "The name of the index to drop")]
+        index_name: String
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Subcommand)]
+pub enum SearchOrder {
+    #[command(about = "Get top N results (highest scores first)")]
+    Top {
+        #[arg(help = "Number of results to return", value_name = "COUNT")]
+        count: usize,
+    },
+    
+    #[command(about = "Get top N results (alias for 'top')")]
+    Head {
+        #[arg(help = "Number of results to return", value_name = "COUNT")]
+        count: usize,
+    },
+    
+    #[command(about = "Get bottom N results (lowest scores first)")]
+    Bottom {
+        #[arg(help = "Number of results to return", value_name = "COUNT")]
+        count: usize,
+    },
+    
+    #[command(about = "Get bottom N results (alias for 'bottom')")]
+    Tail {
+        #[arg(help = "Number of results to return", value_name = "COUNT")]
+        count: usize,
+    },
 }
 
 /// Arguments for the unified query command.

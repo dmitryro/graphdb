@@ -12,7 +12,8 @@ use lib::daemon::daemon_management::{
     check_pid_validity_sync,
 };
 use lib::daemon::daemon_registry::GLOBAL_DAEMON_REGISTRY;
-use lib::commands::{ IndexAction };
+// Updated import to include both IndexAction and SearchOrder
+use lib::commands::{IndexAction, SearchOrder}; 
 use lib::config::{ StorageConfig, DEFAULT_STORAGE_CONFIG_PATH_RELATIVE };
 use crate::cli::handlers_queries::{
     find_or_create_working_daemon,
@@ -239,90 +240,8 @@ pub async fn initialize_storage_for_index() -> Result<u16, anyhow::Error> {
     Ok(working_port)
 }
 
-/// Handles all index-related CLI commands by routing them via ZMQ 
-/// directly to the storage daemon using the globally stored port.
-pub async fn handle_index_command(action: IndexAction) -> Result<()> {
-    
-    // 1. Get the port, initialize if necessary
-    let port = match STORAGE_PORT.get() {
-        Some(p) => *p,
-        None => {
-            // If the port isn't set, run the full initialization process.
-            initialize_storage_for_index().await
-                .context("Failed to initialize storage daemon before executing index command.")?
-        }
-    };
-    
-    // 2. Determine command, parameters, and expected output message
-    let (command, params, success_msg_prefix) = match action {
-        // NOTE: Command names use the daemon handler's expected 'index_' prefix.
-        IndexAction::Create { label, property } => {
-            (
-                "index_create".to_string(),
-                json!({ "label": label, "property": property }),
-                format!("Index created successfully on {}.{}", label, property),
-            )
-        },
-        IndexAction::CreateFulltext { index_name, labels, properties } => {
-             (
-                "index_create_fulltext".to_string(),
-                json!({ 
-                    "name": index_name,
-                    "labels": labels, 
-                    "properties": properties 
-                }),
-                format!("Full-text index '{}' created successfully", index_name),
-             )
-        },
-        IndexAction::Drop { label, property } => {
-            (
-                "index_drop".to_string(),
-                json!({ "label": label, "property": property }),
-                format!("Index dropped successfully on {}.{}", label, property),
-            )
-        },
-        IndexAction::DropFulltext { index_name } => {
-            (
-                "index_drop_fulltext".to_string(),
-                json!({ "name": index_name }),
-                format!("Full-text index '{}' dropped successfully", index_name),
-            )
-        },
-        IndexAction::List => {
-            (
-                "index_list".to_string(),
-                json!({}),
-                "List of all indexes retrieved".to_string(),
-            )
-        },
-        IndexAction::Search { term, top } => {
-            let limit = top.unwrap_or(10);
-            (
-                "index_search".to_string(),
-                json!({ "query": term, "limit": limit }),
-                format!("Search results for '{}' (top {})", term, limit),
-            )
-        },
-        IndexAction::Rebuild => {
-            (
-                "index_rebuild".to_string(),
-                json!({}),
-                "Index rebuild (All Indices) initiated".to_string(),
-            )
-        },
-        IndexAction::Stats => {
-            (
-                "index_stats".to_string(),
-                json!({}),
-                "Index statistics retrieved".to_string(),
-            )
-        },
-    };
-
-    // 3. Execute the command directly via ZMQ (retries are handled internally)
-    info!("Dispatching index command '{}' directly via ZMQ to port {}", command, port);
-    let query_result: QueryResult = send_raw_zmq_request(port, &command, params).await?;
-
+// Helper function to format and print the result, shared by both handlers
+async fn format_and_print_result(command_name: &str, query_result: QueryResult, success_msg_prefix: String) -> Result<()> {
     // 4. Pattern match and parse the inner String payload into a mutable Value.
     let mut raw_result_value: Value = match query_result {
         QueryResult::Success(json_str) => {
@@ -365,8 +284,8 @@ pub async fn handle_index_command(action: IndexAction) -> Result<()> {
     if let Value::Object(map) = &raw_result_value {
         if map.get("status").and_then(|s| s.as_str()) == Some("error") {
             let msg = map.get("message").and_then(|m| m.as_str()).unwrap_or("Unknown index error");
-            error!("Index command failed: {}", msg);
-            return Err(anyhow!("Index command '{}' failed on the storage daemon: {}", command, msg));
+            error!("{} command failed: {}", command_name, msg);
+            return Err(anyhow!("{} command failed on the storage daemon: {}", command_name, msg));
         }
     }
     
@@ -375,3 +294,114 @@ pub async fn handle_index_command(action: IndexAction) -> Result<()> {
 
     Ok(())
 }
+
+/// Handles all index-related CLI commands by routing them via ZMQ 
+/// directly to the storage daemon using the globally stored port.
+pub async fn handle_index_command(action: IndexAction) -> Result<()> {
+    
+    // 1. Get the port, initialize if necessary
+    let port = match STORAGE_PORT.get() {
+        Some(p) => *p,
+        None => {
+            // If the port isn't set, run the full initialization process.
+            initialize_storage_for_index().await
+                .context("Failed to initialize storage daemon before executing index command.")?
+        }
+    };
+    
+    // 2. Determine command, parameters, and expected output message
+    let (command, params, success_msg_prefix) = match action {
+        // NOTE: Command names use the daemon handler's expected 'index_' prefix.
+        IndexAction::Create { label, property } => {
+            (
+                "index_create".to_string(),
+                json!({ "label": label, "property": property }),
+                format!("B-Tree index created successfully on {}.{}", label, property),
+            )
+        },
+        IndexAction::CreateFulltext { index_name, labels, properties } => {
+            (
+                "index_create_fulltext".to_string(),
+                json!({ 
+                    "name": index_name,
+                    "labels": labels, 
+                    "properties": properties 
+                }),
+                format!("Full-text index '{}' created successfully", index_name),
+            )
+        },
+        IndexAction::Drop { label, property } => {
+            (
+                "index_drop".to_string(),
+                json!({ "label": label, "property": property }),
+                format!("B-Tree index dropped successfully on {}.{}", label, property),
+            )
+        },
+        IndexAction::DropFulltext { index_name } => {
+            (
+                "index_drop_fulltext".to_string(),
+                json!({ "name": index_name }),
+                format!("Full-text index '{}' dropped successfully", index_name),
+            )
+        },
+        IndexAction::List => {
+            (
+                "index_list".to_string(),
+                json!({}),
+                "List of all indexes retrieved".to_string(),
+            )
+        },
+        IndexAction::Search { term, order } => {
+            // Default parameters: limit 10, descending order (highest score first)
+            let mut limit = 10;
+            let mut sort_order = "desc";
+
+            if let Some(ord) = order {
+                match ord {
+                    SearchOrder::Top { count } | SearchOrder::Head { count } => {
+                        limit = count;
+                        sort_order = "desc";
+                    }
+                    SearchOrder::Bottom { count } | SearchOrder::Tail { count } => {
+                        limit = count;
+                        sort_order = "asc"; // Lowest score first
+                    }
+                }
+            }
+            
+            (
+                "index_search".to_string(),
+                json!({ 
+                    "query": term, 
+                    "limit": limit,
+                    "sort_order": sort_order 
+                }),
+                format!("Full-text search results for '{}' (limit {})", term, limit),
+            )
+        },
+        IndexAction::Rebuild => {
+            (
+                "index_rebuild".to_string(),
+                json!({}),
+                "Index rebuild (All Indices) initiated".to_string(),
+            )
+        },
+        IndexAction::Stats => {
+            (
+                "index_stats".to_string(),
+                json!({}),
+                "Index statistics retrieved".to_string(),
+            )
+        },
+    };
+
+    // 3. Execute the command directly via ZMQ (retries are handled internally)
+    info!("Dispatching index command '{}' directly via ZMQ to port {}", command, port);
+    let query_result: QueryResult = send_raw_zmq_request(port, &command, params).await?;
+
+    // 4. Format and print result using the new helper
+    format_and_print_result(&command, query_result, success_msg_prefix).await
+}
+
+// NOTE: handle_search_command has been removed as it relied on the now-removed SearchCommandData 
+// struct and its functionality is duplicated by IndexAction::Search within handle_index_command.
