@@ -24,7 +24,8 @@ members = [
     "logging_service", 
     "graph_visualizing", 
     "medical_knowledge", 
+    "normalization",
     "driver", 
-    "schema", 
+    "schema", "normalization", "settings", 
 ]
 

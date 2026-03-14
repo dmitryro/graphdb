@@ -519,6 +519,7 @@ pub enum CypherQuery {
         order_by: Vec<OrderByItem>, // Placeholder for ORDER BY expressions
         skip: Option<i64>,        // Parsed value for SKIP
         limit: Option<i64>,       // Parsed value for LIMIT
+        is_distinct: bool, 
     },
     // NEW: UNWIND clause support
     Unwind {
@@ -1311,19 +1312,17 @@ impl Expression {
             },
             Expression::FunctionCall { name, args } => {
                 match name.to_uppercase().as_str() {
-                    "ID" => {
-                        if let Some(Expression::Variable(var_name)) = args.get(0) {
-                            if let Some(val) = ctx.variables.get(var_name) {
-                                match val {
-                                    CypherValue::Vertex(v) => Ok(CypherValue::String(v.id.to_string())),
-                                    CypherValue::Edge(e) => Ok(CypherValue::String(e.id.to_string())),
-                                    _ => Ok(CypherValue::Null),
-                                }
-                            } else {
-                                Ok(CypherValue::Null)
-                            }
-                        } else {
-                            Err(GraphError::EvaluationError("ID() requires a variable".into()))
+                   "ID" => {
+                        // Evaluates the argument first to handle both ID(n) and ID(existing_id_var)
+                        let val = args.get(0)
+                            .ok_or_else(|| GraphError::EvaluationError("ID() requires 1 argument".into()))?
+                            .evaluate(ctx)?;
+                        match val {
+                            CypherValue::Vertex(v) => Ok(CypherValue::String(v.id.to_string())),
+                            CypherValue::Edge(e) => Ok(CypherValue::String(e.id.to_string())),
+                            CypherValue::Uuid(u) => Ok(CypherValue::String(u.to_string())),
+                            CypherValue::String(s) => Ok(CypherValue::String(s)),
+                            _ => Ok(CypherValue::Null),
                         }
                     },
                     "KEYS" => {
@@ -1332,11 +1331,16 @@ impl Expression {
                             .evaluate(ctx)?;
                         match val {
                             CypherValue::Vertex(v) => {
+                                // 1. Get all keys from the dynamic properties map
                                 let mut key_list: Vec<CypherValue> = v.properties.keys()
                                     .map(|k| CypherValue::String(k.clone()))
                                     .collect();
+                                
+                                // 2. Add the virtual/hardcoded metadata keys
+                                // Ensuring "id" and "label" (or "event_type") are visible to UNWIND
                                 key_list.push(CypherValue::String("id".to_string()));
                                 key_list.push(CypherValue::String("label".to_string()));
+                                
                                 Ok(CypherValue::List(key_list))
                             },
                             CypherValue::Edge(e) => {
@@ -1344,7 +1348,6 @@ impl Expression {
                                     .map(|k| CypherValue::String(k.clone()))
                                     .collect();
                                 key_list.push(CypherValue::String("id".to_string()));
-                                key_list.push(CypherValue::String("label".to_string()));
                                 Ok(CypherValue::List(key_list))
                             },
                             CypherValue::Map(map) => {
@@ -1356,23 +1359,36 @@ impl Expression {
                             _ => Ok(CypherValue::List(vec![])),
                         }
                     },
-                    "TYPE" => {
-                        let val = args.get(0)
-                            .ok_or_else(|| GraphError::EvaluationError("TYPE() requires 1 argument".into()))?
-                            .evaluate(ctx)?;
-                        match val {
-                            CypherValue::Edge(e) => Ok(CypherValue::String(e.label.to_string())),
-                            _ => Ok(CypherValue::Null),
-                        }
-                    },
                     "LABELS" => {
                         let val = args.get(0)
                             .ok_or_else(|| GraphError::EvaluationError("LABELS() requires 1 argument".into()))?
                             .evaluate(ctx)?;
                         match val {
                             CypherValue::Vertex(v) => Ok(CypherValue::List(vec![
+                                // FIX: Use to_string() on the label Identifier
                                 CypherValue::String(v.label.to_string())
                             ])),
+                            _ => Ok(CypherValue::Null),
+                        }
+                    },
+                    "COUNT" => {
+                        // Aggregation COUNT(*) is usually handled in the ReturnStatement grouping logic,
+                        // but this handles COUNT(list_var)
+                        let val = args.get(0)
+                            .ok_or_else(|| GraphError::EvaluationError("count() requires 1 argument".into()))?
+                            .evaluate(ctx)?;
+                        match val {
+                            CypherValue::List(l) => Ok(CypherValue::Integer(l.len() as i64)),
+                            CypherValue::Null => Ok(CypherValue::Integer(0)),
+                            _ => Ok(CypherValue::Integer(1)),
+                        }
+                    },
+                    "TYPE" => {
+                        let val = args.get(0)
+                            .ok_or_else(|| GraphError::EvaluationError("TYPE() requires 1 argument".into()))?
+                            .evaluate(ctx)?;
+                        match val {
+                            CypherValue::Edge(e) => Ok(CypherValue::String(e.label.to_string())),
                             _ => Ok(CypherValue::Null),
                         }
                     },
@@ -1394,16 +1410,6 @@ impl Expression {
                                 Ok(CypherValue::Map(map))
                             },
                             _ => Ok(CypherValue::Null),
-                        }
-                    },
-                    "COUNT" => {
-                        let val = args.get(0)
-                            .ok_or_else(|| GraphError::EvaluationError("count() requires 1 argument".into()))?
-                            .evaluate(ctx)?;
-                        match val {
-                            CypherValue::List(l) => Ok(CypherValue::Integer(l.len() as i64)),
-                            CypherValue::Null => Ok(CypherValue::Integer(0)),
-                            _ => Ok(CypherValue::Integer(1)),
                         }
                     },
                     "LEVENSHTEIN" => {
@@ -1901,7 +1907,7 @@ pub fn property_value_to_cypher(pv: &PropertyValue) -> CypherValue {
         PropertyValue::Byte(b) => CypherValue::Integer(*b as i64),
 
         PropertyValue::DateTime(dt) => {
-            // Convert to RFC 3339 / ISO 8601 string – standard for Cypher datetime parameters
+            // Standardizing on RFC 3339 for MPI traceability
             CypherValue::String(dt.0.to_rfc3339())
         }
 
@@ -1918,7 +1924,13 @@ pub fn property_value_to_cypher(pv: &PropertyValue) -> CypherValue {
             CypherValue::Map(new_map)
         }
 
-        PropertyValue::Vertex(_) => CypherValue::Null,
+        // FIX: Access the inner Vertex through the UnhashableVertex wrapper
+        PropertyValue::Vertex(v) => {
+            // v is &UnhashableVertex. 
+            // v.0 is the inner Vertex.
+            // v.0.id is the ID (likely a UUID or similar string-convertible type).
+            CypherValue::String(v.0.id.to_string())
+        },
     }
 }
 

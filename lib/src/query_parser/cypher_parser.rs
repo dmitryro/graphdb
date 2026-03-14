@@ -1690,7 +1690,6 @@ pub fn evaluate_expression(
                 Ok(CypherValue::Null)
             }
         },
-
         Expression::FunctionCall { name, args } => {
             let func_name = name.to_uppercase();
             match func_name.as_str() {
@@ -1849,7 +1848,6 @@ pub fn evaluate_expression(
                 _ => Err(GraphError::QueryExecutionError(format!("Unknown function: {}", name)))
             }
         },
-
         Expression::Binary { op, left, right } => {
             let left_val = evaluate_expression(left, context)?;
             let right_val = evaluate_expression(right, context)?;
@@ -2859,10 +2857,21 @@ pub fn parse_sequential_statements_with_context(
         // 2. Handle RETURN (Terminal)
         if trimmed_upper.starts_with("RETURN") {
             let (final_remaining, return_clause) = parse_return_clause_as_struct(rest)?;
+            
+            // Reconstruct the projection string ensuring aliases are preserved
+            let projection_items_str = return_clause.items.iter()
+                .map(|item| {
+                    if let Some(alias) = &item.alias {
+                        format!("{} AS {}", item.expression, alias)
+                    } else {
+                        item.expression.clone()
+                    }
+                })
+                .collect::<Vec<String>>()
+                .join(", ");
+
             let return_statement = CypherQuery::ReturnStatement {
-                projection_string: format!("RETURN {}", 
-                    return_clause.items.iter().map(|item| item.expression.to_string()).collect::<Vec<_>>().join(", ")
-                ),
+                projection_string: format!("RETURN {}", projection_items_str),
                 order_by: return_clause.order_by.unwrap_or_default()
                     .into_iter()
                     .map(|(expr_str, asc)| OrderByItem { 
@@ -2872,32 +2881,29 @@ pub fn parse_sequential_statements_with_context(
                     .collect(),
                 skip: return_clause.skip.map(|s| s as i64),
                 limit: return_clause.limit.map(|l| l as i64),
+                is_distinct: return_clause.distinct, // FIXED: Added missing field
             };
+            
             clauses.push(return_statement);
             return Ok((final_remaining, (CypherQuery::Chain(clauses), current_symbol_table)));
         }
 
-        // 3. Handle WITH (Chaining) - FIXED: Don't update symbol table, just parse
+        // 3. Handle WITH (Chaining)
         if trimmed_upper.starts_with("WITH") {
             println!("===> Parsing WITH clause");
             let (new_remaining, with_parsed) = parse_with_full(rest)?;
             
-            // CRITICAL FIX: Don't try to resolve aliases at parse time
-            // Just register the alias names in the symbol table for parsing purposes
             let mut updated_symbols = current_symbol_table.clone();
             
             for item in &with_parsed.items {
                 if let Some(ref alias) = item.alias {
-                    // Register the alias with a placeholder UUID
-                    // The actual UUID will be bound at execution time in the Chain handler
                     updated_symbols.bind_variable(alias.clone(), SerializableUuid::default());
-                    println!("===> Registered alias '{}' in symbol table (will be bound at execution)", alias);
+                    println!("===> Registered alias '{}' in symbol table", alias);
                 }
             }
             
-            // Create a MatchPattern with empty patterns to represent the WITH clause
             let with_clause_query = CypherQuery::MatchPattern {
-                patterns: vec![],  // Empty patterns signals this is a standalone WITH
+                patterns: vec![],
                 where_clause: None,
                 with_clause: Some(with_parsed),
                 return_clause: None,
@@ -3496,8 +3502,20 @@ fn full_statement_parser(input: &str) -> IResult<&str, CypherQuery> {
         ];
         
         if let Some(ret) = captured_return {
+            // Reconstruct a clean projection string from the items
+            let projection_items_str = ret.items.iter()
+                .map(|item| {
+                    if let Some(alias) = &item.alias {
+                        format!("{} AS {}", item.expression, alias)
+                    } else {
+                        item.expression.clone()
+                    }
+                })
+                .collect::<Vec<String>>()
+                .join(", ");
+
             chain_clauses.push(CypherQuery::ReturnStatement {
-                projection_string: serde_json::to_string(&ret).unwrap_or_default(),
+                projection_string: format!("RETURN {}", projection_items_str),
                 order_by: ret.order_by.clone().unwrap_or_default()
                     .into_iter()
                     .map(|(expr, asc)| OrderByItem { 
@@ -3507,6 +3525,7 @@ fn full_statement_parser(input: &str) -> IResult<&str, CypherQuery> {
                     .collect(),
                 skip: ret.skip.map(|s| s as i64),
                 limit: ret.limit.map(|l| l as i64),
+                is_distinct: ret.distinct, // FIXED: Missing field added here
             });
         }
         
@@ -4128,6 +4147,7 @@ fn parse_clause_with_symbol_table<'a>(
                 .collect::<Vec<String>>()
                 .join(", ");
 
+            // Build the query and include the missing is_distinct field
             let query = CypherQuery::ReturnStatement {
                 projection_string: format!("RETURN {}", clean_projection),
                 order_by: return_clause.order_by.unwrap_or_default()
@@ -4139,6 +4159,7 @@ fn parse_clause_with_symbol_table<'a>(
                     .collect(),
                 skip: return_clause.skip.map(|s| s as i64),
                 limit: return_clause.limit.map(|l| l as i64),
+                is_distinct: return_clause.distinct, // FIXED: Added field here
             };
             return Ok((remainder, (query, symbol_table.clone())));
         }
@@ -4987,7 +5008,6 @@ fn parse_single_query_clause(input: &str) -> IResult<&str, CypherQuery> {
             } else if rest_upper.starts_with("RETURN") {
                 let (new_remaining, return_struct) = parse_return_clause_as_struct(rest)?;
                 
-                // FIXED: Don't try to serialize ReturnClause, just extract the fields
                 let order_by_items = return_struct.order_by.clone().unwrap_or_default()
                     .into_iter()
                     .map(|(expr, asc)| OrderByItem { 
@@ -4996,18 +5016,19 @@ fn parse_single_query_clause(input: &str) -> IResult<&str, CypherQuery> {
                     })
                     .collect();
                 
+                // FIX: Added is_distinct field here
                 clauses.push(CypherQuery::ReturnStatement {
                     projection_string: format!("RETURN {:?}", return_struct.items),
                     order_by: order_by_items,
                     skip: return_struct.skip.map(|s| s as i64),
                     limit: return_struct.limit.map(|l| l as i64),
+                    is_distinct: return_struct.distinct, // Use the value from the parsed struct
                 });
                 current_input = new_remaining;
                 break;
             } else if rest_upper.starts_with("WITH") {
                 let (new_remaining, with_clause) = parse_with_full(rest)?;
                 
-                // FIXED: Extract where_clause first, then use with_clause
                 let where_clause_opt = with_clause.where_clause.as_ref().map(|wc| WhereClause { 
                     condition: wc.condition.clone() 
                 });
@@ -5046,7 +5067,7 @@ fn parse_single_query_clause(input: &str) -> IResult<&str, CypherQuery> {
         }
     }
 
-    // 4. Fallback for standalone WITH (used in chainable queries)
+    // 4. Fallback for standalone WITH
     if let Ok(result) = parse_with_clause(input) {
         return Ok(result);
     }
@@ -6879,7 +6900,6 @@ fn parse_node_pattern(input: &str) -> GraphResult<(Option<String>, HashMap<Strin
 // 4. Paste them into your file where the old full_statement_parser was
 // 5. Make sure parse_return_clause exists and looks like this:
 // Helper to consume RETURN ... [ORDER BY ...]
-
 fn parse_return_clause(input: &str) -> IResult<&str, CypherQuery> {
     println!("===> parse_return_clause START"); 
     
@@ -6891,8 +6911,13 @@ fn parse_return_clause(input: &str) -> IResult<&str, CypherQuery> {
     
     // 2. Consume whitespace
     let (input, _) = multispace0.parse(input)?;
+
+    // --- NEW: Handle DISTINCT keyword ---
+    let (input, distinct_token) = opt(pair(tag_no_case("DISTINCT"), multispace1)).parse(input)?;
+    let is_distinct = distinct_token.is_some();
+    // ------------------------------------
     
-    // Check if RETURN is empty or incomplete
+    // Check if remaining input is empty or incomplete
     let trimmed = input.trim_start();
     let is_incomplete = trimmed.is_empty() || 
         trimmed.to_uppercase().starts_with("ORDER") ||
@@ -6902,20 +6927,19 @@ fn parse_return_clause(input: &str) -> IResult<&str, CypherQuery> {
     
     if is_incomplete {
         println!("===> ERROR: Incomplete RETURN statement in parse_return_clause");
-        // Use Failure to prevent backtracking to other parsers
         return Err(nom::Err::Failure(nom::error::Error::new(
             input,
             nom::error::ErrorKind::TooLarge
         )));
     }
     
-    // Capture raw projection string for backward compatibility
+    // Capture raw projection string
+    // Note: take_while1 here will stop at ORDER, SKIP, or LIMIT keywords
     let (input_after_proj, projection_items_str) = take_while1(|c: char| {
         let upper = c.to_ascii_uppercase();
         !(upper == 'O' || upper == 'S' || upper == 'L' || c == ';' || c == '\n' || c == '\r')
     }).parse(input)?;
     
-    // Validate projection string is not empty after trimming
     let proj_trimmed = projection_items_str.trim();
     if proj_trimmed.is_empty() {
         println!("===> ERROR: Empty projection string after RETURN");
@@ -6944,12 +6968,13 @@ fn parse_return_clause(input: &str) -> IResult<&str, CypherQuery> {
         map_res(take_while1(|c: char| c.is_ascii_digit()), |s: &str| s.parse::<i64>())
     )).parse(input)?;
     
-    // 6. Build query
+    // 6. Build query - FIX: Added is_distinct field
     let return_query = CypherQuery::ReturnStatement { 
         projection_string: proj_trimmed.to_string(),
         order_by,
         skip,
         limit,
+        is_distinct, // Map the local variable here
     };
     
     Ok((input, return_query))
@@ -7610,10 +7635,14 @@ pub fn parse_with_clause(input: &str) -> IResult<&str, CypherQuery> {
     let (input, _) = tag_no_case("WITH")(input)?;
     let (input, _) = multispace1(input)?;
 
-    // 1. Parse the items (e.g., "p AS target_patient, e.id")
+    // 1. Check for optional DISTINCT
+    let (input, distinct_token) = opt(pair(tag_no_case("DISTINCT"), multispace1)).parse(input)?;
+    let is_distinct = distinct_token.is_some();
+
+    // 2. Parse the items (e.g., "p AS target_patient, e.id")
     let (input, item_strings) = parse_return_items(input)?;
     
-    // 2. Parse optional trailing clauses often found in WITH
+    // 3. Parse optional trailing clauses
     let (input, _) = multispace0(input)?;
     let (input, where_clause) = opt(parse_where_clause).parse(input)?;
     let (input, _) = multispace0(input)?;
@@ -7623,8 +7652,7 @@ pub fn parse_with_clause(input: &str) -> IResult<&str, CypherQuery> {
     let (input, _) = multispace0(input)?;
     let (input, limit) = opt(preceded(pair(tag_no_case("LIMIT"), multispace1), nom::character::complete::u64)).parse(input)?;
 
-    // 3. Map strings into QueryReturnItem structs
-    // This handles the "AS" aliasing logic
+    // 4. Map strings into QueryReturnItem structs
     let items: Vec<QueryReturnItem> = item_strings.into_iter().map(|s| {
         if s.to_uppercase().contains(" AS ") {
             let parts: Vec<&str> = s.splitn(2, |c: char| c.is_whitespace()).collect();
@@ -7639,27 +7667,25 @@ pub fn parse_with_clause(input: &str) -> IResult<&str, CypherQuery> {
         }
     }).collect();
 
-    // 4. Construct the ParsedWithClause
+    // 5. Construct the ParsedWithClause
     let with_data = ParsedWithClause {
         items,
-        distinct: false, // Can be expanded with opt(tag_no_case("DISTINCT"))
+        distinct: is_distinct, 
         where_clause: where_clause.map(|cond| WhereClause { condition: cond }),
         order_by: order_by.unwrap_or_default(),
         skip: skip.map(|s| s as i64),
         limit: limit.map(|l| l as i64),
     };
 
-    // 5. Wrap in a Chain to satisfy the CypherQuery return type
-    // Note: The parse_sequential_statements_with_context function 
-    // will destructure this Chain to extract the ParsedWithClause.
+    // 6. Wrap in a Chain
+    // FIX: Added is_distinct field to the ReturnStatement initializer
     Ok((input, CypherQuery::Chain(vec![
-        // We use a dummy marker or specific variant if needed for the execution engine,
-        // but the struct above is what carries the MPI context.
         CypherQuery::ReturnStatement {
             projection_string: "WITH".to_string(),
             order_by: with_data.order_by.clone(),
             skip: with_data.skip,
             limit: with_data.limit,
+            is_distinct: with_data.distinct, // Field added here
         }
     ])))
 }
@@ -9041,10 +9067,10 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                         // ============================================================================
                         // INTERNAL RETURN HANDLER (Inside Chain match arm)
                         // ============================================================================
-                        CypherQuery::ReturnStatement { projection_string, order_by, .. } => {
-                            println!("===> Processing RETURN in Chain using global context");
+                        CypherQuery::ReturnStatement { projection_string, order_by, is_distinct, .. } => {
+                            println!("===> Processing RETURN in Chain using global context (Distinct: {})", is_distinct);
                             
-                            // 1. Snapshot the context including the new scalar_rows
+                            // 1. Snapshot the context including scalar_rows produced by UNWIND
                             let (current_vertices, current_edges, vertex_bindings, edge_bindings, scalar_rows) = {
                                 let ctx = global_context.read().await;
                                 (
@@ -9081,8 +9107,10 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                                     }
                                 }
                             } else {
+                                // Handle raw string "RETURN label, count(*) AS count"
                                 let raw_items: Vec<&str> = trimmed_proj
                                     .trim_start_matches("RETURN ")
+                                    .trim_start_matches("DISTINCT ")
                                     .split(',')
                                     .map(|s| s.trim())
                                     .collect();
@@ -9103,6 +9131,7 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                             let has_aggregation = final_items.iter().any(|(expr, _)| expr.contains("count("));
                             let mut result_rows = Vec::new();
 
+                            // Determine data source: UNWIND rows or fallback to direct matches
                             let rows_to_process = if !scalar_rows.is_empty() {
                                 scalar_rows
                             } else {
@@ -9161,6 +9190,7 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                                     result_rows.push(serde_json::Value::Object(result_row));
                                 }
                             } else {
+                                // Non-aggregated path
                                 for row_bindings in rows_to_process {
                                     let mut result_row = serde_json::Map::new();
                                     for (expr_raw, alias_opt) in &final_items {
@@ -9168,8 +9198,7 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                                         
                                         if let Some(val) = row_bindings.get(expr_raw) {
                                             result_row.insert(key.clone(), val.to_json());
-                                        } 
-                                        else if let Some(dot_pos) = expr_raw.find('.') {
+                                        } else if let Some(dot_pos) = expr_raw.find('.') {
                                             let var_name = &expr_raw[..dot_pos];
                                             let prop_name = &expr_raw[dot_pos + 1..];
                                             if let Some(val) = row_bindings.get(var_name) {
@@ -9180,17 +9209,17 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                                                 };
                                                 result_row.insert(key.clone(), json_val);
                                             }
-                                        }
-                                        else if let Some(ids) = vertex_bindings.get(expr_raw) {
-                                            if let Some(v) = current_vertices.iter().find(|v| ids.contains(&v.id.0)) {
-                                                result_row.insert(key.clone(), CypherValue::Vertex(v.clone()).to_json());
-                                            }
-                                        }
-                                        else {
+                                        } else {
                                             result_row.insert(key.clone(), serde_json::json!(null));
                                         }
                                     }
                                     result_rows.push(serde_json::Value::Object(result_row));
+                                }
+                                
+                                // Apply DISTINCT
+                                if *is_distinct {
+                                    let mut seen = std::collections::HashSet::new();
+                                    result_rows.retain(|x| seen.insert(x.to_string()));
                                 }
                             }
 
@@ -9220,16 +9249,18 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                                 });
                             }
 
-                            println!("===> Final results: Generated {} aggregated rows", result_rows.len());
+                            println!("===> Final results: Generated {} rows", result_rows.len());
                             
                             return Ok(serde_json::json!({
-                                "vertices": result_rows,
-                                "edges": current_edges,
-                                "stats": {
-                                    "vertices_matched": current_vertices.len(),
-                                    "edges_matched": current_edges.len(),
-                                    "contains_updates": false
-                                }
+                                "results": [{
+                                    "vertices": result_rows,
+                                    "edges": current_edges,
+                                    "stats": {
+                                        "vertices_matched": current_vertices.len(),
+                                        "edges_matched": current_edges.len(),
+                                        "contains_updates": false
+                                    }
+                                }]
                             }));
                         }
                         // ============================================================================
@@ -9336,16 +9367,26 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                             let mut new_rows = Vec::new();
                             let ctx_snapshot = global_context.read().await;
 
-                            // Use existing scalar_rows if they exist, otherwise use current_vertices
+                            // Determine the source of data to unwind
                             let rows_to_process = if !ctx_snapshot.scalar_rows.is_empty() {
                                 ctx_snapshot.scalar_rows.clone()
                             } else {
-                                // Fallback: Convert matched vertices into the row format
+                                // FIX: For MATCH (e:IdentityEvent), we must iterate ALL 142 vertices
+                                // and bind each one to the variable name 'e' so keys(e) works.
                                 ctx_snapshot.current_vertices.iter().map(|v| {
                                     let mut map = HashMap::new();
-                                    // We bind 'n' (or whatever the node var was) so labels(n) works
-                                    // In your log, the variable was 'n'
-                                    map.insert("n".to_string(), CypherValue::Vertex(v.clone()));
+                                    
+                                    // Map ALL variables bound to this specific vertex
+                                    for (var_name, ids) in &ctx_snapshot.vertex_bindings {
+                                        if ids.contains(&v.id.0) {
+                                            map.insert(var_name.clone(), CypherValue::Vertex(v.clone()));
+                                        }
+                                    }
+
+                                    // Fallback for safety: if no binding found, use 'n'
+                                    if map.is_empty() {
+                                        map.insert("n".to_string(), CypherValue::Vertex(v.clone()));
+                                    }
                                     map
                                 }).collect::<Vec<_>>()
                             };
@@ -9356,7 +9397,7 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                                     parameters: HashMap::new(), 
                                 };
                                 
-                                // Evaluate expression (e.g., labels(n))
+                                // Evaluate expression (e.g., keys(e))
                                 if let Ok(val) = expression.evaluate(&eval_ctx) {
                                     match val {
                                         CypherValue::List(items) => {
@@ -9367,7 +9408,6 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                                             }
                                         },
                                         scalar => {
-                                            // If it's a single value, it's still an unwind of 1 item
                                             let mut new_row = row_bindings.clone();
                                             new_row.insert(variable.clone(), scalar);
                                             new_rows.push(new_row);
@@ -9381,7 +9421,6 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                             ctx_write.scalar_rows = new_rows; 
                             println!("===> UNWIND complete: Produced {} rows", ctx_write.scalar_rows.len());
                         }
-
                         // ================================================================
                         // SET Statement in Chain
                         // ================================================================
@@ -10255,11 +10294,13 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                     }))
                 }
             }
-
-            // ============================================================================
-            // EXTERNAL RETURN HANDLER (Outside Chain, standalone RETURN)
-            // ============================================================================
-            CypherQuery::ReturnStatement { projection_string, order_by, skip, limit } => {
+            CypherQuery::ReturnStatement { 
+                projection_string, 
+                order_by, 
+                skip, 
+                limit, 
+                is_distinct 
+            } => {
                 info!("===> EXECUTING External RETURN Statement");
                 
                 let order_by_str = graph_service.serialize_order_by_to_string(&order_by);
@@ -10297,50 +10338,44 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                     json!({ "vertices": [], "edges": [], "stats": { "vertices_matched": 0, "edges_matched": 0 } })
                 };
                 
-                // CRITICAL FIX: Property extraction and Nonsense Access Prevention
+                // --- FIX: Initialize new_len here so it's available in the outer scope ---
+                let mut current_count = final_wrapped_result
+                    .get("vertices")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+
+                // 1. Property extraction and Nonsense Access Prevention
                 if let Some(vertices) = final_wrapped_result.get_mut("vertices").and_then(|v| v.as_array_mut()) {
-                    for row in vertices {
+                    
+                    let projection_items: Vec<&str> = projection_string
+                        .trim_start_matches("RETURN ")
+                        .split(',')
+                        .map(|s| s.trim())
+                        .collect();
+                    
+                    let projection_items_clone = projection_items.clone();
+
+                    for row in vertices.iter_mut() {
                         if let Some(obj) = row.as_object_mut() {
-                            
-                            // Parse projection to understand what properties/entities are being requested
-                            let projection_items: Vec<&str> = projection_string
-                                .trim_start_matches("RETURN ")
-                                .split(',')
-                                .map(|s| s.trim())
-                                .collect();
-                            
-                            let projection_items_clone = projection_items.clone();
-                            
-                            // STEP 1: Property Extraction from nested objects
+                            // STEP 1: Property Extraction
                             for item in &projection_items {
-                                if item.to_lowercase().starts_with("type(") {
-                                    continue;
-                                }
-                                
+                                if item.to_lowercase().starts_with("type(") { continue; }
                                 if let Some(dot_pos) = item.find('.') {
                                     let var_name = item[..dot_pos].trim();
                                     let prop_name = item[dot_pos + 1..].trim();
                                     let full_key = item.to_string();
                                     
-                                    // Check if this property key needs population
                                     let needs_extraction = obj.get(&full_key).map_or(true, |v| v.is_null());
-                                    
                                     if needs_extraction {
-                                        let entity_value = obj.get(var_name).cloned();
-                                        
-                                        if let Some(entity_val) = entity_value {
+                                        if let Some(entity_val) = obj.get(var_name).cloned() {
                                             if let Some(entity_obj) = entity_val.as_object() {
-                                                // Try extraction from standard 'properties' map
                                                 if let Some(props) = entity_obj.get("properties").and_then(|p| p.as_object()) {
                                                     if let Some(prop_val) = props.get(prop_name) {
                                                         obj.insert(full_key.clone(), prop_val.clone());
-                                                        info!("===> Extracted {}.{} = {:?}", var_name, prop_name, prop_val);
                                                     }
-                                                }
-                                                // Fallback to direct access on the object
-                                                else if let Some(prop_val) = entity_obj.get(prop_name) {
+                                                } else if let Some(prop_val) = entity_obj.get(prop_name) {
                                                     obj.insert(full_key.clone(), prop_val.clone());
-                                                    info!("===> Extracted {}.{} = {:?} (direct)", var_name, prop_name, prop_val);
                                                 }
                                             }
                                         }
@@ -10348,26 +10383,17 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                                 }
                             }
                             
-                            // STEP 2: Nonsense Cleanup - Remove full objects not explicitly in RETURN
+                            // STEP 2: Nonsense Cleanup
                             let current_keys: Vec<String> = obj.keys().cloned().collect();
                             for key in current_keys {
                                 if let Some(val) = obj.get(&key) {
-                                    // Detect if value is a raw Vertex or Edge object
-                                    if val.is_object() 
-                                        && val.get("id").is_some() 
-                                        && val.get("label").is_some() 
-                                        && val.get("properties").is_some() {
-                                        
-                                        // Check if the user actually asked for this whole variable
+                                    if val.is_object() && val.get("id").is_some() && val.get("label").is_some() {
                                         let is_requested = projection_items_clone.iter().any(|item| {
                                             let trimmed = item.trim();
                                             trimmed == key || trimmed.starts_with(&format!("{} AS", key))
                                         });
-                                        
                                         if !is_requested {
-                                            // Variable was only context for a property (e.g., p in p.mrn)
                                             obj.remove(&key);
-                                            info!("===> Cleaned up top-level nonsense object: '{}'", key);
                                         }
                                     }
                                 }
@@ -10377,11 +10403,27 @@ fn execute_cypher_sync_wrapper<'a>( // 1. Introduce lifetime parameter 'a
                             apply_projection_aliases(&projection_string, obj);
                         }
                     }
+
+                    // 2. Handle DISTINCT Deduplication
+                    if is_distinct {
+                        let mut unique_set = std::collections::HashSet::new();
+                        vertices.retain(|row| {
+                            let serialized = serde_json::to_string(row).unwrap_or_default();
+                            unique_set.insert(serialized)
+                        });
+                    }
+
+                    // Update the count for the outer scope
+                    current_count = vertices.len();
+                } 
+
+                // 3. Update stats (Now safe because the borrow of vertices has expired)
+                if let Some(stats) = final_wrapped_result.get_mut("stats").and_then(|s| s.as_object_mut()) {
+                    stats.insert("vertices_matched".to_string(), serde_json::json!(current_count));
                 }
                 
                 Ok(final_wrapped_result)
             }
-
             // NEW: Handles the standalone SET clause for chaining (e.g., `MATCH (n) SET n.prop = 'new'`)
             CypherQuery::SetStatement { assignments } => {
                 println!("===> EXECUTING Standalone SetStatement");

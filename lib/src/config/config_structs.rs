@@ -11,7 +11,7 @@ use uuid::Uuid;
 use log::{debug, error, info, warn, trace};
 use std::path::{Path, PathBuf};
 use std::collections::{HashMap};
-use serde::{de::DeserializeOwned, Deserialize, Serialize, Serializer, Deserializer};
+use serde::{self, de::DeserializeOwned, Deserialize, Serialize, Serializer, Deserializer};
 use serde::de::{self, MapAccess, Visitor};
 use serde_yaml2 as serde_yaml;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -846,6 +846,7 @@ pub struct SelectedStorageConfig {
 /// Wrapper for selected storage configuration
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct SelectedStorageConfigWrapper {
+    #[serde(flatten)]
     pub storage: SelectedStorageConfig,
 }
 

@@ -85,6 +85,7 @@ daemon_api = { path = "../daemon_api", version = "0.1.0" }
 proto = { path = "../proto", version = "0.1.0", features = ["server"] }
 models = { path = "../models", version = "0.1.0" }
 schema = { path = "../schema", version = "0.1.0" }
+normalization = { path = "../normalization", version = "0.1.0" }
 logging_service = { path = "../logging_service", version = "0.1.0" }
 notifications_service = { path = "../notifications_service", version = "0.1.0" }
 analytics_service = { path = "../analytics_service", version = "0.1.0" }
