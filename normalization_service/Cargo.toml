@@ -1,0 +1,14 @@
+[package]
+name = "normalization_service"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sysinfo = { version = "0.37.0", features = ["default", "serde"] }
+chrono = { version = "0.4.39", features = ["serde"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+tokio = { version = "1.44.2", features = ["full"] }
+lib = { path = "../lib", version = "0.1.0", features = ["sled-datastore"] }
+models = { path = "../models", version = "0.1.0" }
+schema = { path = "../schema", version = "0.1.0" }
